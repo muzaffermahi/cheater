@@ -60,3 +60,8 @@ eval_runs_dirty_check/
 # OS / editor
 Thumbs.db
 .DS_Store
+
+# Embedded git repositories (legacy / archive)
+_archive/cheater_nested_repo/
+_archive/*/.git/
+_archive/**/*.git/
