@@ -41,6 +41,7 @@ export interface RollbackPoint {
   gitRef?: string;
   patchFile?: string;
   snapshotDir?: string;
+  existedFiles?: string[];
   description: string;
 }
 

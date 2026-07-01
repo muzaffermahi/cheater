@@ -5,26 +5,38 @@ export interface DiffInput {
   diffText?: string;
 }
 
-export function runDiffGuard(commitlet: Commitlet, input: DiffInput): DiffGuardReport {
+export interface DiffGuardOverrides {
+  allowLargeDeletion?: boolean;
+}
+
+export function runDiffGuard(commitlet: Commitlet, input: DiffInput, overrides: DiffGuardOverrides = {}): DiffGuardReport {
   const allowed = new Set(commitlet.allowedFiles);
   const touchedFiles = [...new Set(input.touchedFiles)];
   const diffLines = countDiffLines(input.diffText);
   const blockingIssues: string[] = [];
   const warnings: string[] = [];
+  const allowedList = commitlet.allowedFiles.join(", ") || "(none)";
   const outside = touchedFiles.filter((file) => !allowed.has(file));
-  if (outside.length) blockingIssues.push(`Touched files outside allowedFiles: ${outside.join(", ")}`);
+  if (outside.length) blockingIssues.push(`Touched files outside allowedFiles: ${outside.join(", ")}. -> Edit only ${allowedList} for this commitlet; to change another file, finish this commitlet and call cheater_commitlet_next.`);
   const forbidden = touchedFiles.filter((file) => commitlet.forbiddenFiles.includes(file));
-  if (forbidden.length) blockingIssues.push(`Touched forbidden files: ${forbidden.join(", ")}`);
-  if (touchedFiles.length > commitlet.maxFilesTouched) blockingIssues.push(`Touched ${touchedFiles.length} files, max is ${commitlet.maxFilesTouched}`);
-  if (diffLines > commitlet.maxDiffLines) blockingIssues.push(`Diff has ${diffLines} changed lines, max is ${commitlet.maxDiffLines}`);
-  if (touchedFiles.some(isDependencyFile) && !commitlet.healthBudget.allowDependencyEdits) blockingIssues.push("Dependency/manifest edit is not allowed for this commitlet.");
-  if (touchedFiles.some(isLockfile) && !commitlet.healthBudget.allowLockfileEdits) blockingIssues.push("Lockfile edit is not allowed for this commitlet.");
-  if (touchedFiles.some(isTestFile) && !commitlet.healthBudget.allowTestEdits) blockingIssues.push("Test edit is not allowed for this commitlet.");
-  if (touchedFiles.some(isGeneratedFile)) blockingIssues.push("Generated/compiled artifact was touched.");
+  if (forbidden.length) blockingIssues.push(`Touched forbidden files: ${forbidden.join(", ")}. -> Revert those files and keep the change inside ${allowedList}.`);
+  if (touchedFiles.length > commitlet.maxFilesTouched) blockingIssues.push(`Touched ${touchedFiles.length} files, max is ${commitlet.maxFilesTouched}. -> Split this into one commitlet per file; revert all but one and call cheater_commitlet_next for the rest.`);
+  if (diffLines > commitlet.maxDiffLines) blockingIssues.push(`Diff has ${diffLines} changed lines, max is ${commitlet.maxDiffLines}. -> Make a smaller, more focused change or split it across commitlets.`);
+  if (touchedFiles.some(isDependencyFile) && !commitlet.healthBudget.allowDependencyEdits) blockingIssues.push("Dependency/manifest edit is not allowed for this commitlet. -> Revert the manifest change; if a dependency is truly required, tell the user and get explicit approval first.");
+  if (touchedFiles.some(isLockfile) && !commitlet.healthBudget.allowLockfileEdits) blockingIssues.push("Lockfile edit is not allowed for this commitlet. -> Revert the lockfile; let the package manager regenerate it only after an approved dependency change.");
+  if (touchedFiles.some(isTestFile) && !commitlet.healthBudget.allowTestEdits) blockingIssues.push("Test edit is not allowed for this commitlet. -> Revert the test change and fix the source instead; only edit tests when the task is explicitly about them.");
+  if (touchedFiles.some(isGeneratedFile)) blockingIssues.push("Generated/compiled artifact was touched. -> Revert it and change the source that produces it instead.");
   const churn = formattingChurn(input.diffText ?? "");
-  if (churn >= 40) blockingIssues.push(`Broad formatting-only churn detected across ${churn} changed lines.`);
+  if (churn >= 40) {
+    // A large formatting-only churn in a single file is usually a real refactor, not a
+    // whole-repo reformat; demote it to a warning there and only hard-block multi-file churn.
+    const msg = `Broad formatting-only churn detected across ${churn} changed lines. -> Keep whitespace/format changes out of a behavior commitlet.`;
+    if (touchedFiles.length <= 1) warnings.push(msg);
+    else blockingIssues.push(msg);
+  }
   const deletion = largeDeletion(input.diffText ?? "");
-  if (deletion) blockingIssues.push(deletion);
+  if (deletion && !overrides.allowLargeDeletion) blockingIssues.push(deletion);
+  else if (deletion) warnings.push("Large deletion approved via approveLargeDeletion.");
   const editedVerification = editedFocusedVerificationTarget(commitlet, touchedFiles);
   if (editedVerification) blockingIssues.push(editedVerification);
   return {
@@ -82,7 +94,7 @@ function largeDeletion(diffText: string): string | undefined {
   const removed = normalizedChangedLines(diffText, "-").length;
   const added = normalizedChangedLines(diffText, "+").length;
   if (removed >= 50 && added < Math.ceil(removed / 3)) {
-    return `Large deletion requires explicit approval: removed ${removed} lines and added ${added}.`;
+    return `Large deletion requires explicit approval: removed ${removed} lines and added ${added}. -> If the deletion is intended, re-run cheater_commitlet_next with approveLargeDeletion=true; otherwise restore what should not be removed.`;
   }
   return undefined;
 }

@@ -132,18 +132,24 @@ def run_gym_cli(rest: Sequence[str], cwd: Path) -> int:
     """Delegate `cheater gym ...` to the TypeScript CLI when available.
 
     The Gym implementation lives in the cheater-pi package. This launcher
-    prefers the npm-installed `cheater` binary (which already routes to the
-    TypeScript code path) and falls back to `node dist/src/index.js` for
-    local development.
+    prefers a real built `cheater-pi/dist/src/index.js` run with node, and
+    avoids recursively calling the `cheater` command on PATH (which may be
+    this same Python launcher and would loop forever).
     """
-    candidates = []
-    on_path = shutil.which("cheater")
-    if on_path:
-        candidates.append([on_path])
-    candidates.append([sys.executable, "-m", "no.such.module"])
     dist_index = PACKAGE_DIR / "dist" / "src" / "index.js"
-    candidates.append([sys.executable, str(dist_index)])
-    candidates.append(["node", str(dist_index)])
+    candidates: list[list[str]] = []
+    if dist_index.is_file():
+        candidates.append(["node", str(dist_index)])
+    npm_cheater = _resolve_external_cheater_binary()
+    if npm_cheater:
+        candidates.append([npm_cheater])
+
+    if not candidates:
+        sys.stderr.write(
+            "cheater gym: no built cheater-pi/dist/src/index.js found and no external cheater binary.\n"
+            "Build the package first: `cd cheater-pi && npm run build`.\n"
+        )
+        return 127
 
     last_error: Exception | None = None
     for cmd in candidates:
@@ -153,10 +159,7 @@ def run_gym_cli(rest: Sequence[str], cwd: Path) -> int:
         except FileNotFoundError as err:
             last_error = err
             continue
-    sys.stderr.write(
-        "cheater gym: no cheater binary or built cheater-pi/dist/src/index.js found.\n"
-        "Build the package first: `cd cheater-pi && npm run build`.\n"
-    )
+    sys.stderr.write("cheater gym: could not run the TypeScript CLI.\n")
     if last_error:
         sys.stderr.write(f"last error: {last_error}\n")
     return 127
@@ -172,7 +175,9 @@ def run_reliability_bench_cli(rest: Sequence[str], cwd: Path) -> int:
         )
         return 127
     try:
-        completed = subprocess.run(["node", str(dist_index), "bench", "reliability", *rest], cwd=cwd)
+        completed = subprocess.run(
+            ["node", str(dist_index), "bench", "reliability", *rest], cwd=cwd
+        )
     except FileNotFoundError:
         sys.stderr.write("cheater bench reliability: node not found.\n")
         return 127
@@ -438,6 +443,36 @@ def _is_stale_cheater_pi_shim(path: Path) -> bool:
     if "--wrap-pi" not in text:
         return False
     return True
+
+
+def _resolve_external_cheater_binary() -> str | None:
+    """Resolve a non-Python ``cheater`` binary on PATH, skipping this launcher.
+
+    ``shutil.which("cheater")`` may return this same Python launcher (when
+    pip-installed), which would cause ``cheater gym`` to recurse forever.
+    We skip any candidate that resolves to the current ``sys.executable`` or
+    whose content looks like the Python entry point.
+    """
+    current = Path(sys.executable).resolve()
+    for name in ("cheater", "cheater.cmd", "cheater.exe", "cheater.bat"):
+        found = shutil.which(name)
+        if not found:
+            continue
+        resolved = Path(found).resolve()
+        try:
+            same = resolved == current or resolved.samefile(current)
+        except OSError:
+            same = str(resolved).lower() == str(current).lower()
+        if same:
+            continue
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return found
+        if "from cheater.pi_launcher import main" in text or "cheater.__main__" in text:
+            continue
+        return found
+    return None
 
 
 if __name__ == "__main__":

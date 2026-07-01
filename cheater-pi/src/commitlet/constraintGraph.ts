@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, relative } from "node:path";
 import type { RepoOrientation } from "../blueprint/types.js";
+import { detectProjectCommands } from "../reliability/projectCommands.js";
 
 export interface RepoConstraintGraph {
   files: string[];
@@ -39,6 +40,7 @@ export function buildRepoConstraintGraph(repoRoot: string, files: string[]): Rep
     relatedFiles: [],
     verificationCommands: []
   };
+  const cachedCommands = detectProjectCommands(repoRoot);
   for (const rel of usableFiles) {
     const path = join(repoRoot, rel);
     if (!existsSync(path)) continue;
@@ -52,7 +54,7 @@ export function buildRepoConstraintGraph(repoRoot: string, files: string[]): Rep
     if (/registerTool\(/.test(text)) graph.toolRegistrations.push(rel);
     for (const match of text.matchAll(/\b([a-zA-Z]\w+)\??:\s*(?:boolean|string|number)/g)) graph.configKeys.push(`${rel}:${match[1]}`);
     if (/(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(rel)) graph.tests.push(rel);
-    graph.verificationCommands.push(...verificationHints(rel, text));
+    graph.verificationCommands.push(...verificationHints(rel, text, cachedCommands));
   }
   graph.testMappings.push(...mapTestsToFiles(usableFiles));
   graph.testMappings.push(...discoverCoLocatedTests(repoRoot, usableFiles));
@@ -139,14 +141,16 @@ function relatedFiles(files: string[]): Array<{ file: string; relatedFile: strin
   return uniqueBy(relations, (item) => `${item.file}:${item.relatedFile}:${item.reason}`).slice(0, 40);
 }
 
-function verificationHints(file: string, text: string): Array<{ file: string; command: string; reason: string }> {
+function verificationHints(file: string, text: string, cmds: ReturnType<typeof detectProjectCommands>): Array<{ file: string; command: string; reason: string }> {
   const hints: Array<{ file: string; command: string; reason: string }> = [];
-  if (isTestFile(file)) hints.push({ file, command: "npm test", reason: "test file changed" });
-  if (/registerCommand\(/.test(text)) hints.push({ file, command: "npm test -- --test-name-pattern=command", reason: "command registry behavior" });
-  if (/registerTool\(/.test(text)) hints.push({ file, command: "npm test -- --test-name-pattern=tool", reason: "tool schema/registry behavior" });
-  if (/\bexport\s+interface\s+CheaterConfig\b|\bDEFAULT_CONFIG\b|\bDEFAULT_.*CONFIG\b/.test(text)) hints.push({ file, command: "npm test -- --test-name-pattern=config", reason: "config/startup defaults" });
-  if (/\.(ts|tsx)$/.test(file)) hints.push({ file, command: "npm run build", reason: "TypeScript signature/import coherence" });
-  if (/\.(py)$/.test(file)) hints.push({ file, command: "pytest -q", reason: "Python behavior/import coherence" });
+  const testCmd = cmds.testCommand ?? "npm test";
+  const buildCmd = cmds.buildCommand ?? "npm run build";
+  if (isTestFile(file)) hints.push({ file, command: testCmd, reason: "test file changed" });
+  if (/registerCommand\(/.test(text)) hints.push({ file, command: `${testCmd} -- --test-name-pattern=command`, reason: "command registry behavior" });
+  if (/registerTool\(/.test(text)) hints.push({ file, command: `${testCmd} -- --test-name-pattern=tool`, reason: "tool schema/registry behavior" });
+  if (/\bexport\s+interface\s+CheaterConfig\b|\bDEFAULT_CONFIG\b|\bDEFAULT_.*CONFIG\b/.test(text)) hints.push({ file, command: `${testCmd} -- --test-name-pattern=config`, reason: "config/startup defaults" });
+  if (/\.(ts|tsx)$/.test(file)) hints.push({ file, command: buildCmd, reason: "TypeScript signature/import coherence" });
+  if (/\.(py)$/.test(file)) hints.push({ file, command: cmds.testCommand ?? "pytest -q", reason: "Python behavior/import coherence" });
   return uniqueBy(hints, (item) => `${item.file}:${item.command}:${item.reason}`);
 }
 

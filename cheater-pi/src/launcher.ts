@@ -68,12 +68,15 @@ export function resolvePiCommand(config: CheaterConfig = {}): PiCommandResolutio
 export function buildPiCommand(config: CheaterConfig, options: LaunchOptions, root = packageDir()): string[] {
   const resolved = resolvePiCommand(config).command;
   const paths = resourcePaths(root);
+  // Cheater's system prompt is injected once, config-aware, at before_agent_start (see
+  // prompts.ts buildSystemPrompt). We deliberately do NOT also pass --append-system-prompt
+  // for cheater.md: a small model reconciling two drifted copies of the same rulebook is a
+  // known failure mode. --prompt-template stays for Pi's base identity/template resolution.
   const command = [
     ...resolved,
     "--extension", paths.extension,
     "--skill", paths.skills,
     "--prompt-template", paths.prompts,
-    "--append-system-prompt", paths.prompt,
     "--name", "Cheater"
   ];
   if (config.provider) command.push("--provider", config.provider);

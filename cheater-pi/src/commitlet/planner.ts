@@ -1,6 +1,7 @@
 import type { AutopilotDecision } from "../autopilot/types.js";
 import type { BlueprintPlan, WorkPacket } from "../blueprint/types.js";
 import { splitPacketsByTouchedFile } from "../reliability/perFilePackets.js";
+import { defaultVerificationCommand } from "../reliability/projectCommands.js";
 import { commitletConfig } from "./config.js";
 import { forgeCommitletSpec } from "./spec.js";
 import type { Commitlet, CommitletHealthBudget, CommitletPlan, CommitletPlanInput, VerificationStep } from "./types.js";
@@ -8,9 +9,10 @@ import { verificationFromBlueprint, workPacketToAllowedFiles } from "./types.js"
 import { emptyHealthReport } from "./health.js";
 
 export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
+  const projectTestCommand = defaultVerificationCommand(input.repoRoot);
   const commitlets = input.blueprintPlan
     ? commitletsFromBlueprint(input.blueprintPlan, input.autopilotDecision)
-    : commitletsFromDecision(input.userGoal, input.autopilotDecision);
+    : commitletsFromDecision(input.userGoal, input.autopilotDecision, projectTestCommand);
   const finalVerification = mergeFinalVerification(commitlets);
   const plan: CommitletPlan = {
     id: `commitlet-plan-${Date.now().toString(36)}`,
@@ -80,7 +82,10 @@ export function createRepairCommitlet(failed: Commitlet, failureSummary: string)
       ]
     },
     result: undefined,
-    rollbackPoint: undefined
+    // Carry the ORIGINAL commitlet's pre-edit rollback point so reverting a failed repair
+    // restores the clean prior state, not the already-broken intermediate the repair started
+    // from. Without this the harness reports "reverted" while leaving broken code on disk.
+    rollbackPoint: failed.rollbackPoint
   };
 }
 
@@ -95,7 +100,7 @@ export function createCleanupCommitlet(plan: CommitletPlan, healthSummary: strin
     expectedFilesTouched: allowedFiles,
     focusedVerification: plan.finalVerification.length
       ? plan.finalVerification
-      : [{ command: "npm test", purpose: "Focused or available local test command", required: true }],
+      : defaultVerification({ taskKind: "refactor" } as AutopilotDecision, defaultVerificationCommand(plan.repoRoot)),
     risk: "low",
     allowTestEdits: false
   });
@@ -145,16 +150,16 @@ function commitletFromPacket(packet: WorkPacket, index: number, decision: Autopi
   });
 }
 
-function commitletsFromDecision(userGoal: string, decision: AutopilotDecision): Commitlet[] {
+function commitletsFromDecision(userGoal: string, decision: AutopilotDecision, projectTestCommand: string | null): Commitlet[] {
   if (decision.executionDiscipline === "none") return [];
   if (decision.executionDiscipline === "single_commitlet" || decision.executionDiscipline === "fast_path") {
-    return [directCommitlet("c1-single", userGoal, decision, inferAllowedFiles(userGoal, decision))];
+    return [directCommitlet("c1-single", userGoal, decision, inferAllowedFiles(userGoal, decision), projectTestCommand)];
   }
   const parts = splitGoalIntoScopes(userGoal, decision);
-  return parts.map((part, index) => directCommitlet(`c${index + 1}-${safeId(part.scope)}`, part.title, decision, part.files, part.scope));
+  return parts.map((part, index) => directCommitlet(`c${index + 1}-${safeId(part.scope)}`, part.title, decision, part.files, projectTestCommand, part.scope));
 }
 
-function directCommitlet(id: string, title: string, decision: AutopilotDecision, allowedFiles: string[], scope: string = decision.taskKind): Commitlet {
+function directCommitlet(id: string, title: string, decision: AutopilotDecision, allowedFiles: string[], projectTestCommand: string | null, scope: string = decision.taskKind): Commitlet {
   return makeCommitlet({
     id,
     title,
@@ -162,7 +167,7 @@ function directCommitlet(id: string, title: string, decision: AutopilotDecision,
     scope,
     allowedFiles,
     expectedFilesTouched: allowedFiles,
-    focusedVerification: defaultVerification(decision),
+    focusedVerification: defaultVerification(decision, projectTestCommand),
     risk: decision.risk,
     allowTestEdits: decision.taskKind === "test_failure" || /\btest\b/i.test(title)
   });
@@ -241,9 +246,14 @@ function cleanupAllowedFiles(plan: CommitletPlan): string[] {
   return allowed.slice(0, Math.max(1, commitletConfig().maxFilesTouchedDefault));
 }
 
-function defaultVerification(decision: AutopilotDecision): VerificationStep[] {
+function defaultVerification(decision: AutopilotDecision, projectTestCommand: string | null): VerificationStep[] {
   if (decision.taskKind === "docs") return [{ purpose: "Manual docs review", required: true }];
-  return [{ command: "npm test", purpose: "Focused or available local test command", required: true }];
+  if (!projectTestCommand) {
+    // No detected command: a command-less step passes as "manual review" instead of
+    // running a guessed `npm test` that reverts correct work in a non-npm repo.
+    return [{ purpose: "No project test command detected; verify manually or via cheater_verification_run", required: false }];
+  }
+  return [{ command: projectTestCommand, purpose: "Detected local test command", required: true }];
 }
 
 function mergeFinalVerification(commitlets: Commitlet[]): VerificationStep[] {

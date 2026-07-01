@@ -41,27 +41,35 @@ function summarizeDecision(mode: AutopilotDecision["executionMode"], reason: str
   return "Planning internally because this looks like a multi-step code task.";
 }
 
-export function buildAutopilotInstruction(decision: AutopilotDecision, goal: string): string {
-  const lines = [
-    "Cheater Autopilot decision",
-    `mode: ${decision.executionMode}`,
-    `executionDiscipline: ${decision.executionDiscipline}`,
-    `taskKind: ${decision.taskKind}`,
-    `risk: ${decision.risk}`,
-    `confidence: ${decision.confidence.toFixed(2)}`,
-    `reason: ${decision.reason}`,
-    `goal: ${goal}`
-  ];
+// Model-facing instruction: only imperative directives, no routing telemetry
+// (mode/discipline/risk/confidence live in the TUI widget and /autopilot-status). A small
+// model attends to the top of the message, so the goal keeps positional primacy and this
+// block is short.
+export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: string): string {
   if (decision.executionMode === "answer_only") {
-    lines.push("Proceed by answering directly. Do not edit files or run blueprint tools.");
-  } else if (decision.executionDiscipline === "blocked_needs_user") {
-    lines.push("Stop before editing and ask the user for explicit approval because this is high risk.");
-  } else if (decision.executionDiscipline === "single_commitlet" || decision.executionDiscipline === "fast_path") {
-    lines.push("For this code-changing task, first call cheater_reliability_start. Do not manually chain cheater_commitlet_plan, cheater_commitlet_next, or cheater_blueprint_create. Do not ask the user to type /blueprint or /commitlet; users do not need /blueprint or /commitlet. Each file-change commitlet must run in a different worker session.");
-  } else if (decision.executionMode === "mission_control") {
-    lines.push("Use Cheater Mission Control only when repro/evidence is needed. If editing is required after repro/evidence, continue by first calling cheater_reliability_start. Do not manually chain cheater_commitlet_plan, cheater_commitlet_next, or cheater_blueprint_create. Do not ask the user to type /blueprint or /commitlet; users do not need /blueprint or /commitlet. Each file-change commitlet must run in a different worker session.");
-  } else {
-    lines.push("Planner session only: for this code-changing task, first call cheater_reliability_start. Do not manually chain cheater_commitlet_plan, cheater_commitlet_next, or cheater_blueprint_create. Do not call read, grep, ls, bash, edit, or write yourself. Each file-change commitlet must run in a different worker session; do not ask the user to type /blueprint or /commitlet. Users do not need /blueprint or /commitlet.");
+    return "Cheater: this is a question, not a code change. Answer directly. Do not edit files or start a commitlet plan.";
   }
+  if (decision.executionDiscipline === "blocked_needs_user") {
+    return "Cheater: this looks high-risk (dependency/lockfile/destructive change). Stop before editing and ask the user for explicit approval.";
+  }
+  const lines: string[] = [];
+  if (decision.executionMode === "blueprint_orchestrator") {
+    lines.push(
+      "Cheater plan (this session is the planner only: do not read, grep, ls, bash, edit, or write yourself):",
+      "1. Call cheater_reliability_start with the goal; it builds the commitlet plan and returns the first fresh-call prompt.",
+      "2. After each fresh worker finishes its one-file commitlet, call cheater_commitlet_next to grade it and get the next commitlet or the final review.",
+      "3. When cheater_commitlet_next reports the final review, call cheater_verification_run then cheater_finish_gate before telling the user it is done."
+    );
+    return lines.join("\n");
+  }
+  if (decision.executionMode === "mission_control") {
+    lines.push("Cheater: reproduce the bug and gather evidence first, then run the commitlet flow below.");
+  }
+  lines.push(
+    "Cheater plan:",
+    "1. Call cheater_reliability_start with the goal; it builds the commitlet plan and returns the first fresh-call prompt.",
+    "2. Edit only the allowed files, then call cheater_commitlet_next (it grades the edit in code). Repeat until it reports the final review.",
+    "3. Call cheater_verification_run then cheater_finish_gate before telling the user it is done. If verification cannot run, say so explicitly."
+  );
   return lines.join("\n");
 }

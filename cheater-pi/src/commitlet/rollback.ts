@@ -6,17 +6,25 @@ export function createRollbackPoint(repoRoot: string, commitlet: Commitlet): Rol
   const id = `rollback-${commitlet.id}-${Date.now().toString(36)}`;
   const snapshotDir = join(repoRoot, ".cheater", "commitlets", "rollbacks", id);
   mkdirSync(snapshotDir, { recursive: true });
+  const existedFiles: string[] = [];
   for (const rel of commitlet.allowedFiles.filter((file) => !isVirtualPath(file))) {
     const src = join(repoRoot, rel);
     const dest = join(snapshotDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
-    if (existsSync(src)) writeFileSync(dest, readFileSync(src), "utf8");
+    // Copy raw bytes (no "utf8"), so binaries are snapshotted without corruption.
+    if (existsSync(src)) {
+      writeFileSync(dest, readFileSync(src));
+      existedFiles.push(rel);
+    }
   }
   const rollback: RollbackPoint = {
     id,
     createdAt: new Date().toISOString(),
     snapshotDir,
-    description: `Snapshot of allowed files before commitlet ${commitlet.id}.`
+    description: `Snapshot of allowed files before commitlet ${commitlet.id}.`,
+    // Files that existed at snapshot time; anything else in allowedFiles that exists on revert
+    // was created during the commitlet and must be removed to truly restore the prior state.
+    existedFiles
   };
   writeFileSync(join(snapshotDir, "rollback.json"), JSON.stringify(rollback, null, 2), "utf8");
   return rollback;
@@ -32,18 +40,30 @@ export function revertRollbackPoint(repoRoot: string, commitlet: Commitlet): { o
     return { ok: false, restoredFiles: [], reason: "Rollback snapshot is missing." };
   }
   const restoredFiles: string[] = [];
+  const removedFiles: string[] = [];
+  const existed = point.existedFiles ? new Set(point.existedFiles) : undefined;
   for (const rel of commitlet.allowedFiles.filter((file) => !isVirtualPath(file))) {
     const snapshot = join(point.snapshotDir, rel);
-    if (!existsSync(snapshot)) continue;
     const target = join(repoRoot, rel);
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(target, readFileSync(snapshot, "utf8"), "utf8");
-    restoredFiles.push(rel);
+    if (existsSync(snapshot)) {
+      mkdirSync(dirname(target), { recursive: true });
+      // Restore raw bytes (no "utf8"), so binaries are restored intact.
+      writeFileSync(target, readFileSync(snapshot));
+      restoredFiles.push(rel);
+    } else if (existed && !existed.has(rel) && existsSync(target)) {
+      // Created during the commitlet (no snapshot, not pre-existing): delete to restore state.
+      rmSync(target, { force: true });
+      removedFiles.push(rel);
+    }
   }
+  const parts = [
+    restoredFiles.length ? `restored ${restoredFiles.length}` : "",
+    removedFiles.length ? `removed ${removedFiles.length} created file(s)` : ""
+  ].filter(Boolean);
   return {
     ok: true,
-    restoredFiles,
-    reason: restoredFiles.length ? `Restored ${restoredFiles.length} allowed file snapshot(s).` : "No snapshot files needed restoring."
+    restoredFiles: [...restoredFiles, ...removedFiles.map((f) => `${f} (removed)`)],
+    reason: parts.length ? `Rollback: ${parts.join(", ")}.` : "No snapshot files needed restoring."
   };
 }
 

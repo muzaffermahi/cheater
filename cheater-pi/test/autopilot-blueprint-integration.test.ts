@@ -15,15 +15,17 @@ function makePi() {
   const tools = new Map<string, any>();
   const events = new Map<string, any>();
   const messages: string[] = [];
+  const customMessages: Array<{ message: any; options: any }> = [];
   const pi = {
     registerCommand(name: string, def: any) { commands.set(name, def); },
     registerTool(def: any) { tools.set(def.name, def); },
     on(name: string, handler: any) { events.set(name, handler); },
     sendUserMessage(text: string) { messages.push(text); },
+    sendMessage(message: any, options?: any) { customMessages.push({ message, options }); },
     getAllTools() { return [...tools.values()]; },
     getCommands() { return [...commands.keys()].map((name) => ({ name })); }
   };
-  return { pi, commands, tools, events, messages };
+  return { pi, commands, tools, events, messages, customMessages };
 }
 
 function ctx() {
@@ -37,6 +39,7 @@ function ctx() {
       setStatus() {},
       setWidget(key: string, value: unknown) { widgets.set(key, value); }
     },
+    hasPendingMessages: () => false,
     widgets
   };
 }
@@ -54,7 +57,6 @@ test("extension registers autopilot and blueprint commands/tools", () => {
   assert.ok(commands.has("health-report"));
   assert.ok(commands.has("constraint-graph"));
   assert.ok(commands.has("bench-report"));
-  assert.ok(tools.has("cheater_autopilot_route"));
   assert.ok(tools.has("cheater_blueprint_create"));
   assert.ok(tools.has("cheater_blueprint_approve"));
   assert.ok(tools.has("cheater_blueprint_next_packet"));
@@ -63,14 +65,25 @@ test("extension registers autopilot and blueprint commands/tools", () => {
   assert.ok(tools.has("cheater_line_edit"));
   assert.ok(tools.has("cheater_reliability_start"));
   assert.ok(tools.has("cheater_bug_worker"));
-  assert.ok(tools.has("cheater_commitlet_plan"));
-  assert.ok(tools.has("cheater_commitlet_verify"));
+  assert.ok(tools.has("cheater_commitlet_next"));
+  assert.ok(tools.has("cheater_finish_gate"));
+  assert.ok(tools.has("cheater_verification_run"));
+  assert.ok(tools.has("cheater_ledger_status"));
+  assert.equal(tools.has("cheater_autopilot_route"), false, "routing is harness-level now, not a model-facing tool");
+  assert.equal(tools.has("cheater_commitlet_plan"), false, "superseded by cheater_reliability_start");
+  assert.equal(tools.has("cheater_commitlet_guard"), false, "grading is inlined into cheater_commitlet_next");
+  assert.equal(tools.has("cheater_commitlet_verify"), false, "grading is inlined into cheater_commitlet_next");
+  assert.equal(tools.has("cheater_commitlet_finalize"), false, "final review runs automatically from cheater_commitlet_next");
   assert.ok(tools.has("cheater_rollback_status"));
   assert.ok(tools.has("cheater_health_report"));
   assert.ok(tools.has("cheater_constraint_graph"));
   assert.ok(tools.has("cheater_bench_report"));
   assert.ok(events.has("before_agent_start"));
-  assert.ok(events.has("before_user_message"));
+  assert.ok(events.has("input"));
+  assert.ok(events.has("tool_call"));
+  assert.ok(events.has("tool_result"));
+  assert.ok(events.has("agent_end"));
+  assert.equal(events.has("before_user_message"), false, "Pi has no before_user_message event; routing hangs off input");
 });
 
 test("doctor separates public commands from debug-only internals", async () => {
@@ -372,13 +385,26 @@ test("legacy blueprint prompt execution is disabled even when config asks otherw
   assert.equal(result.details.alwaysFreshWorkers, true);
 });
 
-test("normal user message triggers router lifecycle hook", async () => {
+test("normal interactive input triggers router lifecycle hook via the real Pi input event", async () => {
   const { pi, events } = makePi();
   cheaterExtension(pi);
-  const result = await events.get("before_user_message")({ message: "add a /hello command with tests and docs" }, ctx());
-  assert.match(result.message, /Cheater Autopilot decision/);
-  assert.match(result.message, /blueprint_orchestrator/);
-  assert.match(result.message, /Planner session only/);
+  const result = await events.get("input")({ type: "input", text: "add a /hello command with tests and docs", source: "interactive" }, ctx());
+  assert.equal(result.action, "transform");
+  // Header diet: model sees the goal first, then imperative directives only - routing
+  // telemetry (mode/discipline/confidence) lives in the TUI widget, not the model message.
+  assert.match(result.text, /User request: add a \/hello command/);
+  assert.match(result.text, /Cheater plan/);
+  assert.match(result.text, /planner only/i);
+  assert.match(result.text, /cheater_reliability_start/);
+  assert.match(result.text, /cheater_commitlet_next/);
+  assert.doesNotMatch(result.text, /confidence:|executionDiscipline/);
+});
+
+test("extension-sourced input (e.g. finish-gate nudge) is not re-routed through autopilot", async () => {
+  const { pi, events } = makePi();
+  cheaterExtension(pi);
+  const result = await events.get("input")({ type: "input", text: "Cheater Finish Gate: ...", source: "extension" }, ctx());
+  assert.deepEqual(result, { action: "continue" });
 });
 
 test("bug worker tool gathers evidence and dispatches a fresh bug agent", async () => {

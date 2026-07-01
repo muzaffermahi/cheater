@@ -59,6 +59,8 @@ export interface CheaterConfig {
   packetContextBudgetTokensMoE?: number;
   packetHardContextCeilingTokens9B?: number;
   packetHardContextCeilingTokensMoE?: number;
+  postEditSyntaxGateEnabled?: boolean;
+  autoVerifyOnFinish?: boolean;
   loopGovernorEnabled?: boolean;
   maxLoopBreaksPerPacket?: number;
   maxToolCallsTinyPacket?: number;
@@ -80,6 +82,10 @@ export interface CheaterConfig {
   benchmarkDefaultTaskLimit?: number;
   commitletModeEnabled?: boolean;
   commitletAutoForCodeTasks?: boolean;
+  // When true, each commitlet is dispatched to a real isolated fresh worker session
+  // (context isolation) by default, instead of returning a prompt to the orchestrator.
+  // Requires a working model backend; keep false for offline/dry-run use.
+  commitletFreshWorkerDefault?: boolean;
   rollbackRequired?: boolean;
   maxFilesTouchedDefault?: number;
   maxDiffLinesDefault?: number;

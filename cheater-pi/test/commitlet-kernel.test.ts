@@ -19,7 +19,7 @@ import { defaultCommitletState } from "../src/commitlet/state.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
 import { blockCommitletScopeViolation } from "../src/extension.js";
 import { runFocusedVerification } from "../src/commitlet/verification.js";
-import { createRepairCommitlet } from "../src/commitlet/planner.js";
+import { createCleanupCommitlet, createRepairCommitlet } from "../src/commitlet/planner.js";
 import { registerCommitletTools } from "../src/commitlet/tools.js";
 import { telemetryFromPlan } from "../src/commitlet/telemetry.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
@@ -130,7 +130,8 @@ test("commitlet fresh-call prompt includes bounded snippets and graph facts", ()
   const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, commitlet, ["one", "two", "three", "four"]).prompt;
   assert.match(prompt, /constraintFacts:\n-/);
   assert.match(prompt, /src\/commands\.ts registers commands/);
-  assert.match(prompt, /relevantSnippets:\n--- src\/commands\.ts snippet ---/);
+  // Snippet is now a symbol slice (or head fallback), both labeled with the file path.
+  assert.match(prompt, /relevantSnippets:\n--- src\/commands\.ts \((?:relevant symbol|head)\) ---/);
   assert.match(prompt, /previousState:\n- two\n- three\n- four/);
   assert.doesNotMatch(prompt, /value79/);
 });
@@ -181,10 +182,12 @@ test("diff guard blocks forbidden files, too many files, deps, tests, generated 
 test("diff guard blocks broad formatting churn, large deletion, and edited verification target", () => {
   const decision = routeAutopilot({ cwd: process.cwd(), message: "change one typo in README" });
   const commitlet = createCommitletPlan({ repoRoot: process.cwd(), userGoal: "change one typo in README", autopilotDecision: decision }).commitlets[0];
-  const formatting = runDiffGuard(commitlet, {
-    touchedFiles: ["README.md"],
-    diffText: Array.from({ length: 40 }, (_, index) => `-const value${index}=true;\n+const value${index} = true;`).join("\n")
-  });
+  const churnDiff = Array.from({ length: 40 }, (_, index) => `-const value${index}=true;\n+const value${index} = true;`).join("\n");
+  // Single-file churn is usually a real refactor, so it is a warning, not a hard block.
+  const singleFileChurn = runDiffGuard(commitlet, { touchedFiles: ["README.md"], diffText: churnDiff });
+  assert.match(singleFileChurn.warnings.join("; "), /formatting-only churn/);
+  // Broad churn across multiple files still hard-blocks.
+  const formatting = runDiffGuard(commitlet, { touchedFiles: ["README.md", "src/a.ts"], diffText: churnDiff });
   assert.match(formatting.blockingIssues.join("; "), /formatting-only churn/);
   const deletion = runDiffGuard(commitlet, {
     touchedFiles: ["README.md"],
@@ -205,8 +208,8 @@ test("lifecycle scope guard blocks edits outside running commitlet allowed files
     ...plan,
     commitlets: [{ ...plan.commitlets[0], status: "running", allowedFiles: ["src/config.ts"] }]
   });
-  assert.equal(blockCommitletScopeViolation({ toolName: "edit", args: { path: "src/config.ts" } }), undefined);
-  assert.match(blockCommitletScopeViolation({ toolName: "edit", args: { path: "src/other.ts" } })?.reason ?? "", /outside allowed/);
+  assert.equal(blockCommitletScopeViolation({ toolName: "edit", input: { path: "src/config.ts" } }), undefined);
+  assert.match(blockCommitletScopeViolation({ toolName: "edit", input: { path: "src/other.ts" } })?.reason ?? "", /outside allowed/);
   defaultCommitletState.clear();
 });
 
@@ -327,10 +330,11 @@ test("final review blocks unresolved commitlets and accepts clean chains", () =>
   assert.match(lowHealth.blockingIssues.join("; "), /cleanup commitlet required/);
 });
 
-test("finalize creates low-risk cleanup commitlet for health-only blockers", async () => {
-  const { pi, tools } = makePi();
-  defaultCommitletState.clear();
-  registerCommitletTools(pi, { config: { ...DEFAULT_CONFIG, telemetryEnabled: false } });
+test("final review creates a low-risk cleanup commitlet for health-only blockers", () => {
+  // cheater_commitlet_finalize was removed - final review + cleanup commitlet creation now
+  // happens automatically inside cheater_commitlet_next once no commitlets are pending. That
+  // path always reviews with the plan's own accumulated diff evidence (no external diffText
+  // override), so this test exercises the same pure functions the tool now calls internally.
   const decision = routeAutopilot({ cwd: process.cwd(), message: "change one typo in README" });
   const plan = createCommitletPlan({ repoRoot: process.cwd(), userGoal: "change one typo in README", autopilotDecision: decision });
   const passed = {
@@ -351,21 +355,13 @@ test("finalize creates low-risk cleanup commitlet for health-only blockers", asy
       }
     }))
   };
-  defaultCommitletState.setPlan(passed);
-  const result = await tools.get("cheater_commitlet_finalize").execute(
-    "finalize-cleanup",
-    { diffText: "+if (a && b) {}\n".repeat(13) },
-    undefined,
-    undefined,
-    commitletToolCtx()
-  );
-  const updated = defaultCommitletState.get().currentPlan;
-  const cleanup = updated?.commitlets.at(-1);
-  assert.equal(updated?.status, "running");
-  assert.equal(cleanup?.id, "c2-cleanup-health");
-  assert.equal(cleanup?.status, "pending");
-  assert.deepEqual(cleanup?.allowedFiles, ["README.md"]);
-  assert.match(result.content[0].text, /Created cleanup commitlet: c2-cleanup-health/);
+  const review = runCommitletFinalReview(passed, "+if (a && b) {}\n".repeat(13));
+  assert.equal(review.accepted, false);
+  assert.match(review.blockingIssues.join("; "), /cleanup commitlet required/);
+  const cleanup = createCleanupCommitlet(passed, review.blockingIssues.join("; "));
+  assert.equal(cleanup.id, "c2-cleanup-health");
+  assert.equal(cleanup.status, "pending");
+  assert.deepEqual(cleanup.allowedFiles, ["README.md"]);
 });
 
 test("commitlet telemetry uses plan creation time and records local metrics", () => {

@@ -39,7 +39,9 @@ export class BlueprintState {
           ? {
               summary,
               filesTouched: packet.filesToTouch.map((file) => file.path),
-              verificationPassed: status === "done"
+              // A packet being marked "done" is not verification evidence; the commitlet
+              // grader runs the real focused verification and records the honest result.
+              verificationPassed: packet.result?.verificationPassed ?? false
             }
           : packet.result
       };
