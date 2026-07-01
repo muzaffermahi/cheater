@@ -1,0 +1,172 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
+import { commandHelp } from "./ui.js";
+import { renderSkills } from "./skills.js";
+import { saveMemory } from "./tools.js";
+
+type ExtensionAPI = any;
+type CommandContext = any;
+
+const PUBLIC_COMMAND_NAMES = [
+  "cheater",
+  "autopilot-status",
+  "reliability-status",
+  "blueprint-show",
+  "blueprint-review",
+  "blueprint-cancel",
+  "blueprint-force",
+  "blueprint-docs",
+  "blueprint-memory",
+  "mission",
+  "mission-status",
+  "mission-cancel",
+  "mission-save",
+  "fix",
+  "orient",
+  "orientation",
+  "repro",
+  "evidence",
+  "playbook",
+  "verify",
+  "learn",
+  "delta-bench",
+  "gym",
+  "gym-list",
+  "gym-run",
+  "gym-run-suite",
+  "gym-report",
+  "gym-delta",
+  "gym-learn",
+  "gym-clean",
+  "test",
+  "map",
+  "bug-memory",
+  "remember",
+  "skills",
+  "traces",
+  "history",
+  "settings",
+  "doctor"
+];
+
+const DEBUG_COMMAND_NAMES = [
+  "blueprint-candidates",
+  "blueprint-step",
+  "blueprint-debug",
+  "blueprint-quality-repair",
+  "commitlet-next",
+  "commitlet-finalize",
+  "commitlet-debug"
+];
+
+function notifyBlock(ctx: CommandContext, text: string): void {
+  ctx.ui.notify(text, "info");
+  ctx.ui.setWidget?.("cheater-help", text.split("\n").slice(0, 80), { placement: "aboveEditor" });
+}
+
+async function askOrUse(args: string, ctx: CommandContext, title: string, placeholder: string): Promise<string | undefined> {
+  const trimmed = args.trim();
+  if (trimmed) return trimmed;
+  if (!ctx.hasUI) return undefined;
+  return ctx.ui.input(title, placeholder);
+}
+
+export function registerCheaterCommands(pi: ExtensionAPI): void {
+  pi.registerCommand("cheater", {
+    description: "Show Cheater status and commands",
+    handler: async (_args: string, ctx: CommandContext) => {
+      notifyBlock(ctx, `${commandHelp()}\n\nrepo: ${ctx.cwd}`);
+    }
+  });
+
+  pi.registerCommand("test", {
+    description: "Infer or run a focused test command",
+    handler: async (args: string, ctx: CommandContext) => {
+      const hint = args.trim();
+      const pkg = join(ctx.cwd, "package.json");
+      const pyproject = join(ctx.cwd, "pyproject.toml");
+      const fallback = existsSync(pyproject) ? "pytest -q" : existsSync(pkg) ? "npm test" : "";
+      const request = hint
+        ? `Cheater /test: run or refine this focused test command and summarize compactly: ${hint}`
+        : `Cheater /test: infer the narrowest useful test command for this repo${fallback ? `, starting from ${fallback}` : ""}. Run it if safe and summarize compactly.`;
+      pi.sendUserMessage(request);
+    }
+  });
+
+  pi.registerCommand("map", {
+    description: "Ask Pi for a compact repo overview",
+    handler: async (_args: string, _ctx: CommandContext) => {
+      pi.sendUserMessage("Cheater /map: build a compact repo overview using Pi's native search/list/read tools. Keep it short and emphasize entry points, tests, and likely edit areas.");
+    }
+  });
+
+  pi.registerCommand("bug-memory", {
+    description: "Search compacted solved-bug memories",
+    handler: async (args: string, ctx: CommandContext) => {
+      const query = await askOrUse(args, ctx, "Cheater /bug-memory", "Error text, failing test, API name, or bug description");
+      if (!query) {
+        ctx.ui.notify("No bug-memory query provided.", "warning");
+        return;
+      }
+      const result = await searchBugMemories({ cwd: ctx.cwd, query, topK: 5 });
+      notifyBlock(ctx, formatBugMemoryHits(result));
+    }
+  });
+
+  pi.registerCommand("remember", {
+    description: "Save a Cheater project note",
+    handler: async (args: string, ctx: CommandContext) => {
+      const note = await askOrUse(args, ctx, "Cheater /remember", "Project note to remember");
+      if (!note) {
+        ctx.ui.notify("No note saved.", "warning");
+        return;
+      }
+      const file = saveMemory(ctx.cwd, note);
+      ctx.ui.notify(`Saved Cheater memory: ${file}`, "info");
+    }
+  });
+
+  pi.registerCommand("skills", {
+    description: "List Cheater skills",
+    handler: async (_args: string, ctx: CommandContext) => {
+      notifyBlock(ctx, renderSkills());
+    }
+  });
+
+  const historyHandler = async (_args: string, ctx: CommandContext) => {
+    const entries = ctx.sessionManager?.getEntries?.() ?? [];
+    notifyBlock(ctx, `Cheater history\nsession entries: ${entries.length}\nUse Pi's session commands for full history and resume behavior.`);
+  };
+  pi.registerCommand("traces", { description: "Show recent Cheater/Pi history summary", handler: historyHandler });
+  pi.registerCommand("history", { description: "Alias for /traces", handler: historyHandler });
+
+  pi.registerCommand("settings", {
+    description: "Show Cheater settings",
+    handler: async (_args: string, ctx: CommandContext) => {
+      const tools = pi.getActiveTools?.() ?? [];
+      notifyBlock(ctx, `Cheater settings\nrepo: ${ctx.cwd}\nactive tools: ${tools.join(", ") || "(none)"}\nCheater package: active`);
+    }
+  });
+
+  pi.registerCommand("doctor", {
+    description: "Run Cheater extension diagnostics",
+    handler: async (_args: string, ctx: CommandContext) => {
+      const tools = pi.getAllTools?.().map((tool: { name: string }) => tool.name) ?? [];
+      const commands = pi.getCommands?.().map((command: { name: string }) => command.name) ?? [];
+      notifyBlock(
+        ctx,
+        [
+          "Cheater doctor",
+          `repo: ${ctx.cwd}`,
+          `mode: ${ctx.mode}`,
+          `project trusted: ${ctx.isProjectTrusted?.() ? "yes" : "no"}`,
+          `Cheater tools loaded: ${tools.filter((name: string) => name.startsWith("cheater_")).join(", ")}`,
+          `Compacted bug memories: ${tools.includes("cheater_bug_memory_search") ? "enabled" : "missing"}`,
+          `Public commands loaded: ${commands.filter((name: string) => PUBLIC_COMMAND_NAMES.includes(name)).join(", ")}`,
+          `Debug commands loaded: ${commands.filter((name: string) => DEBUG_COMMAND_NAMES.includes(name)).join(", ") || "(none)"}`
+        ].join("\n")
+      );
+    }
+  });
+}

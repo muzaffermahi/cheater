@@ -1,0 +1,62 @@
+# Generated / large data — canonical cards are built locally, not checked in.
+data/cards/
+data/indexes/
+
+# Tiny checked-in samples are NOT ignored (explicitly tracked):
+!data/samples/
+!data/benchmarks/
+
+# Large generated artifacts
+bug_cards_raw.jsonl
+data/solved_bug_cards.jsonl
+data/compact_bug_cards.jsonl
+
+# Indexes, caches, checkpoints
+*.idx
+*.npz
+*.npy
+cheater-pi/node_modules/
+cheater-pi/dist/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Run artifacts, logs, checkpoints, model outputs
+eval_runs/
+eval_runs_*/
+bench_runs/
+runs/
+acceptance_runs/
+isolation_smoke_runs/
+repeated_trial_smoke_runs/
+prompt_ablation_runs/
+retrieval_ablation_runs/
+retrieval_comparisons/
+eval_comparisons/
+local_bench_repos/
+local_bench_envs/
+local_bench_validation/
+local_eval_smoke_repo/
+local_eval_sources/
+local_eval_tasks/
+local_task_checks_smoke/
+eval_task_validation/
+eval_task_validation_final/
+eval_runs_dirty_check/
+*.log
+*.tmp
+*.checkpoint
+
+# Local config / env / state
+.env
+.cheater/cache/
+.cheater/sessions/
+.memory/
+.code-graph/
+.smallcode/
+
+# OS / editor
+Thumbs.db
+.DS_Store

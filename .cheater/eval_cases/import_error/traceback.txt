@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "tests/test_memory.py", line 4, in <module>
+    from cheater.memory import memory_search
+  File "cheater/memory.py", line 3, in <module>
+    from cheater.budget import ContextBudget
+ModuleNotFoundError: No module named 'cheater.budget'

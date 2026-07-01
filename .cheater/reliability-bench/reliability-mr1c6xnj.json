@@ -1,0 +1,43 @@
+{
+  "createdAt": "2026-07-01T00:27:58.303Z",
+  "results": [
+    {
+      "taskId": "task-1",
+      "variant": "E",
+      "passed": true,
+      "loopBreaks": 1,
+      "repeatedFileReads": 1,
+      "repeatedCommands": 0,
+      "toolCalls": 4,
+      "wallMs": 7,
+      "filesTouched": 1,
+      "diffLines": 6,
+      "manualInterventions": 0,
+      "commitletsCompleted": 1,
+      "forbiddenEditsCaught": 0,
+      "rollbackSuccess": true,
+      "healthScore": 100,
+      "testWeakeningCaught": true,
+      "retrievalGateTrusted": true
+    },
+    {
+      "taskId": "task-2",
+      "variant": "E",
+      "passed": true,
+      "loopBreaks": 1,
+      "repeatedFileReads": 1,
+      "repeatedCommands": 0,
+      "toolCalls": 4,
+      "wallMs": 4,
+      "filesTouched": 2,
+      "diffLines": 24,
+      "manualInterventions": 0,
+      "commitletsCompleted": 1,
+      "forbiddenEditsCaught": 1,
+      "rollbackSuccess": true,
+      "healthScore": 100,
+      "testWeakeningCaught": true,
+      "retrievalGateTrusted": true
+    }
+  ]
+}

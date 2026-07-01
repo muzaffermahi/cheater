@@ -1,0 +1,3 @@
+Fix the failing pytest import error in the cheater package.
+The test `tests/test_memory.py` is failing with:
+ModuleNotFoundError: No module named 'cheater.memory'

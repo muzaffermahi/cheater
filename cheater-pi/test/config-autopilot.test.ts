@@ -1,0 +1,52 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { DEFAULT_CONFIG, loadConfig } from "../src/config.js";
+
+test("config defaults enable automatic low-risk-safe blueprint behavior", () => {
+  assert.equal(DEFAULT_CONFIG.autopilotEnabled, true);
+  assert.equal(DEFAULT_CONFIG.autopilotRouteAllCodeTasks, true);
+  assert.equal(DEFAULT_CONFIG.blueprintModeEnabled, true);
+  assert.equal(DEFAULT_CONFIG.blueprintRequireApproval, "high_risk_only");
+  assert.equal(DEFAULT_CONFIG.blueprintOfficialDocsSearchEnabled, false);
+  assert.equal(DEFAULT_CONFIG.blueprintMaxCallsPerPacket, 1);
+  assert.equal(DEFAULT_CONFIG.blueprintFreshAgentPerPacket, true);
+  assert.equal(DEFAULT_CONFIG.blueprintMaxAgentTokens, 12000);
+  assert.equal(DEFAULT_CONFIG.blueprintBlockPlannerFileTools, true);
+  assert.equal(DEFAULT_CONFIG.maxContextTokens, 12000);
+  assert.equal(DEFAULT_CONFIG.freshCallPacketsEnabled, true);
+  assert.equal(DEFAULT_CONFIG.packetOneFilePerWorkerEnabled, true);
+  assert.equal(DEFAULT_CONFIG.packetMaxFilesToTouch, 1);
+  assert.equal(DEFAULT_CONFIG.loopGovernorEnabled, true);
+  assert.equal(DEFAULT_CONFIG.jsonStopSentinel, "@@END_JSON@@");
+  assert.equal(DEFAULT_CONFIG.contextCompactRatio, 0.85);
+  assert.equal(DEFAULT_CONFIG.oracleRunBroadTests, "always");
+  assert.equal(DEFAULT_CONFIG.oracleRunAllChecks, true);
+  assert.equal(DEFAULT_CONFIG.bugFreshAgentEnabled, true);
+  assert.equal(DEFAULT_CONFIG.commitletModeEnabled, true);
+  assert.equal(DEFAULT_CONFIG.rollbackRequired, true);
+  assert.equal(DEFAULT_CONFIG.maxFilesTouchedDefault, 3);
+  assert.equal(DEFAULT_CONFIG.maxDiffLinesDefault, 180);
+  assert.equal(DEFAULT_CONFIG.maxModelCallsPerCommitlet, 1);
+  assert.equal(DEFAULT_CONFIG.repairAttemptsPerCommitlet, 1);
+  assert.equal(DEFAULT_CONFIG.healthScoreThreshold, 75);
+  assert.equal(DEFAULT_CONFIG.hardRejectHealthThreshold, 50);
+  assert.equal(DEFAULT_CONFIG.allowDependencyEditsByDefault, false);
+  assert.equal(DEFAULT_CONFIG.allowLockfileEditsByDefault, false);
+  assert.equal(DEFAULT_CONFIG.allowTestEditsByDefault, false);
+  assert.equal(DEFAULT_CONFIG.finalReviewEnabled, true);
+  assert.equal(DEFAULT_CONFIG.autoCleanupLowRiskHealthIssues, true);
+  assert.equal(DEFAULT_CONFIG.telemetryEnabled, true);
+  assert.equal(DEFAULT_CONFIG.telemetryLocalOnly, true);
+  assert.equal(DEFAULT_CONFIG.retrievalMaxPlanningFacts, 3);
+  assert.equal(DEFAULT_CONFIG.retrievalMaxFeedbackFacts, 5);
+  assert.equal(DEFAULT_CONFIG.gymDefaultLimit, 5);
+  assert.equal(DEFAULT_CONFIG.gymDefaultConcurrency, 1);
+  assert.equal(DEFAULT_CONFIG.gymRunFullTests, "if_cheap");
+  assert.equal(DEFAULT_CONFIG.gymAutoLearn, false);
+});
+
+test("loadConfig includes autopilot defaults", () => {
+  const config = loadConfig("C:\\definitely-not-a-real-cheater-cwd");
+  assert.equal(config.autopilotEnabled, true);
+  assert.equal(config.blueprintCandidateCount, 3);
+});

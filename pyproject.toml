@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cheater"
+version = "0.7.0"
+description = "Pi-based coding agent distribution with Cheater defaults, slash commands, skills, and theme."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "textual>=0.50.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+ingest = [
+    "datasets>=2.20.0",
+    "huggingface_hub>=0.24.0",
+    "pyarrow>=16.0.0",
+]
+llm = [
+    "openai>=1.40.0",
+]
+tui = [
+    "textual>=0.50.0",
+    "rich>=13.0.0",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4.0",
+]
+all = [
+    "datasets>=2.20.0",
+    "huggingface_hub>=0.24.0",
+    "pyarrow>=16.0.0",
+    "openai>=1.40.0",
+    "textual>=0.50.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+cheater = "cheater.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cheater*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

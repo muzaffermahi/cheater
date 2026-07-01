@@ -1,0 +1,16 @@
+{
+  "swebench_verified": {
+    "type": "hf_dataset",
+    "dataset": "SWE-bench/SWE-bench_Verified",
+    "split": "test"
+  },
+  "swebench_lite": {
+    "type": "hf_dataset",
+    "dataset": "SWE-bench/SWE-bench_Lite",
+    "split": "test"
+  },
+  "custom_jsonl": {
+    "type": "jsonl",
+    "path": "benchmarks/custom_tasks.jsonl"
+  }
+}

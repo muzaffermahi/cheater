@@ -1,0 +1,2 @@
+Fix the syntax error in cheater/localizer.py.
+The build fails with a SyntaxError on line 42.

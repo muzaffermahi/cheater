@@ -1,0 +1,5 @@
+{"id": "bench_pydantic_env", "query": "pydantic ValidationError env_nested_delimiter prefix field name nested environment variable", "expected_card_ids": ["pydantic__pydantic-3975"], "notes": "env var parsing in pydantic BaseSettings"}
+{"id": "bench_geopandas_join", "query": "geopandas left spatial join sorted by right index instead of left index predicate", "expected_card_ids": ["geopandas__geopandas-3240"], "notes": "spatial join ordering regression"}
+{"id": "bench_cognitive", "query": "cognitive complexity binary logical operators BoolOp nesting increment fundamental", "expected_card_ids": ["Melevir__cognitive_complexity-15"], "notes": "AST cognitive complexity counting"}
+{"id": "bench_biomedsheets", "query": "biomedsheets GermlineTSVSheetException hyphen not allowed patientName sample sheet", "expected_card_ids": ["bihealth__biomedsheets-23"], "notes": "overly restrictive validation of hyphens"}
+{"id": "bench_sqlglot_keyerror", "query": "sqlglot KeyError empty arguments parse function call", "expected_card_ids": ["tobymao__sqlglot-2063"], "notes": "sqlglot KeyError on empty args"}

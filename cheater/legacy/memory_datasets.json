@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-06-23T14:00:00",
+  "datasets": [
+    {
+      "dataset_id": "nebius/SWE-rebench-V2-PRs",
+      "hf_name": "nebius/SWE-rebench-V2-PRs",
+      "role": "memory_source",
+      "default_split": "train",
+      "license": "MIT",
+      "contamination_scope": "swe_bench_derived",
+      "priority": 1,
+      "enabled_by_default": true,
+      "notes": "PR-level trajectories from SWE-rebench V2. Primary memory source."
+    },
+    {
+      "dataset_id": "nebius/SWE-rebench-V2",
+      "hf_name": "nebius/SWE-rebench-V2",
+      "role": "memory_source",
+      "default_split": "train",
+      "license": "MIT",
+      "contamination_scope": "swe_bench_derived",
+      "priority": 2,
+      "enabled_by_default": true,
+      "notes": "Instance-level SWE-rebench V2 trajectories. Secondary memory source."
+    },
+    {
+      "dataset_id": "nebius/SWE-rebench",
+      "hf_name": "nebius/SWE-rebench",
+      "role": "memory_source",
+      "default_split": "train",
+      "license": "MIT",
+      "contamination_scope": "swe_bench_derived",
+      "priority": 3,
+      "enabled_by_default": true,
+      "notes": "Original SWE-rebench trajectories. Tertiary memory source."
+    },
+    {
+      "dataset_id": "ByteDance-Seed/Multi-SWE-bench",
+      "hf_name": "ByteDance-Seed/Multi-SWE-bench",
+      "role": "memory_source",
+      "default_split": "train",
+      "license": "Apache-2.0",
+      "contamination_scope": "multi_lang_swe_bench_derived",
+      "priority": 4,
+      "enabled_by_default": false,
+      "notes": "Multi-language SWE-bench extension. Requires explicit opt-in."
+    },
+    {
+      "dataset_id": "somethingone/MULocBench",
+      "hf_name": "somethingone/MULocBench",
+      "role": "localization_source",
+      "default_split": "train",
+      "license": "Unknown",
+      "contamination_scope": "bug_localization",
+      "priority": 5,
+      "enabled_by_default": false,
+      "notes": "Bug localization benchmark. Used as localization memory, not patch memory."
+    },
+    {
+      "dataset_id": "princeton-nlp/SWE-bench",
+      "hf_name": "princeton-nlp/SWE-bench",
+      "role": "benchmark_holdout",
+      "default_split": "test",
+      "license": "MIT",
+      "contamination_scope": "swe_bench_official",
+      "priority": 100,
+      "enabled_by_default": false,
+      "quarantined": true,
+      "notes": "Official SWE-bench benchmark. Must NOT be ingested into memory by default."
+    },
+    {
+      "dataset_id": "princeton-nlp/SWE-bench_Verified",
+      "hf_name": "princeton-nlp/SWE-bench_Verified",
+      "role": "benchmark_holdout",
+      "default_split": "test",
+      "license": "MIT",
+      "contamination_scope": "swe_bench_official",
+      "priority": 100,
+      "enabled_by_default": false,
+      "quarantined": true,
+      "notes": "Official SWE-bench Verified benchmark. Must NOT be ingested into memory by default."
+    }
+  ]
+}
