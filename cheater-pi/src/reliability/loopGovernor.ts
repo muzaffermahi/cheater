@@ -126,11 +126,32 @@ function repeatedJsonFields(text: string): boolean {
 function overLimit(records: ToolCallRecord[], kind: ToolCallRecord["kind"], limit: number): string | undefined {
   const counts = new Map<string, number>();
   for (const record of records.filter((r) => r.kind === kind)) {
-    const key = normalize(record.value);
+    const key = structuralKey(record);
     counts.set(key, (counts.get(key) ?? 0) + 1);
     if ((counts.get(key) ?? 0) > limit) return record.value;
   }
   return undefined;
+}
+
+/**
+ * Repetition key that ignores cosmetic differences so genuine degeneration is caught but
+ * ordinary iteration is not. Commands are made flag-insensitive and number-insensitive
+ * (line numbers, ports, timestamps collapse), so `pytest -v x.py` and `pytest -q x.py`
+ * count as the same command family instead of two "different" calls.
+ */
+function structuralKey(record: ToolCallRecord): string {
+  if (record.kind === "failed_command" || record.kind === "other") return commandSignature(record.value);
+  return normalize(record.value);
+}
+
+function commandSignature(cmd: string): string {
+  return cmd
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((token) => token && !token.startsWith("-"))
+    .map((token) => token.replace(/\d+/g, "#"))
+    .join(" ")
+    .trim();
 }
 
 function pingPongFiles(records: ToolCallRecord[]): boolean {

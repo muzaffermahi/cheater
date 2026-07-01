@@ -42,18 +42,15 @@ export function registerCommitletCommands(pi: ExtensionAPI): void {
     }
   });
   pi.registerCommand("commitlet-verify", {
-    description: "Run focused verification for current or named commitlet",
-    handler: async (args: string, _ctx: CommandContext) => {
-      const id = args.trim();
-      pi.sendUserMessage(id
-        ? `Cheater /commitlet-verify: call cheater_commitlet_verify with commitletId=${id}.`
-        : "Cheater /commitlet-verify: identify the current running commitlet, call cheater_commitlet_verify, and report compactly.");
+    description: "Grade the running commitlet (guard, health, test audit, focused verification)",
+    handler: async (_args: string, _ctx: CommandContext) => {
+      pi.sendUserMessage("Cheater /commitlet-verify: call cheater_commitlet_next to grade the running commitlet in code and advance the plan, then report compactly.");
     }
   });
   pi.registerCommand("commitlet-finalize", {
-    description: "Run commitlet final review manually",
+    description: "Run commitlet final review (runs automatically once no commitlets are pending)",
     handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /commitlet-finalize: call cheater_commitlet_finalize and report the final review compactly.");
+      pi.sendUserMessage("Cheater /commitlet-finalize: call cheater_commitlet_next; it runs the final review automatically once no commitlets are pending, and reports it compactly.");
     }
   });
   pi.registerCommand("commitlet-debug", {

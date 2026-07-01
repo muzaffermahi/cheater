@@ -49,6 +49,7 @@ export interface ToolCallRecord {
   value: string;
   ok?: boolean;
   changedFiles?: string[];
+  toolCallId?: string;
 }
 
 export interface LoopBreakEvent {

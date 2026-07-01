@@ -13,11 +13,10 @@ test("loop governor detects repeated text and tool loops", () => {
   const governor = new LoopGovernor(DEFAULT_BLUEPRINT_CONFIG, "p1");
   assert.equal(Boolean(governor.observeText("Repeat this sentence for reliability loop detection testing. Repeat this sentence for reliability loop detection testing. Repeat this sentence for reliability loop detection testing.")), true);
   const tools = new LoopGovernor(DEFAULT_BLUEPRINT_CONFIG, "p2");
-  const event = tools.observeTools([
-    { kind: "read_file", value: "src/a.ts" },
-    { kind: "read_file", value: "src/a.ts" },
-    { kind: "read_file", value: "src/a.ts" }
-  ]);
+  // Reading the same file a few times is normal iteration; the governor only breaks once
+  // reads exceed the (recalibrated, more permissive) sameFileReadLimit.
+  const reads = Array.from({ length: DEFAULT_BLUEPRINT_CONFIG.sameFileReadLimit + 1 }, () => ({ kind: "read_file" as const, value: "src/a.ts" }));
+  const event = tools.observeTools(reads);
   assert.match(event?.reason ?? "", /same file read/);
   assert.equal(event?.recovery.action, "inspect_one_file");
   assert.match(event?.recovery.instruction ?? "", /Inspect exactly one/);
@@ -26,10 +25,12 @@ test("loop governor detects repeated text and tool loops", () => {
 
 test("loop governor emits one forced recovery action and stops after max breaks", () => {
   const failed = new LoopGovernor(DEFAULT_BLUEPRINT_CONFIG, "p3");
+  // The same failed command must repeat past sameFailedCommandLimit before the governor
+  // intervenes (one retry is normal); flag/number variants still collapse to one family.
+  const failedCalls = Array.from({ length: DEFAULT_BLUEPRINT_CONFIG.sameFailedCommandLimit + 1 }, () => ({ kind: "failed_command" as const, value: "npm test -- commands" }));
   const failedEvent = failed.observeTools([
     { kind: "patch", value: "src/a.ts", changedFiles: ["src/a.ts"] },
-    { kind: "failed_command", value: "npm test -- commands" },
-    { kind: "failed_command", value: "npm test -- commands" }
+    ...failedCalls
   ]);
   assert.equal(failedEvent?.recovery.action, "edit_one_file");
   assert.equal(failedEvent?.recovery.target, "src/a.ts");

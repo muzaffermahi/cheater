@@ -64,7 +64,8 @@ export function renderFreshCallPacket(packet: FreshCallPacket): string {
     `endSentinel: ${packet.endSentinel}`,
     `modelClass: ${packet.modelClass ?? "unknown"}`,
     `contextBudgetTokens: ${packet.contextBudgetTokens ?? "(default)"}`,
-    `maxOutputTokens: ${packet.maxOutputTokens ?? "(default)"}`,
+    // maxOutputTokens is a server-side sampling parameter the model cannot set itself, so
+    // it is not rendered into the packet as advisory noise. Configure it on the backend.
     packet.modelOperatingRules?.length ? `modelOperatingRules:\n- ${packet.modelOperatingRules.join("\n- ")}` : "modelOperatingRules: default",
     "",
     "Use Pi native tools only. Do not execute unrelated packets. Do not include unrelated prior chat.",

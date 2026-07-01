@@ -65,3 +65,7 @@ Thumbs.db
 _archive/cheater_nested_repo/
 _archive/*/.git/
 _archive/**/*.git/
+
+# Generated command/verification cache written by the extension at runtime
+.cheater/commands.json
+cheater-pi/.cheater/

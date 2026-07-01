@@ -24,7 +24,11 @@ export function scorePatchHealth(params: {
   if (/^\+.*\b(TODO|HACK|FIXME)\b/gim.test(diff)) score -= 8;
   if (/^\+.*\bcatch\s*\([^)]*\)\s*\{|except\s+Exception\b/gim.test(diff)) score -= 10;
   if (/^\+.*\b(globalThis|global\s+|window\.)\b/gim.test(diff)) score -= 6;
-  if (assertionDelta < 0) blockingIssues.push("Assertions were removed or weakened.");
+  // Only treat a negative assertion delta as a blocker when a test file was actually
+  // touched; otherwise deleting a source line that happens to contain "should"/"expect"
+  // (e.g. a comment or a string) false-blocks correct work.
+  const touchedTestFile = params.filesTouched.some((file) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(file));
+  if (assertionDelta < 0 && touchedTestFile) blockingIssues.push("Assertions were removed or weakened in a test. -> Restore the removed assertion, or explain in the commitlet why the weaker check is correct.");
   const finalScore = Math.max(0, Math.round(score));
   if (finalScore < (params.hardRejectThreshold ?? 50)) blockingIssues.push(`Patch health score ${finalScore} is below hard reject threshold.`);
   else if (finalScore < (params.threshold ?? 75)) warnings.push(`Patch health score ${finalScore} is below preferred threshold.`);

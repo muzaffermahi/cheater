@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { compressFailureOutput } from "../reliability/failureCompressor.js";
 import type { Commitlet, VerificationStep } from "./types.js";
 
 export interface VerificationResult {
@@ -31,8 +32,9 @@ export function runFocusedVerification(cwd: string, commitlet: Commitlet, timeou
     });
     const exitCode = typeof result.status === "number" ? result.status : 1;
     if (exitCode !== 0) {
-      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
-      failures.push(`${step.command}: exit ${exitCode}; ${compressFailure(output)}`);
+      // Structured failure card (expected/got, top stack file, next-action) instead of a
+      // blunt tail truncation, so the repair prompt is a localization answer not noise.
+      failures.push(compressFailureOutput(step.command, result.stdout ?? "", result.stderr ?? "", exitCode));
       if (step.required) break;
     }
   }

@@ -57,10 +57,14 @@ The Cheater extension adds:
   `cheater_orientation_show`, `cheater_orientation_update`,
   `cheater_repro_gate`, `cheater_evidence_packet`, `cheater_playbook_show`,
   `cheater_oracle_stack`, `cheater_mission_learn`, `cheater_delta_bench`
-- autopilot/blueprint tools: `cheater_autopilot_route`,
-  `cheater_blueprint_create`, `cheater_blueprint_next_packet`,
+- blueprint tools: `cheater_blueprint_create`, `cheater_blueprint_next_packet`,
   `cheater_blueprint_review`, `cheater_blueprint_candidates`,
   `cheater_blueprint_docs`
+- reliability/commitlet tools (the one-shot flow): `cheater_reliability_start`,
+  `cheater_commitlet_next`, `cheater_verification_run`, `cheater_finish_gate`,
+  `cheater_ledger_status`. Autopilot routing itself is not a model-facing tool -
+  it is injected automatically by the extension's `input` hook on every normal
+  message.
 
 These additions are intentionally small. They steer Pi rather than replacing it.
 

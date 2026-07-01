@@ -5,8 +5,8 @@ import { defaultBlueprintState } from "../blueprint/state.js";
 import { createCleanupCommitlet, createCommitletPlan, createRepairCommitlet } from "./planner.js";
 import { commitletConfig } from "./config.js";
 import { defaultCommitletState } from "./state.js";
-import { buildCommitletExecutionPrompt, prepareCommitlet } from "./executor.js";
-import { runDiffGuard } from "./guard.js";
+import { buildCommitletExecutionPrompt, prepareCommitlet, spawnFreshWorkerForCommitlet } from "./executor.js";
+import { runDiffGuard, countDiffLines } from "./guard.js";
 import { scorePatchHealth } from "./health.js";
 import { auditTestChanges } from "./testAudit.js";
 import { runCommitletFinalReview } from "./reviewer.js";
@@ -15,7 +15,13 @@ import { telemetryFromPlan, writeTelemetry } from "./telemetry.js";
 import { cleanupOldRollbackSnapshots, listRollbackSnapshotFiles, revertRollbackPoint } from "./rollback.js";
 import { runFocusedVerification } from "./verification.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
+import { buildCommitletDiff } from "./diffUtil.js";
 import { latestReliabilityBenchmark, compareReliabilityBenchmark } from "../reliability/bench.js";
+import { liveSessionState } from "../reliability/sessionState.js";
+import { classifyFailure, ledgerAllowsFinish } from "../reliability/lifecycle.js";
+import { runVerification } from "../reliability/verificationRunner.js";
+import { detectProjectCommands } from "../reliability/projectCommands.js";
+import type { Commitlet, CommitletPlan } from "./types.js";
 import type { CheaterConfig } from "../types.js";
 
 type ExtensionAPI = any;
@@ -25,51 +31,175 @@ function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text", text }], details };
 }
 
-export function registerCommitletTools(pi: ExtensionAPI, deps: { config: CheaterConfig }): void {
-  pi.registerTool({
-    name: "cheater_commitlet_plan",
-    label: "Cheater Commitlet Plan",
-    description: "Create a Reliability Kernel commitlet plan. Does not edit files.",
-    parameters: Type.Object({
-      userGoal: Type.String(),
-      useActiveBlueprint: Type.Optional(Type.Boolean())
-    }),
-    async execute(_id: string, params: { userGoal: string; useActiveBlueprint?: boolean }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
-      const decision = routeAutopilot({ cwd: ctx.cwd, message: params.userGoal });
-      const activeBlueprint = params.useActiveBlueprint === false
-        ? undefined
-        : defaultBlueprintState.get().currentPlan ?? undefined;
-      const blueprintPlan = activeBlueprint ?? (decision.executionMode === "blueprint_orchestrator" || decision.needsBlueprint
-        ? await createAutonomousBlueprint({
-          cwd: ctx.cwd,
-          userGoal: params.userGoal,
-          taskType: decision.taskKind,
-          modelName: ctx.model?.id ?? deps.config.model,
-          config: deps.config
-        })
-        : undefined);
-      if (blueprintPlan && blueprintPlan !== activeBlueprint) defaultBlueprintState.setPlan(blueprintPlan);
+interface GradeResult {
+  advance: boolean;
+  message: string;
+  details: unknown;
+}
 
-      const plan = createCommitletPlan({
-        repoRoot: ctx.cwd,
-        userGoal: params.userGoal,
-        autopilotDecision: decision,
-        blueprintPlan
-      });
-      defaultCommitletState.setPlan(plan);
-      return textResult(formatCommitletPlan(plan), plan);
+/**
+ * Runs diff guard, patch health, test audit, and focused verification for the currently
+ * running commitlet in code, instead of trusting the model to call separate guard/verify
+ * tools honestly. Returns advance=true when the plan may move on to the next commitlet
+ * (passed, or a bounded repair commitlet was just queued); advance=false stops the chain
+ * (guard/health/audit rejection, or a repair attempt also failed).
+ */
+function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig, overrides: { allowLargeDeletion?: boolean } = {}): GradeResult {
+  const observedEdits = liveSessionState.consumeCommitletEdits();
+  const candidateFiles = [...new Set([...commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")), ...observedEdits])];
+  const { diffText, touchedFiles } = buildCommitletDiff(cwd, candidateFiles, commitlet.rollbackPoint?.snapshotDir);
+
+  const guard = runDiffGuard(commitlet, { touchedFiles, diffText }, { allowLargeDeletion: overrides.allowLargeDeletion });
+  const health = scorePatchHealth({ diffText, filesTouched: touchedFiles, threshold: config.healthScoreThreshold, hardRejectThreshold: config.hardRejectHealthThreshold });
+  const isTestChange = touchedFiles.some((file) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(file));
+  const audit = isTestChange ? auditTestChanges(diffText, commitlet.spec?.acceptanceCriteria ?? []) : { passed: true, warnings: [], blockingIssues: [] };
+  const guardOk = guard.passed && health.passed && audit.passed;
+
+  if (!guardOk) {
+    const issues = [...guard.blockingIssues, ...health.blockingIssues, ...audit.blockingIssues];
+    const observed = {
+      filesChanged: touchedFiles,
+      diffLines: countDiffLines(diffText),
+      testsRun: [],
+      verificationPassed: false,
+      healthPassed: health.passed,
+      rollbackAvailable: Boolean(commitlet.rollbackPoint),
+      summary: `Guard failed: ${issues.join("; ")}`,
+      issues
+    };
+    if (commitlet.rollbackPoint) {
+      const reverted = revertRollbackPoint(cwd, commitlet);
+      defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `Guard failed: ${issues.join("; ")}; ${reverted.reason}`, observed);
+    } else {
+      defaultCommitletState.updateCommitlet(commitlet.id, "failed", `Guard failed: ${issues.join("; ")}`, observed);
     }
-  });
+    return {
+      advance: false,
+      message: [`Commitlet ${commitlet.id} blocked by guard/health/test audit.`, formatGuardHealthAudit({ guard, health, audit })].join("\n"),
+      details: { guard, health, audit }
+    };
+  }
 
+  const verify = runFocusedVerification(cwd, commitlet);
+  const ledger = liveSessionState.getLedger();
+  if (ledger) {
+    for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
+    ledger.recordVerificationStage({
+      stage: "focused_tests",
+      status: verify.passed ? "ok" : "failed",
+      summary: verify.summary,
+      failureClass: verify.passed ? "unknown" : classifyFailure({ exitCode: 1, stdout: "", stderr: verify.failures.join("\n") }),
+      artifacts: [],
+      signals: { commitletId: commitlet.id }
+    });
+  }
+
+  if (verify.passed) {
+    defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
+      filesChanged: touchedFiles,
+      diffLines: countDiffLines(diffText),
+      testsRun: verify.commandsRun,
+      verificationPassed: true,
+      healthPassed: health.passed,
+      rollbackAvailable: Boolean(commitlet.rollbackPoint),
+      summary: verify.summary,
+      issues: []
+    });
+    return {
+      advance: true,
+      message: [`Commitlet ${commitlet.id} passed guard, health, and focused verification.`, verify.summary].join("\n"),
+      details: { guard, health, audit, verify }
+    };
+  }
+
+  const alreadyRepair = /-repair$/.test(commitlet.id);
+  if (!alreadyRepair) {
+    const repair = createRepairCommitlet(commitlet, verify.summary);
+    const plan = defaultCommitletState.get().currentPlan;
+    if (plan) {
+      defaultCommitletState.setPlan({
+        ...plan,
+        commitlets: plan.commitlets.flatMap((item) => item.id === commitlet.id ? [{
+          ...item,
+          status: "failed" as const,
+          result: {
+            filesChanged: touchedFiles.length ? touchedFiles : item.expectedFilesTouched,
+            diffLines: countDiffLines(diffText),
+            testsRun: verify.commandsRun,
+            verificationPassed: false,
+            healthPassed: health.passed,
+            rollbackAvailable: Boolean(item.rollbackPoint),
+            summary: verify.summary,
+            issues: verify.failures
+          }
+        }, repair] : [item])
+      });
+    }
+    return {
+      advance: true,
+      message: [verify.summary, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
+      details: { guard, health, audit, verify, repair }
+    };
+  }
+
+  if (commitlet.rollbackPoint) {
+    const reverted = revertRollbackPoint(cwd, commitlet);
+    defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${verify.summary}; ${reverted.reason}`);
+    return { advance: false, message: [verify.summary, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted } };
+  }
+  defaultCommitletState.updateCommitlet(commitlet.id, "failed", verify.summary);
+  return { advance: false, message: [verify.summary, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify } };
+}
+
+function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {
+  if (review.accepted) return false;
+  if (plan.commitlets.some((commitlet) => /cleanup-health$/.test(commitlet.id))) return false;
+  return review.blockingIssues.length > 0 && review.blockingIssues.every((issue) => /below preferred threshold|cleanup commitlet required/i.test(issue));
+}
+
+function finalizePlan(cwd: string, plan: CommitletPlan, config: CheaterConfig): { text: string; details: unknown } {
+  // Reconstruct the real accumulated diff (each commitlet's pre-edit snapshot vs current)
+  // so the final review scores actual changes instead of an empty string.
+  const accumulatedDiff = plan.commitlets
+    .filter((commitlet) => commitlet.rollbackPoint?.snapshotDir)
+    .map((commitlet) => buildCommitletDiff(
+      cwd,
+      commitlet.result?.filesChanged?.length ? commitlet.result.filesChanged : commitlet.allowedFiles,
+      commitlet.rollbackPoint?.snapshotDir
+    ).diffText)
+    .filter(Boolean)
+    .join("\n");
+  const review = runCommitletFinalReview(plan, accumulatedDiff);
+  const cfg = commitletConfig(config);
+  const cleanup = cfg.autoCleanupLowRiskHealthIssues && shouldCreateCleanupCommitlet(plan, review)
+    ? createCleanupCommitlet(plan, review.blockingIssues.join("; ") || review.warnings.join("; "))
+    : undefined;
+  const updated = cleanup
+    ? { ...plan, finalReview: review, status: "running" as const, commitlets: [...plan.commitlets, cleanup], currentIndex: plan.commitlets.length }
+    : { ...plan, finalReview: review, status: review.accepted ? "complete" as const : "failed" as const };
+  defaultCommitletState.setPlan(updated);
+  const telemetryFile = config.telemetryEnabled === false ? undefined : writeTelemetry(cwd, telemetryFromPlan(updated));
+  return {
+    text: [
+      "No pending commitlets. Ran automatic final review.",
+      formatCommitletFinalReview(review),
+      cleanup ? `Created cleanup commitlet: ${cleanup.id} (${cleanup.title})` : ""
+    ].filter(Boolean).join("\n"),
+    details: { review, telemetryFile, cleanup, plan: updated }
+  };
+}
+
+export function registerCommitletTools(pi: ExtensionAPI, deps: { config: CheaterConfig }): void {
   pi.registerTool({
     name: "cheater_reliability_start",
     label: "Cheater Reliability Start",
-    description: "Route autopilot, create a commitlet plan, prepare the first commitlet with rollback, and return a fresh-call prompt.",
+    description: "Route autopilot, create a commitlet plan, prepare the first commitlet with rollback, and return a fresh-call prompt. By default the fresh-worker handoff is simulated (prompt returned to the current session). Set spawnFreshWorker=true to spawn a real isolated LLM session via sdkFreshAgentPacketRunner.",
     parameters: Type.Object({
       userGoal: Type.String(),
-      useActiveBlueprint: Type.Optional(Type.Boolean())
+      useActiveBlueprint: Type.Optional(Type.Boolean()),
+      spawnFreshWorker: Type.Optional(Type.Boolean({ description: "When true, spawn a real isolated worker session instead of returning a prompt to the current session." }))
     }),
-    async execute(_id: string, params: { userGoal: string; useActiveBlueprint?: boolean }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
+    async execute(_id: string, params: { userGoal: string; useActiveBlueprint?: boolean; spawnFreshWorker?: boolean }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
       const decision = routeAutopilot({ cwd: ctx.cwd, message: params.userGoal });
       const decisionSummary = [
         `mode=${decision.executionMode}`,
@@ -109,6 +239,8 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         blueprintPlan
       });
       defaultCommitletState.setPlan(plan);
+      liveSessionState.reset(params.userGoal);
+      liveSessionState.ensure(deps.config, params.userGoal);
 
       const index = plan.commitlets.findIndex((commitlet) => commitlet.status === "pending");
       const next = index >= 0 ? plan.commitlets[index] : undefined;
@@ -124,7 +256,41 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       const commitlets = plan.commitlets.map((commitlet) => commitlet.id === next.id ? prepared : commitlet);
       const updated = { ...plan, status: "running" as const, currentIndex: index, commitlets };
       defaultCommitletState.setPlan(updated);
-      const prompt = buildCommitletExecutionPrompt(updated, prepared);
+      liveSessionState.setPacketId(prepared.id);
+      liveSessionState.beginCommitlet();
+      const wantRealWorker = params.spawnFreshWorker ?? deps.config.commitletFreshWorkerDefault ?? false;
+      const prompt = buildCommitletExecutionPrompt(updated, prepared, [], wantRealWorker ? "real" : "simulated");
+
+      if (wantRealWorker) {
+        const workerResult = await spawnFreshWorkerForCommitlet(updated, prepared, deps.config);
+        if (!workerResult.ok) {
+          defaultCommitletState.updateCommitlet(prepared.id, "failed", workerResult.summary);
+          return textResult([
+            "Cheater Reliability Start (real fresh worker failed)",
+            `autopilot: ${decisionSummary}`,
+            `first: ${prepared.title}`,
+            workerResult.summary
+          ].join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, workerResult, freshWorkerMode: "real" });
+        }
+        const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
+        const grade = gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
+        return textResult([
+          "Cheater Reliability Start (real fresh worker)",
+          `autopilot: ${decisionSummary}`,
+          `plan: ${updated.summary}${updated.blueprintPlanId ? ` blueprint=${updated.blueprintPlanId}` : ""}`,
+          `commitlets: ${updated.commitlets.length}`,
+          `first: ${prepared.title}`,
+          `allowedFiles: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
+          `rollback: ${prepared.rollbackPoint?.id ?? "(none)"}`,
+          `freshWorkerMode: real`,
+          workerResult.sessionId ? `session: ${workerResult.sessionId}` : "",
+          workerResult.sessionFile ? `sessionFile: ${workerResult.sessionFile}` : "",
+          "",
+          workerResult.summary,
+          "",
+          grade.message
+        ].filter(Boolean).join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, prompt, workerResult, grade: grade.details, freshWorkerMode: "real" });
+      }
 
       return textResult([
         "Cheater Reliability Start",
@@ -134,158 +300,74 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         `first: ${prepared.title}`,
         `allowedFiles: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
         `rollback: ${prepared.rollbackPoint?.id ?? "(none)"}`,
+        `freshWorkerMode: simulated (prompt returned to current session; set spawnFreshWorker=true for a real isolated worker)`,
         "",
         "fresh-call prompt:",
         prompt.prompt
-      ].join("\n"), { decision, plan: updated, commitlet: prepared, prompt });
+      ].join("\n"), { decision, plan: updated, commitlet: prepared, prompt, freshWorkerMode: "simulated" });
     }
   });
 
   pi.registerTool({
     name: "cheater_commitlet_next",
     label: "Cheater Commitlet Next",
-    description: "Prepare the next commitlet with rollback and return a fresh-call execution prompt.",
+    description: "Grades the running commitlet in code (diff guard, patch health, test audit, focused verification - not model say-so), then prepares the next commitlet with rollback and returns a fresh-call execution prompt. When no commitlets remain, runs the automatic final review.",
     parameters: Type.Object({
-      completedCommitletId: Type.Optional(Type.String()),
-      summary: Type.Optional(Type.String())
+      spawnFreshWorker: Type.Optional(Type.Boolean({ description: "When true, spawn a real isolated worker session for the next commitlet and grade it immediately." })),
+      approveLargeDeletion: Type.Optional(Type.Boolean({ description: "Approve an intended large deletion that the diff guard would otherwise block." }))
     }),
-    async execute(_id: string, params: { completedCommitletId?: string; summary?: string } = {}, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
+    async execute(_id: string, params: { spawnFreshWorker?: boolean; approveLargeDeletion?: boolean } = {}, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
       let plan = defaultCommitletState.get().currentPlan;
       if (!plan) return textResult("No active Cheater commitlet plan.");
-      if (params.completedCommitletId) {
-        defaultCommitletState.updateCommitlet(params.completedCommitletId, "passed", params.summary ?? "Commitlet completed.");
-        plan = defaultCommitletState.get().currentPlan;
-        if (!plan) return textResult("No active Cheater commitlet plan.");
+
+      const running = plan.commitlets.find((commitlet) => commitlet.status === "running");
+      if (running) {
+        const grade = gradeCommitlet(ctx.cwd, running, deps.config, { allowLargeDeletion: params.approveLargeDeletion });
+        plan = defaultCommitletState.get().currentPlan!;
+        if (!grade.advance) return textResult(grade.message, grade.details);
       }
+
       const index = plan.commitlets.findIndex((commitlet) => commitlet.status === "pending");
-      const next = index >= 0 ? plan.commitlets[index] : undefined;
-      if (!next) {
-        const review = runCommitletFinalReview(plan);
-        const updated = { ...plan, finalReview: review, status: review.accepted ? "complete" as const : "failed" as const };
-        defaultCommitletState.setPlan(updated);
-        const telemetryFile = deps.config.telemetryEnabled === false ? undefined : writeTelemetry(ctx.cwd, telemetryFromPlan(updated));
-        return textResult([
-          "No pending commitlets. Ran automatic final review.",
-          formatCommitletFinalReview(review)
-        ].join("\n"), { review, telemetryFile, plan: updated });
+      if (index < 0) {
+        const { text, details } = finalizePlan(ctx.cwd, plan, deps.config);
+        return textResult(text, details);
       }
+
+      const next = plan.commitlets[index];
       const prepared = prepareCommitlet(ctx.cwd, next);
       const commitlets = plan.commitlets.map((commitlet) => commitlet.id === next.id ? prepared : commitlet);
       const updated = { ...plan, status: "running" as const, currentIndex: index, commitlets };
       defaultCommitletState.setPlan(updated);
-      const prompt = buildCommitletExecutionPrompt(updated, prepared, plan.commitlets.filter((commitlet) => commitlet.result?.summary).map((commitlet) => `${commitlet.id}: ${commitlet.result?.summary}`));
+      liveSessionState.beginCommitlet();
+      const previousState = plan.commitlets.filter((commitlet) => commitlet.result?.summary).map((commitlet) => `${commitlet.id}: ${commitlet.result?.summary}`);
+      const wantRealWorker = params.spawnFreshWorker ?? deps.config.commitletFreshWorkerDefault ?? false;
+      const prompt = buildCommitletExecutionPrompt(updated, prepared, previousState, wantRealWorker ? "real" : "simulated");
+
+      if (!wantRealWorker) {
+        return textResult([
+          `Running commitlet ${index + 1}/${updated.commitlets.length}: ${prepared.title}`,
+          `Allowed files: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
+          `Rollback: ${prepared.rollbackPoint?.id}`,
+          "freshWorkerMode: simulated",
+          "",
+          prompt.prompt
+        ].join("\n"), { commitlet: prepared, prompt, freshWorkerMode: "simulated" });
+      }
+
+      const workerResult = await spawnFreshWorkerForCommitlet(updated, prepared, deps.config);
+      if (!workerResult.ok) {
+        defaultCommitletState.updateCommitlet(prepared.id, "failed", workerResult.summary);
+        return textResult([`Fresh worker failed for commitlet ${prepared.id}.`, workerResult.summary].join("\n"), { commitlet: prepared, workerResult, freshWorkerMode: "real" });
+      }
+      const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
+      const grade = gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
       return textResult([
-        `Running commitlet ${index + 1}/${plan.commitlets.length}: ${prepared.title}`,
-        `Allowed files: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
-        `Rollback: ${prepared.rollbackPoint?.id}`,
+        `Cheater Commitlet Next (real fresh worker): ${prepared.title}`,
+        "workerStatus: ok",
+        workerResult.summary,
         "",
-        prompt.prompt
-      ].join("\n"), { commitlet: prepared, prompt });
-    }
-  });
-
-  pi.registerTool({
-    name: "cheater_commitlet_guard",
-    label: "Cheater Commitlet Guard",
-    description: "Run diff guard, patch health score, and test audit for a commitlet.",
-    parameters: Type.Object({
-      commitletId: Type.String(),
-      touchedFiles: Type.Array(Type.String()),
-      diffText: Type.Optional(Type.String())
-    }),
-    async execute(_id: string, params: { commitletId: string; touchedFiles: string[]; diffText?: string }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
-      const plan = defaultCommitletState.get().currentPlan;
-      const commitlet = plan?.commitlets.find((item) => item.id === params.commitletId);
-      if (!plan || !commitlet) return textResult(`Unknown commitlet: ${params.commitletId}`);
-      const guard = runDiffGuard(commitlet, { touchedFiles: params.touchedFiles, diffText: params.diffText });
-      const health = scorePatchHealth({
-        diffText: params.diffText,
-        filesTouched: params.touchedFiles,
-        threshold: deps.config.healthScoreThreshold,
-        hardRejectThreshold: deps.config.hardRejectHealthThreshold
-      });
-      const audit = params.touchedFiles.some((file) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(file))
-        ? auditTestChanges(params.diffText ?? "", commitlet.spec?.acceptanceCriteria ?? [])
-        : { passed: true, warnings: [], blockingIssues: [] };
-      const ok = guard.passed && health.passed && audit.passed;
-      defaultCommitletState.updateCommitlet(commitlet.id, ok ? "passed" : "failed", ok ? "Guard, health, and test audit passed." : [...guard.blockingIssues, ...health.blockingIssues, ...audit.blockingIssues].join("; "));
-      if (!ok && commitlet.rollbackPoint) {
-        const reverted = revertRollbackPoint(ctx.cwd, commitlet);
-        if (reverted.ok) defaultCommitletState.updateCommitlet(commitlet.id, "reverted", `Guard failed; ${reverted.reason}`);
-      }
-      return textResult(formatGuardHealthAudit({ guard, health, audit }), { guard, health, audit, ok });
-    }
-  });
-
-  pi.registerTool({
-    name: "cheater_commitlet_verify",
-    label: "Cheater Commitlet Verify",
-    description: "Run focused verification for a commitlet and create one bounded repair commitlet on failure.",
-    parameters: Type.Object({
-      commitletId: Type.String(),
-      timeoutSeconds: Type.Optional(Type.Number())
-    }),
-    async execute(_id: string, params: { commitletId: string; timeoutSeconds?: number }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
-      const plan = defaultCommitletState.get().currentPlan;
-      const commitlet = plan?.commitlets.find((item) => item.id === params.commitletId);
-      if (!plan || !commitlet) return textResult(`Unknown commitlet: ${params.commitletId}`);
-      const result = runFocusedVerification(ctx.cwd, commitlet, (params.timeoutSeconds ?? 120) * 1000);
-      if (result.passed) {
-        defaultCommitletState.updateCommitlet(commitlet.id, "passed", result.summary);
-        return textResult(result.summary, result);
-      }
-      const alreadyRepair = /-repair$/.test(commitlet.id);
-      if (!alreadyRepair) {
-        const repair = createRepairCommitlet(commitlet, result.summary);
-        defaultCommitletState.setPlan({
-          ...plan,
-          commitlets: plan.commitlets.flatMap((item) => item.id === commitlet.id ? [{ ...item, status: "failed" as const, result: {
-            filesChanged: item.expectedFilesTouched,
-            diffLines: 0,
-            testsRun: result.commandsRun,
-            verificationPassed: false,
-            healthPassed: false,
-            rollbackAvailable: Boolean(item.rollbackPoint),
-            summary: result.summary,
-            issues: result.failures
-          } }, repair] : [item])
-        });
-        return textResult(`${result.summary}\nCreated bounded repair commitlet: ${repair.id}`, { result, repair });
-      }
-      if (commitlet.rollbackPoint) {
-        const reverted = revertRollbackPoint(ctx.cwd, commitlet);
-        defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${result.summary}; ${reverted.reason}`);
-        return textResult(`${result.summary}\nRepair failed; ${reverted.reason}`, { result, reverted });
-      }
-      defaultCommitletState.updateCommitlet(commitlet.id, "failed", result.summary);
-      return textResult(`${result.summary}\nRepair failed and no rollback was available.`, result);
-    }
-  });
-
-  pi.registerTool({
-    name: "cheater_commitlet_finalize",
-    label: "Cheater Commitlet Finalize",
-    description: "Run Reliability Kernel final review and local telemetry.",
-    parameters: Type.Object({
-      diffText: Type.Optional(Type.String())
-    }),
-    async execute(_id: string, params: { diffText?: string } = {}, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
-      const plan = defaultCommitletState.get().currentPlan;
-      if (!plan) return textResult("No active Cheater commitlet plan.");
-      const review = runCommitletFinalReview(plan, params.diffText);
-      const cfg = commitletConfig(deps.config);
-      const cleanup = cfg.autoCleanupLowRiskHealthIssues && shouldCreateCleanupCommitlet(plan, review)
-        ? createCleanupCommitlet(plan, review.blockingIssues.join("; ") || review.warnings.join("; "))
-        : undefined;
-      const updated = cleanup
-        ? { ...plan, finalReview: review, status: "running" as const, commitlets: [...plan.commitlets, cleanup], currentIndex: plan.commitlets.length }
-        : { ...plan, finalReview: review, status: review.accepted ? "complete" as const : "failed" as const };
-      defaultCommitletState.setPlan(updated);
-      const telemetryFile = deps.config.telemetryEnabled === false ? undefined : writeTelemetry(ctx.cwd, telemetryFromPlan(updated));
-      return textResult([
-        formatCommitletFinalReview(review),
-        cleanup ? `Created cleanup commitlet: ${cleanup.id} (${cleanup.title})` : ""
-      ].filter(Boolean).join("\n"), { review, telemetryFile, cleanup });
+        grade.message
+      ].join("\n"), { commitlet: prepared, workerResult, grade: grade.details, freshWorkerMode: "real" });
     }
   });
 
@@ -394,10 +476,107 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       return textResult(results.length ? compareReliabilityBenchmark(results) : "No reliability benchmark report found.", { results });
     }
   });
-}
 
-function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {
-  if (review.accepted) return false;
-  if (plan.commitlets.some((commitlet) => /cleanup-health$/.test(commitlet.id))) return false;
-  return review.blockingIssues.length > 0 && review.blockingIssues.every((issue) => /below preferred threshold|cleanup commitlet required/i.test(issue));
+  pi.registerTool({
+    name: "cheater_finish_gate",
+    label: "Cheater Finish Gate",
+    description: "Check the completion ledger and block finishing a task without verification evidence. Returns allowed=false when verification is missing or failures are unresolved. Pass waiver=<reason> to explicitly and traceably skip verification (recorded in the ledger) instead of quietly claiming it was skipped.",
+    parameters: Type.Object({
+      summary: Type.Optional(Type.String({ description: "Proposed finish summary" })),
+      waiver: Type.Optional(Type.String({ description: "Explicit reason to finish without full verification; recorded in the ledger as a tracked skip." }))
+    }),
+    async execute(_id: string, params: { summary?: string; waiver?: string } = {}, _sig: unknown, _upd: unknown, _ctx: ExtensionContext) {
+      const ledger = liveSessionState.getLedger();
+      if (!ledger) {
+        return textResult("Cheater Finish Gate: no active completion ledger. Run cheater_reliability_start first.", { allowed: false, reason: "no_ledger" });
+      }
+      if (params.waiver) {
+        ledger.addEntry("verification_waiver", params.waiver.slice(0, 200), { waiver: params.waiver });
+        ledger.finalize(true, `verification waived: ${params.waiver}`.slice(0, 200), "low");
+        return textResult([
+          "Cheater Finish Gate: ALLOWED (verification WAIVED)",
+          `waiver recorded: ${params.waiver}`,
+          "This skip is tracked in the completion ledger; tell the user verification was skipped and why."
+        ].join("\n"), { allowed: true, reason: "waived", waiver: params.waiver });
+      }
+      const verdict = ledgerAllowsFinish(ledger);
+      const state = ledger.get();
+      const lines = [
+        `Cheater Finish Gate: ${verdict.allowed ? "ALLOWED" : "BLOCKED"}`,
+        `reason: ${verdict.reason}`,
+        `changedFiles: ${state.changedFiles.length} (${state.changedFiles.slice(0, 5).join(", ") || "none"})`,
+        `commandsRun: ${state.commandsRun.length}`,
+        `verificationStages: ${state.verification.length} (${state.verification.filter((v) => v.status === "ok").length} ok)`,
+        `unresolvedFailures: ${state.unresolvedFailures.length}`,
+        params.summary ? `proposedSummary: ${params.summary}` : ""
+      ].filter(Boolean);
+      if (!verdict.allowed) {
+        lines.push("", "Finish blocked. Run cheater_verification_run to collect evidence, or resolve the listed failures before finishing.");
+      }
+      return textResult(lines.join("\n"), { allowed: verdict.allowed, reason: verdict.reason, ledger: state });
+    }
+  });
+
+  pi.registerTool({
+    name: "cheater_verification_run",
+    label: "Cheater Verification Run",
+    description: "Detect project dev/test/score commands, start owned services on a clean port, probe workspace identity, run smoke/focused/full/scoring checks, collect artifacts, stop owned services, and feed the completion ledger.",
+    parameters: Type.Object({
+      planKind: Type.Optional(Type.Union([Type.Literal("webapp"), Type.Literal("cli")])),
+      port: Type.Optional(Type.Number({ description: "Optional fixed port; otherwise a free port is selected" }))
+    }),
+    async execute(_id: string, params: { planKind?: "webapp" | "cli"; port?: number } = {}, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
+      const cmds = detectProjectCommands(ctx.cwd);
+      const planKind = params.planKind ?? (cmds.devCommand ? "webapp" : "cli");
+      const result = await runVerification({
+        cwd: ctx.cwd,
+        userGoal: liveSessionState.getLedger()?.get().userGoal ?? "verification",
+        planKind,
+        projectCommands: cmds,
+        port: params.port
+      });
+      const ledger = liveSessionState.getLedger();
+      if (ledger) {
+        for (const stage of result.stages) {
+          ledger.recordVerificationStage(stage);
+        }
+        for (const artifact of result.artifacts) {
+          ledger.recordArtifact(artifact);
+        }
+        for (const cmd of result.ledger.get().commandsRun) {
+          ledger.recordCommand(cmd);
+        }
+      }
+      const lines = [
+        `Cheater Verification Run: ${result.passed ? "PASSED" : "FAILED"}`,
+        `planKind: ${planKind}`,
+        `packageManager: ${cmds.packageManager}`,
+        `framework: ${cmds.framework ?? "(none)"}`,
+        `devCommand: ${cmds.devCommand ?? "(none)"}`,
+        `testCommand: ${cmds.testCommand ?? "(none)"}`,
+        `scoreCommand: ${cmds.scoreCommand ?? "(none)"}`,
+        `port: ${result.registry.runningProcesses().length ? result.registry.runningProcesses()[0]?.port ?? params.port : params.port ?? "(n/a)"}`,
+        result.mismatches.length ? `STALE WORKSPACE: ${result.mismatches[0].evidence}` : "",
+        "",
+        "stages:",
+        ...result.stages.map((stage) => `  [${stage.status}] ${stage.stage}: ${stage.summary}`),
+        result.artifacts.length ? `artifacts: ${result.artifacts.join(", ")}` : "artifacts: (none)",
+        "",
+        result.ledger.toHuman()
+      ].filter(Boolean);
+      return textResult(lines.join("\n"), { result, passed: result.passed, planKind, cmds });
+    }
+  });
+
+  pi.registerTool({
+    name: "cheater_ledger_status",
+    label: "Cheater Ledger Status",
+    description: "Show the live completion ledger for the current reliability session, including changed files, commands, verification stages, and unresolved failures.",
+    parameters: Type.Object({}),
+    async execute() {
+      const ledger = liveSessionState.getLedger();
+      if (!ledger) return textResult("No active Cheater completion ledger.");
+      return textResult(ledger.toHuman(), { ledger: ledger.get() });
+    }
+  });
 }

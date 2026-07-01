@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { isAbsolute, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
-import { renderSkills } from "./skills.js";
+import { focusTestCommand, detectProjectCommands } from "./reliability/projectCommands.js";
 
 type ExtensionAPI = any;
 type ExtensionContext = any;
@@ -202,17 +202,15 @@ export function registerCheaterTools(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId: string, params: { hint?: string }, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) {
       const cwd = ctx.cwd;
-      let command = "npm test -- --runInBand";
-      if (existsSync(resolve(cwd, "pyproject.toml")) || existsSync(resolve(cwd, "pytest.ini"))) command = "pytest -q";
-      if (existsSync(resolve(cwd, "package.json"))) {
-        try {
-          const pkg = JSON.parse(readFileSync(resolve(cwd, "package.json"), "utf8")) as { scripts?: Record<string, string> };
-          if (pkg.scripts?.test) command = "npm test";
-          if (pkg.scripts?.["test:unit"]) command = "npm run test:unit";
-        } catch {}
-      }
-      if (params.hint) command += ` # focus: ${params.hint}`;
-      return textResult(command, { command });
+      const cmds = detectProjectCommands(cwd);
+      const command = focusTestCommand(cwd, params.hint);
+      const lines = [
+        command,
+        `packageManager: ${cmds.packageManager}`,
+        `framework: ${cmds.framework ?? "(auto-detected)"}`,
+        cmds.evidence.slice(0, 4).join("; ")
+      ];
+      return textResult(lines.join("\n"), { command, packageManager: cmds.packageManager, framework: cmds.framework, evidence: cmds.evidence });
     }
   });
 
@@ -263,18 +261,8 @@ export function registerCheaterTools(pi: ExtensionAPI): void {
   });
 
   pi.registerTool(createCheaterBugMemorySearchTool());
-
-  pi.registerTool({
-    name: "cheater_skill_search",
-    label: "Cheater Skill Search",
-    description: "List Cheater skills packaged for Pi.",
-    parameters: Type.Object({
-      query: Type.Optional(Type.String())
-    }),
-    async execute(_toolCallId: string) {
-      return textResult(renderSkills());
-    }
-  });
+  // cheater_skill_search was removed: it ignored its own query param and just dumped the
+  // static skill list, which Pi already surfaces natively via --skill progressive disclosure.
 }
 
 export function saveMemory(cwd: string, text: string): string {

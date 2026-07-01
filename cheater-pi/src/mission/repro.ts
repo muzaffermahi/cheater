@@ -67,7 +67,9 @@ export function runRepro(options: RunReproOptions): RunReproOutput {
   const combined = `${stdout}\n${stderr}`.trim();
   const exitCode = typeof result.status === "number" ? result.status : 1;
   const signal = result.signal ?? "";
-  const timedOut = signal === "SIGTERM" && Boolean(result.error) === false && result.status === null;
+  // On a spawnSync timeout Node sets error.code = "ETIMEDOUT" (and kills with SIGTERM). The
+  // old check required error to be ABSENT, so it could never be true - timeouts were missed.
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" || (signal === "SIGTERM" && result.status === null);
 
   const envFailure = ENV_FAILURE_PATTERNS.some((pattern) => pattern.test(combined));
   const parsed = parseReproOutput(combined);

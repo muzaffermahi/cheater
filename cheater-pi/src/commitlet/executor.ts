@@ -3,16 +3,22 @@ import { buildPacketExecutionPrompts } from "../blueprint/executor.js";
 import { fileSnippet } from "../blueprint/contextSketch.js";
 import { createRoleSeparation, renderBlueprintArtifact } from "../blueprint/artifact.js";
 import { evaluateBlueprintQuality } from "../blueprint/qualityGate.js";
+import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgentPacketRunner } from "../blueprint/worker.js";
 import { createRollbackPoint } from "./rollback.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
+import { symbolSnippet } from "../reliability/symbolSlice.js";
+import type { CheaterConfig } from "../types.js";
+
+export type FreshWorkerMode = "simulated" | "real";
 
 export interface CommitletExecutionPrompt {
   commitletId: string;
   prompt: string;
+  freshWorkerMode: FreshWorkerMode;
 }
 
-export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Commitlet, previousState: string[] = []): CommitletExecutionPrompt {
+export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Commitlet, previousState: string[] = [], freshWorkerMode: FreshWorkerMode = "simulated"): CommitletExecutionPrompt {
   const packetPlan = commitletPlanAsBlueprint(plan, commitlet);
   const prompt = buildPacketExecutionPrompts(packetPlan, {
     freshCallPacketsEnabled: true,
@@ -23,13 +29,26 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
   const boundedFiles = commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")).slice(0, 3);
   const graph = buildRepoConstraintGraph(plan.repoRoot, boundedFiles);
   const constraintFacts = boundedFiles.flatMap((file) => queryConstraintFacts(graph, file).slice(0, 4)).slice(0, 8);
-  const snippets = boundedFiles.slice(0, 2).map((file) => compactSnippet(file, fileSnippet(plan.repoRoot, file, 800))).filter(Boolean);
+  // Slice the actual target symbol (function/class whose name overlaps the task terms) rather
+  // than the first 40 lines of imports. Repair commitlets seed terms from the observed failure.
+  const sliceTerms = [
+    commitlet.title,
+    ...(spec?.behaviorMustHold ?? []),
+    ...(spec?.acceptanceCriteria ?? []),
+    spec?.observedFailure ?? ""
+  ].filter(Boolean);
+  const snippets = boundedFiles.slice(0, 2).map((file) => symbolSnippet(plan.repoRoot, file, sliceTerms) || compactSnippet(file, fileSnippet(plan.repoRoot, file, 800))).filter(Boolean);
+  const workerNotice = freshWorkerMode === "real"
+    ? "freshWorkerMode: real (this commitlet runs in a separate isolated LLM session via sdkFreshAgentPacketRunner)"
+    : "freshWorkerMode: simulated (this prompt is returned to the current agent session; no separate context boundary is created)";
   return {
     commitletId: commitlet.id,
+    freshWorkerMode,
     prompt: [
       "Cheater Reliability Kernel commitlet.",
       `commitletId: ${commitlet.id}`,
       `title: ${commitlet.title}`,
+      workerNotice,
       `allowedFiles: ${commitlet.allowedFiles.join(", ") || "(inspect only)"}`,
       `forbiddenFiles: ${commitlet.forbiddenFiles.join(", ") || "(none)"}`,
       `maxDiffLines: ${commitlet.maxDiffLines}`,
@@ -52,6 +71,27 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
   };
 }
 
+export async function spawnFreshWorkerForCommitlet(
+  plan: CommitletPlan,
+  commitlet: Commitlet,
+  config: CheaterConfig,
+  runner: FreshAgentPacketRunner = sdkFreshAgentPacketRunner
+): Promise<FreshAgentPacketResult> {
+  const packetPlan = commitletPlanAsBlueprint(plan, commitlet);
+  const packet = packetPlan.workPackets[0];
+  if (!packet) {
+    return { ok: false, summary: `No work packet for commitlet ${commitlet.id}`, error: "no_packet" };
+  }
+  const promptBody = buildCommitletExecutionPrompt(plan, commitlet, [], "real").prompt;
+  return runner.runPacket({
+    cwd: plan.repoRoot,
+    plan: packetPlan,
+    packet,
+    prompt: promptBody,
+    config
+  });
+}
+
 function compactSnippet(file: string, text: string): string {
   if (!text.trim()) return "";
   const lines = text.split(/\r?\n/).slice(0, 40).join("\n").slice(0, 800);
@@ -62,7 +102,9 @@ export function prepareCommitlet(repoRoot: string, commitlet: Commitlet): Commit
   return {
     ...commitlet,
     status: "running",
-    rollbackPoint: createRollbackPoint(repoRoot, commitlet)
+    // Preserve an inherited rollback point (e.g. a repair carrying the original's pre-edit
+    // snapshot); only create a fresh one when the commitlet has none.
+    rollbackPoint: commitlet.rollbackPoint ?? createRollbackPoint(repoRoot, commitlet)
   };
 }
 
