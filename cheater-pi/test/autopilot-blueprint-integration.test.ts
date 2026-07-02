@@ -4,12 +4,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import cheaterExtension from "../src/extension.js";
-import { DEFAULT_CONFIG } from "../src/config.js";
-import { registerBlueprintTools } from "../src/blueprint/tools.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
 import { noteWorkerBackend, resetWorkerBackendLatch } from "../src/blueprint/worker.js";
-import { registerMissionTools } from "../src/mission/tools.js";
-import { inMemoryMissionStore } from "../src/mission/store.js";
+import type { BlueprintPlan } from "../src/blueprint/types.js";
 
 function makePi() {
   const commands = new Map<string, any>();
@@ -45,40 +42,34 @@ function ctx() {
   };
 }
 
-test("extension registers autopilot and blueprint commands/tools", () => {
+test("extension registers exactly the one-flow surface: every registered cheater tool is mask-visible", () => {
   const { pi, commands, tools, events } = makePi();
   cheaterExtension(pi);
   assert.ok(commands.has("autopilot-status"));
   assert.ok(commands.has("blueprint-show"));
-  assert.ok(commands.has("blueprint-candidates"));
-  assert.ok(commands.has("blueprint-approve"));
-  assert.ok(commands.has("blueprint-quality-repair"));
   assert.ok(commands.has("commitlet-status"));
   assert.ok(commands.has("rollback-status"));
-  assert.ok(commands.has("health-report"));
   assert.ok(commands.has("constraint-graph"));
   assert.ok(commands.has("bench-report"));
-  assert.ok(tools.has("cheater_blueprint_create"));
-  assert.ok(tools.has("cheater_blueprint_approve"));
-  assert.ok(tools.has("cheater_blueprint_next_packet"));
-  assert.ok(tools.has("cheater_blueprint_quality_repair"));
-  assert.ok(tools.has("cheater_blueprint_complete_packet"));
   assert.ok(tools.has("cheater_line_edit"));
   assert.ok(tools.has("cheater_reliability_start"));
-  assert.equal(tools.has("cheater_bug_worker"), false, "Mission Control is opt-in now; its tools are not registered by default");
   assert.ok(tools.has("cheater_commitlet_next"));
   assert.ok(tools.has("cheater_finish_gate"));
   assert.ok(tools.has("cheater_verification_run"));
   assert.ok(tools.has("cheater_ledger_status"));
-  assert.equal(tools.has("cheater_autopilot_route"), false, "routing is harness-level now, not a model-facing tool");
-  assert.equal(tools.has("cheater_commitlet_plan"), false, "superseded by cheater_reliability_start");
-  assert.equal(tools.has("cheater_commitlet_guard"), false, "grading is inlined into cheater_commitlet_next");
-  assert.equal(tools.has("cheater_commitlet_verify"), false, "grading is inlined into cheater_commitlet_next");
-  assert.equal(tools.has("cheater_commitlet_finalize"), false, "final review runs automatically from cheater_commitlet_next");
   assert.ok(tools.has("cheater_rollback_status"));
-  assert.ok(tools.has("cheater_health_report"));
-  assert.ok(tools.has("cheater_constraint_graph"));
-  assert.ok(tools.has("cheater_bench_report"));
+  // The purge: subsystems and tools the model could never see (not in any mask) are GONE,
+  // not merely hidden - if masking ever no-ops, there is nothing confusing to expose.
+  for (const dead of [
+    "cheater_blueprint_create", "cheater_blueprint_next_packet", "cheater_blueprint_approve",
+    "cheater_blueprint_quality_repair", "cheater_blueprint_complete_packet", "cheater_blueprint_docs",
+    "cheater_mission_start", "cheater_bug_worker", "cheater_focus_test", "cheater_diff_safety_check",
+    "cheater_health_report", "cheater_constraint_graph", "cheater_bench_report", "cheater_delta_bench",
+    "cheater_autopilot_route", "cheater_commitlet_plan", "cheater_commitlet_guard",
+    "cheater_commitlet_verify", "cheater_commitlet_finalize"
+  ]) {
+    assert.equal(tools.has(dead), false, `${dead} must not be registered - dead model surface`);
+  }
   assert.ok(events.has("before_agent_start"));
   assert.ok(events.has("input"));
   assert.ok(events.has("tool_call"));
@@ -87,7 +78,7 @@ test("extension registers autopilot and blueprint commands/tools", () => {
   assert.equal(events.has("before_user_message"), false, "Pi has no before_user_message event; routing hangs off input");
 });
 
-test("doctor separates public commands from debug-only internals", async () => {
+test("doctor separates public commands from debug-only internals and nothing is uncategorized", async () => {
   const { pi, commands } = makePi();
   cheaterExtension(pi);
   let notice = "";
@@ -107,11 +98,8 @@ test("doctor separates public commands from debug-only internals", async () => {
 
   assert.match(notice, /Public commands loaded:/);
   assert.match(notice, /Debug commands loaded:/);
-  assert.match(notice, /\/?blueprint-step|blueprint-step/);
   assert.doesNotMatch(notice, /Cheater commands loaded:/);
-  // These were previously missing from PUBLIC_COMMAND_NAMES, so /doctor silently
-  // under-reported what was actually registered and loaded.
-  for (const name of ["commitlet-status", "rollback-status", "health-report", "constraint-graph", "bench-report", "model-profile", "loop-report"]) {
+  for (const name of ["commitlet-status", "rollback-status", "constraint-graph", "bench-report", "model-profile"]) {
     assert.match(notice, new RegExp(name), `${name} must appear in /doctor's public command list`);
   }
   assert.doesNotMatch(notice, /Uncategorized commands loaded/, "every registered Cheater command must be categorized");
@@ -145,202 +133,16 @@ test("cheater_line_edit applies bounded line edits and refuses stale context", a
   assert.match(readFileSync(file, "utf8"), /Keep me/);
 });
 
-test("blueprint next packet advances past completed inspect packet", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  const dispatched: string[] = [];
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: true },
-    packetRunner: {
-      async runPacket({ packet }) {
-        dispatched.push(packet.id);
-        return { ok: true, summary: `${packet.id} completed by fake worker`, sessionId: `worker-${packet.id}` };
-      }
-    }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests and docs", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  const first = await tools.get("cheater_blueprint_next_packet").execute("next-1", {}, undefined, undefined, context);
-  assert.match(first.content[0].text, /Spawned fresh worker session for packet inspect/);
-  const second = await tools.get("cheater_blueprint_next_packet").execute(
-    "next-2",
-    {},
-    undefined,
-    undefined,
-    context
-  );
-  assert.doesNotMatch(second.content[0].text, /packet inspect/);
-  assert.match(second.content[0].text, /packet implement-/);
-  assert.equal(dispatched[0], "inspect");
-  assert.match(dispatched[1], /^implement-/);
-});
-
-test("blueprint quality repair tool returns planner-only repair draft", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  registerBlueprintTools(pi, { config: DEFAULT_CONFIG });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "migrate to latest React API and search the web", taskType: "migration" },
-    undefined,
-    undefined,
-    context
-  );
-  const plan = defaultBlueprintState.get().currentPlan!;
-  defaultBlueprintState.setPlan({
-    ...plan,
-    qualityGate: {
-      ...plan.qualityGate,
-      passed: false,
-      blockingIssues: ["external evidence is required but no remote docs or web evidence was gathered"],
-      remediationActions: ["Attach official docs or ranked web evidence for the external API/version before dispatch."]
-    }
-  });
-  const result = await tools.get("cheater_blueprint_quality_repair").execute("repair", {}, undefined, undefined, context);
-  assert.match(result.content[0].text, /planner-only repair draft/);
-  assert.equal(result.details.mustRegeneratePlan, true);
-  assert.ok(result.details.plannerInstructions.some((item: string) => /Regenerate the Blueprint plan/.test(item)));
-});
-
-test("blueprint next packet runs final review automatically when packets are done", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: true },
-    packetRunner: {
-      async runPacket({ packet }) {
-        return { ok: true, summary: `${packet.id} completed`, sessionId: `worker-${packet.id}` };
-      }
-    }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests and docs", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  let result: any;
-  for (let i = 0; i < 12; i += 1) {
-    result = await tools.get("cheater_blueprint_next_packet").execute(`next-${i}`, {}, undefined, undefined, context);
-    if (result.details?.autoFinalReview) break;
-  }
-  assert.equal(result.details.autoFinalReview, true);
-  assert.match(result.content[0].text, /final review/i);
-});
-
-test("blueprint next packet refuses unapproved plans until approval is recorded", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  const dispatched: string[] = [];
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: true, blueprintRequireApproval: "always" },
-    packetRunner: {
-      async runPacket({ packet }) {
-        dispatched.push(packet.id);
-        return { ok: true, summary: `${packet.id} completed`, sessionId: `worker-${packet.id}` };
-      }
-    }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "delete dependencies and rewrite routing", taskType: "refactor" },
-    undefined,
-    undefined,
-    context
-  );
-  const blocked = await tools.get("cheater_blueprint_next_packet").execute("next-blocked", {}, undefined, undefined, context);
-  assert.match(blocked.content[0].text, /requires explicit user approval/);
-  assert.deepEqual(dispatched, []);
-  const approved = await tools.get("cheater_blueprint_approve").execute("approve", { note: "user said yes" }, undefined, undefined, context);
-  assert.match(approved.content[0].text, /approved/);
-  const next = await tools.get("cheater_blueprint_next_packet").execute("next-approved", {}, undefined, undefined, context);
-  assert.match(next.content[0].text, /Spawned fresh worker session/);
-  assert.deepEqual(dispatched, ["inspect"]);
-});
-
-test("blueprint next packet does not silently complete an already running packet", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: false },
-    packetRunner: {
-      async runPacket({ packet }) {
-        return { ok: true, summary: `${packet.id} completed`, sessionId: `worker-${packet.id}` };
-      }
-    }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests and docs", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  const plan = defaultBlueprintState.get().currentPlan;
-  assert.ok(plan);
-  const firstPacket = plan!.workPackets.find((packet) => packet.status === "pending");
-  assert.ok(firstPacket);
-  defaultBlueprintState.updatePacket(firstPacket!.id, "running");
-  const second = await tools.get("cheater_blueprint_next_packet").execute("next-2", {}, undefined, undefined, context);
-  assert.match(second.content[0].text, /already running/);
-  assert.equal(defaultBlueprintState.get().currentPlan?.workPackets.find((packet) => packet.id === firstPacket!.id)?.status, "running");
-  const pending = defaultBlueprintState.get().currentPlan?.workPackets.find((packet) => packet.status === "pending");
-  assert.ok(pending);
-  const badComplete = await tools.get("cheater_blueprint_next_packet").execute("next-bad-complete", { completedPacketId: pending!.id, summary: "skip ahead" }, undefined, undefined, context);
-  assert.match(badComplete.content[0].text, /only completes the current running packet/);
-  assert.equal(defaultBlueprintState.get().currentPlan?.workPackets.find((packet) => packet.id === pending!.id)?.status, "pending");
-});
-
-test("blueprint next packet stops after cancelled or failed state", async () => {
-  const { pi, tools } = makePi();
-  defaultBlueprintState.clear();
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: true },
-    packetRunner: {
-      async runPacket({ packet }) {
-        return { ok: packet.id !== "inspect", summary: `${packet.id} failed`, error: "boom" };
-      }
-    }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests and docs", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  const failed = await tools.get("cheater_blueprint_next_packet").execute("next-fail", {}, undefined, undefined, context);
-  assert.match(failed.content[0].text, /status: failed/);
-  const blocked = await tools.get("cheater_blueprint_next_packet").execute("next-after-fail", {}, undefined, undefined, context);
-  assert.match(blocked.content[0].text, /failed packets/);
-  defaultBlueprintState.cancel();
-  const cancelled = await tools.get("cheater_blueprint_next_packet").execute("next-cancelled", {}, undefined, undefined, context);
-  assert.match(cancelled.content[0].text, /cancelled/);
-});
-
 test("planner file-tool block fires only when real fresh workers can actually spawn", async () => {
-  const { pi, tools, events } = makePi();
+  const { pi, events } = makePi();
+  defaultBlueprintState.clear();
   cheaterExtension(pi);
   const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "modernize templates without looping", taskType: "refactor" },
-    undefined,
-    undefined,
-    context
-  );
+  // A minimal active blueprint plan (the block only inspects workPackets statuses).
+  defaultBlueprintState.setPlan({
+    id: "bp-test",
+    workPackets: [{ id: "p1", status: "pending" }]
+  } as unknown as BlueprintPlan);
 
   // Local backend that cannot spawn sub-sessions: the main session IS the worker, so its
   // file tools must NOT be blocked (blocking them would deadlock every complex task).
@@ -354,56 +156,12 @@ test("planner file-tool block fires only when real fresh workers can actually sp
   assert.equal(blocked.block, true);
   assert.match(blocked.reason, /fresh worker/);
   resetWorkerBackendLatch();
-});
-
-test("blueprint-force avoids same-session packet prompt blasting", async () => {
-  const { pi, commands, messages } = makePi();
-  cheaterExtension(pi);
-  await commands.get("blueprint-force").handler("add a /hello command with tests", ctx());
-  assert.equal(messages.length, 1);
-  assert.match(messages[0], /cheater_blueprint_next_packet/);
-  assert.doesNotMatch(messages[0], /CHEATER FRESH WORKER SESSION/);
-});
-
-test("blueprint-step requests fresh worker dispatch instead of same-session prompt", async () => {
-  const { pi, commands, tools, messages } = makePi();
-  cheaterExtension(pi);
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  await commands.get("blueprint-step").handler("", context);
-  assert.equal(messages.length, 1);
-  assert.match(messages[0], /cheater_blueprint_next_packet/);
-  assert.doesNotMatch(messages[0], /contextSketch:/);
-  assert.doesNotMatch(messages[0], /relevantSnippets:/);
-});
-
-test("legacy blueprint prompt execution is disabled even when config asks otherwise", async () => {
-  const { pi, tools } = makePi();
   defaultBlueprintState.clear();
-  registerBlueprintTools(pi, {
-    config: { ...DEFAULT_CONFIG, blueprintFreshAgentPerPacket: false }
-  });
-  const context = ctx();
-  await tools.get("cheater_blueprint_create").execute(
-    "create",
-    { goal: "add a /hello command with tests", taskType: "tooling" },
-    undefined,
-    undefined,
-    context
-  );
-  const result = await tools.get("cheater_blueprint_execute_as_pi_prompts").execute("legacy", {}, undefined, undefined, context);
-  assert.match(result.content[0].text, /disabled/);
-  assert.equal(result.details.alwaysFreshWorkers, true);
 });
 
 test("normal interactive input triggers router lifecycle hook via the real Pi input event", async () => {
   const { pi, events } = makePi();
+  defaultBlueprintState.clear();
   cheaterExtension(pi);
   const result = await events.get("input")({ type: "input", text: "add a /hello command with tests and docs", source: "interactive" }, ctx());
   assert.equal(result.action, "transform");
@@ -424,33 +182,6 @@ test("extension-sourced input (e.g. finish-gate nudge) is not re-routed through 
   cheaterExtension(pi);
   const result = await events.get("input")({ type: "input", text: "Cheater Finish Gate: ...", source: "extension" }, ctx());
   assert.deepEqual(result, { action: "continue" });
-});
-
-test("bug worker tool gathers evidence and dispatches a fresh bug agent", async () => {
-  const { pi, tools } = makePi();
-  const store = inMemoryMissionStore({ cwd: process.cwd() });
-  const dispatched: string[] = [];
-  registerMissionTools(pi, {
-    store,
-    config: { ...DEFAULT_CONFIG, bugFreshAgentEnabled: true },
-    bugRunner: {
-      async runBug({ query }) {
-        dispatched.push(query);
-        return { ok: true, summary: "fake bug worker fixed it", sessionId: "bug-worker-1" };
-      }
-    }
-  });
-  const context = ctx();
-  store.create({ userGoal: "fix TypeError", missionType: "bug_fix", repoRoot: context.cwd });
-  const result = await tools.get("cheater_bug_worker").execute(
-    "bug-1",
-    { query: "TypeError: cannot read property x", focusedCommand: "node -e \"process.exit(0)\"" },
-    undefined,
-    undefined,
-    context
-  );
-  assert.match(result.content[0].text, /Spawned fresh bug worker session/);
-  assert.deepEqual(dispatched, ["TypeError: cannot read property x"]);
 });
 
 test("/blueprint-show is inspection only and no manual slash command is required", async () => {

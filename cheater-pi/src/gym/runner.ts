@@ -65,7 +65,7 @@ export function buildPrompt(task: GymTask, workspace: string, mode: "cheater" | 
     ].filter(Boolean).join("\n");
   }
   return [
-    `Cheater Mission Control for ${task.id} - ${task.title}`,
+    `Cheater Reliability task ${task.id} - ${task.title}`,
     `Category: ${task.category}    Language: ${task.language}    Difficulty: ${task.difficulty}`,
     `Goal: ${task.goal}`,
     `Workspace: ${workspace}`,
@@ -73,7 +73,7 @@ export function buildPrompt(task: GymTask, workspace: string, mode: "cheater" | 
     task.fullTestCommand ? `Full test command: ${task.fullTestCommand}` : "",
     `Expected files: ${task.expectedTouchedFiles.join(", ") || "(none)"}`,
     `Forbidden files: ${task.forbiddenTouchedFiles.join(", ") || "(none)"}`,
-    "Use cheater_mission_classify -> cheater_repro_gate -> cheater_evidence_packet -> patch -> cheater_oracle_stack.",
+    "Run the one flow: cheater_reliability_start -> edit the allowed files -> cheater_commitlet_next -> cheater_verification_run -> cheater_finish_gate.",
     "Do not edit tests. Do not edit dependencies or lockfiles. Make the smallest change."
   ].filter(Boolean).join("\n");
 }

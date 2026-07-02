@@ -9,14 +9,6 @@ export interface CheaterConfig {
   skillsEnabled?: boolean;
   debug?: boolean;
   showStartupCard?: boolean;
-  missionControlEnabled?: boolean;
-  reproRequiredBeforePatch?: boolean;
-  allowNoOpSuccess?: boolean;
-  onlineEvidenceEnabled?: boolean;
-  offlineStackOverflowEnabled?: boolean;
-  autoSaveLearning?: boolean;
-  oracleRunBroadTests?: "never" | "ask" | "always";
-  oracleRunAllChecks?: boolean;
   maxContextTokens?: number;
   // Explicit ceiling for the MAIN interactive session's context (planner/orchestrator).
   // Unset (default) means "breathe up to ~90% of the model's real context window" - do not
@@ -27,8 +19,6 @@ export interface CheaterConfig {
   // editing. Default false: Cheater is autonomous - one prompt runs to completion, and
   // destructive intent is surfaced as a caution the model proceeds through, not a hard stop.
   requireApprovalForHighRisk?: boolean;
-  maxEvidenceItems?: number;
-  maxMissionRawLogChars?: number;
   gymEnabled?: boolean;
   gymDefaultLimit?: number;
   gymDefaultConcurrency?: number;
@@ -131,6 +121,30 @@ export interface CheaterConfig {
   telemetryLocalOnly?: boolean;
   retrievalMaxPlanningFacts?: number;
   retrievalMaxFeedbackFacts?: number;
+  // Durable run state: .cheater/runs/<taskId>/ with the acceptance contract, workspace
+  // digest, mutation/validation ledgers, per-worker capsules/plans/reports, phase control,
+  // and the post-success guard. This is the context-reincarnation layer: a controller can be
+  // respawned from these files alone. Default on.
+  runStateEnabled?: boolean;
+  // Action budget for the time-aware phase controller (EXPLORE/IMPLEMENT/VALIDATE/RESERVE).
+  // Unset = derived from the plan's per-commitlet tool budgets.
+  runStateActionBudget?: number;
+  // Read-before-write hook: overwriting an existing file the run never read (and that the
+  // contract does not name as an artifact) is blocked. Default on.
+  readBeforeWriteEnabled?: boolean;
+  // Threshold (chars) above which a full-file rewrite of an existing file draws a
+  // verification-required warning. Default 6000.
+  largeWriteWarnChars?: number;
+  // Allow a capsule over the 8K hard token limit to spawn anyway (recorded as a warning).
+  capsuleInvariantOverride?: boolean;
+  // Max allowed files per worker capsule before the spawn invariant fails. Default 4.
+  maxWorkerAllowedFiles?: number;
+  // Worker fork mode: how much parent-session history a spawned worker inherits. The default
+  // (and only safe value) is "none" - workers are briefed by capsule, never by transcript.
+  // "last_n"/"all" additionally require workerForkModeOverrideReason and log a warning event.
+  workerForkMode?: "none" | "last_n" | "all";
+  workerForkModeOverrideReason?: string;
+  workerForkTurns?: number;
 }
 
 export interface LaunchOptions {

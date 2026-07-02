@@ -1,6 +1,6 @@
 import { buildSystemPrompt } from "./prompts.js";
 import { registerCheaterCommands } from "./commands.js";
-import { registerCheaterTools, saveMemory } from "./tools.js";
+import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
 import { loadConfig } from "./config.js";
 import { registerAutopilotCommands } from "./autopilot/commands.js";
@@ -8,12 +8,8 @@ import { routeAutopilot, buildAutopilotInstruction } from "./autopilot/router.js
 import { defaultAutopilotState } from "./autopilot/status.js";
 import { formatAutopilotDecision } from "./autopilot/ui.js";
 import { registerBlueprintCommands } from "./blueprint/commands.js";
-import { registerBlueprintTools } from "./blueprint/tools.js";
 import { defaultBlueprintState } from "./blueprint/state.js";
 import { contextCompactRatio, isBlueprintWorkerSession, mainSessionContextCap, workerBackendState } from "./blueprint/worker.js";
-import { defaultMissionStore } from "./mission/store.js";
-import { registerMissionCommands } from "./mission/commands.js";
-import { registerMissionTools } from "./mission/tools.js";
 import { registerGymCommands } from "./gym/commands.js";
 import { registerReliabilityCommands } from "./reliability/commands.js";
 import { registerCommitletCommands } from "./commitlet/commands.js";
@@ -30,6 +26,10 @@ import { compressFailureOutput } from "./reliability/failureCompressor.js";
 import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
 import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
+import { activeTaskRun, endTaskRun, resumeTaskRun } from "./runstate/runState.js";
+import { preToolUse, postToolUse, bridgeLoopEvents } from "./runstate/hooks.js";
+import { listUnfinishedRuns } from "./runstate/worldState.js";
+import { reconstructRunState, renderReincarnationBrief } from "./runstate/workerPlans.js";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -62,20 +62,9 @@ export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", s
   execute: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
 
-// Mission Control tools, appended to the masks only when the user opted into Mission Control
-// (its slash commands instruct the model to call these; hiding them would strand the flow).
-const MISSION_TOOL_NAMES = [
-  "cheater_mission_start", "cheater_mission_status", "cheater_mission_classify", "cheater_mission_cancel",
-  "cheater_mission_learn", "cheater_orientation_show", "cheater_orientation_scan", "cheater_orientation_update",
-  "cheater_repro_gate", "cheater_evidence_packet", "cheater_playbook_show", "cheater_oracle_stack",
-  "cheater_bug_worker", "cheater_focus_test", "cheater_diff_safety_check"
-];
-
-/** The cheater tools visible in a mode, config-aware (Mission Control opt-in extends the set). */
-export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", config: CheaterConfig): string[] {
-  const base = [...CHEATER_TOOL_MODES[mode]];
-  if (config.missionControlEnabled === true && mode !== "planner") base.push(...MISSION_TOOL_NAMES);
-  return base;
+/** The cheater tools visible in a mode. Every registered cheater tool appears in a mode. */
+export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", _config: CheaterConfig): string[] {
+  return [...CHEATER_TOOL_MODES[mode]];
 }
 
 // getActiveTools/setActiveTools live on the ExtensionAPI (`pi`) object, NOT on the per-event
@@ -214,6 +203,18 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
     artifacts: [],
     signals: { auto: true, command: cmd, kind }
   });
+  // Mirror into the run's validation ledger with whole-workspace dependency (empty
+  // validates), so ANY later mutation stales this auto-verify pass.
+  if (config?.runStateEnabled !== false) {
+    activeTaskRun()?.recordValidation({
+      name: `auto_verify:${stage}`,
+      command: cmd,
+      actor: "harness_auto_verify",
+      validates: [],
+      status: ok ? "pass" : "fail",
+      outputSummary: summary.slice(0, 300)
+    });
+  }
   return true;
 }
 
@@ -407,6 +408,16 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
   let gitBaseline: Map<string, string> | null = null;
+  // Run-state hints raised at tool_call time, delivered in-band on the matching tool_result.
+  const pendingRunHints = new Map<string, string[]>();
+  // De-dup for risk-middleware hints: the same standing condition (e.g. "stale validation
+  // exists") must not be re-attached to every subsequent tool result.
+  let lastRunHintKey = "";
+  // Last fingerprint the RUN's mutation ledger saw per file. The per-turn gitBaseline must
+  // stay frozen for the completion ledger, but re-recording the same shell edit against the
+  // frozen baseline on every later command would wrongly stale validations that ran AFTER
+  // the edit - the mutation ledger only records a file when its fingerprint moves again.
+  let runSeenFingerprints = new Map<string, string>();
 
   registerCheaterCommands(pi, config);
   registerCheaterTools(pi);
@@ -415,22 +426,10 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   }
   if (config.blueprintModeEnabled !== false) {
     registerBlueprintCommands(pi, { config });
-    registerBlueprintTools(pi, { config });
   }
   if (config.commitletModeEnabled !== false) {
     registerCommitletCommands(pi);
     registerCommitletTools(pi, { config });
-  }
-
-  if (config.missionControlEnabled !== false) {
-    const store = defaultMissionStore({ cwd: process.cwd() });
-    registerMissionCommands(pi, {
-      store,
-      config,
-      getCwd: (ctx) => ctx.cwd,
-      saveProjectMemory: (cwd, text) => saveMemory(cwd, text)
-    });
-    registerMissionTools(pi, { store, config });
   }
 
   if (config.gymEnabled !== false) {
@@ -463,7 +462,41 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     if (!message || message.startsWith("/")) return { action: "continue" };
     liveSessionState.beginInteractiveTurn(config);
     gitBaseline = gitChangedFingerprints(ctx.cwd);
+    runSeenFingerprints = new Map(gitBaseline);
     liveSessionState.setLastUserGoal(message);
+
+    // Session reincarnation: an unfinished durable run from a dead session resumes from its
+    // run directory alone - no old chat context exists or is wanted. A continuation message
+    // ("continue", "go ahead") resumes the most recent unfinished run with a small brief; a
+    // clearly new goal is never force-resumed (a notice surfaces the unfinished work).
+    if (config.runStateEnabled !== false && !activeTaskRun() && !defaultCommitletState.get().currentPlan) {
+      const unfinished = listUnfinishedRuns(ctx.cwd);
+      if (unfinished.length && !looksLikeNewGoal(message)) {
+        const target = unfinished[0];
+        resumeTaskRun(ctx.cwd, target.taskId, target.goal);
+        const brief = renderReincarnationBrief(reconstructRunState(ctx.cwd, target.taskId), 2000);
+        ctx.ui.notify?.(
+          unfinished.length > 1
+            ? `Cheater: resuming unfinished run ${target.taskId} (${unfinished.length - 1} other(s): ${unfinished.slice(1, 4).map((run) => run.taskId).join(", ")})`
+            : `Cheater: resuming unfinished run ${target.taskId}`,
+          "info"
+        );
+        applyToolMask(pi, config, "execute");
+        return {
+          action: "transform",
+          text: [
+            `User request: ${message}`,
+            "",
+            brief,
+            "",
+            `Resume this task now: call cheater_reliability_start with the original goal ("${target.goal.slice(0, 200)}"). The contract, ledgers, and protected artifacts above persist on disk.`
+          ].join("\n")
+        };
+      }
+      if (unfinished.length) {
+        ctx.ui.notify?.(`Cheater: ${unfinished.length} unfinished run(s) on disk (${unfinished.slice(0, 3).map((run) => run.taskId).join(", ")}). Say "continue" to resume.`, "info");
+      }
+    }
 
     // Mid-task follow-ups ("ok continue", "yes go ahead") must not be re-classified: a bare
     // acknowledgement routes to answer_only and would inject "do not edit files" while a plan
@@ -479,6 +512,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     // stuck as "current session" forever.
     if (!continuingPlan && looksLikeNewGoal(message)) {
       liveSessionState.reset(message);
+      // A new goal also retires the previous durable run: its ledgers/guard must not veto or
+      // protect anything for an unrelated task. The run directory itself stays on disk.
+      endTaskRun("new goal");
     }
 
     if (config.autopilotEnabled === false || config.autopilotRouteAllCodeTasks === false) return { action: "continue" };
@@ -606,6 +642,36 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const commitletBlock = blockCommitletScopeViolation(event);
     if (commitletBlock) return commitletBlock;
 
+    // Durable-run pre-tool hook pipeline: controlled-exec policy (guard, reserve, shell-edit
+    // scope, long-running), phase budget, protected artifacts, read-before-write, and
+    // large-write - blocks return immediately; warns become pending hints delivered in-band
+    // on the tool's own result (never a mid-stream chat notification - that jumps the
+    // viewport).
+    const run = config.runStateEnabled !== false ? activeTaskRun() : null;
+    if (run) {
+      const runningCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.status === "running");
+      const content = (event.input as { content?: unknown } | undefined)?.content;
+      const decisions = preToolUse({
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        cwd: ctx.cwd,
+        path: extractPath(event.input) || undefined,
+        command: extractCommand(event.input) || undefined,
+        contentChars: typeof content === "string" ? content.length : undefined,
+        commitletAllowedFiles: runningCommitlet?.allowedFiles.filter((file) => !file.startsWith("("))
+      }, run, config);
+      const blocked = decisions.find((decision) => decision.action === "block");
+      if (blocked && blocked.action === "block") {
+        ctx.ui?.notify?.(`Cheater ${blocked.hook.replace(/_/g, " ")} hook blocked ${event.toolName}`, "error");
+        return { block: true, reason: `Cheater ${blocked.hook} hook: ${blocked.reason}` };
+      }
+      const warns = decisions.filter((decision) => decision.action === "warn").map((decision) => (decision as { message: string }).message);
+      if (warns.length) {
+        if (pendingRunHints.size > 50) pendingRunHints.clear();
+        pendingRunHints.set(event.toolCallId, warns);
+      }
+    }
+
     // Planner/worker isolation only makes sense when real fresh workers can actually spawn.
     // On a local backend that can't spawn sub-sessions (the common case), reliability_start
     // hands the packet to THIS session to execute - so blocking its file tools here would
@@ -663,6 +729,13 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     let extraNotice = "";
     if (warning) extraNotice += `\n\n[${warning.message}]`;
 
+    // Deliver run-state hints raised at tool_call time in-band on this tool's own result.
+    const runHints = pendingRunHints.get(event.toolCallId);
+    if (runHints?.length) {
+      pendingRunHints.delete(event.toolCallId);
+      extraNotice += `\n\n[${runHints.join("]\n[")}]`;
+    }
+
     // Edit-failure rescue (ported from Cline's replace_in_file fallback matchers): a small
     // model's #1 edit failure is oldText that differs from disk only by whitespace or a
     // hazy middle line. Instead of letting it retry blind, locate the line-trimmed or
@@ -706,6 +779,40 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       }
     }
 
+    // Durable-run post-tool hook pipeline: file mutations and commands land in the ledgers
+    // (staleing dependent validations), reads feed the read-before-write evidence, check
+    // commands become typed validation evidence, and the risk middleware gets one look at
+    // the completed action - filesystem truth as state, not scrollback.
+    const run = config.runStateEnabled !== false ? activeTaskRun() : null;
+    if (run) {
+      const editedPath = extractPath(event.input);
+      const feedback = postToolUse({
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        cwd: ctx.cwd,
+        path: editedPath || undefined,
+        command: extractCommand(event.input) || undefined,
+        isError: event.isError === true,
+        outputText: resultText(event.content).slice(0, 4000)
+      }, run);
+      if (EDIT_TOOLS.has(event.toolName) && event.isError !== true && editedPath) {
+        // Sync the seen-fingerprint map so the git sweep below does not re-record this same
+        // edit after a later command and wrongly stale a validation that ran in between.
+        try {
+          const abs = resolve(ctx.cwd, editedPath);
+          const stat = statSync(abs);
+          // Key by the repo-relative forward-slash path git porcelain uses, so the sweep's
+          // lookup actually hits this entry.
+          runSeenFingerprints.set(relative(ctx.cwd, abs).replace(/\\/g, "/"), `${stat.mtimeMs}:${stat.size}`);
+        } catch { /* file may be virtual or deleted; the sweep will handle it */ }
+      }
+      const key = feedback.notices.join("|");
+      if (feedback.notices.length && key !== lastRunHintKey) {
+        lastRunHintKey = key;
+        extraNotice += `\n\n[${feedback.notices.join("]\n[")}]`;
+      }
+    }
+
     // Ground-truth: after a shell command, record any files git sees as newly changed OR
     // re-modified vs the turn baseline (fingerprint compare catches bash edits to files that
     // were already dirty), so shell edits bypass neither the ledger nor scope tracking.
@@ -713,7 +820,13 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       const ledger = liveSessionState.getLedger();
       if (ledger) {
         for (const [file, fp] of gitChangedFingerprints(ctx.cwd)) {
-          if (gitBaseline.get(file) !== fp) ledger.recordFileChange(file);
+          if (gitBaseline.get(file) !== fp) {
+            ledger.recordFileChange(file);
+            if (run && runSeenFingerprints.get(file) !== fp) {
+              runSeenFingerprints.set(file, fp);
+              run.recordFileMutation(file, "file_modified", "main-session", "shell edit (git fingerprint)");
+            }
+          }
         }
       }
     }
@@ -731,6 +844,8 @@ export default function cheaterExtension(pi: ExtensionAPI) {
         command: command || undefined,
         failureClass
       }, config);
+      // Loop/non-progress bridge: loop-governor verdicts also become durable run risk events.
+      if (run && events.length) bridgeLoopEvents(run, events);
       for (const evt of events) {
         // Delivered in-band on the tool result below; a chat notification per flagged tool
         // result injected mid-stream chat lines and jumped the viewport. Terminal verdicts
@@ -769,7 +884,12 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       }
     }
     const verdict = ledgerAllowsFinish(ledger);
-    if (verdict.allowed) {
+    // Freshness downgrade: the completion ledger can say "verified" while the run-state
+    // ledger knows every pass went stale (files changed after the last green run). A stale
+    // "done" is the exact lie this layer exists to stop.
+    const run = config.runStateEnabled !== false ? activeTaskRun() : null;
+    const freshness = run?.finishCheck();
+    if (verdict.allowed && (!freshness || freshness.ok)) {
       // Deterministic completion receipt from the ledger - ground truth, not model prose.
       ctx.ui.setWidget?.("cheater-status", buildCompletionReceipt(ledger).split("\n"), { placement: "aboveEditor" });
       return;
@@ -779,7 +899,8 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       customType: "cheater-finish-gate",
       content: [
         "Cheater Finish Gate: this task is not verified yet.",
-        `reason: ${verdict.reason}`,
+        `reason: ${verdict.allowed ? "validation evidence is stale or proxy-only" : verdict.reason}`,
+        ...(freshness && !freshness.ok ? freshness.warnings.map((warning) => `- ${warning}`) : []),
         // Show the remaining work, not just "not verified": a small model that stopped
         // early usually stopped because it lost sight of the unfinished checklist items.
         formatPlanChecklist(defaultCommitletState.get().currentPlan),

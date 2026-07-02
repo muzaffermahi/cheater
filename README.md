@@ -48,7 +48,7 @@ and hands back a small single-file worker prompt. `cheater_commitlet_next` grade
 each edit in code (diff guard, patch health, test audit, focused verification) - it
 is not model say-so. `cheater_finish_gate` refuses to report "done" until the
 completion ledger holds real verification evidence, and a deterministic receipt is
-printed from that ledger. Users do not type `/blueprint`, `/commitlet`, or `/mission`
+printed from that ledger. Users do not type `/blueprint` or `/commitlet`
 before normal work.
 
 ## Install
@@ -126,18 +126,12 @@ them only added tool-choice noise.
 ### Advanced / opt-in surfaces
 
 Blueprint planning powers `cheater_reliability_start` internally; its inspection
-commands (`/blueprint-show`, `/blueprint-review`, `/blueprint-cancel`,
-`/blueprint-force`, `/blueprint-docs`, `/blueprint-memory`) stay available.
+commands (`/blueprint-show`, `/blueprint-cancel`, `/blueprint-docs`,
+`/blueprint-memory`) stay available. The **Gym** local benchmark (`/gym*`)
+stays on for measuring Cheater against vanilla Pi.
 
-**Mission Control is opt-in and off by default.** It is a separate bug-fix
-subsystem (`/mission`, `/fix`, `/orient`, `/repro`, `/evidence`, `/playbook`,
-`/verify`, `/learn`) that duplicates the reliability flow's job; set
-`"missionControlEnabled": true` to load it. The **Gym** local benchmark
-(`/gym*`) stays on for measuring Cheater against vanilla Pi.
-
-Debug-only commands remain for Cheater development: `/blueprint-candidates`,
-`/blueprint-step`, `/blueprint-debug`, `/blueprint-quality-repair`,
-`/commitlet-next`, `/commitlet-finalize`, and `/commitlet-debug`.
+Debug-only commands remain for Cheater development: `/commitlet-next`,
+`/commitlet-debug`, `/autopilot-route`, and `/autopilot-run`.
 
 ## Pi Discovery
 
@@ -179,7 +173,6 @@ Project config overrides global config. Supported keys:
   "autopilotRouteAllCodeTasks": true,
   "requireApprovalForHighRisk": false,
   "maxSessionContextTokens": null,
-  "missionControlEnabled": false,
   "freshCallPacketsEnabled": true,
   "packetOneFilePerWorkerEnabled": true,
   "packetMaxFilesToTouch": 1,
@@ -256,8 +249,7 @@ context. Final review runs automatically through the blueprint tooling.
 
 Tiny edits use the fast path and can escalate to Blueprint after failure. Bug
 and test-failure requests are steered to reproduce and gather evidence before
-editing, then run the same commitlet flow (the standalone Mission Control
-subsystem is opt-in; see above). High-risk actions such as dependency or lockfile
+editing, then run the same commitlet flow. High-risk actions such as dependency or lockfile
 changes, file deletion, broad refactors, or unclear architecture changes require
 user approval.
 

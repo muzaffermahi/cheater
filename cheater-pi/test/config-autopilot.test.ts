@@ -19,8 +19,6 @@ test("config defaults enable automatic low-risk-safe blueprint behavior", () => 
   assert.equal(DEFAULT_CONFIG.loopGovernorEnabled, true);
   assert.equal(DEFAULT_CONFIG.jsonStopSentinel, "@@END_JSON@@");
   assert.equal(DEFAULT_CONFIG.contextCompactRatio, 0.85);
-  assert.equal(DEFAULT_CONFIG.oracleRunBroadTests, "always");
-  assert.equal(DEFAULT_CONFIG.oracleRunAllChecks, true);
   assert.equal(DEFAULT_CONFIG.bugFreshAgentEnabled, true);
   assert.equal(DEFAULT_CONFIG.commitletModeEnabled, true);
   assert.equal(DEFAULT_CONFIG.rollbackRequired, true);

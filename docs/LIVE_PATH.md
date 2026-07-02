@@ -27,28 +27,24 @@ The live product path is the TypeScript Pi extension at `cheater-pi/src/extensio
 `extension.ts` registers, gated by config:
 
 - `registerCheaterCommands` / `registerCheaterTools`
-  - tools: `cheater_project_brief`, `cheater_focus_test`, `cheater_diff_safety_check`,
-    `cheater_line_edit`, `cheater_memory_search`, `cheater_bug_memory_search`.
-    (`cheater_skill_search` was removed; skills are listed via the `/skills` command instead.)
+  - tools: `cheater_project_brief`, `cheater_line_edit`, `cheater_memory_search`,
+    `cheater_bug_memory_search`.
 - `registerAutopilotCommands` (there is no `registerAutopilotTools` - autopilot routing is
   harness-level, hung off the `input` event below, not a tool the model calls)
-- `registerBlueprintCommands` / `registerBlueprintTools`
+- `registerBlueprintCommands` (inspection commands only; blueprint has NO model-facing tools -
+  planning runs inside `cheater_reliability_start`)
 - `registerCommitletCommands` / `registerCommitletTools`
   - tools: `cheater_reliability_start`, `cheater_commitlet_next` (grades the
     running commitlet in code - diff guard, patch health, test audit, focused
     verification - then prepares the next one or runs the final review),
     `cheater_finish_gate`, `cheater_verification_run`, `cheater_ledger_status`,
-    `cheater_commitlet_revert`, `cheater_rollback_status`, `cheater_health_report`,
-    `cheater_constraint_graph`, `cheater_bench_report`.
-    `cheater_commitlet_plan`, `cheater_commitlet_guard`, `cheater_commitlet_verify`,
-    `cheater_commitlet_finalize`, and `cheater_autopilot_route` were removed: the
-    first is a duplicate of `cheater_reliability_start`, the guard/verify/finalize
-    steps are now inlined into `cheater_commitlet_next` instead of being separate
-    tools the model could skip or call out of order, and routing moved to the
-    harness (the `input` hook below) instead of a tool the model had to remember.
-- `registerMissionCommands` / `registerMissionTools`
+    `cheater_commitlet_revert`, `cheater_rollback_status`.
 - `registerGymCommands`
-- `registerReliabilityCommands` (`/reliability-status`, `/model-profile`, `/loop-report`)
+- `registerReliabilityCommands` (`/reliability-status`, `/model-profile`)
+
+Invariant (pinned by `autopilot-blueprint-integration.test.ts`): **every registered
+`cheater_*` tool appears in a tool mask.** There is no registered-but-never-visible
+inventory left to leak if masking degrades.
 
 Pi lifecycle hooks used by the extension:
 
@@ -152,6 +148,36 @@ instruction to actually run it; the packet told the worker "Use Pi native
 tools only" while the surrounding commitlet block told it to use
 `cheater_line_edit`; and a commitlet's target file's code was embedded twice
 in one packet (a symbol-aware slice plus a duplicate raw head excerpt).
+
+## Correction: the 2026-07 production-grade purge
+
+An audit found that 28 of 39 registered `cheater_*` tools appeared in NO tool
+mask - permanently invisible dead surface that would flood a small model with
+choices only in the exact failure case (mask no-op) where extra choices hurt
+most. Additionally, several slash commands (`/health-report`,
+`/constraint-graph`, `/bench-report`) sent the model off to call tools that
+were masked away - the same "approval black hole" shape fixed in the sixth
+pass. Deleted outright rather than hidden:
+
+- the entire Mission Control subsystem (`src/mission/`, 15 tools, ~12 commands;
+  its `scanOrientation` scanner - the one piece the live path used - moved to
+  `blueprint/orientation.ts`); the `mission_control` routing mode was renamed
+  `careful_repro` (same behavior: reproduce first, then the one flow)
+- all 9 `cheater_blueprint_*` model tools plus the packet-dispatch debug
+  commands (`/blueprint-step`, `/blueprint-force`, `/blueprint-review`,
+  `/blueprint-approve`, `/blueprint-candidates`, `/blueprint-debug`,
+  `/blueprint-quality-repair`, `/blueprint-eval`) and their orphaned engines
+  (`evalHarness.ts`, `qualityRepair.ts`, `reviewer.ts`, `blueprint/impact.ts`)
+- never-masked tools `cheater_focus_test`, `cheater_diff_safety_check`,
+  `cheater_health_report`, `cheater_constraint_graph`, `cheater_bench_report`
+  (`/commitlet-health`, `/constraint-graph`, `/bench-report` now render
+  directly from harness state - zero model turns)
+- `/loop-report` (printed hardcoded mock data) and `/health-report` (duplicate
+  of `/commitlet-health`)
+- the gym benchmark prompt still instructed eval models to call deleted
+  mission tools (`cheater_mission_classify -> cheater_repro_gate -> ...`) -
+  rewritten to the real one flow; `commitlet/spec.ts` seeded bug specs with
+  "Use Mission Control repro/evidence output" - rewritten
 
 ## Did lifecycle/anti-stall affect real Pi sessions before this slice?
 

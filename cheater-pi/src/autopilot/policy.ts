@@ -12,21 +12,21 @@ export function decideExecutionMode(input: RoutePolicyInput): Omit<AutopilotDeci
   if (input.taskKind === "explanation_only") {
     executionMode = "answer_only";
   } else if (input.taskKind === "bug_fix" || input.taskKind === "test_failure") {
-    executionMode = failureEscalation || explicitCareful ? "blueprint_orchestrator" : "mission_control";
+    executionMode = failureEscalation || explicitCareful ? "blueprint_orchestrator" : "careful_repro";
   } else if (explicitCareful || failureEscalation) {
     executionMode = "blueprint_orchestrator";
   } else if (input.taskKind === "tiny_edit" && !highComplexity) {
-    executionMode = explicitFast ? "vanilla_pi" : "mission_control";
+    executionMode = explicitFast ? "vanilla_pi" : "careful_repro";
   } else if (input.confidence < 0.55 && input.taskKind !== "unknown") {
     executionMode = "blueprint_orchestrator";
   } else if (explicitFast && input.risk !== "high" && input.complexitySignals.length <= 1) {
-    executionMode = "mission_control";
+    executionMode = "careful_repro";
   } else if (highComplexity || ["feature_addition", "refactor", "tooling", "migration", "benchmark"].includes(input.taskKind)) {
     executionMode = "blueprint_orchestrator";
   } else if (input.taskKind === "docs") {
     executionMode = input.complexitySignals.length > 1 ? "blueprint_orchestrator" : "vanilla_pi";
   } else {
-    executionMode = input.confidence < 0.45 ? "answer_only" : "mission_control";
+    executionMode = input.confidence < 0.45 ? "answer_only" : "careful_repro";
   }
 
   return {
@@ -63,9 +63,9 @@ function decideExecutionDiscipline(mode: ExecutionMode, input: RoutePolicyInput,
 function explainMode(mode: ExecutionMode, input: RoutePolicyInput): string {
   if (mode === "answer_only") return "No code change is implied, so Pi should answer directly.";
   if (mode === "vanilla_pi") return "Task is small enough for Pi's normal path with focused verification.";
-  if (mode === "mission_control") return input.needsRepro
-    ? "Bug/test signal should use Mission Control with repro and evidence."
-    : "Task is bounded enough for Mission Control fast path.";
+  if (mode === "careful_repro") return input.needsRepro
+    ? "Bug/test signal should reproduce first, then run the verified flow."
+    : "Task is bounded enough for the fast path.";
   return input.complexitySignals.length
     ? `Planning path selected because: ${input.complexitySignals.join(", ")}.`
     : "Planning path selected because the request is code-changing and classifier confidence is low.";

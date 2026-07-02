@@ -1,4 +1,4 @@
-import { scanOrientation } from "../mission/orientation.js";
+import { scanOrientation } from "./orientation.js";
 import type { CheaterConfig } from "../types.js";
 import { blueprintConfig } from "./config.js";
 import { repoOrientationFromMissionFacts } from "./contextSketch.js";

@@ -19,9 +19,7 @@ test("execute mode exposes only the one-flow tools, not harness-provided redunda
     assert.ok(execute.includes(core), `execute mode must expose ${core}`);
   }
   // Redundant with deterministic harness behavior (env block, diff guard, verification_run).
-  for (const redundant of ["cheater_project_brief", "cheater_focus_test", "cheater_diff_safety_check"]) {
-    assert.equal(execute.includes(redundant), false, `${redundant} is harness-provided; keep it out of the model's execute surface`);
-  }
+  assert.equal(execute.includes("cheater_project_brief"), false, "cheater_project_brief is harness-provided; keep it out of the model's execute surface");
 });
 
 test("no tool mask leaks a parallel-subsystem tool", () => {
@@ -61,15 +59,10 @@ test("auto-verify prefers a real test but falls back to typecheck then build", (
   assert.equal(pickAutoVerifyCommand({}), null);
 });
 
-test("command help and startup card hide Mission Control unless opted in", () => {
-  const off = commandHelp();
-  assert.doesNotMatch(off, /\/mission /, "Mission Control commands must be hidden by default");
-  assert.doesNotMatch(off, /Start a Cheater Mission Control flow/);
-  const on = commandHelp({ missionControlEnabled: true });
-  assert.match(on, /Start a Cheater Mission Control flow/);
-
-  const cardOff = startupCard("C:\\repo", "qwen-local").join("\n");
-  assert.doesNotMatch(cardOff, /\/mission/);
-  const cardOn = startupCard("C:\\repo", "qwen-local", { missionControlEnabled: true }).join("\n");
-  assert.match(cardOn, /\/mission/);
+test("command help and startup card carry no residue of deleted subsystems or commands", () => {
+  const help = commandHelp();
+  assert.doesNotMatch(help, /\/mission/, "Mission Control was deleted; no residue may remain");
+  assert.doesNotMatch(help, /\/health-report|\/loop-report|\/blueprint-step|\/blueprint-force|\/blueprint-eval/, "removed commands must not be advertised");
+  const card = startupCard("C:\\repo", "qwen-local").join("\n");
+  assert.doesNotMatch(card, /\/mission/);
 });

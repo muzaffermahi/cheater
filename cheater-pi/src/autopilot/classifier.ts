@@ -34,7 +34,7 @@ const RULES: Rule[] = [
     // A from-scratch creation SPEC must outrank bug_fix/test_failure: long feature specs
     // routinely contain the words "bug" ("tag as bug"), "delete" ("delete tasks"), or
     // "fails" ("if build fails, fix it") as feature descriptions, and those words used to
-    // hijack routing into Mission Control + high-risk blocking for a plain app build.
+    // hijack routing into careful-repro + high-risk blocking for a plain app build.
     kind: "feature_addition",
     patterns: [
       /\b(create|build|make|scaffold|generate|write)\b.{0,80}\b(complete|new|full|entire)?\s*(app|application|web ?app|website|webpage|page|project|game|tool|cli|dashboard|component|library)\b.{0,80}\bfrom scratch\b/is,

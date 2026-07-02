@@ -14,7 +14,7 @@ export type TaskKind =
 export type ExecutionMode =
   | "answer_only"
   | "vanilla_pi"
-  | "mission_control"
+  | "careful_repro"
   | "blueprint_orchestrator";
 
 export type ExecutionDiscipline =

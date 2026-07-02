@@ -36,7 +36,7 @@ test("a from-scratch creation spec classifies as feature work, not a bug fix", (
 test("the spec routes to a code-changing mode with no approval block", () => {
   const decision = routeAutopilot({ cwd: process.cwd(), message: FOUNDER_OS_SPEC });
   assert.notEqual(decision.executionMode, "answer_only");
-  assert.notEqual(decision.executionMode, "mission_control", "an app build is not a bug hunt");
+  assert.notEqual(decision.executionMode, "careful_repro", "an app build is not a bug hunt");
   assert.notEqual(decision.executionDiscipline, "blocked_needs_user");
 });
 

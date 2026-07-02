@@ -14,36 +14,17 @@ const PUBLIC_COMMAND_NAMES = [
   "autopilot-status",
   "reliability-status",
   "blueprint-show",
-  "blueprint-review",
   "blueprint-cancel",
-  "blueprint-force",
   "blueprint-docs",
   "blueprint-memory",
-  "blueprint-approve",
   "commitlet-status",
   "commitlet-plan",
-  "commitlet-verify",
   "commitlet-revert",
   "commitlet-health",
   "rollback-status",
-  "health-report",
   "constraint-graph",
   "bench-report",
   "model-profile",
-  "loop-report",
-  "mission",
-  "mission-status",
-  "mission-cancel",
-  "mission-save",
-  "fix",
-  "orient",
-  "orientation",
-  "repro",
-  "evidence",
-  "playbook",
-  "verify",
-  "learn",
-  "delta-bench",
   "gym",
   "gym-list",
   "gym-run",
@@ -64,13 +45,7 @@ const PUBLIC_COMMAND_NAMES = [
 ];
 
 const DEBUG_COMMAND_NAMES = [
-  "blueprint-candidates",
-  "blueprint-step",
-  "blueprint-debug",
-  "blueprint-quality-repair",
-  "blueprint-eval",
   "commitlet-next",
-  "commitlet-finalize",
   "commitlet-debug",
   "autopilot-route",
   "autopilot-run"
@@ -179,7 +154,7 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
       // explicitly instead of disappearing, so this diagnostic can never again silently
       // under-report what is loaded.
       const knownCheaterCommands = new Set(PUBLIC_COMMAND_NAMES.concat(DEBUG_COMMAND_NAMES));
-      const cheaterCommandPrefixes = ["autopilot-", "blueprint-", "commitlet-", "mission-", "gym-", "reliability-"];
+      const cheaterCommandPrefixes = ["autopilot-", "blueprint-", "commitlet-", "gym-", "reliability-"];
       const uncategorized = commands.filter((name: string) =>
         !knownCheaterCommands.has(name) && cheaterCommandPrefixes.some((prefix) => name.startsWith(prefix))
       );

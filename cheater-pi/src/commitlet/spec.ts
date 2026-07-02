@@ -19,7 +19,7 @@ export function forgeCommitletSpec(commitlet: Commitlet, taskKind: TaskKind, use
     temporaryTestsAllowed: isBug,
     permanentTestsAllowed: isBug || /test/i.test(commitlet.scope),
     reproductionCommand: isBug ? commitlet.focusedVerification.find((step) => step.command)?.command : undefined,
-    observedFailure: isBug ? "Use Mission Control repro/evidence output as the observed failure." : undefined,
+    observedFailure: isBug ? "Reproduce the failure first and treat its exact output as the observed failure." : undefined,
     expectedBehavior: isBug ? "Focused verification passes for the original failure." : undefined,
     nonGoals: [
       "Do not touch files outside allowedFiles.",

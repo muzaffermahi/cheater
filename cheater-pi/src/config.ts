@@ -8,20 +8,6 @@ import { DEFAULT_BLUEPRINT_CONFIG } from "./blueprint/config.js";
 export const VERSION = "0.7.0";
 
 export const DEFAULT_CONFIG: CheaterConfig = {
-  // Mission Control is a parallel bug-fix subsystem (its own repro/evidence/oracle/learn tools
-  // and ~12 slash commands). Autopilot already funnels bug-fix and test-failure requests into
-  // the single reliability flow (reproduce -> cheater_reliability_start -> commitlet_next ->
-  // verify -> finish_gate), so Mission Control's separate surface is off by default to keep one
-  // obvious path. Set "missionControlEnabled": true to opt back into /mission, /fix, /orient, etc.
-  missionControlEnabled: false,
-  reproRequiredBeforePatch: true,
-  allowNoOpSuccess: true,
-  onlineEvidenceEnabled: false,
-  offlineStackOverflowEnabled: false,
-  autoSaveLearning: false,
-  oracleRunBroadTests: "always",
-  maxEvidenceItems: 5,
-  maxMissionRawLogChars: 12000,
   gymEnabled: true,
   gymDefaultLimit: 5,
   gymDefaultConcurrency: 1,
@@ -31,7 +17,10 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   gymAutoLearn: false,
   gymDeltaModeEnabled: false,
   ...DEFAULT_BLUEPRINT_CONFIG,
-  blueprintOfficialDocsSearchEnabled: false
+  blueprintOfficialDocsSearchEnabled: false,
+  // Durable run state (contract, digest, ledgers, capsules, phase control, post-success
+  // guard) under .cheater/runs/<taskId>/. Deterministic and local-only; on by default.
+  runStateEnabled: true
 };
 
 export function packageRoot(): string {

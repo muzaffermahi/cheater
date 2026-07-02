@@ -1,5 +1,12 @@
+// Commitlet user commands. Everything here renders DIRECTLY from harness state - no command
+// sends the model off to call a tool it may not see (the "/command tells the model to call a
+// masked-away tool" black hole). The only exceptions are the two flow commands
+// (/commitlet-next, /commitlet-revert) whose tools are in every execute mask.
+
 import { defaultCommitletState } from "./state.js";
 import { formatCommitletFinalReview, formatCommitletPlan, formatCommitletStatus } from "./ui.js";
+import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
+import { latestReliabilityBenchmark, compareReliabilityBenchmark } from "../reliability/bench.js";
 
 type ExtensionAPI = any;
 type CommandContext = any;
@@ -41,18 +48,6 @@ export function registerCommitletCommands(pi: ExtensionAPI): void {
       pi.sendUserMessage(`Cheater /commitlet-revert: call cheater_commitlet_revert${suffix} and report rollback status compactly.`);
     }
   });
-  pi.registerCommand("commitlet-verify", {
-    description: "Grade the running commitlet (guard, health, test audit, focused verification)",
-    handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /commitlet-verify: call cheater_commitlet_next to grade the running commitlet in code and advance the plan, then report compactly.");
-    }
-  });
-  pi.registerCommand("commitlet-finalize", {
-    description: "Run commitlet final review (runs automatically once no commitlets are pending)",
-    handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /commitlet-finalize: call cheater_commitlet_next; it runs the final review automatically once no commitlets are pending, and reports it compactly.");
-    }
-  });
   pi.registerCommand("commitlet-debug", {
     description: "Show active commitlet JSON",
     handler: async (_args: string, ctx: CommandContext) => {
@@ -68,27 +63,34 @@ export function registerCommitletCommands(pi: ExtensionAPI): void {
     }
   });
 
-  pi.registerCommand("health-report", {
-    description: "Show latest Reliability Kernel health report",
-    handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /health-report: call cheater_health_report and report compactly.");
-    }
-  });
-
   pi.registerCommand("constraint-graph", {
     description: "Show compact repo constraint graph facts",
-    handler: async (args: string, _ctx: CommandContext) => {
-      const file = args.trim();
-      pi.sendUserMessage(file
-        ? `Cheater /constraint-graph: call cheater_constraint_graph with queryFile=${file}.`
-        : "Cheater /constraint-graph: call cheater_constraint_graph for the active commitlet files.");
+    handler: async (args: string, ctx: CommandContext) => {
+      const queryFile = args.trim();
+      const plan = defaultCommitletState.get().currentPlan;
+      const files = queryFile
+        ? [queryFile]
+        : [...new Set(plan?.commitlets.flatMap((commitlet) => commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/"))) ?? [])];
+      if (!files.length) {
+        widget(ctx, "No files to graph: pass a file (/constraint-graph src/foo.ts) or start a plan first.");
+        return;
+      }
+      const graph = buildRepoConstraintGraph(ctx.cwd, files);
+      const facts = queryFile ? queryConstraintFacts(graph, queryFile) : [];
+      widget(ctx, [
+        "Constraint graph",
+        `files: ${graph.files.length}, symbols: ${graph.symbols.length}, exports: ${graph.exports.length}, imports: ${graph.imports.length}`,
+        `tests: ${graph.tests.length}, testMappings: ${graph.testMappings.length}, verificationHints: ${graph.verificationCommands.length}`,
+        facts.length ? `facts:\n- ${facts.join("\n- ")}` : ""
+      ].filter(Boolean).join("\n"));
     }
   });
 
   pi.registerCommand("bench-report", {
     description: "Show latest local reliability benchmark report",
-    handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /bench-report: call cheater_bench_report and report compactly.");
+    handler: async (_args: string, ctx: CommandContext) => {
+      const results = latestReliabilityBenchmark(ctx.cwd);
+      widget(ctx, results.length ? compareReliabilityBenchmark(results) : "No reliability benchmark report found.");
     }
   });
 }

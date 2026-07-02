@@ -8,6 +8,14 @@ import { createRollbackPoint } from "./rollback.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
+import { activeTaskRun, type TaskRunState } from "../runstate/runState.js";
+import { buildPromptCapsule, type PromptCapsule } from "../runstate/promptCapsule.js";
+import { recallHarnessLessons, selectRulePacks } from "../runstate/rulePacks.js";
+import { collectFragmentsForWorker, fragmentMeta, renderFragmentBundle, type ContextFragment } from "../runstate/contextFragments.js";
+import { checkCapsuleInvariants } from "../runstate/invariants.js";
+import { buildWorkerSpawnSpec, roleForCommitlet } from "../runstate/workerSpawn.js";
+import { planToolExposure, workerModeForCommitlet } from "../runstate/toolExposure.js";
+import { appendRunEvent } from "../runstate/runDir.js";
 import type { CheaterConfig } from "../types.js";
 
 export type FreshWorkerMode = "simulated" | "real";
@@ -16,6 +24,8 @@ export interface CommitletExecutionPrompt {
   commitletId: string;
   prompt: string;
   freshWorkerMode: FreshWorkerMode;
+  /** The persisted prompt capsule, when a durable run is active. */
+  capsule?: PromptCapsule;
 }
 
 // Verified-resampling attempt stances. Independent samples only help if they are diverse;
@@ -87,9 +97,23 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
   const workerNotice = freshWorkerMode === "real"
     ? "freshWorkerMode: real (this commitlet runs in a separate isolated LLM session via sdkFreshAgentPacketRunner)"
     : "freshWorkerMode: simulated (this prompt is returned to the current agent session; no separate context boundary is created)";
+  // Durable-run augmentation: when a task run is active, record this worker's whole context
+  // as a prompt capsule (persisted + size-instrumented) and append the compact run-state
+  // block (phase, contract, mutation/validation truth, prior reports, rules). Built from the
+  // SAME bounded inputs as the prompt - never from the parent session's transcript or logs.
+  const run = activeTaskRun();
+  const built = run
+    ? buildRunCapsule(run, plan, commitlet, {
+      snippets: sliceCandidates.map((file, index) => ({ path: file, snippet: perFileSnippets[index] })),
+      repoFacts: constraintFacts
+    })
+    : undefined;
+  const capsule = built?.capsule;
+  const runStateBlock = built ? built.runStateBlock : "";
   return {
     commitletId: commitlet.id,
     freshWorkerMode,
+    capsule,
     prompt: [
       "Cheater Reliability Kernel commitlet.",
       `commitletId: ${commitlet.id}`,
@@ -116,12 +140,69 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
         ...(observedFailureForAttempt(spec.observedFailure, attempt) ? [`observedFailure:\n${observedFailureForAttempt(spec.observedFailure, attempt)}`] : [])
       ].join("\n") : "",
       attemptStance(attempt),
+      runStateBlock,
       "",
       prompt,
       "",
       "Before editing, rollback must exist. After editing, stop for diff guard, focused verification, health score, and test audit."
     ].filter(Boolean).join("\n")
   };
+}
+
+/**
+ * Build and persist the prompt capsule for one commitlet worker, assembled from TYPED
+ * context fragments (phase, contract, ledger summaries, protections, rules, world-state
+ * diff) - never ad hoc string piles, never the parent session's chat or logs. The fragment
+ * ids land in capsule metadata so what entered this worker's context is auditable from the
+ * run directory.
+ */
+function buildRunCapsule(
+  run: TaskRunState,
+  plan: CommitletPlan,
+  commitlet: Commitlet,
+  extras: { snippets: Array<{ path: string; snippet: string }>; repoFacts: string[] }
+): { capsule: PromptCapsule; runStateBlock: string; fragments: ContextFragment[] } {
+  const spec = commitlet.spec;
+  const packSeed = `${plan.userGoal} ${commitlet.allowedFiles.join(" ")}`;
+  const rules = [
+    ...selectRulePacks(packSeed).flatMap((pack) => pack.rules).slice(0, 8),
+    ...recallHarnessLessons(packSeed, 2)
+  ];
+  const fragments = collectFragmentsForWorker(run, {
+    goalSeed: packSeed,
+    ruleLines: rules,
+    priorReports: run.recentReportLines()
+  });
+  const guardLine = run.guard.warningLine();
+  const capsule = buildPromptCapsule({
+    taskId: run.taskId,
+    workerRole: commitlet.id,
+    workerGoal: `${commitlet.title}: ${commitlet.purpose}`,
+    nonGoals: spec?.nonGoals,
+    acceptanceContract: [
+      ...(spec?.acceptanceCriteria ?? []),
+      ...run.contract.checklist.slice(0, 4)
+    ],
+    relevantFiles: extras.snippets
+      .filter((entry) => entry.snippet)
+      .map((entry) => ({ path: entry.path, reason: "commitlet target", snippet: entry.snippet })),
+    allowedFiles: commitlet.allowedFiles,
+    forbiddenFiles: commitlet.forbiddenFiles,
+    repoFacts: extras.repoFacts,
+    constraints: plan.globalConstraints,
+    riskWarnings: guardLine ? [guardLine] : [],
+    validationPlan: commitlet.focusedVerification.map((step) => step.command ?? step.purpose),
+    workspaceDigest: run.refreshDigest(),
+    mutationSummary: run.mutations.renderSummaryLines(),
+    priorWorkerReports: run.recentReportLines(),
+    phaseLines: run.phase.capsuleLines(),
+    rulePack: rules,
+    fragments: fragmentMeta(fragments)
+  });
+  run.noteCapsule(capsule);
+  const runStateBlock = renderFragmentBundle(fragments, "=== CHEATER RUN STATE (durable truth for this run) ===")
+    + `\nrun dir: .cheater/runs/${run.taskId}/ (digest: workspace-digest.md)`;
+  return { capsule, runStateBlock, fragments };
 }
 
 export async function spawnFreshWorkerForCommitlet(
@@ -138,7 +219,40 @@ export async function spawnFreshWorkerForCommitlet(
     return { ok: false, summary: `No work packet for commitlet ${commitlet.id}`, error: "no_packet" };
   }
   const modelName = (model as { id?: string } | undefined)?.id ?? config.model;
-  const promptBody = buildCommitletExecutionPrompt(plan, commitlet, [], "real", attempt, modelName).prompt;
+  const execution = buildCommitletExecutionPrompt(plan, commitlet, [], "real", attempt, modelName);
+  const promptBody = execution.prompt;
+  // Spawn discipline: an explicit fork-none spawn spec, a role-scoped tool list (exposure
+  // only ever shrinks), and the capsule invariant gate. A capsule that fails invariants does
+  // not spawn - the controller is told to split or compress instead of shipping bloat.
+  const run = activeTaskRun();
+  const mode = workerModeForCommitlet(commitlet);
+  const exposure = planToolExposure(mode);
+  if (run && execution.capsule) {
+    if (attempt === 1) {
+      buildWorkerSpawnSpec({
+        run,
+        workerId: commitlet.id,
+        role: roleForCommitlet(commitlet),
+        taskName: commitlet.title,
+        allowedFiles: commitlet.allowedFiles,
+        forbiddenFiles: commitlet.forbiddenFiles,
+        mode,
+        maxContextTokens: execution.capsule.tokenBudgetHint,
+        maxToolCalls: commitlet.maxToolCalls,
+        config
+      });
+    }
+    const invariants = checkCapsuleInvariants(execution.capsule, { run, workerTools: exposure.workerTools, config });
+    if (!invariants.ok) {
+      run.bumpTelemetry("invariantFailures");
+      appendRunEvent(run.runDir, "capsule_invariant_failed", { workerId: commitlet.id, failures: invariants.failures.slice(0, 5) });
+      return {
+        ok: false,
+        summary: `Capsule invariants failed for ${commitlet.id}: ${invariants.failures.join("; ")}. Split the task or compress the capsule before spawning.`,
+        error: "capsule_invariant_failed"
+      };
+    }
+  }
   try {
     return await runner.runPacket({
       cwd: plan.repoRoot,
@@ -147,6 +261,7 @@ export async function spawnFreshWorkerForCommitlet(
       prompt: promptBody,
       config,
       model,
+      tools: exposure.workerTools,
       thinkingLevel: attemptThinkingLevel(attempt)
     });
   } catch (err) {

@@ -21,6 +21,9 @@ export interface FreshAgentPacketRunner {
     packet: WorkPacket;
     prompt: string;
     config: CheaterConfig;
+    // Role-scoped tool list from the exposure lattice. May only SHRINK the default
+    // WORKER_TOOLS set (read-only workers, validators); anything broader is ignored.
+    tools?: string[];
     // The parent session's currently selected model (ctx.model from the tool call site).
     // Without this, createAgentSession re-resolves a model from global settings defaults,
     // which is silently unrelated to whatever model the user is actually driving Cheater
@@ -237,7 +240,10 @@ function compactSentinelBody(text: string | undefined, sentinel: string, fallbac
 }
 
 export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
-  async runPacket({ cwd, plan, packet, prompt, config, model, thinkingLevel }) {
+  async runPacket({ cwd, plan, packet, prompt, config, model, tools, thinkingLevel }) {
+    // Exposure may only reduce: a caller-provided tool list is honored only when it is a
+    // subset of the battle-tested default; anything unknown or broader falls back safely.
+    const workerTools = tools?.length && tools.every((tool) => WORKER_TOOLS.includes(tool)) ? tools : WORKER_TOOLS;
     if (config.packetOneFilePerWorkerEnabled !== false && packet.filesToTouch.length > (config.packetMaxFilesToTouch ?? 1)) {
       return {
         ok: false,
@@ -264,7 +270,7 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
           cwd,
           sessionManager,
           settingsManager,
-          tools: WORKER_TOOLS,
+          tools: workerTools,
           customTools: [createCheaterLineEditTool()],
           // Inherit the parent session's model so a worker never silently runs on whatever
           // global default happens to be configured instead of the model the user picked.

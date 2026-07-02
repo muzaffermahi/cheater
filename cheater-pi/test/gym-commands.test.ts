@@ -62,7 +62,7 @@ test("/gym-run prepares a workspace and sends a user message", async () => {
   const ctx = makeCtx(cwd);
   await commands.get("gym-run")!.handler("py_off_by_one_001", ctx);
   assert.equal(messages.length, 1);
-  assert.match(messages[0], /Cheater Mission Control for py_off_by_one_001/);
+  assert.match(messages[0], /Cheater Reliability task py_off_by_one_001/);
   rmSync(cwd, { recursive: true, force: true });
 });
 

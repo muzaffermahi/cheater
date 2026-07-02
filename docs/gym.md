@@ -1,7 +1,7 @@
 # Cheater Gym
 
 Cheater Gym is a local benchmark and self-improvement system for Cheater.
-It creates small, disposable repos with known bugs, runs Cheater Mission
+It creates small, disposable repos with known bugs, runs the Cheater reliability
 Control on them, scores the result, records traces, and turns failures and
 successes into memory/skill/anti-pattern suggestions.
 
@@ -16,7 +16,7 @@ built a small local gym that:
 
 * ships 25 tiny reproducible tasks in two languages (Python + JS/TS),
 * runs them in temp workspaces,
-* measures whether Cheater Mission Control actually helps the model,
+* measures whether the Cheater harness actually helps the model,
 * converts the run results into bug-memory, anti-pattern, and skill
   suggestions that the user can accept or reject.
 
@@ -30,7 +30,7 @@ built a small local gym that:
 * **Fixture support** under `.cheater/gym/tasks/<id>/repo/` for tasks
   that need a real on-disk repo instead of inline files.
 * **A runner** that creates a temp workspace, snapshots a baseline, runs
-  Mission Control against the task, collects the diff, and scores it.
+  the Cheater flow against the task, collects the diff, and scores it.
 * **A scorer** with explicit penalties for editing tests, editing
   dependencies/lockfiles, huge diffs, missing reproduction, and missing
   evidence.
@@ -38,7 +38,7 @@ built a small local gym that:
 * **Learning pipeline** that turns each run into a `bug_memory`,
   `anti_pattern`, or `skill_improvement` suggestion. Suggestions are
   never auto-saved; the user must accept them.
-* **Delta mode** that compares Cheater Mission Control to vanilla Pi.
+* **Delta mode** that compares the Cheater harness to vanilla Pi.
   When the vanilla run is not available the report is generated
   honestly, saying "vanilla mode not available".
 * **Default concurrency = 1** to stay safe on 16 GB RAM machines.
@@ -54,7 +54,7 @@ cheater gym clean             # remove workspaces + reports
 cheater gym help              # list subcommands
 ```
 
-The CLI prepares the workspace and prints the exact Mission Control
+The CLI prepares the workspace and prints the exact reliability-flow
 prompt that should be sent into Pi. It does not run the model itself,
 because Pi owns the agent loop.
 
@@ -65,7 +65,7 @@ because Pi owns the agent loop.
 ```
 /gym                # help + status
 /gym-list           # list tasks
-/gym-run <id>       # prepare a workspace, send Mission Control prompt
+/gym-run <id>       # prepare a workspace, send the reliability-flow prompt
 /gym-run-suite      # run a small suite (mocked or real)
 /gym-report         # show the latest report
 /gym-delta <id>     # show Cheater vs vanilla delta
@@ -164,14 +164,13 @@ without confirmation, no auto-save, no global state.
 ## Limitations
 
 * The "real" agent loop is owned by Pi. Gym does not spawn its own
-  agent. It prepares a workspace and a Mission Control prompt; the
+  agent. It prepares a workspace and a reliability-flow prompt; the
   user runs the prompt inside `cheater` (or via the `/gym-run-suite`
   slash command which uses an injected `runAgent` hook).
 * Vanilla mode is not auto-discovered. If the user wants a true
   Cheater-vs-vanilla comparison, the vanilla run must be recorded
   separately (typically by repeating the suite with
-  `gymDeltaModeEnabled: true` after temporarily disabling Mission
-  Control).
+  `gymDeltaModeEnabled: true` with a vanilla Pi session).
 * The zoo tasks are intentionally small. They are not a substitute
   for SWE-bench or real repos. The point is to measure the harness,
   not the model.
@@ -185,9 +184,9 @@ Inside `cheater` after `cheater gym run py_off_by_one_001`:
 
 ```
 The focused test is `python -m pytest tests/test_sum_range.py -q`.
-Run cheater_mission_classify, then cheater_repro_gate with the focused
-command, then cheater_evidence_packet. After the failing test is
-reproduced, edit `src/sum_range.py` only. Do not edit
-`tests/test_sum_range.py`, `pyproject.toml`, or `requirements.txt`.
-Then run cheater_oracle_stack.
+Reproduce the failure with the focused command, then call
+cheater_reliability_start with the goal. Edit `src/sum_range.py` only.
+Do not edit `tests/test_sum_range.py`, `pyproject.toml`, or
+`requirements.txt`. Then call cheater_commitlet_next,
+cheater_verification_run, and cheater_finish_gate.
 ```

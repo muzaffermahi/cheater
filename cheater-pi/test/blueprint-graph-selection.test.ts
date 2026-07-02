@@ -5,10 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAutonomousBlueprint } from "../src/blueprint/autonomous.js";
 import { buildPlannerGraph, selectFilesByGoalFromGraph, buildRepoConstraintGraph, queryConstraintFacts } from "../src/commitlet/constraintGraph.js";
-import { runFinalBlueprintReview } from "../src/blueprint/reviewer.js";
 import { scoutOfficialDocs, searxngOfficialFacts, fetchOfficialDocsPages } from "../src/blueprint/docsScout.js";
 import { docsCacheKey, readDocsCache, writeDocsCache, docsCacheDir } from "../src/blueprint/docsCache.js";
-import { runBlueprintEval, summarizeEval } from "../src/blueprint/evalHarness.js";
 import { buildBlueprintIntelligencePack, packetScopedWorkerBrief } from "../src/blueprint/intelligence.js";
 import { inferFilePlans } from "../src/blueprint/contextSketch.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
@@ -177,122 +175,4 @@ test("docs cache failure is non-fatal and scout falls back to local", async () =
     config: { ...DEFAULT_BLUEPRINT_CONFIG, blueprintOfficialDocsSearchEnabled: false }
   });
   assert.ok(Array.isArray(facts));
-});
-
-test("final review surfaces quality-gate warnings and debug notes distinctly", async () => {
-  const dir = makeRepo();
-  const plan = await createAutonomousBlueprint({
-    cwd: dir,
-    userGoal: "add a command with tests",
-    taskType: "tooling",
-    modelName: "qwen-9b"
-  });
-  const review = runFinalBlueprintReview(plan);
-  assert.ok(review.debugNotes.some((n) => /quality gate/.test(n)));
-  assert.ok(Array.isArray(review.blockingIssues));
-  assert.ok(Array.isArray(review.nonBlockingWarnings));
-  assert.ok(Array.isArray(review.debugNotes));
-  assert.ok(!review.blockingIssues.includes("No final verification steps are recorded."));
-  assert.equal(review.accepted, false);
-});
-
-test("final review surfaces quality-gate blocking issues when quality gate fails", async () => {
-  const dir = makeRepo();
-  const plan = await createAutonomousBlueprint({
-    cwd: dir,
-    userGoal: "add a command with tests",
-    taskType: "tooling",
-    modelName: "qwen-9b"
-  });
-  const failingPlan = {
-    ...plan,
-    qualityGate: { ...plan.qualityGate, blockingIssues: ["quality gate hard block: evidence missing"], remediationActions: ["Attach evidence before dispatch"], passed: false }
-  };
-  const review = runFinalBlueprintReview(failingPlan);
-  assert.ok(review.blockingIssues.some((b) => /quality gate hard block/.test(b)));
-  assert.ok(review.remediationActions?.includes("Attach evidence before dispatch"));
-  assert.ok(review.suggestedRepairPackets[0]?.acceptanceCriteria.some((item) => /Attach evidence before dispatch/.test(item)));
-});
-
-test("eval harness shows graph_intelligence beats plain and basic for target+test selection", async () => {
-  const dir = makeRepo();
-  const orientation: RepoOrientation = {
-    repoRoot: dir, languages: ["typescript"], frameworks: [], testCommands: ["npm test"],
-    typecheckCommands: ["npm run build"], entrypoints: ["src/"], importantPaths: ["package.json"]
-  };
-  const results = await runBlueprintEval({
-    cwd: dir,
-    orientation,
-    task: {
-      goal: "add a cheater command for hello",
-      taskType: "tooling",
-      expectedFiles: ["src/commands.ts"],
-      expectedTests: ["test/commands.test.ts"],
-      expectedSymbols: ["registerCheaterCommands"],
-      modelName: "qwen-9b"
-    }
-  });
-  assert.equal(results.length, 3);
-  assert.deepEqual(results.map((r) => r.variant), ["plain", "basic_blueprint", "graph_intelligence"]);
-  const scores = Object.fromEntries(results.map((r) => [r.variant, r.metrics.score]));
-  assert.ok(scores.graph_intelligence > scores.plain, JSON.stringify(scores));
-  assert.ok(scores.graph_intelligence > scores.basic_blueprint, JSON.stringify(scores));
-  const graph = results.find((r) => r.variant === "graph_intelligence")!;
-  assert.equal(graph.metrics.correctFileTarget, true);
-  assert.equal(graph.metrics.likelyTestDiscovered, true);
-  assert.equal(graph.metrics.doneCriteriaPresent, true);
-  assert.equal(graph.metrics.qualityGateSurfaced, true);
-  assert.equal(graph.metrics.briefBounded, true);
-  assert.equal(graph.metrics.irrelevantBugMemoryIncluded, false);
-  assert.equal(graph.metrics.mockEditMatchesExpectedFile, true, `mock edit file: ${graph.mockEdit.touchedFile}`);
-  assert.equal(graph.metrics.localModelReady, true);
-  assert.equal(graph.metrics.packetPromptBudgetFit, true);
-  assert.equal(graph.metrics.oneFileWorkerScope, true);
-  assert.equal(graph.metrics.handoffDisciplinePresent, true);
-  const summary = summarizeEval(results);
-  assert.match(summary, /graph_intelligence: score=/);
-  assert.match(summary, /localReady=true/);
-});
-
-test("eval harness reports plain context lacks done criteria and quality gate", async () => {
-  const dir = makeRepo();
-  const results = await runBlueprintEval({
-    cwd: dir,
-    orientation: { ...orientation, repoRoot: dir },
-    task: { goal: "add a command", expectedFiles: ["src/commands.ts"], expectedTests: ["test/commands.test.ts"] }
-  });
-  const plain = results.find((r) => r.variant === "plain")!;
-  assert.equal(plain.metrics.doneCriteriaPresent, false);
-  assert.equal(plain.metrics.qualityGateSurfaced, false);
-  assert.equal(plain.metrics.correctFileTarget, false);
-  assert.equal(plain.metrics.localModelReady, false);
-  assert.equal(plain.metrics.handoffDisciplinePresent, false);
-});
-
-test("eval harness pipeline variant exercises the full autonomous pipeline offline", async () => {
-  const dir = makeRepo();
-  const results = await runBlueprintEval({
-    cwd: dir,
-    orientation: { ...orientation, repoRoot: dir },
-    task: {
-      goal: "add a cheater command for hello with tests",
-      taskType: "tooling",
-      expectedFiles: ["src/commands.ts"],
-      expectedTests: ["test/commands.test.ts"],
-      expectedSymbols: ["registerCheaterCommands"],
-      modelName: "qwen-9b"
-    }
-  }, { includePipeline: true });
-  assert.equal(results.length, 4);
-  const pipeline = results.find((r) => r.variant === "graph_intelligence_pipeline")!;
-  assert.ok(pipeline, "pipeline variant should be present");
-  assert.equal(pipeline.metrics.correctFileTarget, true, `selectedFiles: ${JSON.stringify(pipeline.selectedFiles)}`);
-  assert.equal(pipeline.metrics.qualityGateSurfaced, true);
-  assert.equal(pipeline.metrics.doneCriteriaPresent, true);
-  assert.equal(pipeline.metrics.mockEditMatchesExpectedFile, true, `mock edit: ${pipeline.mockEdit.touchedFile}`);
-  assert.equal(pipeline.metrics.localModelReady, true);
-  assert.equal(pipeline.metrics.packetPromptBudgetFit, true);
-  assert.equal(pipeline.metrics.oneFileWorkerScope, true);
-  const scores = Object.fromEntries(results.map((r) => [r.variant, r.metrics.score]));
-  assert.ok(scores.graph_intelligence_pipeline >= scores.basic_blueprint, JSON.stringify(scores));
 });

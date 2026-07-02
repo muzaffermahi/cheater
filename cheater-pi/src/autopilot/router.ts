@@ -34,7 +34,7 @@ export function inferRepoHints(cwd: string): AutopilotRepoHints {
 function summarizeDecision(mode: AutopilotDecision["executionMode"], reason: string): string {
   if (mode === "answer_only") return "This looks informational, so I will answer without editing.";
   if (mode === "vanilla_pi") return "This looks small, so I will wrap Pi's fast path in one commitlet and verify narrowly.";
-  if (mode === "mission_control") return "I will use Mission Control, then run the edit as a verified commitlet.";
+  if (mode === "careful_repro") return "I will reproduce and verify carefully, running the edit as a verified commitlet.";
   if (/because: /.test(reason)) {
     const signals = reason.replace(/^.*because:\s*/, "").replace(/\.$/, "");
     return `Planning internally because this touches ${signals}.`;
@@ -60,7 +60,7 @@ export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: st
   // edit": on a local backend that can't spawn sub-sessions, you ARE the one who edits, and
   // the commitlet scope guard keeps your edits inside the allowed file.
   const lines: string[] = [];
-  if (decision.executionMode === "mission_control") {
+  if (decision.executionMode === "careful_repro") {
     lines.push("Cheater: reproduce the bug and gather evidence first, then run the flow below.");
   }
   lines.push(

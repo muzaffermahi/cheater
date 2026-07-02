@@ -2,7 +2,6 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { isAbsolute, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
-import { focusTestCommand, detectProjectCommands } from "./reliability/projectCommands.js";
 
 type ExtensionAPI = any;
 type ExtensionContext = any;
@@ -196,51 +195,11 @@ export function registerCheaterTools(pi: ExtensionAPI): void {
     }
   });
 
-  pi.registerTool({
-    name: "cheater_focus_test",
-    label: "Cheater Focus Test",
-    description: "Suggest a focused test command for the current repo.",
-    promptSnippet: "cheater_focus_test - suggest a narrow test command before broad verification.",
-    parameters: Type.Object({
-      hint: Type.Optional(Type.String({ description: "Optional file, framework, or failing command hint" }))
-    }),
-    async execute(_toolCallId: string, params: { hint?: string }, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) {
-      const cwd = ctx.cwd;
-      const cmds = detectProjectCommands(cwd);
-      const command = focusTestCommand(cwd, params.hint);
-      const lines = [
-        command,
-        `packageManager: ${cmds.packageManager}`,
-        `framework: ${cmds.framework ?? "(auto-detected)"}`,
-        cmds.evidence.slice(0, 4).join("; ")
-      ];
-      return textResult(lines.join("\n"), { command, packageManager: cmds.packageManager, framework: cmds.framework, evidence: cmds.evidence });
-    }
-  });
-
-  pi.registerTool({
-    name: "cheater_diff_safety_check",
-    label: "Cheater Diff Safety",
-    description: "Check a changed-file list for risky Cheater diff categories.",
-    promptSnippet: "cheater_diff_safety_check - flag tests, dependencies, lockfiles, and large diffs.",
-    parameters: Type.Object({
-      files: Type.Array(Type.String(), { description: "Changed file paths to inspect" })
-    }),
-    async execute(_toolCallId: string, params: { files: string[] }) {
-      const files = params.files ?? [];
-      const risky = files.filter((file) =>
-        /(^|[\\/])(test|tests|__tests__)[\\/]/i.test(file) ||
-        /(^|[\\/])package-lock\.json$|(^|[\\/])pnpm-lock\.yaml$|(^|[\\/])yarn\.lock$|(^|[\\/])requirements\.txt$|(^|[\\/])pyproject\.toml$/i.test(file)
-      );
-      const tooMany = files.length > 12;
-      const verdict = risky.length || tooMany ? "review carefully before applying" : "focused diff shape";
-      return textResult(
-        [`verdict: ${verdict}`, `files: ${files.length}`, risky.length ? `risk files: ${risky.join(", ")}` : "risk files: none"].join("\n"),
-        { risky, tooMany }
-      );
-    }
-  });
-
+  // cheater_focus_test and cheater_diff_safety_check were removed: neither appeared in any
+  // tool mask (the harness provides both deterministically - project commands ride the env
+  // block and the diff guard grades every commitlet), so they were pure dead surface that
+  // would only ever appear to a model if masking failed - exactly when extra tool choices
+  // hurt most.
   pi.registerTool(createCheaterLineEditTool());
 
   pi.registerTool({
