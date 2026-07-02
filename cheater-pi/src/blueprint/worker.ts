@@ -21,10 +21,84 @@ export interface FreshAgentPacketRunner {
     packet: WorkPacket;
     prompt: string;
     config: CheaterConfig;
+    // The parent session's currently selected model (ctx.model from the tool call site).
+    // Without this, createAgentSession re-resolves a model from global settings defaults,
+    // which is silently unrelated to whatever model the user is actually driving Cheater
+    // with - a worker for a Sonnet session could spawn on a completely different model.
+    model?: unknown;
+    // Per-attempt reasoning-depth jitter for verified resampling. Pi's SDK has no sampling
+    // temperature option (verified against its type declarations), so thinking level is the
+    // one sampling knob a caller can vary; Pi clamps it to the model's capabilities.
+    thinkingLevel?: "off" | "low" | "medium" | "high";
   }): Promise<FreshAgentPacketResult>;
 }
 
 let workerDepth = 0;
+
+// Process-level worker-backend latch. A broken backend (no provider/auth, model offline)
+// can take tens of seconds to fail inside createAgentSession; after the first structured
+// failure we remember it so heuristic real-worker defaults degrade instantly instead of
+// paying that cost per commitlet. An explicit spawnFreshWorker=true request still retries.
+let backendLatch: "unknown" | "available" | "unavailable" = "unknown";
+
+export function workerBackendState(): "unknown" | "available" | "unavailable" {
+  return backendLatch;
+}
+
+export function noteWorkerBackend(ok: boolean): void {
+  backendLatch = ok ? "available" : "unavailable";
+}
+
+export function resetWorkerBackendLatch(): void {
+  backendLatch = "unknown";
+}
+
+export interface WorkerBackendProbeResult {
+  ok: boolean;
+  reason: string;
+  modelId?: string;
+}
+
+/**
+ * Verified backend probe: resolves the bootstrap deadlock where real workers auto-enable
+ * only from the latch, but the latch only flips after a real worker runs. The probe creates
+ * a throwaway session and checks that a MODEL WITH AUTH actually resolved (createAgentSession
+ * succeeds even with nothing configured - the model is only validated at resolution time, so
+ * `session.model` being defined is the evidence). No model tokens are spent. The outcome
+ * latches, so the probe runs at most once per process; explicit spawnFreshWorker=true still
+ * resets the latch for a retry. `createFn` is injectable so tests never touch the real SDK.
+ */
+export async function probeWorkerBackend(
+  cwd: string,
+  createFn: (options: Record<string, unknown>) => Promise<{ session: { model?: { id?: string }; dispose?: () => void } }> = createAgentSession as any
+): Promise<WorkerBackendProbeResult> {
+  if (backendLatch !== "unknown") {
+    return { ok: backendLatch === "available", reason: `already latched: ${backendLatch}` };
+  }
+  try {
+    const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+    const sessionManager = SessionManager.create(cwd, undefined, { id: `cheater-backend-probe-${process.pid.toString(36)}` });
+    const { session } = await createFn({ cwd, sessionManager, settingsManager, noTools: "all" });
+    const modelId = session.model?.id;
+    try { session.dispose?.(); } catch { /* probe cleanup is best-effort */ }
+    if (modelId) {
+      noteWorkerBackend(true);
+      return { ok: true, reason: `worker backend verified: model ${modelId} resolved with auth`, modelId };
+    }
+    noteWorkerBackend(false);
+    return { ok: false, reason: "no model/auth resolvable for fresh worker sessions" };
+  } catch (err) {
+    noteWorkerBackend(false);
+    return { ok: false, reason: `worker backend probe failed: ${(err as Error).message}` };
+  }
+}
+
+// Prompt-time errors that prove the backend itself is broken (vs. the packet failing).
+const BACKEND_ERROR_PATTERN = /no model selected|no api key|no models available|not logged in|use \/login/i;
+
+export function isBackendError(message: string): boolean {
+  return BACKEND_ERROR_PATTERN.test(message ?? "");
+}
 
 export function isBlueprintWorkerSession(): boolean {
   return workerDepth > 0;
@@ -129,7 +203,7 @@ function compactSentinelBody(text: string | undefined, sentinel: string, fallbac
 }
 
 export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
-  async runPacket({ cwd, plan, packet, prompt, config }) {
+  async runPacket({ cwd, plan, packet, prompt, config, model, thinkingLevel }) {
     if (config.packetOneFilePerWorkerEnabled !== false && packet.filesToTouch.length > (config.packetMaxFilesToTouch ?? 1)) {
       return {
         ok: false,
@@ -141,19 +215,50 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
       const requiredSentinel = sentinelFor(outputFormatFor(packet), blueprintConfig(config));
       const cap = effectiveAgentTokenCap(config);
       const threshold = compactThresholdTokens(config);
-      const settingsManager = SettingsManager.inMemory({
-        compaction: compactSettingsForCap(undefined, cap, threshold),
-        steeringMode: "one-at-a-time",
-        followUpMode: "one-at-a-time"
-      }, { projectTrusted: true });
-      const sessionManager = SessionManager.create(cwd, undefined, { id: packetSessionId(packet) });
-      const { session } = await createAgentSession({
-        cwd,
-        sessionManager,
-        settingsManager,
-        tools: ["read", "edit", "bash", "grep", "find", "ls", "cheater_line_edit"],
-        customTools: [createCheaterLineEditTool()]
-      });
+      // Session creation must fail structurally, not reject the caller's promise: a missing
+      // provider/model config or a dead local backend is an expected condition the commitlet
+      // layer degrades from (falls back to a simulated in-session prompt), not a crash.
+      let session: any;
+      try {
+        const settingsManager = SettingsManager.inMemory({
+          compaction: compactSettingsForCap(undefined, cap, threshold),
+          steeringMode: "one-at-a-time",
+          followUpMode: "one-at-a-time"
+        }, { projectTrusted: true });
+        const sessionManager = SessionManager.create(cwd, undefined, { id: packetSessionId(packet) });
+        ({ session } = await createAgentSession({
+          cwd,
+          sessionManager,
+          settingsManager,
+          tools: ["read", "edit", "bash", "grep", "find", "ls", "cheater_line_edit"],
+          customTools: [createCheaterLineEditTool()],
+          // Inherit the parent session's model so a worker never silently runs on whatever
+          // global default happens to be configured instead of the model the user picked.
+          ...(model ? { model: model as any } : {}),
+          ...(thinkingLevel ? { thinkingLevel: thinkingLevel as any } : {})
+        }));
+      } catch (err) {
+        noteWorkerBackend(false);
+        return {
+          ok: false,
+          summary: `Could not create a fresh worker session for ${packet.id}: ${(err as Error).message}`,
+          error: "worker_backend_unavailable"
+        };
+      }
+      // Session creation is NOT proof the backend works: Pi creates a session even with no
+      // model/auth configured and only fails at prompt() ("No model selected"). Only a
+      // resolved model counts as evidence for the availability latch.
+      if (session.model?.id) {
+        noteWorkerBackend(true);
+      } else {
+        noteWorkerBackend(false);
+        try { session.dispose(); } catch { /* best-effort */ }
+        return {
+          ok: false,
+          summary: `Fresh worker session for ${packet.id} has no resolvable model (no provider/auth configured).`,
+          error: "worker_backend_unavailable"
+        };
+      }
       try {
         const contextWindow = session.model?.contextWindow;
         const effectiveCap = effectiveAgentTokenCap(config, contextWindow);
@@ -188,10 +293,24 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
           sessionFile: session.sessionFile
         };
       } catch (err) {
+        const message = (err as Error).message;
+        // "No model selected" / "No API key" at prompt time proves the BACKEND is broken,
+        // not the packet: latch it (so heuristic defaults degrade instantly) and return the
+        // structured error the commitlet layer already degrades from.
+        if (isBackendError(message)) {
+          noteWorkerBackend(false);
+          return {
+            ok: false,
+            summary: `Worker backend unavailable for ${packet.id}: ${message}`,
+            error: "worker_backend_unavailable",
+            sessionId: session.sessionId,
+            sessionFile: session.sessionFile
+          };
+        }
         return {
           ok: false,
-          summary: `Worker session failed for ${packet.id}: ${(err as Error).message}`,
-          error: (err as Error).message,
+          summary: `Worker session failed for ${packet.id}: ${message}`,
+          error: message,
           sessionId: session.sessionId,
           sessionFile: session.sessionFile
         };

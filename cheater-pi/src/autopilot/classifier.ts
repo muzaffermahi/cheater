@@ -40,7 +40,12 @@ const RULES: Rule[] = [
   },
   {
     kind: "bug_fix",
-    patterns: [/\b(fix|debug|repair|broken|bug|crash|exception|traceback|stack trace|wrong|incorrect|not working)\b/i],
+    patterns: [
+      /\b(fix|debug|repair|broken|bug|crash|exception|traceback|stack trace|wrong|incorrect|not working)\b/i,
+      // Keyword-less symptom reports: "the login button doesn't do anything when clicked"
+      // is a fix request even though it never says "fix" or "bug".
+      /\b(doesn'?t|does not|won'?t|will not|can'?t|cannot|isn'?t working|stopped working|no longer works?|does nothing|nothing happens|never (loads|renders|updates|saves|fires|responds))\b/i
+    ],
     confidence: 0.78,
     needsRepro: true,
     risk: "medium",
@@ -104,6 +109,13 @@ const RULES: Rule[] = [
   }
 ];
 
+// explanation_only is start-anchored ("Explain...", "Walk me through...") so it wins on
+// messages that OPEN with an explanation verb even when they explicitly command a code
+// change later ("Explain why the login test is failing and fix it"). Any of these action
+// verbs ANYWHERE in the message means the request is not purely informational, so
+// explanation_only must not fire regardless of how the message opens.
+const ACTION_OVERRIDE = /\b(fix|repair|implement|refactor|resolve|build|create|add|enable|support|change|update|modify|remove|delete|wire|register)\b/i;
+
 export function classifyAutopilotTask(input: AutopilotInput): AutopilotClassification {
   const text = `${input.message}\n${input.recentErrors ?? ""}`;
   const lower = text.toLowerCase();
@@ -120,8 +132,10 @@ export function classifyAutopilotTask(input: AutopilotInput): AutopilotClassific
   }
   let best: Rule | undefined;
   let score = 0;
+  const hasActionIntent = ACTION_OVERRIDE.test(text);
 
   for (const rule of RULES) {
+    if (rule.kind === "explanation_only" && hasActionIntent) continue;
     const matches = rule.patterns.filter((pattern) => pattern.test(text)).length;
     if (matches > 0) {
       const nextScore = matches * rule.confidence;

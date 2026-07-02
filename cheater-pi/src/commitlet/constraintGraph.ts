@@ -45,11 +45,26 @@ export function buildRepoConstraintGraph(repoRoot: string, files: string[]): Rep
     const path = join(repoRoot, rel);
     if (!existsSync(path)) continue;
     const text = readFileSync(path, "utf8");
-    for (const match of text.matchAll(/\b(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|const)\s+([A-Za-z_]\w*)/g)) graph.symbols.push(`${rel}:${match[1]}`);
+    const isPython = /\.py$/i.test(rel);
+    // symbols/exports must include Python's "def"/module-level assignment so
+    // selectFilesByGoalFromGraph (which reads only symbols+exports) can target Python files by
+    // function name; previously only signatures (one line below) caught "def", making a
+    // Python function invisible to goal-driven file selection even though its own signature
+    // line was extracted right after it.
+    for (const match of text.matchAll(/\b(?:export\s+)?(?:async\s+)?(?:function|def|class|interface|type|const)\s+([A-Za-z_]\w*)/g)) graph.symbols.push(`${rel}:${match[1]}`);
     for (const match of text.matchAll(/\bexport\s+(?:async\s+)?(?:function|class|interface|type|const)\s+([A-Za-z_]\w*)/g)) graph.exports.push(`${rel}:${match[1]}`);
+    if (isPython) {
+      // Python has no `export` keyword: a module-level def/class not prefixed with `_` is
+      // its public surface by convention.
+      for (const match of text.matchAll(/^(?:def|class)\s+([A-Za-z]\w*)/gm)) graph.exports.push(`${rel}:${match[1]}`);
+    }
     for (const match of text.matchAll(/\b(?:export\s+)?(?:async\s+)?(?:function|def)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)/g)) graph.signatures.push(`${rel}:${match[1]}(${compactSignature(match[2])})`);
     for (const match of text.matchAll(/\b(?:export\s+)?class\s+([A-Za-z_]\w*)/g)) graph.signatures.push(`${rel}:class ${match[1]}`);
     for (const match of text.matchAll(/\bimport\s+.*?\s+from\s+["']([^"']+)["']/g)) graph.imports.push({ file: rel, importPath: match[1] });
+    if (isPython) {
+      for (const match of text.matchAll(/^\s*from\s+([\w.]+)\s+import\b/gm)) graph.imports.push({ file: rel, importPath: match[1] });
+      for (const match of text.matchAll(/^\s*import\s+([\w.]+)/gm)) graph.imports.push({ file: rel, importPath: match[1] });
+    }
     if (/registerCommand\(/.test(text)) graph.commandRegistrations.push(rel);
     if (/registerTool\(/.test(text)) graph.toolRegistrations.push(rel);
     for (const match of text.matchAll(/\b([a-zA-Z]\w+)\??:\s*(?:boolean|string|number)/g)) graph.configKeys.push(`${rel}:${match[1]}`);
@@ -243,6 +258,28 @@ function shallowCollect(repoRoot: string, relDir: string, into: Set<string>): vo
 export function buildPlannerGraph(repoRoot: string, orientation: RepoOrientation): RepoConstraintGraph {
   const files = collectPlannerFiles(repoRoot, orientation);
   return buildRepoConstraintGraph(repoRoot, files);
+}
+
+const EMPTY_ORIENTATION_FIELDS = { languages: [], frameworks: [], testCommands: [], typecheckCommands: [], entrypoints: [], importantPaths: [] };
+
+/**
+ * Pick one real, existing file to edit for a goal by scanning the repo's own source (up to
+ * PLANNER_MAX_FILES files under common source dirs) and matching goal terms against actual
+ * symbols/exports/registrations. Returns null when nothing matches - an honest "inspect
+ * first" is better than a wrong guess. This replaces literal-filename guessing
+ * ("src/commands.ts", "src/config.ts") that only happened to work for Cheater's own repo and
+ * produced nothing for every other project.
+ */
+export function selectSingleFileForGoal(repoRoot: string, goal: string): string | null {
+  try {
+    const files = collectPlannerFiles(repoRoot, { repoRoot, ...EMPTY_ORIENTATION_FIELDS });
+    if (!files.length) return null;
+    const graph = buildRepoConstraintGraph(repoRoot, files);
+    const target = selectFilesByGoalFromGraph(goal, graph, { includeTests: false, includeRelated: false }).find((t) => t.role === "touch");
+    return target?.path ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeRel(path: string): string {

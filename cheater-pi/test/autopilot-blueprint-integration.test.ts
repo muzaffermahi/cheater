@@ -64,7 +64,7 @@ test("extension registers autopilot and blueprint commands/tools", () => {
   assert.ok(tools.has("cheater_blueprint_complete_packet"));
   assert.ok(tools.has("cheater_line_edit"));
   assert.ok(tools.has("cheater_reliability_start"));
-  assert.ok(tools.has("cheater_bug_worker"));
+  assert.equal(tools.has("cheater_bug_worker"), false, "Mission Control is opt-in now; its tools are not registered by default");
   assert.ok(tools.has("cheater_commitlet_next"));
   assert.ok(tools.has("cheater_finish_gate"));
   assert.ok(tools.has("cheater_verification_run"));
@@ -108,6 +108,12 @@ test("doctor separates public commands from debug-only internals", async () => {
   assert.match(notice, /Debug commands loaded:/);
   assert.match(notice, /\/?blueprint-step|blueprint-step/);
   assert.doesNotMatch(notice, /Cheater commands loaded:/);
+  // These were previously missing from PUBLIC_COMMAND_NAMES, so /doctor silently
+  // under-reported what was actually registered and loaded.
+  for (const name of ["commitlet-status", "rollback-status", "health-report", "constraint-graph", "bench-report", "model-profile", "loop-report"]) {
+    assert.match(notice, new RegExp(name), `${name} must appear in /doctor's public command list`);
+  }
+  assert.doesNotMatch(notice, /Uncategorized commands loaded/, "every registered Cheater command must be categorized");
 });
 
 test("cheater_line_edit applies bounded line edits and refuses stale context", async () => {

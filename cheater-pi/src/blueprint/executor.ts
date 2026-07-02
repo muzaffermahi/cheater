@@ -12,7 +12,7 @@ export interface PacketExecutionPrompt {
   prompt: string;
 }
 
-export function buildPacketExecutionPrompts(plan: BlueprintPlan, rawConfig: CheaterConfig = {}): PacketExecutionPrompt[] {
+export function buildPacketExecutionPrompts(plan: BlueprintPlan, rawConfig: CheaterConfig = {}, opts: { skipSnippetsForFiles?: string[] } = {}): PacketExecutionPrompt[] {
   const config = blueprintConfig(rawConfig);
   const packetConfig = { ...config, model: rawConfig.model };
   const profile = modelProfile(rawConfig.model, config);
@@ -23,7 +23,8 @@ export function buildPacketExecutionPrompts(plan: BlueprintPlan, rawConfig: Chea
       packet,
       previousState: summaries,
       contextBudgetTokens: profile.packetContextBudget,
-      config: packetConfig
+      config: packetConfig,
+      skipSnippetsForFiles: opts.skipSnippetsForFiles
     });
     const prompt = config.freshCallPacketsEnabled ? renderFreshCallPacket(reliabilityPacket) : [
       `Cheater Autonomous Blueprint fresh-agent packet ${packet.id}: ${packet.title}`,

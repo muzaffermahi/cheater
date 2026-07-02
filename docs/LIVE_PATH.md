@@ -15,14 +15,10 @@ The Python process exits into a Pi subprocess. No Python agent loop runs.
 
 ## Is the Python AgentLoop ever used?
 
-No. `cheater/pi_launcher.py` (the only console entry point) never imports
-`cheater.agent_loop.AgentLoop`. The grep below confirms `AgentLoop` is referenced
-only in legacy/internal modules (`agent_cli`, `arena`, `tui_textual`,
-`tui/adapters`, `example_cli`, `bench_cli`), none of which are on the live path.
-
-```
-grep -rn "AgentLoop" cheater/pi_launcher.py   # 0 matches
-```
+No - and as of the 2026-07 cleanup it no longer exists. The legacy Python agent
+(agent loop, TUI, arena, retrieval stack, `cheater/legacy/`) was deleted; the
+Python package now contains only the launcher surface: `cheater/__init__.py`,
+`cheater/__main__.py`, and `cheater/pi_launcher.py` (stdlib-only).
 
 The live product path is the TypeScript Pi extension at `cheater-pi/src/extension.ts`.
 
@@ -32,9 +28,10 @@ The live product path is the TypeScript Pi extension at `cheater-pi/src/extensio
 
 - `registerCheaterCommands` / `registerCheaterTools`
   - tools: `cheater_project_brief`, `cheater_focus_test`, `cheater_diff_safety_check`,
-    `cheater_line_edit`, `cheater_memory_search`, `cheater_bug_memory_search`,
-    `cheater_skill_search`
-- `registerAutopilotCommands` / `registerAutopilotTools`
+    `cheater_line_edit`, `cheater_memory_search`, `cheater_bug_memory_search`.
+    (`cheater_skill_search` was removed; skills are listed via the `/skills` command instead.)
+- `registerAutopilotCommands` (there is no `registerAutopilotTools` - autopilot routing is
+  harness-level, hung off the `input` event below, not a tool the model calls)
 - `registerBlueprintCommands` / `registerBlueprintTools`
 - `registerCommitletCommands` / `registerCommitletTools`
   - tools: `cheater_reliability_start`, `cheater_commitlet_next` (grades the
@@ -100,6 +97,61 @@ every unit test passed:
 
 See `docs/LIVE_PATH_CHANGES.md` for the fix and the tests that would fail if
 any of these three regressed.
+
+## Correction: a second wiring pass found and fixed (2026-07-02)
+
+A cross-module audit against `node_modules/@earendil-works/pi-coding-agent`'s
+own type declarations found and fixed six more live-path defects, all now
+covered by tests:
+
+1. **The entire tool mask was a no-op.** `applyToolMask` called
+   `ctx.getActiveTools()`/`ctx.setActiveTools()`, but those methods exist only
+   on the `pi` (`ExtensionAPI`) object, never on the per-event `ctx`. Every
+   phase (`answer_only`/`planner`/`execute`) silently exposed the full
+   `cheater_*` tool surface regardless of mode. Fixed by masking off `pi`.
+2. **Planner isolation depended on the loop governor being on.** The
+   `tool_call` handler returned early when `loopGovernorEnabled === false`,
+   before the (separately configured) blueprint-planner file-tool block ran -
+   disabling the loop governor silently also disabled planner/worker
+   isolation. Fixed by moving the planner block first and unconditional.
+3. **Completion ledger state leaked across unrelated turns.** A
+   failed/unverified code turn's ledger (stale files, unresolved failures, old
+   goal) survived into the next turn if that turn was a pure question,
+   dragging the finish gate into nagging about a task the user was not asking
+   about. Fixed by resetting the ledger with the new goal whenever the `input`
+   handler detects a genuinely new goal (not a continuation of an active
+   plan).
+4. **Bash edits to an already-dirty file were invisible to the ledger.**
+   `gitBaseline` was a plain membership set; a file dirty from a prior turn
+   was "in the baseline" forever, so a bash/sed edit to it in a later turn
+   never registered as a file change. Fixed by fingerprinting (mtime+size)
+   instead of membership.
+5. **The autopilot classifier misrouted commands that open with an
+   explanation verb.** `"Explain why X is failing and fix it"` scored
+   `explanation_only` (start-anchored pattern) over `bug_fix`/`test_failure`
+   on a same-score tie, injecting "do not edit files" into an explicit fix
+   request. Fixed by skipping `explanation_only` whenever the message also
+   contains a code-mutation verb anywhere.
+6. **Generic bug-fix/feature requests picked a file by guessing a literal
+   filename that only happened to match Cheater's own repo** (`src/commands.ts`,
+   `src/tools.ts`, `src/config.ts`), so on any other project the single most
+   common routing path (`single_commitlet`, no blueprint) shipped a worker
+   packet with the placeholder `allowedFiles: ["(select one target file after
+   inspection)"]` - which `executor.ts` then filters out entirely, producing
+   zero code and zero repo facts in the packet. Fixed by scanning the actual
+   target repo's source and matching goal terms against real
+   symbols/exports/registrations (`selectSingleFileForGoal`), falling back to
+   the placeholder only when nothing matches.
+
+Also fixed in the same pass: fresh workers never inherited the parent
+session's model (silently resolved a different model via global defaults);
+`buildCommitletExecutionPrompt` never forwarded the model name so
+`modelClass` was always `"unknown"`, dropping the model-specific operating
+rules; a packet's verification command was stated as a bare fact with no
+instruction to actually run it; the packet told the worker "Use Pi native
+tools only" while the surrounding commitlet block told it to use
+`cheater_line_edit`; and a commitlet's target file's code was embedded twice
+in one packet (a symbol-aware slice plus a duplicate raw head excerpt).
 
 ## Did lifecycle/anti-stall affect real Pi sessions before this slice?
 

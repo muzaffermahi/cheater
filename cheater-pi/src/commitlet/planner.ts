@@ -1,9 +1,12 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AutopilotDecision } from "../autopilot/types.js";
 import type { BlueprintPlan, WorkPacket } from "../blueprint/types.js";
 import { splitPacketsByTouchedFile } from "../reliability/perFilePackets.js";
 import { defaultVerificationCommand } from "../reliability/projectCommands.js";
 import { commitletConfig } from "./config.js";
 import { forgeCommitletSpec } from "./spec.js";
+import { selectSingleFileForGoal } from "./constraintGraph.js";
 import type { Commitlet, CommitletHealthBudget, CommitletPlan, CommitletPlanInput, VerificationStep } from "./types.js";
 import { verificationFromBlueprint, workPacketToAllowedFiles } from "./types.js";
 import { emptyHealthReport } from "./health.js";
@@ -12,7 +15,7 @@ export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
   const projectTestCommand = defaultVerificationCommand(input.repoRoot);
   const commitlets = input.blueprintPlan
     ? commitletsFromBlueprint(input.blueprintPlan, input.autopilotDecision)
-    : commitletsFromDecision(input.userGoal, input.autopilotDecision, projectTestCommand);
+    : commitletsFromDecision(input.userGoal, input.autopilotDecision, projectTestCommand, input.repoRoot);
   const finalVerification = mergeFinalVerification(commitlets);
   const plan: CommitletPlan = {
     id: `commitlet-plan-${Date.now().toString(36)}`,
@@ -59,11 +62,16 @@ export function commitletsFromBlueprint(plan: BlueprintPlan, decision: Autopilot
 }
 
 export function createRepairCommitlet(failed: Commitlet, failureSummary: string): Commitlet {
+  // Evidence (the cheat sheet appended to a graded failure) belongs ONLY in observedFailure.
+  // The purpose/acceptance slices must be built from the bare failure, or evidence headers
+  // pollute acceptance criteria and leak into attempts that deliberately withhold evidence.
+  const sheetStart = failureSummary.indexOf("=== CHEATER CHEAT SHEET");
+  const bareFailure = (sheetStart > 0 ? failureSummary.slice(0, sheetStart) : failureSummary).trim();
   return {
     ...failed,
     id: `${failed.id}-repair`,
     title: `Repair ${failed.title}`,
-    purpose: `Repair failed commitlet without expanding scope: ${failureSummary.slice(0, 220)}`,
+    purpose: `Repair failed commitlet without expanding scope: ${bareFailure.slice(0, 220)}`,
     status: "pending",
     maxModelCalls: 1,
     expectedFilesTouched: failed.expectedFilesTouched,
@@ -71,10 +79,13 @@ export function createRepairCommitlet(failed: Commitlet, failureSummary: string)
       behaviorMustHold: [`Original commitlet passes after repair: ${failed.title}`],
       behaviorMustNotChange: failed.spec?.behaviorMustNotChange ?? ["Unrelated behavior must not change."],
       edgeCases: ["Do not weaken tests or broaden the diff to hide the failure."],
-      acceptanceCriteria: [`Focused verification failure is resolved: ${failureSummary.slice(0, 220)}`],
+      acceptanceCriteria: [`Focused verification failure is resolved: ${bareFailure.slice(0, 220)}`],
       temporaryTestsAllowed: false,
       permanentTestsAllowed: failed.healthBudget.allowTestEdits,
-      observedFailure: failureSummary.slice(0, 600),
+      // 2600 chars fits one compressed failure card (~900) plus a full rendered cheat sheet
+      // (<= 1300), so the harness-retrieved evidence survives into the repair packet - the
+      // repair worker (and each of its resample attempts) receives it with zero tool calls.
+      observedFailure: failureSummary.slice(0, 2600),
       expectedBehavior: "Focused verification passes.",
       nonGoals: [
         "Do not touch files outside the original allowedFiles.",
@@ -150,12 +161,12 @@ function commitletFromPacket(packet: WorkPacket, index: number, decision: Autopi
   });
 }
 
-function commitletsFromDecision(userGoal: string, decision: AutopilotDecision, projectTestCommand: string | null): Commitlet[] {
+function commitletsFromDecision(userGoal: string, decision: AutopilotDecision, projectTestCommand: string | null, repoRoot: string): Commitlet[] {
   if (decision.executionDiscipline === "none") return [];
   if (decision.executionDiscipline === "single_commitlet" || decision.executionDiscipline === "fast_path") {
-    return [directCommitlet("c1-single", userGoal, decision, inferAllowedFiles(userGoal, decision), projectTestCommand)];
+    return [directCommitlet("c1-single", userGoal, decision, inferAllowedFiles(userGoal, decision, repoRoot), projectTestCommand)];
   }
-  const parts = splitGoalIntoScopes(userGoal, decision);
+  const parts = splitGoalIntoScopes(userGoal, decision, repoRoot);
   return parts.map((part, index) => directCommitlet(`c${index + 1}-${safeId(part.scope)}`, part.title, decision, part.files, projectTestCommand, part.scope));
 }
 
@@ -216,24 +227,31 @@ function makeCommitlet(params: {
   };
 }
 
-function splitGoalIntoScopes(userGoal: string, decision: AutopilotDecision): Array<{ scope: string; title: string; files: string[] }> {
+function splitGoalIntoScopes(userGoal: string, decision: AutopilotDecision, repoRoot: string): Array<{ scope: string; title: string; files: string[] }> {
   const lower = userGoal.toLowerCase();
   const parts: Array<{ scope: string; title: string; files: string[] }> = [];
-  if (/\bconfig|setting|defaults?\b/.test(lower)) parts.push({ scope: "config", title: "Apply scoped config/default change", files: ["src/config.ts"] });
-  if (/\bcommand|slash|\/[a-z]/.test(lower)) parts.push({ scope: "command_registration", title: "Register command and command help", files: ["src/commands.ts"] });
-  if (/\btool|schema\b/.test(lower)) parts.push({ scope: "tool_registration", title: "Update tool registration/schema", files: ["src/tools.ts"] });
+  if (/\bconfig|setting|defaults?\b/.test(lower)) parts.push({ scope: "config", title: "Apply scoped config/default change", files: inferAllowedFiles(userGoal, decision, repoRoot, "src/config.ts") });
+  if (/\bcommand|slash|\/[a-z]/.test(lower)) parts.push({ scope: "command_registration", title: "Register command and command help", files: inferAllowedFiles(userGoal, decision, repoRoot, "src/commands.ts") });
+  if (/\btool|schema\b/.test(lower)) parts.push({ scope: "tool_registration", title: "Update tool registration/schema", files: inferAllowedFiles(userGoal, decision, repoRoot, "src/tools.ts") });
   if (/\bdocs?|readme|help\b/.test(lower)) parts.push({ scope: "docs", title: "Update docs/help separately", files: ["README.md"] });
   if (/\btest|coverage|regression\b/.test(lower)) parts.push({ scope: "tests", title: "Add or update focused tests", files: ["test/"] });
-  if (!parts.length) parts.push({ scope: decision.taskKind, title: "Implement minimal scoped change", files: inferAllowedFiles(userGoal, decision) });
+  if (!parts.length) parts.push({ scope: decision.taskKind, title: "Implement minimal scoped change", files: inferAllowedFiles(userGoal, decision, repoRoot) });
   return parts;
 }
 
-function inferAllowedFiles(userGoal: string, decision: AutopilotDecision): string[] {
+/**
+ * Real, data-driven file selection: scan the actual repo's source for a file whose symbols,
+ * exports, or command/tool/config registrations match the goal's terms. Only Cheater's own
+ * repo happens to have files literally named "src/commands.ts"/"src/config.ts"; every other
+ * project needs its OWN target file discovered from its OWN source, not a guessed filename.
+ * `conventionalFallback` is tried only if the repo scan finds nothing AND happens to exist.
+ */
+function inferAllowedFiles(userGoal: string, decision: AutopilotDecision, repoRoot: string, conventionalFallback?: string): string[] {
   const lower = userGoal.toLowerCase();
-  if (/\bcommand|slash|\/[a-z]/.test(lower)) return ["src/commands.ts"];
-  if (/\btool\b/.test(lower)) return ["src/tools.ts"];
-  if (/\bconfig|setting\b/.test(lower)) return ["src/config.ts"];
   if (/\bdocs?|readme\b/.test(lower)) return ["README.md"];
+  const found = selectSingleFileForGoal(repoRoot, userGoal);
+  if (found) return [found];
+  if (conventionalFallback && existsSync(join(repoRoot, conventionalFallback))) return [conventionalFallback];
   return decision.taskKind === "docs" ? ["README.md"] : ["(select one target file after inspection)"];
 }
 

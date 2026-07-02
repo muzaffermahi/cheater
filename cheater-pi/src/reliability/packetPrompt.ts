@@ -12,10 +12,15 @@ export function freshCallPacketFromWorkPacket(params: {
   previousState?: string[];
   contextBudgetTokens: number;
   config: BlueprintConfig;
+  // Files already given a symbol-aware snippet by an outer caller (e.g. the commitlet
+  // block); skipping them here avoids embedding the same file's code twice in one packet.
+  skipSnippetsForFiles?: string[];
 }): FreshCallPacket {
   const outputFormat = outputFormatFor(params.packet);
   const profile = modelProfile((params.config as BlueprintConfig & { model?: string }).model, params.config);
   const contextBudgetTokens = Math.min(params.contextBudgetTokens, profile.packetContextBudget);
+  const verificationCommand = params.packet.verification.find((step) => step.required && step.command)?.command
+    ?? params.packet.verification.find((step) => step.command)?.command;
   return {
     globalGoal: oneParagraph(params.plan.userGoal, 360),
     packetId: params.packet.id,
@@ -26,13 +31,14 @@ export function freshCallPacketFromWorkPacket(params: {
       packetScopedWorkerBrief(params.plan, params.packet),
       buildPacketContext(params.packet, params.previousState ?? [], params.plan.docsFacts ?? [])
     ].filter(Boolean).join("\n\n"), contextBudgetTokens),
-    relevantSnippets: relevantSnippets(params.plan, params.packet, profile.class),
+    relevantSnippets: relevantSnippets(params.plan, params.packet, profile.class, params.skipSnippetsForFiles),
     previousState: (params.previousState ?? []).slice(-3),
     acceptanceCriteria: params.packet.acceptanceCriteria,
     allowedActions: ["inspect", "edit", "run_test", "stop_blocked"],
     stopWhen: params.packet.type === "review" ? "final review is complete" : "this packet's acceptance criteria are met or one blocker is clear",
     outputFormat,
     endSentinel: sentinelFor(outputFormat, params.config),
+    verificationCommand,
     modelClass: profile.class,
     contextBudgetTokens,
     maxOutputTokens: profile.maxOutputTokens,
@@ -60,6 +66,7 @@ export function renderFreshCallPacket(packet: FreshCallPacket): string {
     `acceptanceCriteria:\n- ${packet.acceptanceCriteria.join("\n- ")}`,
     `allowedActions: ${packet.allowedActions.join(", ")}`,
     `stopWhen: ${packet.stopWhen}`,
+    ...(packet.verificationCommand ? [`verificationCommand: ${packet.verificationCommand} - run this yourself via bash after editing, before ending the packet.`] : []),
     `outputFormat: ${packet.outputFormat}`,
     `endSentinel: ${packet.endSentinel}`,
     `modelClass: ${packet.modelClass ?? "unknown"}`,
@@ -68,7 +75,11 @@ export function renderFreshCallPacket(packet: FreshCallPacket): string {
     // it is not rendered into the packet as advisory noise. Configure it on the backend.
     packet.modelOperatingRules?.length ? `modelOperatingRules:\n- ${packet.modelOperatingRules.join("\n- ")}` : "modelOperatingRules: default",
     "",
-    "Use Pi native tools only. Do not execute unrelated packets. Do not include unrelated prior chat.",
+    // Prefer structured edit tools (cheater_line_edit, then Pi's native edit) over emitting a
+    // raw diff - this used to say "Use Pi native tools only", contradicting the commitlet
+    // block's own instruction to use cheater_line_edit and pushing outputFormat:"patch" into
+    // the worker's ending as a literal diff instead of a tool call.
+    "Use structured edit tools (cheater_line_edit, or Pi's native edit) to make the change; outputFormat/endSentinel describe how to REPORT the result, not how to edit. Do not execute unrelated packets. Do not include unrelated prior chat.",
     "One file-change worker means one file-change worker: after editing the listed file, stop and hand off. Do not continue to another file.",
     "End with a compact handoff summary and the sentinel."
   ].join("\n");
@@ -94,13 +105,14 @@ function trimToBudget(text: string, budgetTokens: number): string {
   return text.length > maxChars ? text.slice(0, maxChars) : text;
 }
 
-function relevantSnippets(plan: BlueprintPlan, packet: WorkPacket, modelClass: ReturnType<typeof modelProfile>["class"]): string[] {
+function relevantSnippets(plan: BlueprintPlan, packet: WorkPacket, modelClass: ReturnType<typeof modelProfile>["class"], skipFiles: string[] = []): string[] {
   const maxFiles = modelClass === "9b" ? 1 : 2;
   const maxChars = modelClass === "9b" ? 900 : 1400;
+  const skip = new Set(skipFiles);
   const files = [
     ...packet.filesToTouch.map((file) => file.path),
     ...packet.filesToInspect.map((file) => file.path)
-  ].filter(isSnippetSafeFile);
+  ].filter((file) => isSnippetSafeFile(file) && !skip.has(file));
   return [...new Set(files)].slice(0, maxFiles).map((file) => {
     const snippet = fileSnippet(plan.repoRoot, file, maxChars).trim();
     if (!snippet) return "";

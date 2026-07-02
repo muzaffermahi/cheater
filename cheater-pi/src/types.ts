@@ -60,6 +60,10 @@ export interface CheaterConfig {
   packetHardContextCeilingTokens9B?: number;
   packetHardContextCeilingTokensMoE?: number;
   postEditSyntaxGateEnabled?: boolean;
+  // Post-edit import gate: after each successful edit, verify the file's imports resolve
+  // (repo files exist, named symbols are exported, npm packages are installed) and report
+  // problems in-band on the edit's own result. Catches hallucinated imports immediately.
+  postEditImportGateEnabled?: boolean;
   autoVerifyOnFinish?: boolean;
   loopGovernorEnabled?: boolean;
   maxLoopBreaksPerPacket?: number;
@@ -86,6 +90,20 @@ export interface CheaterConfig {
   // (context isolation) by default, instead of returning a prompt to the orchestrator.
   // Requires a working model backend; keep false for offline/dry-run use.
   commitletFreshWorkerDefault?: boolean;
+  // Verified resampling: number of independent fresh-worker attempts per commitlet in
+  // real-worker mode. The harness scores each candidate in code (guard/health/focused
+  // verification), accepts the first verified pass, and keeps the best failing candidate
+  // otherwise. 1 (default) = today's single attempt; 2-3 recommended for small local models
+  // where samples are cheap and pass@1 is weak.
+  commitletCandidateSamples?: number;
+  // Experience store: harness-written bug memory. Cards are saved only on verified
+  // fail->pass transitions and recalled in-band inside failure cards. Local-only JSONL.
+  experienceStoreEnabled?: boolean;
+  // Cheat Layer: on failures, the harness classifies the failure, retrieves compact evidence
+  // (verified experience -> bug corpus -> local docs -> official docs when enabled), and
+  // injects at most 3 hypothesis cards into repair packets and failure notices. The model
+  // never calls a search tool; the verifier remains the source of truth.
+  cheatSheetEnabled?: boolean;
   rollbackRequired?: boolean;
   maxFilesTouchedDefault?: number;
   maxDiffLinesDefault?: number;

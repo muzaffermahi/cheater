@@ -1,3 +1,0 @@
-{"ts": 1782609285.986, "event": "run_start", "kind": "run_start", "payload": {"task": "fix the bug", "repo_root": "C:\\Users\\LENOVO\\Desktop\\cheater", "max_steps": 15, "read_only": true}}
-{"ts": 1782609285.986, "event": "task_received", "kind": "task_received", "payload": {"task": "fix the bug"}}
-{"ts": 1782609285.986, "event": "run_finished", "kind": "run_finished", "payload": {"success": false, "finished_by": "no_model", "elapsed": 0.0, "error": "no model configured; cannot run the agent loop", "steps": 0}}

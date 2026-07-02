@@ -23,11 +23,15 @@ import { liveSessionState } from "./reliability/sessionState.js";
 import { ledgerAllowsFinish } from "./reliability/lifecycle.js";
 import { loadProjectCommands } from "./reliability/projectCommands.js";
 import { checkFileSyntax } from "./reliability/diagnostics.js";
+import { checkImports } from "./reliability/importGate.js";
 import { compressFailureOutput } from "./reliability/failureCompressor.js";
+import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
+import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import type { CheaterConfig } from "./types.js";
 
 type ExtensionAPI = any;
 
@@ -37,27 +41,48 @@ const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 
 // Mode-scoped cheater tool sets. Pi-native tools are never touched (we only ever filter the
 // cheater_* namespace), so a small model - whose weakest skill is multi-tool orchestration -
-// sees a handful of relevant tools per phase instead of the full ~20 cheater tools at once.
-const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", string[]> = {
-  answer_only: ["cheater_bug_memory_search", "cheater_project_brief"],
+// sees only the handful of tools that phase actually needs, never the full ~20 cheater tools.
+//
+// Deliberately excluded from execute mode: project_brief, focus_test, and diff_safety_check.
+// The harness already provides all three deterministically during execution (the env block
+// injects git state + project commands, cheater_commitlet_next runs the diff guard, and
+// cheater_verification_run detects and runs the focused test), so exposing them again only
+// adds redundant tool-choice ambiguity for a weak model. Blueprint tools are deliberately in
+// no mode: blueprint planning runs INSIDE cheater_reliability_start, not via model calls.
+export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", string[]> = {
+  answer_only: ["cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
   planner: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
-  execute: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_bug_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert", "cheater_project_brief", "cheater_focus_test", "cheater_diff_safety_check"]
+  execute: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
 
-function applyToolMask(ctx: any, mode: "answer_only" | "planner" | "execute"): void {
-  const active: string[] | undefined = ctx.getActiveTools?.();
-  if (!active || typeof ctx.setActiveTools !== "function") return;
+// Mission Control tools, appended to the masks only when the user opted into Mission Control
+// (its slash commands instruct the model to call these; hiding them would strand the flow).
+const MISSION_TOOL_NAMES = [
+  "cheater_mission_start", "cheater_mission_status", "cheater_mission_classify", "cheater_mission_cancel",
+  "cheater_mission_learn", "cheater_orientation_show", "cheater_orientation_scan", "cheater_orientation_update",
+  "cheater_repro_gate", "cheater_evidence_packet", "cheater_playbook_show", "cheater_oracle_stack",
+  "cheater_bug_worker", "cheater_focus_test", "cheater_diff_safety_check"
+];
+
+/** The cheater tools visible in a mode, config-aware (Mission Control opt-in extends the set). */
+export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", config: CheaterConfig): string[] {
+  const base = [...CHEATER_TOOL_MODES[mode]];
+  if (config.missionControlEnabled === true && mode !== "planner") base.push(...MISSION_TOOL_NAMES);
+  return base;
+}
+
+// getActiveTools/setActiveTools live on the ExtensionAPI (`pi`) object, NOT on the per-event
+// ctx (verified against pi-coding-agent's extensions/types.d.ts) - calling them on ctx was a
+// silent no-op that left every mode exposing all ~20 cheater tools.
+function applyToolMask(pi: ExtensionAPI, config: CheaterConfig, mode: "answer_only" | "planner" | "execute"): void {
+  const active: string[] | undefined = pi.getActiveTools?.();
+  if (!active || typeof pi.setActiveTools !== "function") return;
   // Pi-native tools persist (never removed); recompute the cheater subset from the known
   // mode map so masking is reversible across turns.
   const piNative = active.filter((name) => !name.startsWith("cheater_"));
-  ctx.setActiveTools([...piNative, ...CHEATER_TOOL_MODES[mode]]);
+  pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode, config)]);
 }
 
-/**
- * Run the detected focused test once and record the stage into the ledger. Bounded by a
- * timeout so it cannot hang the turn. Returns true if it actually ran a command. (A fully
- * async, streaming runner is the follow-up; this sync version buys ground truth now.)
- */
 /**
  * Compact restatement of goal + plan + progress, injected after compaction. Periodic goal
  * restatement into fresh context is the documented mitigation for small-model coherence
@@ -82,15 +107,29 @@ function buildWorkingSetCapsule(): string | null {
 }
 
 /** Compact, code-generated completion receipt: what the harness actually observed. */
-function buildCompletionReceipt(ledger: CompletionLedger): string {
+export function buildCompletionReceipt(ledger: CompletionLedger): string {
   const s = ledger.get();
   const okStages = s.verification.filter((v) => v.status === "ok").map((v) => v.stage);
-  return [
+  const lines = [
     "Cheater: done - verified",
     `changed: ${s.changedFiles.slice(0, 6).join(", ") || "(none)"}`,
     `ran: ${s.commandsRun.slice(-3).join(" | ") || "(none)"}`,
     `verified: ${okStages.join(", ") || "(none)"}`
-  ].join("\n");
+  ];
+  // Resampling and evidence facts come from ledger entries the harness itself recorded -
+  // the receipt reports what actually happened, including degraded fresh-worker modes.
+  const resamples = s.entries.filter((entry) => entry.kind === "resample");
+  if (resamples.length) {
+    const last = resamples.at(-1)!;
+    const x = last.extra as { attemptsRun?: number; samplesRequested?: number; appliedAttempt?: number; passed?: boolean; freshWorkerMode?: string };
+    lines.push(`resampling: attempt ${x.appliedAttempt}/${x.attemptsRun} applied (${x.passed ? "verified pass" : "best failing candidate"}); workers: ${x.freshWorkerMode ?? "real"}`);
+  }
+  const evidence = s.entries.filter((entry) => entry.kind === "cheat_evidence");
+  if (evidence.length) {
+    const sources = [...new Set(evidence.flatMap((entry) => ((entry.extra as { sources?: string[] })?.sources ?? [])))];
+    lines.push(`evidence: cheat sheet used (${sources.join(", ")})`);
+  }
+  return lines.join("\n");
 }
 
 function runCommandAsync(cmd: string, cwd: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -109,28 +148,74 @@ function runCommandAsync(cmd: string, cwd: string, timeoutMs: number): Promise<{
 }
 
 /**
- * Run the detected focused test once (async, so the extension host is not frozen) and record
- * the stage into the ledger. Returns true if it actually ran a command.
+ * Pick the command the harness runs to auto-verify an edit, preferring a real test but
+ * falling back to typecheck then build so a repo with no tests still gets deterministic edit
+ * verification (tsc/mypy/build catches the most common edit errors) instead of leaving the
+ * finish gate to nag for a command that does not exist. Returns null when nothing is runnable.
  */
-async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any): Promise<boolean> {
+export function pickAutoVerifyCommand(cmds: {
+  focusedTestCommand?: string | null;
+  testCommand?: string | null;
+  typecheckCommand?: string | null;
+  buildCommand?: string | null;
+}): { cmd: string; stage: "focused_tests" | "smoke"; kind: "test" | "typecheck_or_build" } | null {
+  const test = cmds.focusedTestCommand ?? cmds.testCommand;
+  if (test) return { cmd: test, stage: "focused_tests", kind: "test" };
+  const fallback = cmds.typecheckCommand ?? cmds.buildCommand;
+  if (fallback) return { cmd: fallback, stage: "smoke", kind: "typecheck_or_build" };
+  return null;
+}
+
+async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any, config?: CheaterConfig): Promise<boolean> {
   const state = ledger.get();
   if (!state.changedFiles.length) return false;
-  const cmds = loadProjectCommands(cwd);
-  const cmd = cmds.focusedTestCommand ?? cmds.testCommand;
-  if (!cmd) return false;
+  const picked = pickAutoVerifyCommand(loadProjectCommands(cwd));
+  if (!picked) return false;
+  const { cmd, stage, kind } = picked;
   ctx?.ui?.notify?.(`Cheater verifying: ${cmd}`, "info");
   const r = await runCommandAsync(cmd, cwd, 90000);
   const ok = r.code === 0;
+  let summary = ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code);
+  if (!ok) {
+    // Cheat Layer: the harness classifies the failure, retrieves evidence across every
+    // source it owns (verified experience -> bug corpus -> local docs -> official docs when
+    // enabled), and attaches at most three hypothesis cards - no model search tool involved.
+    const sheet = await buildCheatSheet(cwd, summary, config ?? {});
+    if (sheet) summary = `${summary}\n${renderCheatSheet(sheet, cmd)}`;
+  } else if (config?.experienceStoreEnabled !== false) {
+    // Verified fail->pass inside one session: the harness itself observed the earlier failed
+    // stage and now the pass, and git shows what changed - write the experience card.
+    const priorFailure = state.verification.filter((v) => v.status === "failed").at(-1);
+    if (priorFailure?.summary) {
+      saveVerifiedFix(cwd, {
+        failureText: priorFailure.summary,
+        diffText: gitDiffFor(cwd, state.changedFiles),
+        files: state.changedFiles.slice(0, 6),
+        goal: state.userGoal
+      });
+    }
+  }
   ledger.recordCommand(cmd);
   ledger.recordVerificationStage({
-    stage: "focused_tests",
+    stage,
     status: ok ? "ok" : "failed",
-    summary: ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code),
+    summary,
     failureClass: ok ? "unknown" : classifyFailure({ exitCode: r.code, stdout: r.stdout, stderr: r.stderr }),
     artifacts: [],
-    signals: { auto: true, command: cmd }
+    signals: { auto: true, command: cmd, kind }
   });
   return true;
+}
+
+/** Bounded git diff over specific files (tracked modifications only; best-effort). */
+function gitDiffFor(cwd: string, files: string[]): string {
+  if (!files.length) return "";
+  try {
+    const r = spawnSync("git", ["diff", "HEAD", "--", ...files.slice(0, 8)], { cwd, encoding: "utf8", windowsHide: true, maxBuffer: 1024 * 1024 });
+    return r.status === 0 ? (r.stdout ?? "").slice(0, 20000) : "";
+  } catch {
+    return "";
+  }
 }
 
 // @-file references: resolve @path tokens in the user message to bounded excerpts and the
@@ -161,15 +246,31 @@ function resolveAtFiles(cwd: string, message: string): { block: string; files: s
   return { block: parts.length ? `\n\nReferenced files (read-only context):\n${parts.join("\n\n")}` : "", files };
 }
 
-/** Set of repo-relative paths git currently sees as modified/added/untracked (gitignore honored). */
-function gitChangedSet(cwd: string): Set<string> {
+/**
+ * Repo-relative dirty files (git porcelain, gitignore honored) with a cheap content
+ * fingerprint (mtime:size). Membership alone is not enough: a file left dirty by a previous
+ * turn and re-edited via bash this turn is "already in the baseline" and would never be
+ * recorded - the fingerprint catches the re-edit.
+ */
+function gitChangedFingerprints(cwd: string): Map<string, string> {
+  const out = new Map<string, string>();
   try {
     const r = spawnSync("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd, encoding: "utf8", windowsHide: true });
-    if (r.status !== 0) return new Set();
-    const files = (r.stdout ?? "").split(/\r?\n/).filter(Boolean).map((line) => line.slice(3).trim().replace(/^"|"$/g, ""));
-    return new Set(files);
+    if (r.status !== 0) return out;
+    for (const line of (r.stdout ?? "").split(/\r?\n/).filter(Boolean)) {
+      const file = line.slice(3).trim().replace(/^"|"$/g, "");
+      let fp = "";
+      try {
+        const s = statSync(join(cwd, file));
+        fp = `${s.mtimeMs}:${s.size}`;
+      } catch {
+        fp = "missing";
+      }
+      out.set(file, fp);
+    }
+    return out;
   } catch {
-    return new Set();
+    return out;
   }
 }
 
@@ -217,8 +318,8 @@ function cheaterCapPrompt(cap: number, threshold: number): string {
     `CHEATER HARD SESSION CAP: keep this LLM session under ${cap} context tokens.`,
     `When estimated context reaches ${threshold} tokens, compact immediately or stop with a compact handoff.`,
     "In blueprint_orchestrator mode, the current session is the planner only: it must not read, grep, list, shell, edit, or write project files.",
-    "Use cheater_blueprint_create, then cheater_blueprint_next_packet. Each packet/file change must run in a fresh worker LLM session and stop after its packet.",
-    "One file change means one worker. If a second file is needed, stop and dispatch another fresh worker with new context."
+    "Use cheater_reliability_start (it plans internally), then cheater_commitlet_next after each commitlet. Each file change runs in a fresh worker session.",
+    "One file change means one worker. If a second file is needed, finish the commitlet and let cheater_commitlet_next dispatch the next fresh worker."
   ].join("\n");
 }
 
@@ -276,9 +377,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   const defaultCompactThreshold = compactThresholdTokens(config);
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
-  let gitBaseline: Set<string> | null = null;
+  let gitBaseline: Map<string, string> | null = null;
 
-  registerCheaterCommands(pi);
+  registerCheaterCommands(pi, config);
   registerCheaterTools(pi);
   if (config.autopilotEnabled !== false) {
     registerAutopilotCommands(pi);
@@ -316,7 +417,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event: unknown, ctx: any) => {
     ctx.ui.setTitle?.(`Cheater - ${ctx.cwd}`);
     ctx.ui.setStatus?.("cheater", ctx.ui.theme?.fg ? ctx.ui.theme.fg("accent", "Cheater") : "Cheater");
-    ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id), { placement: "aboveEditor" });
+    ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
     ctx.ui.notify?.("Cheater mode active", "info");
   });
 
@@ -326,21 +427,36 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // gets routed - otherwise the finish-gate nudge below would reset its own counter.
   pi.on("input", async (event: { type: "input"; text?: string; source?: string }, ctx: any) => {
     if (event.source !== "interactive") return { action: "continue" };
-    liveSessionState.beginInteractiveTurn(config);
-    gitBaseline = gitChangedSet(ctx.cwd);
     const message = (event.text ?? "").trim();
+    // Slash commands and empty submits must not touch per-turn state: resetting the loop
+    // governor / nudge counter on "/help" mid-task would wipe a stalled session's detection
+    // history and let a loop restart its streak from zero.
     if (!message || message.startsWith("/")) return { action: "continue" };
+    liveSessionState.beginInteractiveTurn(config);
+    gitBaseline = gitChangedFingerprints(ctx.cwd);
     liveSessionState.setLastUserGoal(message);
-    if (config.autopilotEnabled === false || config.autopilotRouteAllCodeTasks === false) return { action: "continue" };
 
     // Mid-task follow-ups ("ok continue", "yes go ahead") must not be re-classified: a bare
     // acknowledgement routes to answer_only and would inject "do not edit files" while a plan
     // is in flight. If a commitlet plan is active, continue it instead of re-routing.
     const activePlan = defaultCommitletState.get().currentPlan;
     const activeCommitlet = activePlan?.commitlets.find((c) => c.status === "pending" || c.status === "running");
-    if (activePlan && activeCommitlet && !looksLikeNewGoal(message)) {
+    const continuingPlan = Boolean(activePlan && activeCommitlet && !looksLikeNewGoal(message));
+
+    // A genuinely new goal gets a fresh completion ledger seeded with the REAL goal text.
+    // Without this, an unverified previous turn's ledger (stale changedFiles, unresolved
+    // failures, old goal) leaks into unrelated turns and wedges the finish gate; and because
+    // observeToolCall auto-creates the ledger before any goal is known, the goal used to be
+    // stuck as "current session" forever.
+    if (!continuingPlan && looksLikeNewGoal(message)) {
+      liveSessionState.reset(message);
+    }
+
+    if (config.autopilotEnabled === false || config.autopilotRouteAllCodeTasks === false) return { action: "continue" };
+
+    if (continuingPlan && activePlan && activeCommitlet) {
       const done = activePlan.commitlets.filter((c) => ["passed", "skipped", "repaired"].includes(c.status)).length;
-      applyToolMask(ctx, "execute");
+      applyToolMask(pi, config, "execute");
       ctx.ui.notify?.(`Continuing active plan (${done}/${activePlan.commitlets.length})`, "info");
       return {
         action: "transform",
@@ -356,7 +472,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const atFiles = resolveAtFiles(ctx.cwd, message);
     const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined });
     defaultAutopilotState.setDecision(message, decision);
-    applyToolMask(ctx, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+    applyToolMask(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
     ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(decision).split("\n"), { placement: "aboveEditor" });
     ctx.ui.notify?.(decision.userVisibleSummary, "info");
     return {
@@ -415,6 +531,21 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown> }, ctx: any) => {
     const commitletBlock = blockCommitletScopeViolation(event);
     if (commitletBlock) return commitletBlock;
+
+    // Planner/worker isolation is its own config flag; it must be enforced regardless of
+    // whether the loop governor is enabled (it used to be skipped by the governor's early
+    // return, so loopGovernorEnabled:false silently disabled planner file-tool blocking).
+    if (config.blueprintBlockPlannerFileTools !== false && !isBlueprintWorkerSession()) {
+      const plan = defaultBlueprintState.get().currentPlan;
+      const activeBlueprint = Boolean(plan && plan.workPackets.some((packet) => packet.status === "pending" || packet.status === "running"));
+      if (activeBlueprint && PLANNER_BLOCKED_TOOLS.has(event.toolName)) {
+        return {
+          block: true,
+          reason: "Cheater blueprint planner sessions cannot use file or shell tools. Call cheater_blueprint_next_packet to spawn a fresh worker LLM session for the next packet/file change."
+        };
+      }
+    }
+
     if (config.loopGovernorEnabled === false) return {};
     const path = extractPath(event.input);
     const query = extractQuery(event.input);
@@ -436,15 +567,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
         };
       }
     }
-    if (config.blueprintBlockPlannerFileTools === false) return {};
-    if (isBlueprintWorkerSession()) return {};
-    const plan = defaultBlueprintState.get().currentPlan;
-    const activeBlueprint = Boolean(plan && plan.workPackets.some((packet) => packet.status === "pending" || packet.status === "running"));
-    if (!activeBlueprint || !PLANNER_BLOCKED_TOOLS.has(event.toolName)) return {};
-    return {
-      block: true,
-      reason: "Cheater blueprint planner sessions cannot use file or shell tools. Call cheater_blueprint_next_packet to spawn a fresh worker LLM session for the next packet/file change."
-    };
+    return {};
   });
 
   pi.on("tool_result", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown>; content?: Array<{ type: string; text?: string }>; isError?: boolean }, ctx: any) => {
@@ -452,24 +575,33 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     let extraNotice = "";
     if (warning) extraNotice += `\n\n[${warning.message}]`;
 
-    // Post-edit syntax gate: after a successful edit, run the cheapest per-file check and
-    // surface any parse error in-band on the edit's own result so the model fixes it now
-    // instead of discovering it three tool calls later via a failed test.
-    if (config.postEditSyntaxGateEnabled !== false && EDIT_TOOLS.has(event.toolName) && event.isError !== true) {
+    // Post-edit gates: after a successful edit, run the cheapest per-file checks and surface
+    // problems in-band on the edit's own result so the model fixes them now instead of
+    // discovering them three tool calls later via a failed test. Syntax first (does it
+    // parse), then imports (hallucinated modules/symbols/packages - the most common
+    // small-model failure).
+    if (EDIT_TOOLS.has(event.toolName) && event.isError !== true) {
       const editedPath = extractPath(event.input);
       if (editedPath) {
-        const diag = checkFileSyntax(ctx.cwd, editedPath);
-        if (diag && !diag.ok) extraNotice += `\n\n[Cheater syntax gate: ${editedPath} does not parse. Fix it before continuing:\n${diag.message}]`;
+        if (config.postEditSyntaxGateEnabled !== false) {
+          const diag = checkFileSyntax(ctx.cwd, editedPath);
+          if (diag && !diag.ok) extraNotice += `\n\n[Cheater syntax gate: ${editedPath} does not parse. Fix it before continuing:\n${diag.message}]`;
+        }
+        if (config.postEditImportGateEnabled !== false) {
+          const imports = checkImports(ctx.cwd, editedPath);
+          if (!imports.ok) extraNotice += `\n\n[Cheater import gate (${editedPath}):\n- ${imports.issues.join("\n- ")}]`;
+        }
       }
     }
 
-    // Ground-truth: after a shell command, record any files git sees as newly changed vs the
-    // turn baseline, so edits made through bash bypass neither the ledger nor scope tracking.
+    // Ground-truth: after a shell command, record any files git sees as newly changed OR
+    // re-modified vs the turn baseline (fingerprint compare catches bash edits to files that
+    // were already dirty), so shell edits bypass neither the ledger nor scope tracking.
     if (COMMAND_TOOLS.has(event.toolName) && gitBaseline) {
       const ledger = liveSessionState.getLedger();
       if (ledger) {
-        for (const file of gitChangedSet(ctx.cwd)) {
-          if (!gitBaseline.has(file)) ledger.recordFileChange(file);
+        for (const [file, fp] of gitChangedFingerprints(ctx.cwd)) {
+          if (gitBaseline.get(file) !== fp) ledger.recordFileChange(file);
         }
       }
     }
@@ -503,7 +635,10 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const ledger = liveSessionState.getLedger();
     if (!ledger) return;
     const state = ledger.get();
-    if (!state.changedFiles.length && !state.commandsRun.length) return;
+    // Only edits create a verification obligation. A read-only turn (ls, git status, running
+    // tests to answer a question) records commands into the ledger but changes nothing -
+    // nudging "this task is not verified" on a Q&A turn is noise, not truthfulness.
+    if (!state.changedFiles.length) return;
     if (!liveSessionState.canNudge()) return;
     const last = event.messages?.at(-1);
     if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
@@ -512,7 +647,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     // cheater_verification_run, run the detected focused test ourselves and record it. The
     // model's only remaining job is fixing a failure it is handed - the task it does best.
     if (config.autoVerifyOnFinish !== false && !ledgerAllowsFinish(ledger).allowed) {
-      const ran = await harnessAutoVerify(ctx.cwd, ledger, ctx);
+      const ran = await harnessAutoVerify(ctx.cwd, ledger, ctx, config);
       if (ran && ledgerAllowsFinish(ledger).allowed) {
         ctx.ui.notify?.("Cheater auto-verified the changes; finish gate is satisfied.", "info");
         return;

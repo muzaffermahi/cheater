@@ -5,7 +5,10 @@ import { defaultBlueprintState } from "../blueprint/state.js";
 import { createCleanupCommitlet, createCommitletPlan, createRepairCommitlet } from "./planner.js";
 import { commitletConfig } from "./config.js";
 import { defaultCommitletState } from "./state.js";
-import { buildCommitletExecutionPrompt, prepareCommitlet, spawnFreshWorkerForCommitlet } from "./executor.js";
+import { buildCommitletExecutionPrompt, prepareCommitlet } from "./executor.js";
+import { runResampledWorker } from "./resampling.js";
+import { saveVerifiedFix } from "../reliability/experience.js";
+import { buildCheatSheet, renderCheatSheet } from "../reliability/cheatSheet.js";
 import { runDiffGuard, countDiffLines } from "./guard.js";
 import { scorePatchHealth } from "./health.js";
 import { auditTestChanges } from "./testAudit.js";
@@ -17,6 +20,7 @@ import { runFocusedVerification } from "./verification.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
 import { buildCommitletDiff } from "./diffUtil.js";
 import { latestReliabilityBenchmark, compareReliabilityBenchmark } from "../reliability/bench.js";
+import { probeWorkerBackend, resetWorkerBackendLatch, workerBackendState } from "../blueprint/worker.js";
 import { liveSessionState } from "../reliability/sessionState.js";
 import { classifyFailure, ledgerAllowsFinish } from "../reliability/lifecycle.js";
 import { runVerification } from "../reliability/verificationRunner.js";
@@ -29,6 +33,61 @@ type ExtensionContext = any;
 
 function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text", text }], details };
+}
+
+/**
+ * Real fresh workers (context isolation per file change) default on only from VERIFIED
+ * evidence, never a guess: explicit param > config > "a real fresh worker already spawned
+ * successfully earlier in this process" (the backend latch in blueprint/worker.ts, set only
+ * by an actual createAgentSession success). A filesystem heuristic (does Pi have auth on
+ * disk?) was tried and rejected: it cannot distinguish "this process can spawn a working
+ * worker" from "someone once logged into Pi on this machine", so it defaulted tool-harness
+ * and test contexts into slow, doomed real-worker attempts. This self-discovering default
+ * costs nothing extra when unset (starts "unknown" -> false) and upgrades automatically the
+ * moment any commitlet actually proves the backend works, without the user re-passing the
+ * flag - and unlike the disk heuristic, it can never produce a false positive.
+ */
+export function wantsRealWorker(params: { spawnFreshWorker?: boolean }, config: CheaterConfig, _ctx: ExtensionContext): boolean {
+  if (params.spawnFreshWorker !== undefined) {
+    // An explicit request also clears the latch so the user can force a retry after fixing
+    // their backend without restarting the session.
+    if (params.spawnFreshWorker) resetWorkerBackendLatch();
+    return params.spawnFreshWorker;
+  }
+  if (config.commitletFreshWorkerDefault !== undefined) return config.commitletFreshWorkerDefault;
+  return workerBackendState() === "available";
+}
+
+/**
+ * Resolve the fresh-worker mode for this call, running the one-time backend probe when
+ * needed. The latch alone had a bootstrap deadlock: real workers auto-enable only from the
+ * latch, but the latch only flipped after a real worker ran - which never happened because
+ * the default was off. The probe (a throwaway session whose resolved model is the verified
+ * evidence; zero model tokens) breaks the loop. It runs only when: no explicit param, no
+ * config override, latch still unknown, and the CURRENT session has a live model (offline
+ * and test contexts have none, so they never probe).
+ */
+async function resolveRealWorkerMode(params: { spawnFreshWorker?: boolean }, config: CheaterConfig, ctx: ExtensionContext): Promise<boolean> {
+  if (
+    params.spawnFreshWorker === undefined
+    && config.commitletFreshWorkerDefault === undefined
+    && workerBackendState() === "unknown"
+    && ctx?.model?.id
+  ) {
+    await probeWorkerBackend(ctx.cwd);
+  }
+  return wantsRealWorker(params, config, ctx);
+}
+
+/**
+ * The model name for packet operating-rule selection (9b/moe30b/moe35b/unknown), preferring
+ * the live session's actual model over the static config default. Without this,
+ * buildCommitletExecutionPrompt never learned the real model and modelClass was always
+ * "unknown" - silently dropping the model-specific operating rules (including the only rule
+ * that told a moe-class worker to run its own focused verification command).
+ */
+function resolveModelName(config: CheaterConfig, ctx: ExtensionContext): string | undefined {
+  return ctx?.model?.id ?? config.model;
 }
 
 interface GradeResult {
@@ -44,7 +103,7 @@ interface GradeResult {
  * (passed, or a bounded repair commitlet was just queued); advance=false stops the chain
  * (guard/health/audit rejection, or a repair attempt also failed).
  */
-function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig, overrides: { allowLargeDeletion?: boolean } = {}): GradeResult {
+async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig, overrides: { allowLargeDeletion?: boolean } = {}): Promise<GradeResult> {
   const observedEdits = liveSessionState.consumeCommitletEdits();
   const candidateFiles = [...new Set([...commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")), ...observedEdits])];
   const { diffText, touchedFiles } = buildCommitletDiff(cwd, candidateFiles, commitlet.rollbackPoint?.snapshotDir);
@@ -95,6 +154,18 @@ function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig
   }
 
   if (verify.passed) {
+    // Verified fail->pass transition: a repair commitlet just passed the verification its
+    // original failed. The harness knows the observed failure AND the diff that fixed it -
+    // ground truth, no model claim - so it writes the experience card itself. Future
+    // matching failures get this fix recalled in-band inside their failure cards.
+    if (config.experienceStoreEnabled !== false && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
+      saveVerifiedFix(cwd, {
+        failureText: commitlet.spec.observedFailure,
+        diffText,
+        files: touchedFiles,
+        goal: defaultCommitletState.get().currentPlan?.userGoal
+      });
+    }
     defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
       filesChanged: touchedFiles,
       diffLines: countDiffLines(diffText),
@@ -112,9 +183,23 @@ function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig
     };
   }
 
+  // The Cheat Layer: the harness (not the model) classifies this failure, retrieves compact
+  // evidence from every source it owns, and injects the sheet exactly where the failure is
+  // being handed to a model - into the repair commitlet's observedFailure (which flows into
+  // every repair worker/resample packet) and into the grade message the orchestrating
+  // session reads. No search tool call is required or possible here.
+  const sheet = await buildCheatSheet(cwd, [verify.summary, ...verify.failures].join("\n"), config);
+  const renderedSheet = sheet ? renderCheatSheet(sheet, commitlet.focusedVerification.find((step) => step.command)?.command) : "";
+  const failureWithEvidence = renderedSheet ? `${verify.summary}\n${renderedSheet}` : verify.summary;
+  if (sheet && ledger) {
+    // Receipt truthfulness: record WHICH evidence sources were injected, so the completion
+    // receipt can say "cheat evidence used (experience, api_oracle)" from ground truth.
+    ledger.addEntry("cheat_evidence", `trigger ${sheet.trigger}`, { sources: sheet.cards.map((card) => card.source), commitletId: commitlet.id });
+  }
+
   const alreadyRepair = /-repair$/.test(commitlet.id);
   if (!alreadyRepair) {
-    const repair = createRepairCommitlet(commitlet, verify.summary);
+    const repair = createRepairCommitlet(commitlet, failureWithEvidence);
     const plan = defaultCommitletState.get().currentPlan;
     if (plan) {
       defaultCommitletState.setPlan({
@@ -137,18 +222,18 @@ function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig
     }
     return {
       advance: true,
-      message: [verify.summary, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
-      details: { guard, health, audit, verify, repair }
+      message: [failureWithEvidence, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
+      details: { guard, health, audit, verify, repair, cheatSheet: sheet ?? undefined }
     };
   }
 
   if (commitlet.rollbackPoint) {
     const reverted = revertRollbackPoint(cwd, commitlet);
     defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${verify.summary}; ${reverted.reason}`);
-    return { advance: false, message: [verify.summary, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted } };
+    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted, cheatSheet: sheet ?? undefined } };
   }
   defaultCommitletState.updateCommitlet(commitlet.id, "failed", verify.summary);
-  return { advance: false, message: [verify.summary, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify } };
+  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify, cheatSheet: sheet ?? undefined } };
 }
 
 function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {
@@ -258,38 +343,60 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       defaultCommitletState.setPlan(updated);
       liveSessionState.setPacketId(prepared.id);
       liveSessionState.beginCommitlet();
-      const wantRealWorker = params.spawnFreshWorker ?? deps.config.commitletFreshWorkerDefault ?? false;
-      const prompt = buildCommitletExecutionPrompt(updated, prepared, [], wantRealWorker ? "real" : "simulated");
+      const wantRealWorker = await resolveRealWorkerMode(params, deps.config, ctx);
+      let prompt = buildCommitletExecutionPrompt(updated, prepared, [], wantRealWorker ? "real" : "simulated", 1, resolveModelName(deps.config, ctx));
+      let fallbackNotice = "";
 
       if (wantRealWorker) {
-        const workerResult = await spawnFreshWorkerForCommitlet(updated, prepared, deps.config);
-        if (!workerResult.ok) {
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model);
+        const workerResult = resample.workerResult;
+        // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
+        // real fresh workers) is recorded from ground truth, never model prose.
+        liveSessionState.getLedger()?.addEntry("resample", resample.note, {
+          commitletId: prepared.id,
+          attemptsRun: resample.attemptsRun,
+          samplesRequested: resample.samplesRequested,
+          appliedAttempt: resample.appliedAttempt,
+          passed: resample.passed,
+          freshWorkerMode: workerResult.error === "worker_backend_unavailable" ? "unavailable" : "real"
+        });
+        if (workerResult.error === "worker_backend_unavailable") {
+          // Backend cannot spawn sessions: degrade to the simulated in-session prompt below
+          // instead of failing the commitlet over infrastructure.
+          fallbackNotice = "note: fresh worker backend unavailable; this session executes the packet itself (simulated mode)";
+          prompt = buildCommitletExecutionPrompt(updated, prepared, [], "simulated", 1, resolveModelName(deps.config, ctx));
+        } else if (!workerResult.ok && !resample.passed) {
+          // Fail fast only when the best attempt's worker errored AND nothing verified; a
+          // worker that lost its sentinel but produced a verified edit still counts as work.
           defaultCommitletState.updateCommitlet(prepared.id, "failed", workerResult.summary);
           return textResult([
             "Cheater Reliability Start (real fresh worker failed)",
             `autopilot: ${decisionSummary}`,
             `first: ${prepared.title}`,
+            resample.note,
             workerResult.summary
-          ].join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, workerResult, freshWorkerMode: "real" });
+          ].join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, workerResult, resample, freshWorkerMode: "real" });
+        } else {
+          const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
+          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
+          return textResult([
+            "Cheater Reliability Start (real fresh worker)",
+            `autopilot: ${decisionSummary}`,
+            `plan: ${updated.summary}${updated.blueprintPlanId ? ` blueprint=${updated.blueprintPlanId}` : ""}`,
+            `commitlets: ${updated.commitlets.length}`,
+            `first: ${prepared.title}`,
+            `allowedFiles: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
+            `rollback: ${prepared.rollbackPoint?.id ?? "(none)"}`,
+            `freshWorkerMode: real`,
+            resample.note,
+            workerResult.sessionId ? `session: ${workerResult.sessionId}` : "",
+            workerResult.sessionFile ? `sessionFile: ${workerResult.sessionFile}` : "",
+            "",
+            workerResult.summary,
+            "",
+            grade.message
+          ].filter(Boolean).join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, prompt, workerResult, resample, grade: grade.details, freshWorkerMode: "real" });
         }
-        const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
-        const grade = gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
-        return textResult([
-          "Cheater Reliability Start (real fresh worker)",
-          `autopilot: ${decisionSummary}`,
-          `plan: ${updated.summary}${updated.blueprintPlanId ? ` blueprint=${updated.blueprintPlanId}` : ""}`,
-          `commitlets: ${updated.commitlets.length}`,
-          `first: ${prepared.title}`,
-          `allowedFiles: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
-          `rollback: ${prepared.rollbackPoint?.id ?? "(none)"}`,
-          `freshWorkerMode: real`,
-          workerResult.sessionId ? `session: ${workerResult.sessionId}` : "",
-          workerResult.sessionFile ? `sessionFile: ${workerResult.sessionFile}` : "",
-          "",
-          workerResult.summary,
-          "",
-          grade.message
-        ].filter(Boolean).join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, prompt, workerResult, grade: grade.details, freshWorkerMode: "real" });
       }
 
       return textResult([
@@ -301,10 +408,11 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         `allowedFiles: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
         `rollback: ${prepared.rollbackPoint?.id ?? "(none)"}`,
         `freshWorkerMode: simulated (prompt returned to current session; set spawnFreshWorker=true for a real isolated worker)`,
+        fallbackNotice,
         "",
         "fresh-call prompt:",
         prompt.prompt
-      ].join("\n"), { decision, plan: updated, commitlet: prepared, prompt, freshWorkerMode: "simulated" });
+      ].filter(Boolean).join("\n"), { decision, plan: updated, commitlet: prepared, prompt, freshWorkerMode: "simulated", fallbackNotice: fallbackNotice || undefined });
     }
   });
 
@@ -321,10 +429,14 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       if (!plan) return textResult("No active Cheater commitlet plan.");
 
       const running = plan.commitlets.find((commitlet) => commitlet.status === "running");
+      let gradeReport = "";
       if (running) {
-        const grade = gradeCommitlet(ctx.cwd, running, deps.config, { allowLargeDeletion: params.approveLargeDeletion });
+        const grade = await gradeCommitlet(ctx.cwd, running, deps.config, { allowLargeDeletion: params.approveLargeDeletion });
         plan = defaultCommitletState.get().currentPlan!;
         if (!grade.advance) return textResult(grade.message, grade.details);
+        // The grade verdict (including any injected cheat sheet on a failure that spawned a
+        // repair) must reach the orchestrating session; the advance path used to drop it.
+        gradeReport = grade.message;
       }
 
       const index = plan.commitlets.findIndex((commitlet) => commitlet.status === "pending");
@@ -340,34 +452,53 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       defaultCommitletState.setPlan(updated);
       liveSessionState.beginCommitlet();
       const previousState = plan.commitlets.filter((commitlet) => commitlet.result?.summary).map((commitlet) => `${commitlet.id}: ${commitlet.result?.summary}`);
-      const wantRealWorker = params.spawnFreshWorker ?? deps.config.commitletFreshWorkerDefault ?? false;
-      const prompt = buildCommitletExecutionPrompt(updated, prepared, previousState, wantRealWorker ? "real" : "simulated");
+      const wantRealWorker = await resolveRealWorkerMode(params, deps.config, ctx);
+      let prompt = buildCommitletExecutionPrompt(updated, prepared, previousState, wantRealWorker ? "real" : "simulated", 1, resolveModelName(deps.config, ctx));
+      let fallbackNotice = "";
 
-      if (!wantRealWorker) {
-        return textResult([
-          `Running commitlet ${index + 1}/${updated.commitlets.length}: ${prepared.title}`,
-          `Allowed files: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
-          `Rollback: ${prepared.rollbackPoint?.id}`,
-          "freshWorkerMode: simulated",
-          "",
-          prompt.prompt
-        ].join("\n"), { commitlet: prepared, prompt, freshWorkerMode: "simulated" });
+      if (wantRealWorker) {
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model);
+        const workerResult = resample.workerResult;
+        // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
+        // real fresh workers) is recorded from ground truth, never model prose.
+        liveSessionState.getLedger()?.addEntry("resample", resample.note, {
+          commitletId: prepared.id,
+          attemptsRun: resample.attemptsRun,
+          samplesRequested: resample.samplesRequested,
+          appliedAttempt: resample.appliedAttempt,
+          passed: resample.passed,
+          freshWorkerMode: workerResult.error === "worker_backend_unavailable" ? "unavailable" : "real"
+        });
+        if (workerResult.error === "worker_backend_unavailable") {
+          fallbackNotice = "note: fresh worker backend unavailable; this session executes the packet itself (simulated mode)";
+          prompt = buildCommitletExecutionPrompt(updated, prepared, previousState, "simulated", 1, resolveModelName(deps.config, ctx));
+        } else if (!workerResult.ok && !resample.passed) {
+          defaultCommitletState.updateCommitlet(prepared.id, "failed", workerResult.summary);
+          return textResult([`Fresh worker failed for commitlet ${prepared.id}.`, resample.note, workerResult.summary].join("\n"), { commitlet: prepared, workerResult, resample, freshWorkerMode: "real" });
+        } else {
+          const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
+          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
+          return textResult([
+            `Cheater Commitlet Next (real fresh worker): ${prepared.title}`,
+            "workerStatus: ok",
+            resample.note,
+            workerResult.summary,
+            "",
+            grade.message
+          ].join("\n"), { commitlet: prepared, workerResult, resample, grade: grade.details, freshWorkerMode: "real" });
+        }
       }
 
-      const workerResult = await spawnFreshWorkerForCommitlet(updated, prepared, deps.config);
-      if (!workerResult.ok) {
-        defaultCommitletState.updateCommitlet(prepared.id, "failed", workerResult.summary);
-        return textResult([`Fresh worker failed for commitlet ${prepared.id}.`, workerResult.summary].join("\n"), { commitlet: prepared, workerResult, freshWorkerMode: "real" });
-      }
-      const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
-      const grade = gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
       return textResult([
-        `Cheater Commitlet Next (real fresh worker): ${prepared.title}`,
-        "workerStatus: ok",
-        workerResult.summary,
+        ...(gradeReport ? [gradeReport, ""] : []),
+        `Running commitlet ${index + 1}/${updated.commitlets.length}: ${prepared.title}`,
+        `Allowed files: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
+        `Rollback: ${prepared.rollbackPoint?.id}`,
+        "freshWorkerMode: simulated",
+        ...(fallbackNotice ? [fallbackNotice] : []),
         "",
-        grade.message
-      ].join("\n"), { commitlet: prepared, workerResult, grade: grade.details, freshWorkerMode: "real" });
+        prompt.prompt
+      ].join("\n"), { commitlet: prepared, prompt, freshWorkerMode: "simulated", fallbackNotice: fallbackNotice || undefined });
     }
   });
 

@@ -353,7 +353,9 @@ export function registerMissionTools(pi: ExtensionAPI, deps: MissionToolDeps): v
         if (proposal.saveMissingEvidence) saveMemory(ctx.cwd, `missing evidence: ${proposal.saveMissingEvidence}`);
         lines.push("status: saved (auto-save)");
       } else {
-        lines.push("status: proposed only (use /mission-save or cheater_memory_search to persist)");
+        // cheater_memory_search only searches memory notes; it cannot persist one. The one
+        // real persist path when autoSaveLearning is off is the /mission-save command.
+        lines.push("status: proposed only (use /mission-save to persist)");
       }
       return textResult(lines.join("\n"), proposal);
     }
