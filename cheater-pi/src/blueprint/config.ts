@@ -26,7 +26,6 @@ export interface BlueprintConfig extends CommitletConfig {
   blueprintBlockPlannerFileTools: boolean;
   maxContextTokens: number;
   contextCompactRatio: number;
-  oracleRunAllChecks: boolean;
   bugFreshAgentEnabled: boolean;
   freshCallPacketsEnabled: boolean;
   packetOneFilePerWorkerEnabled: boolean;
@@ -79,7 +78,6 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   blueprintBlockPlannerFileTools: true,
   maxContextTokens: 12000,
   contextCompactRatio: 0.85,
-  oracleRunAllChecks: true,
   bugFreshAgentEnabled: true,
   freshCallPacketsEnabled: true,
   packetOneFilePerWorkerEnabled: true,

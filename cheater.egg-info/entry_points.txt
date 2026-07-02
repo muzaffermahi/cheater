@@ -1,2 +1,0 @@
-[console_scripts]
-cheater = cheater.__main__:main

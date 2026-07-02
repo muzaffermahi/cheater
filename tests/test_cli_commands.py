@@ -41,7 +41,11 @@ class TestCheaterPiWrapperCLI(unittest.TestCase):
         self.assertIn("--extension", r.stdout)
         self.assertIn("cheater-pi", r.stdout)
         self.assertIn("extension.ts", r.stdout)
-        self.assertIn("--append-system-prompt", r.stdout)
+        # The system prompt is now injected once (config-aware) at before_agent_start by the
+        # extension; the duplicate --append-system-prompt flag was removed. The prompt template
+        # dir is still passed so Pi resolves the minimal identity note.
+        self.assertIn("--prompt-template", r.stdout)
+        self.assertNotIn("--append-system-prompt", r.stdout)
         self.assertIn("--model openai/test", r.stdout)
         self.assertNotIn("tui.py", r.stdout)
 

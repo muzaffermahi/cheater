@@ -45,7 +45,7 @@ export function isOfficialAllowed(url: string, packageOrLibrary: string): boolea
 }
 
 export function localDocsFacts(cwd: string, query: string, maxFacts = 5): OfficialDocsFact[] {
-  const candidates = ["README.md", "docs/cheater_pi.md", "docs/ARCHITECTURE.md", "docs/STATE_OF_REPO.md"];
+  const candidates = ["README.md", "docs/cheater_pi.md", "docs/ARCHITECTURE.md", "docs/RUNSTATE.md"];
   const q = query.toLowerCase().split(/\W+/).filter((term) => term.length > 3).slice(0, 8);
   const facts: OfficialDocsFact[] = [];
   for (const rel of candidates) {

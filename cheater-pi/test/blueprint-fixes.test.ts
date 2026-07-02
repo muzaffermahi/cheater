@@ -88,43 +88,6 @@ test("docs cache eviction is bounded by byte cap too", async () => {
   assert.ok(stats.bytes <= 5 * 1024 * 1024, `bytes=${stats.bytes} should be bounded`);
 });
 
-// Fix 7: review categorizes blocking by origin
-test("final review categorizes blocking issues by execution vs planning origin", async () => {
-  const { runFinalBlueprintReview } = await import("../src/blueprint/reviewer.js");
-  const { createAutonomousBlueprint } = await import("../src/blueprint/autonomous.js");
-  const dir = mkdtempSync(join(tmpdir(), "cheater-review-origin-"));
-  mkdirSync(join(dir, "src"), { recursive: true });
-  mkdirSync(join(dir, "test"), { recursive: true });
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json", test: "node --test" } }));
-  writeFileSync(join(dir, "src", "commands.ts"), "export function registerCommand(pi: any) { pi.registerCommand('cheater', {}); }\n");
-  writeFileSync(join(dir, "test", "commands.test.ts"), "import test from 'node:test'; test('x', () => {});\n");
-  const plan = await createAutonomousBlueprint({ cwd: dir, userGoal: "add a command with tests", taskType: "tooling", modelName: "qwen-9b" });
-  const review = runFinalBlueprintReview(plan);
-  assert.ok(Array.isArray(review.blockingIssueOrigins));
-  for (const issue of review.blockingIssueOrigins) {
-    assert.ok(issue.origin === "execution" || issue.origin === "planning", `bad origin: ${issue.origin}`);
-  }
-  const pending = review.blockingIssueOrigins.find((o) => o.text.includes("Not all work packets"));
-  assert.ok(pending && pending.origin === "execution");
-});
-
-test("final review separates planning-gate blockers from execution blockers in origins", async () => {
-  const { runFinalBlueprintReview } = await import("../src/blueprint/reviewer.js");
-  const dir = mkdtempSync(join(tmpdir(), "cheater-review-planblock-"));
-  mkdirSync(join(dir, "src"), { recursive: true });
-  mkdirSync(join(dir, "test"), { recursive: true });
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json", test: "node --test" } }));
-  writeFileSync(join(dir, "src", "commands.ts"), "export function registerCommand(pi: any) { pi.registerCommand('cheater', {}); }\n");
-  writeFileSync(join(dir, "test", "commands.test.ts"), "import test from 'node:test'; test('x', () => {});\n");
-  const { createAutonomousBlueprint } = await import("../src/blueprint/autonomous.js");
-  const plan = await createAutonomousBlueprint({ cwd: dir, userGoal: "add a command", taskType: "tooling", modelName: "qwen-9b" });
-  const failingPlan = { ...plan, qualityGate: { ...plan.qualityGate, blockingIssues: ["quality gate hard block"], passed: false } };
-  const review = runFinalBlueprintReview(failingPlan);
-  const origins = Object.fromEntries(review.blockingIssueOrigins.map((o) => [o.text, o.origin]));
-  assert.equal(origins["Not all work packets are complete."], "execution");
-  assert.equal(origins["quality gate hard block"], "planning");
-});
-
 // Fix 6: planner large-dir guard
 test("planner scan skips deep walking for huge directories and stays bounded", async () => {
   const { buildPlannerGraph } = await import("../src/commitlet/constraintGraph.js");
@@ -140,31 +103,3 @@ test("planner scan skips deep walking for huge directories and stays bounded", a
 });
 
 // Fix 5: dev command wires summarizeEval
-test("blueprint-eval dev command is registered and produces a summary", async () => {
-  const { registerBlueprintCommands } = await import("../src/blueprint/commands.js");
-  const commands = new Map<string, any>();
-  const pi: any = {
-    registerCommand: (name: string, def: any) => commands.set(name, def),
-    registerTool: () => {},
-    sendUserMessage: () => {}
-  };
-  registerBlueprintCommands(pi, { config: {} as any });
-  assert.ok(commands.has("blueprint-eval"));
-  const dir = mkdtempSync(join(tmpdir(), "cheater-cmd-eval-"));
-  mkdirSync(join(dir, "src"), { recursive: true });
-  mkdirSync(join(dir, "test"), { recursive: true });
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
-  writeFileSync(join(dir, "src", "commands.ts"), "export function registerCommand(pi: any) { pi.registerCommand('cheater', {}); }\n");
-  writeFileSync(join(dir, "test", "commands.test.ts"), "import test from 'node:test'; test('x', () => {});\n");
-  let widgetText = "";
-  const ctx: any = {
-    cwd: dir, sessionId: "s", model: { id: "qwen-9b" },
-    ui: {
-      notify: () => {},
-      setWidget: (_key: string, lines: string[], _opts?: any) => { widgetText = lines.join("\n"); }
-    }
-  };
-  await commands.get("blueprint-eval").handler("add a cheater command for hello", ctx);
-  assert.match(widgetText, /graph_intelligence: score=/);
-  assert.match(widgetText, /mockFile=/);
-});

@@ -47,7 +47,7 @@ test("cheater gym run prepares workspace and prints prompt", () => {
   const code = runGymCli(["run", "py_off_by_one_001"], { cwd, stdout: (t) => lines.push(t) });
   assert.equal(code, 0);
   assert.ok(lines.some((l) => l.includes("Cheater Gym task ready")));
-  assert.ok(lines.some((l) => l.includes("Cheater Mission Control for py_off_by_one_001")));
+  assert.ok(lines.some((l) => l.includes("Cheater Reliability task py_off_by_one_001")));
   rmSync(cwd, { recursive: true, force: true });
 });
 

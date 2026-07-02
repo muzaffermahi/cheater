@@ -1,20 +1,14 @@
-import { createAutonomousBlueprint } from "./autonomous.js";
+// Blueprint user commands. Blueprint planning runs INSIDE cheater_reliability_start - it is
+// an internal planning engine, not a model-driven flow - so the only commands here are
+// read-only inspection (/blueprint-show, /blueprint-docs, /blueprint-memory) and /blueprint-cancel.
+// The old packet-dispatch commands (/blueprint-step, /blueprint-force, ...) drove a parallel
+// execution path that competed with the reliability flow and were removed with it.
+
 import { defaultBlueprintState } from "./state.js";
-import { runFinalBlueprintReview } from "./reviewer.js";
 import { scoutOfficialDocs } from "./docsScout.js";
 import { blueprintConfig } from "./config.js";
-import { persistBlueprintArtifacts, retrievePlanningMemory } from "./memory.js";
-import { runBlueprintEval, summarizeEval } from "./evalHarness.js";
-import { buildQualityRepairDraft, formatQualityRepairDraft } from "./qualityRepair.js";
-import { repoOrientationFromMissionFacts } from "./contextSketch.js";
-import { scanOrientation } from "../mission/orientation.js";
-import {
-  formatBlueprintCandidates,
-  formatBlueprintDebug,
-  formatBlueprintPlanSummary,
-  formatBlueprintRunState,
-  formatFinalReview
-} from "./ui.js";
+import { retrievePlanningMemory } from "./memory.js";
+import { formatBlueprintRunState } from "./ui.js";
 import type { CheaterConfig } from "../types.js";
 
 type ExtensionAPI = any;
@@ -33,130 +27,11 @@ export function registerBlueprintCommands(pi: ExtensionAPI, deps: { config: Chea
     }
   });
 
-  pi.registerCommand("blueprint-candidates", {
-    description: "Show internal blueprint candidate scores",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      widget(ctx, "cheater-blueprint", plan ? formatBlueprintCandidates(plan) : "No active Cheater blueprint.");
-    }
-  });
-
-  pi.registerCommand("blueprint-step", {
-    description: "Debug: dispatch the next blueprint packet through a fresh worker",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      if (!plan) {
-        widget(ctx, "cheater-blueprint", "No active Cheater blueprint.", "warning");
-        return;
-      }
-      const pending = plan.workPackets.find((packet) => packet.status === "pending");
-      if (!pending) {
-        widget(ctx, "cheater-blueprint", "No pending blueprint packet.", "warning");
-        return;
-      }
-      pi.sendUserMessage("Cheater /blueprint-step: call cheater_blueprint_next_packet now. Do not paste or execute packet prompts in this planner session; the tool must dispatch a fresh worker session.");
-      widget(ctx, "cheater-blueprint", `Requested fresh-worker dispatch for blueprint packet ${pending.id}.`);
-    }
-  });
-
-  pi.registerCommand("blueprint-review", {
-    description: "Run final Autonomous Blueprint review",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      if (!plan) {
-        widget(ctx, "cheater-blueprint", "No active Cheater blueprint.", "warning");
-        return;
-      }
-      const review = runFinalBlueprintReview(plan);
-      defaultBlueprintState.setReview(review);
-      widget(ctx, "cheater-blueprint", formatFinalReview(review), review.accepted ? "info" : "warning");
-    }
-  });
-
-  pi.registerCommand("blueprint-quality-repair", {
-    description: "Show planner-only repair draft for quality-gate blockers",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      if (!plan) {
-        widget(ctx, "cheater-blueprint", "No active Cheater blueprint.", "warning");
-        return;
-      }
-      widget(ctx, "cheater-blueprint-quality-repair", formatQualityRepairDraft(buildQualityRepairDraft(plan)), plan.qualityGate.passed ? "info" : "warning");
-    }
-  });
-
-  pi.registerCommand("blueprint-debug", {
-    description: "Show blueprint graph, packet statuses, and failures",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      widget(ctx, "cheater-blueprint", plan ? formatBlueprintDebug(plan) : "No active Cheater blueprint.");
-    }
-  });
-
-  pi.registerCommand("blueprint-eval", {
-    description: "Debug: run the blueprint eval harness comparing worker-context variants for the current goal",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const plan = defaultBlueprintState.get().currentPlan;
-      const goal = plan?.userGoal ?? _args.trim();
-      if (!goal) {
-        widget(ctx, "cheater-blueprint-eval", "Usage: /blueprint-eval <goal> (or run with an active blueprint)", "warning");
-        return;
-      }
-      const orientation = repoOrientationFromMissionFacts(scanOrientation(ctx.cwd));
-      const expectedFiles = plan ? [...new Set(plan.workPackets.flatMap((p) => p.filesToTouch.map((f) => f.path)))].filter((f) => f && !f.startsWith("(") && !f.endsWith("/")) : [];
-      const results = await runBlueprintEval({
-        cwd: ctx.cwd,
-        orientation,
-        task: { goal, taskType: plan?.preview.taskType, expectedFiles, expectedTests: [], modelName: ctx.model?.id ?? deps.config.model }
-      });
-      widget(ctx, "cheater-blueprint-eval", summarizeEval(results));
-    }
-  });
-
   pi.registerCommand("blueprint-cancel", {
     description: "Cancel the current internal blueprint run",
     handler: async (_args: string, ctx: CommandContext) => {
       defaultBlueprintState.cancel();
       widget(ctx, "cheater-blueprint", "Cheater Blueprint cancelled.");
-    }
-  });
-
-  pi.registerCommand("blueprint-approve", {
-    description: "Approve the current Autonomous Blueprint plan for packet dispatch",
-    handler: async (args: string, ctx: CommandContext) => {
-      const state = defaultBlueprintState.get();
-      const plan = state.currentPlan;
-      if (!plan) {
-        widget(ctx, "cheater-blueprint", "No active Cheater blueprint.", "warning");
-        return;
-      }
-      if (state.cancelled || plan.approval === "cancelled") {
-        widget(ctx, "cheater-blueprint", "Blueprint run is cancelled. Create a new blueprint before approving.", "warning");
-        return;
-      }
-      if (plan.approval !== "needs_user") {
-        widget(ctx, "cheater-blueprint", `Blueprint does not need approval; current approval state is ${plan.approval}.`);
-        return;
-      }
-      defaultBlueprintState.setApproval("approved");
-      const note = args.trim();
-      widget(ctx, "cheater-blueprint", `Cheater Blueprint approved.${note ? ` note: ${note}` : ""}`);
-    }
-  });
-
-  pi.registerCommand("blueprint-force", {
-    description: "Force Autonomous Blueprint mode for a goal",
-    handler: async (args: string, ctx: CommandContext) => {
-      const goal = args.trim();
-      if (!goal) {
-        widget(ctx, "cheater-blueprint", "Usage: /blueprint-force <goal>", "warning");
-        return;
-      }
-      const plan = await createAutonomousBlueprint({ cwd: ctx.cwd, userGoal: goal, plannerSessionId: ctx.sessionId, modelName: ctx.model?.id ?? deps.config.model, config: deps.config });
-      defaultBlueprintState.setPlan(plan);
-      persistBlueprintArtifacts(ctx.cwd, plan);
-      widget(ctx, "cheater-blueprint", formatBlueprintPlanSummary(plan));
-      pi.sendUserMessage("Cheater /blueprint-force: call cheater_blueprint_next_packet to dispatch the next packet in a fresh worker session. Do not execute multiple packet prompts in this planner session.");
     }
   });
 

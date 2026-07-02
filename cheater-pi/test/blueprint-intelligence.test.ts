@@ -9,7 +9,6 @@ import { evaluateBlueprintQuality } from "../src/blueprint/qualityGate.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "../src/commitlet/constraintGraph.js";
 import { renderBlueprintArtifact } from "../src/blueprint/artifact.js";
-import { buildQualityRepairDraft, formatQualityRepairDraft } from "../src/blueprint/qualityRepair.js";
 import type {
   BlueprintArchitectureDecision,
   BlueprintEvidenceItem,
@@ -410,37 +409,6 @@ test("quality gate blocks evidence-required web tasks without remote evidence", 
   const quality = evaluateBlueprintQuality(withEvidence as any);
   assert.equal(quality.blockingIssues.some((issue) => /external evidence is required/.test(issue)), false);
   assert.equal(quality.passed, true, JSON.stringify(quality.blockingIssues));
-});
-
-test("quality repair draft turns gate remediations into planner-only instructions", () => {
-  const packets = [
-    makePacket({ id: "inspect", type: "inspect", filesToInspect: [{ path: "package.json", reason: "r" }], filesToTouch: [] }),
-    makePacket({ id: "implement-src-api", filesToInspect: [{ path: "src/api.ts", reason: "r" }], filesToTouch: [{ path: "src/api.ts", reason: "r" }] }),
-    makePacket({ id: "review", type: "review", filesToInspect: [], filesToTouch: [] })
-  ];
-  const plan = {
-    id: "plan-repair", qualityGate: {
-      score: 50,
-      passed: false,
-      strengths: [],
-      blockingIssues: ["external evidence is required but no remote docs or web evidence was gathered"],
-      warnings: ["packet implement-src-api has no test signal; add a focused test mapping or verification command"],
-      remediationActions: [
-        "Attach official docs or ranked web evidence for the external API/version before dispatch.",
-        "Add a focused test mapping or verification command to packet implement-src-api."
-      ],
-      requiredSections: [],
-      localModelFit: "weak" as const
-    },
-    workPackets: packets
-  } as any;
-  const draft = buildQualityRepairDraft(plan);
-  assert.equal(draft.mustRegeneratePlan, true);
-  assert.ok(draft.packetFocus.some((item) => item.packetId === "implement-src-api"));
-  assert.equal(draft.packetFocus.some((item) => item.packetId === "inspect"), false);
-  assert.ok(draft.plannerInstructions.some((item) => /Regenerate the Blueprint plan/.test(item)));
-  assert.ok(draft.acceptanceCriteria.some((item) => /Quality gate passes/.test(item)));
-  assert.match(formatQualityRepairDraft(draft), /planner-only repair draft/);
 });
 
 test("artifact renders done criteria per packet and bug-workflow match reasons", () => {

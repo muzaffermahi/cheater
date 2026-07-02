@@ -22,14 +22,14 @@ test("tiny edit goes fast path", () => {
   assert.equal(decision.executionMode, "vanilla_pi");
 });
 
-test("bug fix and test failures go to Mission Control", () => {
+test("bug fix and test failures go to the careful repro route", () => {
   const bug = routeAutopilot({ cwd: cwd(), message: "fix this failing test" });
-  assert.equal(bug.executionMode, "mission_control");
+  assert.equal(bug.executionMode, "careful_repro");
   assert.equal(bug.needsRepro, true);
 
   const testFailure = routeAutopilot({ cwd: cwd(), message: "CI is broken", recentErrors: "FAILED test_example - AssertionError" });
   assert.equal(testFailure.taskKind, "test_failure");
-  assert.equal(testFailure.executionMode, "mission_control");
+  assert.equal(testFailure.executionMode, "careful_repro");
 });
 
 test("complex feature goes to blueprint without slash command", () => {

@@ -14,7 +14,7 @@ export type TaskKind =
 export type ExecutionMode =
   | "answer_only"
   | "vanilla_pi"
-  | "mission_control"
+  | "careful_repro"
   | "blueprint_orchestrator";
 
 export type ExecutionDiscipline =
@@ -34,6 +34,8 @@ export interface AutopilotRepoHints {
   likelyFiles?: string[];
   previousFastPathFailed?: boolean;
   repeatedFailure?: boolean;
+  /** The user explicitly approved a previously blocked high-risk request ("proceed"). */
+  userApprovedHighRisk?: boolean;
 }
 
 export interface AutopilotInput {
@@ -41,6 +43,8 @@ export interface AutopilotInput {
   cwd: string;
   recentErrors?: string;
   repoHints?: AutopilotRepoHints;
+  /** When true, high-risk destructive intent stops for approval. Default false (autonomous). */
+  requireApproval?: boolean;
 }
 
 export interface AutopilotDecision {
@@ -64,4 +68,6 @@ export interface RoutePolicyInput {
   needsRepro: boolean;
   complexitySignals: string[];
   repoHints?: AutopilotRepoHints;
+  /** When true, high-risk destructive intent stops for approval. Default false (autonomous). */
+  requireApproval?: boolean;
 }

@@ -134,6 +134,45 @@ test("commitlet fresh-call prompt includes bounded snippets and graph facts", ()
   assert.match(prompt, /relevantSnippets:\n--- src\/commands\.ts \((?:relevant symbol|head)\) ---/);
   assert.match(prompt, /previousState:\n- two\n- three\n- four/);
   assert.doesNotMatch(prompt, /value79/);
+  // The nested fresh-call packet must not re-embed src/commands.ts as a raw head excerpt -
+  // it was already given a symbol-aware slice one section above in the same prompt.
+  assert.doesNotMatch(prompt, /--- src\/commands\.ts excerpt ---/);
+});
+
+test("buildCommitletExecutionPrompt resolves a real modelClass and unlocks its operating rules", () => {
+  const root = mkdtempSync(join(tmpdir(), "cheater-commitlet-model-"));
+  const decision = routeAutopilot({ cwd: root, message: "fix the bug" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the bug", autopilotDecision: decision });
+  const unknownPrompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0]).prompt;
+  assert.match(unknownPrompt, /modelClass: unknown/);
+
+  const moePrompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0], [], "simulated", 1, "qwen-2.5-32b-instruct").prompt;
+  assert.match(moePrompt, /modelClass: moe30b/);
+  assert.match(moePrompt, /Run the focused verification command before broad tests/, "moe-class operating rules must ship once modelClass resolves");
+});
+
+test("fresh-call packet renders the verification command as an explicit run-it-yourself instruction", () => {
+  const root = mkdtempSync(join(tmpdir(), "cheater-commitlet-verify-instr-"));
+  mkdirSync(join(root, "src"), { recursive: true });
+  writeFileSync(join(root, "src", "a.ts"), "export const a = 1;\n", "utf8");
+  const decision = routeAutopilot({ cwd: root, message: "update config" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "update config", autopilotDecision: decision });
+  const commitlet = {
+    ...plan.commitlets[0],
+    allowedFiles: ["src/a.ts"],
+    focusedVerification: [{ command: "npm test -- a.test.ts", purpose: "focused", required: true }]
+  };
+  const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, commitlet).prompt;
+  assert.match(prompt, /verificationCommand: npm test -- a\.test\.ts - run this yourself via bash/);
+});
+
+test("fresh-call packet no longer tells the worker to use Pi-native tools only, contradicting cheater_line_edit", () => {
+  const root = mkdtempSync(join(tmpdir(), "cheater-commitlet-tool-contradiction-"));
+  const decision = routeAutopilot({ cwd: root, message: "fix the bug" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the bug", autopilotDecision: decision });
+  const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0]).prompt;
+  assert.doesNotMatch(prompt, /Use Pi native tools only/);
+  assert.match(prompt, /cheater_line_edit/);
 });
 
 test("commitlet planner creates specs and converts blueprint-free tasks", () => {

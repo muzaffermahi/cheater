@@ -1,6 +1,6 @@
 # Cheater Pi Distribution
 
-Cheater is now a Pi wrapper and package.
+Cheater is a Pi wrapper and package.
 
 Running `cheater` builds a Pi command that preloads:
 
@@ -24,7 +24,7 @@ PowerShell can run the same wrapper after `npm link`.
 
 `cheater` must:
 
-- launch Pi's TUI, not the old Python TUI
+- launch Pi's TUI, not a standalone Cheater TUI
 - load Cheater customization automatically
 - keep Pi responsible for code reading, editing, shell tools, sessions, context,
   slash commands, and the agent loop
@@ -33,130 +33,83 @@ PowerShell can run the same wrapper after `npm link`.
 
 ## Extension Surface
 
-The Cheater extension adds:
+Design rule: the model proposes intent; the harness owns state, permissions,
+execution, context shape, and completion truth. The model-facing tool surface is
+deliberately tiny, and **every registered tool appears in a tool mask** - there
+is no hidden inventory that could confuse a small model if masking fails.
 
-- startup Cheater status widget
-- Cheater system-prompt guidance (with Mission Control)
-- automatic Autopilot routing for normal user requests
-- Autonomous Blueprint tools for internal multi-step planning and review
-- `/cheater`, `/autopilot-status`, `/blueprint-show`, `/blueprint-review`,
-  `/blueprint-cancel`, `/blueprint-force`, `/blueprint-docs`,
-  `/blueprint-memory`, `/mission`, `/mission-status`, `/mission-cancel`, `/mission-save`,
-  `/fix`, `/orient`, `/orientation`, `/repro`, `/evidence`, `/playbook`,
-  `/verify`, `/learn`, `/delta-bench`, `/gym`, `/gym-list`, `/gym-run`,
-  `/gym-run-suite`, `/gym-report`, `/gym-delta`, `/gym-learn`, `/gym-clean`,
-  `/test`, `/map`, `/remember`, `/skills`, `/traces`, `/history`, `/settings`,
-  and `/doctor`
-- debug-only inspection commands: `/blueprint-candidates`, `/blueprint-step`,
-  `/blueprint-debug`, `/commitlet-next`, `/commitlet-finalize`, and
-  `/commitlet-debug`
-- helper tools for project briefs, focused tests, diff safety, memory search,
-  compacted bug-memory search, and skill search
-- mission tools: `cheater_mission_classify`, `cheater_mission_start`,
-  `cheater_mission_status`, `cheater_mission_cancel`, `cheater_orientation_scan`,
-  `cheater_orientation_show`, `cheater_orientation_update`,
-  `cheater_repro_gate`, `cheater_evidence_packet`, `cheater_playbook_show`,
-  `cheater_oracle_stack`, `cheater_mission_learn`, `cheater_delta_bench`
-- blueprint tools: `cheater_blueprint_create`, `cheater_blueprint_next_packet`,
-  `cheater_blueprint_review`, `cheater_blueprint_candidates`,
-  `cheater_blueprint_docs`
-- reliability/commitlet tools (the one-shot flow): `cheater_reliability_start`,
-  `cheater_commitlet_next`, `cheater_verification_run`, `cheater_finish_gate`,
-  `cheater_ledger_status`. Autopilot routing itself is not a model-facing tool -
-  it is injected automatically by the extension's `input` hook on every normal
-  message.
+Model-facing tools (all of them):
 
-These additions are intentionally small. They steer Pi rather than replacing it.
+- one-flow tools: `cheater_reliability_start`, `cheater_commitlet_next`,
+  `cheater_commitlet_revert`, `cheater_finish_gate`, `cheater_verification_run`,
+  `cheater_ledger_status`, `cheater_rollback_status`
+- editing/lookup: `cheater_line_edit`, `cheater_memory_search`,
+  `cheater_bug_memory_search`, `cheater_project_brief`
+
+Autopilot routing itself is not a model-facing tool - it is injected
+automatically by the extension's `input` hook on every normal message.
+
+User commands: `/cheater`, `/autopilot-status`, `/reliability-status`,
+`/commitlet-status`, `/commitlet-plan`, `/commitlet-health`,
+`/commitlet-revert`, `/rollback-status`, `/constraint-graph`, `/bench-report`,
+`/model-profile`, `/blueprint-show`, `/blueprint-cancel`, `/blueprint-docs`,
+`/blueprint-memory`, `/gym*`, `/test`, `/map`, `/bug-memory`, `/remember`,
+`/skills`, `/traces`, `/settings`, `/doctor`. Debug-only: `/commitlet-next`,
+`/commitlet-debug`, `/autopilot-route`, `/autopilot-run`. Status commands render
+directly from harness state - no command sends the model off to call a tool.
 
 ## Autopilot and Autonomous Blueprint
 
 Normal code requests are routed automatically. A user can type `add a /hello
-command` or `refactor the memory search`; Cheater should route before editing
-without requiring `/blueprint`.
+command` or `refactor the memory search`; Cheater routes before editing.
 
 Routing modes:
 
 - `answer_only`: explanation/orientation only, no edits.
 - `vanilla_pi`: tiny fast-path edits with focused verification.
-- `mission_control`: bug fixes and test failures with repro/evidence flow.
+- `careful_repro`: bug fixes and test failures - reproduce first, then the flow.
 - `blueprint_orchestrator`: complex feature/refactor/tooling/migration work.
 
-Blueprint mode creates a compact preview, generates three candidates, scores
-them for completeness, feasibility, edge cases, efficiency, and repo fit, then
-selects one internally. It decomposes the selected plan into sequential work
-packets and hands those packet prompts to Pi. Cheater does not implement a
-standalone agent loop, shell runner, code editor, or TUI.
+Every code mode runs the SAME one flow: `cheater_reliability_start` plans
+(using the internal Autonomous Blueprint engine for complex tasks), the model or
+a fresh isolated worker edits the allowed files, `cheater_commitlet_next` grades
+in code (diff guard, patch health, test audit, focused verification),
+`cheater_verification_run` collects evidence, and `cheater_finish_gate` decides
+completion from the ledgers - not from model prose.
 
-For version-sensitive, migration, exact-error, or user-requested web-search
-tasks, Blueprint records `evidenceRequired=true` in the artifact. If no
-official docs or web evidence is attached, the quality gate blocks packet
-dispatch instead of letting a local model guess at external APIs.
+Blueprint is an internal planning engine, not a model-driven flow: it creates a
+compact preview, generates three candidates, scores them, decomposes the winner
+into work packets, and feeds the commitlet plan. It has no model-facing tools.
+For version-sensitive or exact-error tasks it can require official docs
+evidence before dispatch (`blueprintOfficialDocsSearchEnabled`).
 
-When the quality gate finds blockers or weak plan structure, it also emits
-`Remediate:` actions in the Blueprint artifact and final review result. These
-actions are intentionally concrete, such as adding packet-local repo facts,
-attaching official docs evidence, splitting oversized packets, or adding a
-focused verification command. The debug command `/blueprint-quality-repair`
-renders the same actions as a planner-only repair draft.
-
-Debug commands such as `/blueprint-show`, `/blueprint-candidates`, and
-`/blueprint-step` exist for inspection and override only. They are not the
-primary workflow.
+Durable run state (contract, digest, ledgers, capsules, phases, guards,
+telemetry) is documented in [RUNSTATE.md](RUNSTATE.md).
 
 ## Cheater Gym
 
-Cheater ships a local benchmark (`cheater gym ...`) with 25 small
-tasks (Python + JS/TS) and a scoring/learning layer. See
-[docs/gym.md](gym.md) for the full design.
+Cheater ships a local benchmark (`cheater gym ...`) with small Python + JS/TS
+tasks and a scoring/learning layer. See [docs/gym.md](gym.md).
 
-## Mission Control
+## Configuration
 
-Mission Control is a Pi-native harness layer that turns vague coding requests
-into disciplined workflows. It is enabled by default and configured via
-`.cheater/config.json` (or `~/.config/cheater/config.json`):
+`.cheater/config.json` (or `~/.config/cheater/config.json`); everything has a
+sensible default. Frequently used keys:
 
 ```
 {
-  "missionControlEnabled": true,
-  "reproRequiredBeforePatch": true,
-  "allowNoOpSuccess": true,
-  "onlineEvidenceEnabled": false,
-  "offlineStackOverflowEnabled": false,
-  "autoSaveLearning": false,
-  "oracleRunBroadTests": "ask",
-  "maxEvidenceItems": 5,
-  "maxMissionRawLogChars": 12000,
   "autopilotEnabled": true,
   "autopilotRouteAllCodeTasks": true,
   "blueprintModeEnabled": true,
-  "blueprintAutoForComplexTasks": true,
-  "blueprintUseFastPath": true,
-  "blueprintCandidateCount": 3,
-  "blueprintShowInternalPlanSummary": true,
-  "blueprintRequireApproval": "high_risk_only",
-  "blueprintMaxPackets": 8,
-  "blueprintMaxCallsPerPacket": 1,
-  "blueprintMaxDebugRounds": 3,
-  "blueprintReplanAfterFailedDebug": true,
-  "blueprintMemoryEnabled": true,
   "blueprintOfficialDocsSearchEnabled": false,
-  "blueprintDocsProvider": "local",
-  "searxngBaseUrl": "",
-  "blueprintMaxDocsFacts": 5,
-  "blueprintFetchDocsPages": false
+  "commitletFreshWorkerDefault": false,
+  "commitletCandidateSamples": 1,
+  "experienceStoreEnabled": true,
+  "cheatSheetEnabled": true,
+  "runStateEnabled": true,
+  "requireApprovalForHighRisk": false
 }
 ```
-
-Mission Control's internal flow for bug/test tasks:
-
-1. `/mission <goal>` or `/fix <failing test>` - classify the task
-2. `/orient` - confirm project facts
-3. `/repro <focused command>` - reproduce the failure (or prove no-op)
-4. `/evidence` - consult bug memory + local docs
-5. patch the smallest likely cause
-6. `/verify` - run the oracle stack (focused/typecheck/lint/broad)
-7. `/learn` to propose saving, `/mission-save` to persist
-8. `/delta-bench` to record metrics
 
 ## Compacted Bug Memory
 

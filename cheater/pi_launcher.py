@@ -244,6 +244,10 @@ def load_config() -> LauncherConfig:
 
 def build_pi_command(cfg: LauncherConfig, opts: LaunchOptions) -> list[str]:
     pi = resolve_pi_command(cfg)
+    # Cheater's system prompt is injected once, config-aware, at before_agent_start by the
+    # extension (see cheater-pi/src/prompts.ts buildSystemPrompt). We deliberately do NOT also
+    # pass --append-system-prompt for cheater.md: a small model reconciling two drifted copies
+    # of the same rulebook is a known failure mode. Keeps this launcher in sync with launcher.ts.
     command = [
         *pi,
         "--extension",
@@ -252,8 +256,6 @@ def build_pi_command(cfg: LauncherConfig, opts: LaunchOptions) -> list[str]:
         str(SKILLS_DIR),
         "--prompt-template",
         str(PROMPTS_DIR),
-        "--append-system-prompt",
-        str(PROMPTS_DIR / "cheater.md"),
         "--name",
         "Cheater",
     ]

@@ -8,7 +8,7 @@ export function createRoleSeparation(planId: string, plannerSessionId?: string):
     invariant: "The blueprint planner never edits code; every code-changing packet must run in a different fresh worker session.",
     enforcement: [
       "planner file tools are blocked while an active blueprint has pending/running packets",
-      "cheater_blueprint_next_packet dispatches packets through sdkFreshAgentPacketRunner by default",
+      "commitlet execution dispatches packets through sdkFreshAgentPacketRunner when a worker backend is available",
       "each packet prompt carries one-file worker scope and BLOCKED_NEXT_FILE handoff rules",
       "final review rejects incomplete or failed packets before accepting the plan"
     ]

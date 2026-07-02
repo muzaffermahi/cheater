@@ -20,6 +20,6 @@ test("command help groups debug-only commands away from normal workflow", () => 
   assert.match(help, /Normal workflow/);
   assert.match(help, /Debug-only commands/);
   assert.ok(help.indexOf("Debug-only commands") > help.indexOf("/doctor"));
-  assert.match(help, /\/blueprint-step Dispatch the next packet through a fresh worker/);
+  assert.match(help, /\/commitlet-debug Show detailed commitlet JSON/);
   assert.match(help, /normal coding requests should go through Autopilot/);
 });

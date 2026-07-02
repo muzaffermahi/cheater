@@ -24,9 +24,32 @@ refactor the memory search
 add a /hello command
 ```
 
-Autopilot decides whether Pi should answer directly, use a fast path, use
-Mission Control, or create an internal Autonomous Blueprint. Users do not need
-to type `/blueprint` before normal work.
+Cheater is **autonomous by default**: one prompt runs to completion. There is
+no approval step - a request like "build a whole app from scratch" plans and
+builds in a single turn. Destructive intent (deleting files, dropping a
+database, dependency/lockfile churn) is surfaced to the model as a caution it
+proceeds through, not a stop. Set `"requireApprovalForHighRisk": true` to make
+genuinely destructive requests pause and ask first.
+
+The main session breathes up to ~90% of the model's real context window (set
+`maxSessionContextTokens` to cap it lower). Only the small per-file worker
+packets are deliberately tiny - the planner is never told to ration its work.
+
+Autopilot classifies the request and then drives **one flow** for every
+code-changing task:
+
+```text
+cheater_reliability_start -> edit only the allowed files -> cheater_commitlet_next
+  (repeat) -> cheater_verification_run -> cheater_finish_gate
+```
+
+`cheater_reliability_start` routes, builds a commitlet plan with a rollback point,
+and hands back a small single-file worker prompt. `cheater_commitlet_next` grades
+each edit in code (diff guard, patch health, test audit, focused verification) - it
+is not model say-so. `cheater_finish_gate` refuses to report "done" until the
+completion ledger holds real verification evidence, and a deterministic receipt is
+printed from that ledger. Users do not type `/blueprint` or `/commitlet`
+before normal work.
 
 ## Install
 
@@ -65,87 +88,50 @@ cheater bench reliability run B # run the offline Reliability Mode benchmark
 cheater bench reliability compare
 ```
 
-Inside the Pi TUI, Cheater adds:
+### Model-facing tools (the one flow)
+
+A weak model's worst skill is multi-tool orchestration, so Cheater masks the
+`cheater_*` tool surface per phase. During execution the model sees only these:
+
+| Tool | Purpose |
+| --- | --- |
+| `cheater_reliability_start` | Route, plan commitlets, take a rollback point, return the first single-file worker prompt |
+| `cheater_commitlet_next` | Grade the current edit in code (guard/health/audit/verify), then prepare the next commitlet or run the final review |
+| `cheater_line_edit` | Apply a bounded, stale-safe line/range edit |
+| `cheater_verification_run` | Detect and run the project's dev/test/score commands and feed the ledger |
+| `cheater_finish_gate` | Block "done" until the ledger holds verification evidence (or a tracked waiver) |
+| `cheater_bug_memory_search` | Search the compacted solved-bug corpus on a failure |
+| `cheater_ledger_status` / `cheater_rollback_status` / `cheater_commitlet_revert` | Inspect progress and recover |
+
+`cheater_project_brief`, `cheater_focus_test`, and `cheater_diff_safety_check`
+were deliberately removed from the execution surface: the env block, the automatic
+diff guard, and `cheater_verification_run` already provide them, so re-exposing
+them only added tool-choice noise.
+
+### Status and inspection commands
 
 | Command | Purpose |
 | --- | --- |
 | `/cheater` | Show Cheater status and command help |
 | `/autopilot-status` | Show the latest automatic routing decision |
-| `/blueprint-show` | Inspect the current internal blueprint |
-| `/blueprint-review` | Run final blueprint review manually |
-| `/blueprint-cancel` | Cancel the current blueprint run |
-| `/blueprint-force <goal>` | Force blueprint mode manually |
-| `/blueprint-docs <query>` | Search configured local/official docs facts |
-| `/blueprint-memory` | Show blueprint planning memories |
 | `/reliability-status` | Show Reliability Mode status |
-| `/loop-report` | Show Loop Governor diagnostics |
-| `/model-profile` | Show local-model packet settings |
-| `/commitlet-status` | Show Reliability Kernel commitlet status |
-| `/commitlet-plan` | Show the active commitlet chain |
-| `/commitlet-revert` | Revert current or named commitlet if safe |
-| `/commitlet-verify` | Run focused verification for a commitlet |
-| `/commitlet-health` | Show latest health/final-review result |
+| `/commitlet-status` / `/commitlet-plan` | Show the active commitlet chain |
+| `/commitlet-verify` / `/commitlet-revert` / `/commitlet-health` | Verify, revert, or inspect a commitlet |
 | `/rollback-status` | Show rollback snapshots; pass `cleanup` to remove old snapshots |
-| `/health-report` | Show latest Reliability Kernel health report |
-| `/constraint-graph` | Show compact repo constraint graph facts |
-| `/bench-report` | Show latest local reliability benchmark report |
-| `/mission` | Start a Cheater Mission Control flow |
-| `/fix` | Shortcut: start a bug_fix mission |
-| `/orient` | Show or refresh project orientation |
-| `/repro` | Run the repro gate |
-| `/evidence` | Gather an evidence packet |
-| `/playbook` | Show the playbook for the active mission |
-| `/verify` | Run the oracle stack |
-| `/learn` | Propose or persist learning |
-| `/delta-bench` | Show Cheater delta-benchmark report |
-| `/gym` | Cheater Gym help and status |
-| `/gym-list` | List Cheater Gym tasks |
-| `/gym-run <id>` | Prepare a Gym workspace and prompt |
-| `/gym-run-suite` | Run a small Gym suite |
-| `/gym-report` | Show the latest Gym report |
-| `/gym-delta <id>` | Show Cheater vs vanilla delta |
-| `/gym-learn` | Show learning suggestions from past runs |
-| `/gym-clean` | Remove Gym workspaces and reports |
-| `/test` | Infer or run a focused test command |
-| `/map` | Ask Pi for a compact repo overview |
-| `/bug-memory` | Search compacted solved-bug memories directly |
-| `/remember` | Save a project note under `.cheater/memory` |
-| `/skills` | List Cheater skills loaded by the package |
-| `/traces` / `/history` | Show recent session/history guidance |
-| `/settings` | Show Cheater wrapper/package settings |
-| `/doctor` | Run in-session Cheater diagnostics |
+| `/health-report` / `/constraint-graph` / `/bench-report` | Kernel health, repo constraint facts, benchmark report |
+| `/loop-report` / `/model-profile` | Loop Governor diagnostics, local-model packet settings |
+| `/test` / `/map` / `/bug-memory` / `/remember` | Focused test, repo overview, bug-memory search, save a note |
+| `/skills` / `/settings` / `/doctor` | Skills, settings, in-session diagnostics |
 
-Debug-only commands remain available for Cheater development and incident
-inspection: `/blueprint-candidates`, `/blueprint-step`, `/blueprint-debug`,
-`/blueprint-quality-repair`, `/commitlet-next`, `/commitlet-finalize`, and `/commitlet-debug`. Normal coding
-requests should go through Autopilot instead of manual packet or commitlet
-driving.
+### Advanced / opt-in surfaces
 
-Cheater also registers small helper tools:
+Blueprint planning powers `cheater_reliability_start` internally; its inspection
+commands (`/blueprint-show`, `/blueprint-cancel`, `/blueprint-docs`,
+`/blueprint-memory`) stay available. The **Gym** local benchmark (`/gym*`)
+stays on for measuring Cheater against vanilla Pi.
 
-| Tool | Purpose |
-| --- | --- |
-| `cheater_project_brief` | Compact repo status and top-level shape |
-| `cheater_focus_test` | Suggest a narrow test command |
-| `cheater_diff_safety_check` | Flag risky diff categories |
-| `cheater_memory_search` | Search Cheater project notes |
-| `cheater_bug_memory_search` | Search compacted solved-bug memories with a low-RAM on-disk index |
-| `cheater_skill_search` | List packaged Cheater skills |
-| `cheater_autopilot_route` | Route normal requests before code changes |
-| `cheater_blueprint_create` | Create an internal blueprint plan |
-| `cheater_blueprint_next_packet` | Return the next sequential packet prompt |
-| `cheater_blueprint_review` | Run final blueprint review |
-| `cheater_blueprint_docs` | Gather local/official docs facts |
-| `cheater_commitlet_plan` | Create the Reliability Kernel commitlet chain |
-| `cheater_commitlet_next` | Prepare rollback and fresh-call prompt for the next commitlet |
-| `cheater_commitlet_guard` | Run diff guard, patch health, and test audit |
-| `cheater_commitlet_verify` | Run focused verification and create one repair commitlet on failure |
-| `cheater_commitlet_finalize` | Run final commitlet review and local telemetry |
-| `cheater_commitlet_revert` | Restore allowed-file snapshots for a commitlet |
-| `cheater_rollback_status` | Inspect/cleanup commitlet rollback snapshots |
-| `cheater_health_report` | Show latest patch-health/final-review report |
-| `cheater_constraint_graph` | Build compact graph facts for active files |
-| `cheater_bench_report` | Show latest local reliability benchmark report |
+Debug-only commands remain for Cheater development: `/commitlet-next`,
+`/commitlet-debug`, `/autopilot-route`, and `/autopilot-run`.
 
 ## Pi Discovery
 
@@ -185,6 +171,8 @@ Project config overrides global config. Supported keys:
   "reliabilityModeEnabled": true,
   "autopilotEnabled": true,
   "autopilotRouteAllCodeTasks": true,
+  "requireApprovalForHighRisk": false,
+  "maxSessionContextTokens": null,
   "freshCallPacketsEnabled": true,
   "packetOneFilePerWorkerEnabled": true,
   "packetMaxFilesToTouch": 1,
@@ -226,6 +214,10 @@ Project config overrides global config. Supported keys:
   "benchmarkDefaultTaskLimit": 10,
   "commitletModeEnabled": true,
   "commitletAutoForCodeTasks": true,
+  "commitletCandidateSamples": 1,
+  "experienceStoreEnabled": true,
+  "cheatSheetEnabled": true,
+  "postEditImportGateEnabled": true,
   "rollbackRequired": true,
   "maxFilesTouchedDefault": 3,
   "maxDiffLinesDefault": 180,
@@ -256,9 +248,10 @@ it into sequential packets, and asks Pi to execute those packets with narrow
 context. Final review runs automatically through the blueprint tooling.
 
 Tiny edits use the fast path and can escalate to Blueprint after failure. Bug
-and test-failure requests route to Mission Control first. High-risk actions
-such as dependency or lockfile changes, file deletion, broad refactors, or
-unclear architecture changes require user approval.
+and test-failure requests are steered to reproduce and gather evidence before
+editing, then run the same commitlet flow. High-risk actions such as dependency or lockfile
+changes, file deletion, broad refactors, or unclear architecture changes require
+user approval.
 
 Official docs scouting is local-only by default. If enabled, it uses official
 allowlisted domains or a configured SearXNG instance with site filters; broad
@@ -294,14 +287,112 @@ a Pi wrapper while adding deterministic guardrails around Pi:
   automatically when `autoCleanupLowRiskHealthIssues` is enabled.
 * Test Quality Auditor catches removed assertions, skipped tests, weak/mock-only
   tests, and unexplained golden-output changes.
+* Edit Rescue (ported from Cline's replace_in_file matchers): when an exact-match
+  edit fails, the harness finds the line-trimmed or block-anchor near-match and
+  hands back the exact on-disk text to retry with - the #1 small-model edit
+  failure becomes a one-step recovery. cheater_line_edit's staleness check is
+  whitespace-tolerant for the same reason.
+* Focus Chain (ported from Cline's task_progress): a harness-derived checklist of
+  the whole plan ([x]/[>]/[ ]/[!] per commitlet) is re-shown at every commitlet
+  handoff, after compaction, and in finish-gate nudges - so a small model never
+  finishes item 2 of 6 and declares victory.
+* Identical-call guard (ported from Cline): the exact same tool with the exact
+  same canonicalized args warns in-band on the 3rd consecutive call and blocks on
+  the 6th; hard stops use preserved-state semantics ("plan, rollbacks, and ledger
+  are intact - send a new instruction to resume").
+* Project rules: `.cheater/rules.md` or `.clinerules` (bounded) ride into every
+  session's environment block.
+* Stray-file hygiene: files a failed resample attempt creates OUTSIDE its allowed
+  scope are removed between attempts and before applying the winner (git repos).
+* Import Gate checks every successful edit's imports (repo files resolve,
+  named symbols are actually exported, npm packages are installed) and
+  reports problems in-band on the edit's own result - the single most common
+  small-model failure (a hallucinated import) is caught immediately instead
+  of surfacing three tool calls later as a failed test. Disable with
+  `postEditImportGateEnabled: false`.
 * A lightweight Repo Constraint Graph tracks symbols/imports/exports,
-  command/tool registrations, config keys, tests, and small queryable facts.
+  command/tool registrations, config keys, tests, and small queryable facts,
+  and now also targets a real file for a generic bug-fix/feature request by
+  matching goal terms against actual repo symbols - not a guessed filename.
 * Impact propagation derives extra checks for signature/import/config/command/
   tool/dependency/test/doc changes.
 * Planning and feedback retrieval are bounded and use the existing disagreement
   gate so memories/docs cannot override local source or tests.
 * Docs facts are local/official-only and online search is disabled by default.
 * Final review and local-only telemetry run after commitlet chains.
+
+### Verified resampling (local-native best-of-N)
+
+API-oriented harnesses are sample-frugal because tokens cost money. Local
+tokens are nearly free, and a small model's pass@N on a bounded one-file
+commitlet approaches a frontier model's pass@1 - if something deterministic
+picks the winner. With `"commitletCandidateSamples": 3`, each real-worker
+commitlet runs up to three **independent** fresh workers from the clean
+rollback snapshot. The harness scores every candidate in code (diff guard,
+patch health, focused verification), accepts the first verified pass, and
+otherwise leaves the best-ranked candidate applied so the bounded repair
+starts from the strongest attempt. Attempts are independent on purpose:
+small models are poisoned by failure context, so fresh resamples beat
+feedback loops. Resample attempts after the first also carry a distinct
+approach stance (smallest fix / root-cause fix / clean rewrite) so repeated
+samples are not just re-rolls of the same prompt. The default of 1 keeps
+single-attempt behavior.
+
+Real fresh workers (their own isolated context per file change) turn on
+automatically the moment one has actually spawned successfully in the current
+process - no config needed. This is evidence-based, not a guess: Cheater does
+not infer "a model backend is probably configured" from disk state (that
+produced false positives in offline/test contexts); it only upgrades after a
+real `createAgentSession` call has succeeded. Set `commitletFreshWorkerDefault`
+explicitly (`true`/`false`) to override this in either direction.
+
+### Experience store (bug memory that writes itself)
+
+Static bug corpora hold someone else's bugs, and the model has to remember to
+search them. The experience store fixes both: cards are written **only by the
+harness, only on a verified fail->pass transition** (a repair commitlet passes
+the verification its original failed, or auto-verify passes after an observed
+failure). Each card keys a normalized failure fingerprint (paths, line
+numbers, and literals stripped) to the diff that verifiably fixed it. Recall
+happens through the Cheat Layer below - no tool call, no recall skill
+required. Local-only JSONL under `.cheater/experience/`; disable with
+`"experienceStoreEnabled": false`.
+
+### The Cheat Layer (harness-owned evidence injection)
+
+The model never decides when to search, how to search, what to trust, or
+where the result goes. When a commitlet fails verification (or auto-verify
+fails), the harness:
+
+1. **classifies** the failure deterministically (import error, missing
+   dependency, library API error, syntax, assertion, runtime) and extracts
+   the package/symbol it names;
+2. **retrieves** compact evidence through one cascade, in trust order:
+   the verified experience store (high confidence - proven fail->pass in
+   this repo), the **installed-API oracle** (high - when the failure names
+   a library symbol, the harness reads the ACTUAL signatures/exports of
+   the locally installed version from node_modules type declarations or a
+   bounded `python -c "import inspect, ..."` probe: "installed
+   fakepkg@2.3.4 has no sendGreeting; the real exports are greet, Client,
+   hello" - an environment fact, fully offline), the compacted bug corpus
+   (medium - someone else's verified bugs, analogies only, gated by a
+   relevance check so a lexical search can never inject noise), the target
+   repo's own docs (low), and official docs/web **only when online search
+   is explicitly enabled**;
+3. **compresses** the result into at most 3 tiny evidence cards (observed
+   cause hypothesis, suggested fix pattern, source, confidence, exact
+   verification command when known) - the whole sheet is capped at ~1.3KB;
+4. **injects** the rendered sheet in-band: into the repair commitlet's
+   `observedFailure` (which every repair worker and every resampling
+   attempt receives inside its packet), into the grade message the
+   orchestrating session reads, and into auto-verify failure notices.
+
+An unclassifiable failure with no verified experience match produces **no
+sheet at all** - noisy evidence is worse for a small model than none. Every
+card is explicitly framed as a hypothesis: the sheet's own footer says the
+verifier decides, and nothing in the Cheat Layer can satisfy the finish
+gate. A huge unindexed bug corpus is skipped rather than stalling a grade on
+an index build. Disable with `"cheatSheetEnabled": false`.
 
 Offline benchmark commands:
 

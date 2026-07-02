@@ -14,7 +14,8 @@ export function routeAutopilot(input: AutopilotInput): AutopilotDecision {
     risk: classification.risk,
     needsRepro: classification.needsRepro,
     complexitySignals: classification.complexitySignals,
-    repoHints
+    repoHints,
+    requireApproval: input.requireApproval
   });
   return {
     ...partial,
@@ -33,7 +34,7 @@ export function inferRepoHints(cwd: string): AutopilotRepoHints {
 function summarizeDecision(mode: AutopilotDecision["executionMode"], reason: string): string {
   if (mode === "answer_only") return "This looks informational, so I will answer without editing.";
   if (mode === "vanilla_pi") return "This looks small, so I will wrap Pi's fast path in one commitlet and verify narrowly.";
-  if (mode === "mission_control") return "I will use Mission Control, then run the edit as a verified commitlet.";
+  if (mode === "careful_repro") return "I will reproduce and verify carefully, running the edit as a verified commitlet.";
   if (/because: /.test(reason)) {
     const signals = reason.replace(/^.*because:\s*/, "").replace(/\.$/, "");
     return `Planning internally because this touches ${signals}.`;
@@ -52,23 +53,20 @@ export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: st
   if (decision.executionDiscipline === "blocked_needs_user") {
     return "Cheater: this looks high-risk (dependency/lockfile/destructive change). Stop before editing and ask the user for explicit approval.";
   }
+  // One flow for every code mode. cheater_reliability_start returns a prompt describing the
+  // first commitlet; depending on the backend it either runs a fresh worker automatically or
+  // hands the packet to you to execute - EITHER WAY the model then calls cheater_commitlet_next
+  // to grade and advance. This deliberately does NOT claim "you are planner only, do not
+  // edit": on a local backend that can't spawn sub-sessions, you ARE the one who edits, and
+  // the commitlet scope guard keeps your edits inside the allowed file.
   const lines: string[] = [];
-  if (decision.executionMode === "blueprint_orchestrator") {
-    lines.push(
-      "Cheater plan (this session is the planner only: do not read, grep, ls, bash, edit, or write yourself):",
-      "1. Call cheater_reliability_start with the goal; it builds the commitlet plan and returns the first fresh-call prompt.",
-      "2. After each fresh worker finishes its one-file commitlet, call cheater_commitlet_next to grade it and get the next commitlet or the final review.",
-      "3. When cheater_commitlet_next reports the final review, call cheater_verification_run then cheater_finish_gate before telling the user it is done."
-    );
-    return lines.join("\n");
-  }
-  if (decision.executionMode === "mission_control") {
-    lines.push("Cheater: reproduce the bug and gather evidence first, then run the commitlet flow below.");
+  if (decision.executionMode === "careful_repro") {
+    lines.push("Cheater: reproduce the bug and gather evidence first, then run the flow below.");
   }
   lines.push(
-    "Cheater plan:",
-    "1. Call cheater_reliability_start with the goal; it builds the commitlet plan and returns the first fresh-call prompt.",
-    "2. Edit only the allowed files, then call cheater_commitlet_next (it grades the edit in code). Repeat until it reports the final review.",
+    "Cheater flow (run it start to finish without pausing to ask):",
+    "1. Call cheater_reliability_start with the full goal; it plans and returns the first commitlet's prompt.",
+    "2. Do exactly what that prompt says (edit the allowed file, or note the worker already did), then call cheater_commitlet_next - it grades in code and hands you the next commitlet. Repeat until it reports the final review.",
     "3. Call cheater_verification_run then cheater_finish_gate before telling the user it is done. If verification cannot run, say so explicitly."
   );
   return lines.join("\n");

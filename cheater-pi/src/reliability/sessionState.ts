@@ -22,6 +22,26 @@ export interface LiveToolCallObservation {
   path?: string;
   query?: string;
   command?: string;
+  /** Full tool input, used for the identical-consecutive-call guard. */
+  input?: unknown;
+}
+
+/** Canonical JSON with sorted keys (Cline-style), so arg order never hides an identical call. */
+export function canonicalCallSignature(toolName: string, input: unknown): string {
+  const sortKeys = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map(sortKeys);
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = sortKeys((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  };
+  try {
+    return `${toolName}:${JSON.stringify(sortKeys(input ?? {}))}`;
+  } catch {
+    return `${toolName}:(unserializable)`;
+  }
 }
 
 export interface LiveToolResultObservation {
@@ -55,6 +75,10 @@ class LiveSessionState {
   private commitletEdits: string[] = [];
   private pendingNonProgressBlock: LiveLifecycleEvent | null = null;
   private readonly pendingLoopWarnings = new Map<string, LiveLifecycleEvent>();
+  // Identical-consecutive-call guard (Cline-style): canonical (sorted-key) signature of the
+  // last tool call, and how many times in a row the exact same call was made.
+  private lastCallSignature = "";
+  private identicalCallCount = 0;
 
   reset(userGoal?: string): void {
     this.toolRecords = [];
@@ -69,6 +93,8 @@ class LiveSessionState {
     this.commitletEdits = [];
     this.pendingNonProgressBlock = null;
     this.pendingLoopWarnings.clear();
+    this.lastCallSignature = "";
+    this.identicalCallCount = 0;
   }
 
   /**
@@ -86,6 +112,8 @@ class LiveSessionState {
     this.commitletEdits = [];
     this.pendingNonProgressBlock = null;
     this.pendingLoopWarnings.clear();
+    this.lastCallSignature = "";
+    this.identicalCallCount = 0;
     if (this.ledger) {
       const state = this.ledger.get();
       if (state.done || isTerminalVerified(state.verification)) this.ledger = null;
@@ -170,6 +198,25 @@ class LiveSessionState {
       this.pendingNonProgressBlock = null;
       this.detector?.reset();
     }
+
+    // Identical-consecutive-call guard (ported from Cline): the exact same tool with the
+    // exact same canonicalized args cannot produce a different result. Warn in-band on the
+    // third identical call; hard-block on the sixth. This is fully generic - it also covers
+    // cheater_* tools that the per-kind limits below never classified.
+    const signature = canonicalCallSignature(obs.toolName, obs.input ?? { path: obs.path, query: obs.query, command: obs.command });
+    this.identicalCallCount = signature === this.lastCallSignature ? this.identicalCallCount + 1 : 1;
+    this.lastCallSignature = signature;
+    if (this.identicalCallCount >= 3) {
+      const terminal = this.identicalCallCount >= 6;
+      const event: LiveLifecycleEvent = {
+        kind: "loop_break",
+        message: `Cheater: ${this.identicalCallCount} consecutive identical calls to ${obs.toolName} - the result will not change. Try a different approach, or stop and report what is blocking you.`,
+        terminal
+      };
+      events.push(event);
+      if (!terminal) this.pendingLoopWarnings.set(obs.toolCallId, event);
+    }
+
     const loopEvent = governor.observeTools(this.toolRecords);
     if (loopEvent) {
       const event: LiveLifecycleEvent = { kind: "loop_break", loopBreak: loopEvent, message: `Cheater Loop Governor: ${loopEvent.reason}`, terminal: loopEvent.terminal };

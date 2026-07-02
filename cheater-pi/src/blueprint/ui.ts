@@ -21,26 +21,6 @@ export function formatBlueprintPlanSummary(plan: BlueprintPlan): string {
   ].join("\n");
 }
 
-export function formatBlueprintCandidates(plan: BlueprintPlan): string {
-  return [
-    "Cheater Blueprint candidates",
-    ...plan.scores.map((score) => `${score.candidateId}: overall=${score.overall} valid=${score.valid} penalties=${score.penalties.join(", ") || "none"}`)
-  ].join("\n");
-}
-
-export function formatBlueprintDebug(plan: BlueprintPlan): string {
-  return [
-    formatBlueprintPlanSummary(plan),
-    "graph:",
-    ...plan.planGraph.edges.map((edge) => `  ${edge.from} -> ${edge.to}: ${edge.reason}`),
-    "intelligence:",
-    ...(plan.intelligence?.architectureDecisions.map((item) => `  ${item.id}: ${item.decision}`) ?? ["  unavailable"]),
-    ...(plan.intelligence?.implementationInvariants.map((item) => `  invariant: ${item}`) ?? []),
-    "packets:",
-    ...plan.workPackets.map((packet) => `  ${packet.id}: ${packet.title} (${packet.type}, ${packet.risk})`)
-  ].join("\n");
-}
-
 export function formatFinalReview(result: FinalReviewResult, includeDebug = false): string {
   const lines = [
     "Cheater Blueprint final review",

@@ -38,6 +38,11 @@ export interface FreshCallPacket {
   stopWhen: string;
   outputFormat: ReliabilityPacketOutputFormat;
   endSentinel: string;
+  // The primary verification command for this packet, when the underlying WorkPacket has
+  // one. Rendered as an explicit imperative instruction, not just a fact - a small model
+  // grants bash access and shown a bare command string does not reliably infer it must run
+  // that command itself before finishing.
+  verificationCommand?: string;
   modelClass?: ModelClass;
   contextBudgetTokens?: number;
   maxOutputTokens?: number;

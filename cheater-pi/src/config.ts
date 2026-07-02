@@ -8,15 +8,6 @@ import { DEFAULT_BLUEPRINT_CONFIG } from "./blueprint/config.js";
 export const VERSION = "0.7.0";
 
 export const DEFAULT_CONFIG: CheaterConfig = {
-  missionControlEnabled: true,
-  reproRequiredBeforePatch: true,
-  allowNoOpSuccess: true,
-  onlineEvidenceEnabled: false,
-  offlineStackOverflowEnabled: false,
-  autoSaveLearning: false,
-  oracleRunBroadTests: "always",
-  maxEvidenceItems: 5,
-  maxMissionRawLogChars: 12000,
   gymEnabled: true,
   gymDefaultLimit: 5,
   gymDefaultConcurrency: 1,
@@ -26,7 +17,10 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   gymAutoLearn: false,
   gymDeltaModeEnabled: false,
   ...DEFAULT_BLUEPRINT_CONFIG,
-  blueprintOfficialDocsSearchEnabled: false
+  blueprintOfficialDocsSearchEnabled: false,
+  // Durable run state (contract, digest, ledgers, capsules, phase control, post-success
+  // guard) under .cheater/runs/<taskId>/. Deterministic and local-only; on by default.
+  runStateEnabled: true
 };
 
 export function packageRoot(): string {

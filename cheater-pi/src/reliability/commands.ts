@@ -1,8 +1,8 @@
 import { blueprintConfig } from "../blueprint/config.js";
 import type { CheaterConfig } from "../types.js";
-import { LoopGovernor } from "./loopGovernor.js";
 import { modelProfile } from "./modelProfile.js";
 import { reliabilityStatus } from "./status.js";
+import { activeTaskRun } from "../runstate/runState.js";
 
 type ExtensionAPI = any;
 type CommandContext = any;
@@ -16,7 +16,20 @@ export function registerReliabilityCommands(pi: ExtensionAPI, deps: { config: Ch
   pi.registerCommand("reliability-status", {
     description: "Show Cheater Reliability Mode status",
     handler: async (_args: string, ctx: CommandContext) => {
-      notifyBlock(ctx, reliabilityStatus(deps.config, ctx.model?.id));
+      const base = reliabilityStatus(deps.config, ctx.model?.id);
+      // Local-only run telemetry: what the hidden harness machinery did this run.
+      const run = activeTaskRun();
+      const runLines = run
+        ? [
+          "",
+          `active run: ${run.taskId} (phase ${run.currentPhase()}, ${run.budgetRemainingPercent()}% budget left)`,
+          `capsules: ${run.capsuleMetrics().count} built, max ~${run.capsuleMetrics().maxTokens} tokens`,
+          ...Object.entries(run.telemetrySnapshot())
+            .filter(([, count]) => count > 0)
+            .map(([key, count]) => `${key}: ${count}`)
+        ]
+        : [];
+      notifyBlock(ctx, [base, ...runLines].join("\n"));
     }
   });
 
@@ -27,16 +40,4 @@ export function registerReliabilityCommands(pi: ExtensionAPI, deps: { config: Ch
     }
   });
 
-  pi.registerCommand("loop-report", {
-    description: "Show a mock Loop Governor report for debugging",
-    handler: async (_args: string, ctx: CommandContext) => {
-      const governor = new LoopGovernor(blueprintConfig(deps.config), "debug");
-      const event = governor.observeTools([
-        { kind: "read_file", value: "src/example.ts" },
-        { kind: "read_file", value: "src/example.ts" },
-        { kind: "read_file", value: "src/example.ts" }
-      ]);
-      notifyBlock(ctx, event ? JSON.stringify(event, null, 2) : "No loop event detected.");
-    }
-  });
 }

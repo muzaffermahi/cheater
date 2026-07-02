@@ -69,3 +69,6 @@ _archive/**/*.git/
 # Generated command/verification cache written by the extension at runtime
 .cheater/commands.json
 cheater-pi/.cheater/
+.cheater/experience/
+.cheater/commitlets/
+*.egg-info/

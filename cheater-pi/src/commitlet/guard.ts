@@ -102,6 +102,11 @@ function largeDeletion(diffText: string): string | undefined {
 function editedFocusedVerificationTarget(commitlet: Commitlet, touchedFiles: string[]): string | undefined {
   if (commitlet.healthBudget.allowTestEdits) return undefined;
   const commands = commitlet.focusedVerification.map((step) => step.command ?? "").filter(Boolean);
-  const edited = touchedFiles.find((file) => commands.some((command) => command.includes(file)));
+  // Only TEST files named in the verification command are protected (the gate above is
+  // allowTestEdits: the rule exists so the model cannot edit the test it is graded by).
+  // A source file that appears in the command - e.g. verification is "node app.js" and the
+  // commitlet's whole job is fixing app.js - must stay editable, otherwise every
+  // repro-command commitlet false-blocks its own edit.
+  const edited = touchedFiles.find((file) => isTestFile(file) && commands.some((command) => command.includes(file)));
   return edited ? `Focused verification target was edited without permission: ${edited}` : undefined;
 }

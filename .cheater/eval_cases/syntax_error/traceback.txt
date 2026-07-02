@@ -1,4 +1,0 @@
-  File "cheater/localizer.py", line 42
-    def foo(x, y
-              ^
-SyntaxError: invalid syntax

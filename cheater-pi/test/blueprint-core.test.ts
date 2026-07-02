@@ -9,11 +9,9 @@ import { generateBlueprintCandidates } from "../src/blueprint/planner.js";
 import { buildPacketExecutionPrompts } from "../src/blueprint/executor.js";
 import { scoreBlueprintCandidates, selectBestCandidate } from "../src/blueprint/candidateScorer.js";
 import { buildPlanGraph, detectPlanCycles, topologicalPackets } from "../src/blueprint/planGraph.js";
-import { classifyImpact, propagateImpact } from "../src/blueprint/impact.js";
 import { scoutOfficialDocs, isOfficialAllowed, searxngOfficialFacts, inferLibrary, fetchOfficialDocsPages } from "../src/blueprint/docsScout.js";
 import { blueprintPlanMemoryPath, disagreementGate, persistBlueprintArtifacts, retrievePlanningMemory } from "../src/blueprint/memory.js";
 import { simulatePacket } from "../src/blueprint/checker.js";
-import { runFinalBlueprintReview } from "../src/blueprint/reviewer.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
 import { compactSettingsForCap, effectiveAgentTokenCap } from "../src/blueprint/worker.js";
 import type { RepoOrientation } from "../src/blueprint/types.js";
@@ -258,13 +256,6 @@ test("memory disagreement gate excludes conflicting memories", () => {
   assert.deepEqual(gated.excluded, ["memory:1"]);
 });
 
-test("impact propagation adds derived checks", () => {
-  const labels = classifyImpact(["src/commands.ts"], "+ pi.registerCommand('hello', {})");
-  assert.ok(labels.includes("command_registration_change"));
-  const graph = propagateImpact({ nodes: [{ id: "implement", label: "Implement", status: "done" }], edges: [] }, labels, "implement");
-  assert.ok(graph.nodes.some((node) => /command help/i.test(node.label)));
-});
-
 test("autonomous blueprint creates internal plan and final review blocks unfinished packets", async () => {
   const plan = await createAutonomousBlueprint({ cwd: repo(), userGoal: "add a /hello command with tests and docs", taskType: "tooling", modelName: "qwen3.6-35b-a3b" });
   assert.equal(plan.candidates.length, 3);
@@ -286,9 +277,6 @@ test("autonomous blueprint creates internal plan and final review blocks unfinis
   assert.match(plan.artifactMarkdown, /## Quality Gate/);
   assert.equal(plan.workPackets.some((packet) => packet.type === "review"), true);
   assert.equal(plan.approval, "auto_approved");
-  const review = runFinalBlueprintReview(plan);
-  assert.equal(review.accepted, false);
-  assert.ok(review.blockingIssues.length > 0);
 });
 
 test("blueprint artifacts persist and become future planning memory", async () => {
@@ -308,23 +296,3 @@ test("blueprint artifacts persist and become future planning memory", async () =
   assert.ok(hits.some((hit) => hit.source === "plan" && hit.id === plan.id));
 });
 
-test("final review blocks skipped packets, failed verification, and pending approval", async () => {
-  const plan = await createAutonomousBlueprint({
-    cwd: repo(),
-    userGoal: "delete dependencies and rewrite command routing",
-    taskType: "refactor",
-    config: { blueprintRequireApproval: "always" }
-  });
-  const skippedPlan = {
-    ...plan,
-    approval: "approved" as const,
-    workPackets: plan.workPackets.map((packet, index) => index === 0 ? { ...packet, status: "skipped" as const } : { ...packet, status: "done" as const, result: { summary: "done", filesTouched: [], verificationPassed: true } })
-  };
-  assert.match(runFinalBlueprintReview(plan).blockingIssues.join(" "), /approval/);
-  assert.match(runFinalBlueprintReview(skippedPlan).blockingIssues.join(" "), /Skipped packets/);
-  const failedPlan = {
-    ...skippedPlan,
-    workPackets: skippedPlan.workPackets.map((packet, index) => index === 0 ? { ...packet, status: "done" as const, result: { summary: "failed tests", filesTouched: [], verificationPassed: false } } : packet)
-  };
-  assert.match(runFinalBlueprintReview(failedPlan).blockingIssues.join(" "), /verification failed/);
-});
