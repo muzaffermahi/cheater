@@ -11,6 +11,27 @@ export function formatCommitletPlan(plan: CommitletPlan): string {
   ].join("\n");
 }
 
+/**
+ * Focus chain (ported from Cline's task_progress checklist, harness-derived): a compact
+ * checklist of the WHOLE plan with per-item status, re-shown at every flow touchpoint
+ * (each commitlet handoff, after compaction, in finish-gate nudges). Cline makes the model
+ * maintain this list itself; Cheater's harness already knows the plan and statuses, so the
+ * checklist is ground truth and costs the model zero bookkeeping. Keeping the full arc in
+ * view is what stops a small model from finishing item 2 of 6 and declaring victory.
+ */
+export function formatPlanChecklist(plan: CommitletPlan | null): string {
+  if (!plan || !plan.commitlets.length) return "";
+  const mark = (status: string) => status === "passed" || status === "repaired" || status === "skipped" ? "[x]"
+    : status === "running" ? "[>]"
+    : status === "failed" || status === "reverted" ? "[!]"
+    : "[ ]";
+  const done = plan.commitlets.filter((c) => ["passed", "repaired", "skipped"].includes(c.status)).length;
+  return [
+    `Task progress (${done}/${plan.commitlets.length}):`,
+    ...plan.commitlets.map((c) => `${mark(c.status)} ${c.title}${c.status === "running" ? "  <- current" : ""}`)
+  ].join("\n");
+}
+
 export function formatCommitletStatus(plan: CommitletPlan | null): string {
   if (!plan) return "No active Cheater commitlet plan.";
   const current = plan.commitlets[plan.currentIndex] ?? plan.commitlets.at(-1);

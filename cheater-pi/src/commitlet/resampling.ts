@@ -18,6 +18,7 @@
 //
 // commitletCandidateSamples=1 (the default) is exactly today's single-attempt behavior.
 
+import { spawnSync } from "node:child_process";
 import { readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { runDiffGuard } from "./guard.js";
@@ -64,6 +65,40 @@ export interface ResampleOutcome {
 
 function editableFiles(commitlet: Commitlet): string[] {
   return commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/"));
+}
+
+/** Untracked (gitignore-honored) files right now, or null when not a git repo. */
+function untrackedFiles(cwd: string): Set<string> | null {
+  try {
+    const r = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd, encoding: "utf8", windowsHide: true });
+    if (r.status !== 0) return null;
+    return new Set((r.stdout ?? "").split(/\r?\n/).filter(Boolean).map((f) => f.replace(/\\/g, "/")));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Workspace-checkpoint hygiene (the targeted port of Cline's full-workspace checkpoints):
+ * the allowed-files snapshot restores in-scope files, but a rogue attempt can CREATE stray
+ * files outside its scope (helper scripts, debug dumps), and those used to survive reverts
+ * and leak into later attempts and the final result. Delete any file that is untracked NOW,
+ * was not untracked at the attempt baseline, and is not in the commitlet's allowed files.
+ */
+function removeStrayFiles(cwd: string, baseline: Set<string> | null, commitlet: Commitlet): string[] {
+  if (!baseline) return [];
+  const now = untrackedFiles(cwd);
+  if (!now) return [];
+  const allowed = new Set(editableFiles(commitlet).map((f) => f.replace(/\\/g, "/")));
+  const removed: string[] = [];
+  for (const file of now) {
+    if (baseline.has(file) || allowed.has(file)) continue;
+    try {
+      rmSync(join(cwd, file), { force: true });
+      removed.push(file);
+    } catch { /* best-effort */ }
+  }
+  return removed;
 }
 
 /**
@@ -163,6 +198,7 @@ export async function runResampledWorker(
   const samples = canResample ? requested : 1;
   const attempts: CandidateAttempt[] = [];
   const files = commitlet.allowedFiles.filter((file) => !file.startsWith("(")).join(", ") || "(inspect)";
+  const untrackedBaseline = untrackedFiles(plan.repoRoot);
 
   for (let i = 0; i < samples; i += 1) {
     const startedAt = Date.now();
@@ -202,6 +238,8 @@ export async function runResampledWorker(
     onProgress?.(`attempt ${attempt.index} did not pass (${score.summary.slice(0, 100)})${i < samples - 1 ? "; reverting and resampling fresh" : ""}`);
     if (i < samples - 1) {
       revertRollbackPoint(plan.repoRoot, commitlet);
+      const strays = removeStrayFiles(plan.repoRoot, untrackedBaseline, commitlet);
+      if (strays.length) onProgress?.(`removed ${strays.length} stray out-of-scope file(s) from the failed attempt: ${strays.slice(0, 4).join(", ")}`);
     }
   }
 
@@ -215,6 +253,8 @@ export async function runResampledWorker(
     revertRollbackPoint(plan.repoRoot, commitlet);
     applyCandidate(plan.repoRoot, best.snapshot);
   }
+  // The applied best candidate must not carry another attempt's (or its own) stray files.
+  removeStrayFiles(plan.repoRoot, untrackedBaseline, commitlet);
   return {
     workerResult: best.workerResult,
     attemptsRun: attempts.length,

@@ -13,7 +13,7 @@ import { runDiffGuard, countDiffLines } from "./guard.js";
 import { scorePatchHealth } from "./health.js";
 import { auditTestChanges } from "./testAudit.js";
 import { runCommitletFinalReview } from "./reviewer.js";
-import { formatCommitletFinalReview, formatCommitletPlan, formatGuardHealthAudit } from "./ui.js";
+import { formatCommitletFinalReview, formatCommitletPlan, formatGuardHealthAudit, formatPlanChecklist } from "./ui.js";
 import { telemetryFromPlan, writeTelemetry } from "./telemetry.js";
 import { cleanupOldRollbackSnapshots, listRollbackSnapshotFiles, revertRollbackPoint } from "./rollback.js";
 import { runFocusedVerification } from "./verification.js";
@@ -511,6 +511,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
 
       return textResult([
         ...(gradeReport ? [gradeReport, ""] : []),
+        formatPlanChecklist(updated),
         `Running commitlet ${index + 1}/${updated.commitlets.length}: ${prepared.title}`,
         `Allowed files: ${prepared.allowedFiles.join(", ") || "(inspect only)"}`,
         `Rollback: ${prepared.rollbackPoint?.id}`,

@@ -101,7 +101,11 @@ export function createCheaterLineEditTool() {
         return textResult(`line edit refused: range ${startLine}-${endLine} exceeds file length ${lines.length}`, { ok: false });
       }
       const before = lines.slice(startLine - 1, endLine).join(newline);
-      if (params.expectedText && !before.includes(params.expectedText)) {
+      // Whitespace-tolerant staleness check (Cline-style): a small model reproduces the
+      // expected text with drifted indentation/trailing spaces; that must not fail the
+      // guard. Collapsed-whitespace containment still catches genuinely stale ranges.
+      const normalize = (text: string) => text.replace(/\s+/g, " ").trim();
+      if (params.expectedText && !before.includes(params.expectedText) && !normalize(before).includes(normalize(params.expectedText))) {
         return textResult("line edit refused: expectedText was not found in the selected range", {
           ok: false,
           selected: before.slice(0, 500)

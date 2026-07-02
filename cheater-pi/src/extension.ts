@@ -19,10 +19,12 @@ import { registerReliabilityCommands } from "./reliability/commands.js";
 import { registerCommitletCommands } from "./commitlet/commands.js";
 import { registerCommitletTools } from "./commitlet/tools.js";
 import { defaultCommitletState } from "./commitlet/state.js";
+import { formatPlanChecklist } from "./commitlet/ui.js";
 import { liveSessionState } from "./reliability/sessionState.js";
 import { ledgerAllowsFinish } from "./reliability/lifecycle.js";
 import { loadProjectCommands } from "./reliability/projectCommands.js";
 import { checkFileSyntax } from "./reliability/diagnostics.js";
+import { editRescueNotice } from "./reliability/editMatch.js";
 import { checkImports } from "./reliability/importGate.js";
 import { compressFailureOutput } from "./reliability/failureCompressor.js";
 import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
@@ -99,12 +101,15 @@ function buildWorkingSetCapsule(): string | null {
   if (!ledger && !plan) return null;
   const s = ledger?.get();
   const running = plan?.commitlets.find((c) => c.status === "running" || c.status === "pending");
-  const done = plan ? plan.commitlets.filter((c) => ["passed", "skipped", "repaired"].includes(c.status)).length : 0;
   const lastV = s?.verification.at(-1);
   return [
     "Cheater working set (restated so it survives compaction):",
     s?.userGoal ? `goal: ${s.userGoal}` : "",
-    plan ? `plan: commitlet ${done}/${plan.commitlets.length}${running ? `; next: ${running.title} (edit only: ${running.allowedFiles.join(", ")})` : ""}` : "",
+    // The full focus-chain checklist, not just a counter: after compaction this is often
+    // the ONLY place the remaining work is spelled out, and a small model that can't see
+    // items 4-6 will finish item 3 and declare the task done.
+    formatPlanChecklist(plan),
+    running ? `current: ${running.title} (edit only: ${running.allowedFiles.join(", ")})` : "",
     s?.changedFiles.length ? `files touched: ${s.changedFiles.slice(0, 6).join(", ")}` : "",
     lastV ? `last verification: ${lastV.stage} ${lastV.status}` : "",
     "Continue the active plan; do not restart planning."
@@ -297,6 +302,25 @@ function gitStatusLine(cwd: string): string {
  * commands. Eliminates whole failure classes for a small local model - wrong-shell command
  * generation on Windows and rediscovering "how do I run tests here" every session.
  */
+/**
+ * Project rule files (Cline's .clinerules, plus Cheater's own location): user-authored,
+ * project-local instructions that ride into every session's system prompt. Bounded hard -
+ * rules are constraints, not documentation dumps.
+ */
+export function projectRules(cwd: string): string {
+  for (const rel of [".cheater/rules.md", ".clinerules", ".clinerules.md"]) {
+    try {
+      const abs = join(cwd, rel);
+      if (!existsSync(abs) || !statSync(abs).isFile()) continue;
+      const text = readFileSync(abs, "utf8").trim();
+      if (!text) continue;
+      const clipped = text.length <= 1500 ? text : `${text.slice(0, 1500)}\n... [rules truncated]`;
+      return `## Project rules (${rel})\n${clipped}`;
+    } catch { /* unreadable rules must not break startup */ }
+  }
+  return "";
+}
+
 function buildEnvBlock(cwd: string): string {
   const cmds = loadProjectCommands(cwd);
   const lines: string[] = ["## Environment"];
@@ -315,6 +339,8 @@ function buildEnvBlock(cwd: string): string {
   ].filter(Boolean);
   if (cmdParts.length) lines.push(`project commands: ${cmdParts.join("; ")}`);
   lines.push(`package manager: ${cmds.packageManager}${cmds.framework ? `, framework ${cmds.framework}` : ""}`);
+  const rules = projectRules(cwd);
+  if (rules) lines.push("", rules);
   return lines.join("\n");
 }
 
@@ -610,18 +636,22 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       toolName: event.toolName,
       path: path || undefined,
       query: query || undefined,
-      command: command || undefined
+      command: command || undefined,
+      input: event.input
     }, config);
     for (const evt of events) {
       // Non-terminal warnings are delivered in-band on the tool's own result text; notifying
       // here as well injected a chat line MID-STREAM on every flagged tool call (Pi's notify
-      // appends to the chat container), which forcibly jumped the terminal viewport.
+      // appends to the chat container), which forcibly jumped the viewport.
       if (evt.terminal) {
+        // Graceful-stop semantics (ported from Cline): a hard stop must tell the model AND
+        // the user that nothing is lost and exactly how to resume.
+        const preserved = "Session state is preserved: the plan, rollback snapshots, and ledger are intact. Send a new instruction to resume, or /commitlet-revert to roll back.";
         ctx.ui.notify?.(evt.message, "error");
-        ctx.ui.setWidget?.("cheater-lifecycle", [evt.message, "Cheater blocked this action because the session is stalled. Stop and report the blocker."], { placement: "aboveEditor" });
+        ctx.ui.setWidget?.("cheater-lifecycle", [evt.message, preserved], { placement: "aboveEditor" });
         return {
           block: true,
-          reason: evt.message
+          reason: `${evt.message} ${preserved}`
         };
       }
     }
@@ -632,6 +662,30 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const warning = liveSessionState.consumeLoopWarning(event.toolCallId);
     let extraNotice = "";
     if (warning) extraNotice += `\n\n[${warning.message}]`;
+
+    // Edit-failure rescue (ported from Cline's replace_in_file fallback matchers): a small
+    // model's #1 edit failure is oldText that differs from disk only by whitespace or a
+    // hazy middle line. Instead of letting it retry blind, locate the line-trimmed or
+    // block-anchor near-match and hand back the EXACT on-disk text to retry with.
+    if (EDIT_TOOLS.has(event.toolName) && event.isError === true) {
+      const editedPath = extractPath(event.input);
+      const searches: string[] = [
+        ...(Array.isArray((event.input as any)?.edits) ? (event.input as any).edits.map((e: any) => String(e?.oldText ?? "")) : []),
+        ...(typeof (event.input as any)?.expectedText === "string" ? [(event.input as any).expectedText] : [])
+      ].filter(Boolean);
+      if (editedPath && searches.length) {
+        try {
+          const abs = resolve(ctx.cwd, editedPath);
+          if (existsSync(abs)) {
+            const content = readFileSync(abs, "utf8");
+            for (const search of searches) {
+              const rescue = editRescueNotice(content, search);
+              if (rescue) { extraNotice += `\n\n[${rescue}]`; break; }
+            }
+          }
+        } catch { /* rescue is best-effort; the original error still stands */ }
+      }
+    }
 
     // Post-edit gates: after a successful edit, run the cheapest per-file checks and surface
     // problems in-band on the edit's own result so the model fixes them now instead of
@@ -726,11 +780,14 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       content: [
         "Cheater Finish Gate: this task is not verified yet.",
         `reason: ${verdict.reason}`,
+        // Show the remaining work, not just "not verified": a small model that stopped
+        // early usually stopped because it lost sight of the unfinished checklist items.
+        formatPlanChecklist(defaultCommitletState.get().currentPlan),
         "Before telling the user this is done, do exactly one of the following:",
         "- call cheater_verification_run to collect verification evidence, then cheater_finish_gate to confirm,",
         "- fix the specific failure named above and re-run verification,",
         "- or state explicitly that verification was skipped/blocked and why."
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       display: true
     }, { deliverAs: "followUp" });
   });

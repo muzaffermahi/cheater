@@ -295,6 +295,23 @@ a Pi wrapper while adding deterministic guardrails around Pi:
   automatically when `autoCleanupLowRiskHealthIssues` is enabled.
 * Test Quality Auditor catches removed assertions, skipped tests, weak/mock-only
   tests, and unexplained golden-output changes.
+* Edit Rescue (ported from Cline's replace_in_file matchers): when an exact-match
+  edit fails, the harness finds the line-trimmed or block-anchor near-match and
+  hands back the exact on-disk text to retry with - the #1 small-model edit
+  failure becomes a one-step recovery. cheater_line_edit's staleness check is
+  whitespace-tolerant for the same reason.
+* Focus Chain (ported from Cline's task_progress): a harness-derived checklist of
+  the whole plan ([x]/[>]/[ ]/[!] per commitlet) is re-shown at every commitlet
+  handoff, after compaction, and in finish-gate nudges - so a small model never
+  finishes item 2 of 6 and declares victory.
+* Identical-call guard (ported from Cline): the exact same tool with the exact
+  same canonicalized args warns in-band on the 3rd consecutive call and blocks on
+  the 6th; hard stops use preserved-state semantics ("plan, rollbacks, and ledger
+  are intact - send a new instruction to resume").
+* Project rules: `.cheater/rules.md` or `.clinerules` (bounded) ride into every
+  session's environment block.
+* Stray-file hygiene: files a failed resample attempt creates OUTSIDE its allowed
+  scope are removed between attempts and before applying the winner (git repos).
 * Import Gate checks every successful edit's imports (repo files resolve,
   named symbols are actually exported, npm packages are installed) and
   reports problems in-band on the edit's own result - the single most common
