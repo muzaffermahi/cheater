@@ -126,6 +126,29 @@ export function effectiveAgentTokenCap(config: CheaterConfig = {}, modelContextW
   return Math.max(1024, Math.min(100000, Math.max(8000, configured), Math.max(8000, blueprintCap), modelCap));
 }
 
+/**
+ * Context budget for the MAIN interactive session (planner/orchestrator), which is a
+ * completely different thing from a fresh worker's per-file packet budget. A worker is
+ * deliberately kept tiny (one file, ~12k) so it stays focused; the main session has to hold
+ * the whole conversation, the plan, the spec, and progress, and must breathe up to the
+ * model's real context window. Capping it at the worker budget (the old bug) made a 100k-ctx
+ * model believe it had 12k tokens and panic about "sharing components to save budget".
+ *
+ * Default: 90% of the model's real context window (leaving room for the reply). Only shrink
+ * below that if the user explicitly sets maxSessionContextTokens. Falls back to a generous
+ * 100k when the window is unknown.
+ */
+export function mainSessionContextCap(config: CheaterConfig = {}, modelContextWindow?: number): number {
+  const window = modelContextWindow && modelContextWindow > 0 ? Math.trunc(modelContextWindow) : undefined;
+  const roomy = window ? Math.floor(window * 0.9) : 100000;
+  const requested = config.maxSessionContextTokens;
+  if (typeof requested === "number" && requested > 0) {
+    // An explicit user cap is honored but never allowed to exceed the real window.
+    return window ? Math.min(requested, window) : requested;
+  }
+  return roomy;
+}
+
 export function contextCompactRatio(config: CheaterConfig = {}): number {
   const ratio = Number(config.contextCompactRatio ?? 0.85);
   if (!Number.isFinite(ratio)) return 0.85;
@@ -147,8 +170,18 @@ export function compactSettingsForCap(contextWindow: number | undefined, cap: nu
   };
 }
 
-function workerPrompt(plan: BlueprintPlan, packet: WorkPacket, prompt: string, cap: number, sentinel: string): string {
+// The worker's tool allowlist. `write` is NOT optional: a from-scratch packet's primary
+// operation is creating a new file, Pi's `edit` errors ENOENT on missing files, and
+// cheater_line_edit requires an existing file. A worker without `write` gets cornered into
+// bash heredocs / node -e one-liners, whose quoting explodes on Windows Git Bash - observed
+// live as a 29k-token retry loop that hung the whole flow.
+export const WORKER_TOOLS = ["read", "write", "edit", "bash", "grep", "find", "ls", "cheater_line_edit"];
+
+export function workerPrompt(plan: BlueprintPlan, packet: WorkPacket, prompt: string, cap: number, sentinel: string): string {
   const files = packet.filesToTouch.map((file) => file.path).join(", ") || "(none)";
+  const platformNote = process.platform === "win32"
+    ? "- Platform: Windows; the bash tool is Git Bash. Quoting is fragile here - avoid heredocs and multi-line inline scripts entirely."
+    : "";
   return [
     "CHEATER FRESH WORKER SESSION",
     "",
@@ -162,17 +195,18 @@ function workerPrompt(plan: BlueprintPlan, packet: WorkPacket, prompt: string, c
     "Rules:",
     "- You are the code-changing worker, not the planner.",
     "- Execute only this one packet, then stop. You are not allowed to roll into the next file.",
-    "- Do not call cheater_blueprint_create, cheater_blueprint_next_packet, or cheater_blueprint_execute_as_pi_prompts.",
+    "- To CREATE a new file, use the write tool (path + full content) in ONE call. Never create files via bash heredocs, echo, cat, or node -e: shell quoting will corrupt the content.",
+    "- For existing files, read the exact target lines and use cheater_line_edit or the smallest Pi edit.",
+    platformNote,
     "- If this packet touches a file, do not inspect or edit unrelated sibling templates/styles/source files.",
     "- If another file seems necessary, stop with BLOCKED_NEXT_FILE instead of editing it; the planner will summon a new fresh worker.",
-    "- For existing files, read the exact target lines and use cheater_line_edit or the smallest Pi edit.",
     "- Do not rewrite an entire existing template, stylesheet, or source file unless the packet explicitly requires full replacement.",
-    "- If context pressure approaches the cap, compact once. If still pressured, stop with a compact handoff summary.",
+    "- If a tool fails twice the same way, STOP and report the blocker in your summary instead of trying variations.",
     "- End with PACKET_RESULT, SUMMARY, FILES_TOUCHED, and VERIFY lines.",
     `- Your final assistant message must end with exactly this required packet end sentinel: ${sentinel}`,
     "",
     prompt
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function packetSessionId(packet: WorkPacket): string {
@@ -230,7 +264,7 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
           cwd,
           sessionManager,
           settingsManager,
-          tools: ["read", "edit", "bash", "grep", "find", "ls", "cheater_line_edit"],
+          tools: WORKER_TOOLS,
           customTools: [createCheaterLineEditTool()],
           // Inherit the parent session's model so a worker never silently runs on whatever
           // global default happens to be configured instead of the model the user picked.
@@ -259,6 +293,16 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
           error: "worker_backend_unavailable"
         };
       }
+      // Wall-clock guard: on a slow local backend a wedged worker (e.g. a tool-retry loop)
+      // used to hang the calling tool - and the whole main session - indefinitely with zero
+      // feedback. When the deadline passes we abort the worker session and return a
+      // structured failure the commitlet layer can degrade from.
+      const timeoutMs = Math.max(60_000, config.commitletWorkerTimeoutMs ?? 10 * 60_000);
+      let timedOut = false;
+      const deadline = setTimeout(() => {
+        timedOut = true;
+        try { session.abort?.(); } catch { /* best-effort */ }
+      }, timeoutMs);
       try {
         const contextWindow = session.model?.contextWindow;
         const effectiveCap = effectiveAgentTokenCap(config, contextWindow);
@@ -272,6 +316,15 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
         session.setSessionName(`Cheater worker ${packet.id}`);
         await session.prompt(workerPrompt(plan, packet, prompt, effectiveCap, requiredSentinel), { source: "extension" });
         let assistantText = session.getLastAssistantText();
+        if (timedOut) {
+          return {
+            ok: false,
+            summary: `Worker for ${packet.id} exceeded the ${Math.round(timeoutMs / 60000)}m wall-clock limit and was aborted. Last output: ${compactText(assistantText, "(none)")}`,
+            error: "worker_timeout",
+            sessionId: session.sessionId,
+            sessionFile: session.sessionFile
+          };
+        }
         if (!hasEndingSentinel(assistantText, requiredSentinel)) {
           await session.prompt(repairMissingSentinelPrompt(assistantText ?? "", requiredSentinel), { source: "extension" });
           assistantText = session.getLastAssistantText();
@@ -294,6 +347,15 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
         };
       } catch (err) {
         const message = (err as Error).message;
+        if (timedOut) {
+          return {
+            ok: false,
+            summary: `Worker for ${packet.id} exceeded the ${Math.round(timeoutMs / 60000)}m wall-clock limit and was aborted.`,
+            error: "worker_timeout",
+            sessionId: session.sessionId,
+            sessionFile: session.sessionFile
+          };
+        }
         // "No model selected" / "No API key" at prompt time proves the BACKEND is broken,
         // not the packet: latch it (so heuristic defaults degrade instantly) and return the
         // structured error the commitlet layer already degrades from.
@@ -315,6 +377,7 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
           sessionFile: session.sessionFile
         };
       } finally {
+        clearTimeout(deadline);
         session.dispose();
       }
     });

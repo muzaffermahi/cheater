@@ -1,3 +1,4 @@
+import { HIGH_RISK_INTENT } from "./classifier.js";
 import type { AutopilotDecision, ExecutionDiscipline, ExecutionMode, RoutePolicyInput } from "./types.js";
 
 export function decideExecutionMode(input: RoutePolicyInput): Omit<AutopilotDecision, "userVisibleSummary"> {
@@ -43,7 +44,12 @@ export function decideExecutionMode(input: RoutePolicyInput): Omit<AutopilotDeci
 
 function decideExecutionDiscipline(mode: ExecutionMode, input: RoutePolicyInput, failureEscalation?: boolean): ExecutionDiscipline {
   if (mode === "answer_only") return "none";
-  if (input.risk === "high" && /\b(lockfile|package-lock|dependency|dependencies|delete|remove file|destructive)\b/i.test(input.message)) {
+  // Autonomy is the default: Cheater runs one prompt to completion. The approval block only
+  // fires when the user OPTS IN via requireApprovalForHighRisk, and even then destructive
+  // INTENT is required (shared definition with the classifier) and an explicit approval
+  // clears it. Without opt-in, high-risk work still routes to a careful mode below - it just
+  // never stops to ask.
+  if (input.requireApproval && input.risk === "high" && !input.repoHints?.userApprovedHighRisk && HIGH_RISK_INTENT.test(input.message)) {
     return "blocked_needs_user";
   }
   if (mode === "blueprint_orchestrator") return "blueprint_backed_commitlet_chain";

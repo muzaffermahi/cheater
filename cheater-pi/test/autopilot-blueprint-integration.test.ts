@@ -7,6 +7,7 @@ import cheaterExtension from "../src/extension.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { registerBlueprintTools } from "../src/blueprint/tools.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
+import { noteWorkerBackend, resetWorkerBackendLatch } from "../src/blueprint/worker.js";
 import { registerMissionTools } from "../src/mission/tools.js";
 import { inMemoryMissionStore } from "../src/mission/store.js";
 
@@ -329,7 +330,7 @@ test("blueprint next packet stops after cancelled or failed state", async () => 
   assert.match(cancelled.content[0].text, /cancelled/);
 });
 
-test("blueprint planner blocks file tools after plan creation", async () => {
+test("planner file-tool block fires only when real fresh workers can actually spawn", async () => {
   const { pi, tools, events } = makePi();
   cheaterExtension(pi);
   const context = ctx();
@@ -340,9 +341,19 @@ test("blueprint planner blocks file tools after plan creation", async () => {
     undefined,
     context
   );
-  const result = await events.get("tool_call")({ type: "tool_call", toolCallId: "read-1", toolName: "read", input: { path: "templates/about.html" } }, context);
-  assert.equal(result.block, true);
-  assert.match(result.reason, /fresh worker LLM session/);
+
+  // Local backend that cannot spawn sub-sessions: the main session IS the worker, so its
+  // file tools must NOT be blocked (blocking them would deadlock every complex task).
+  resetWorkerBackendLatch();
+  const notBlocked = await events.get("tool_call")({ type: "tool_call", toolCallId: "read-0", toolName: "read", input: { path: "templates/about.html" } }, context);
+  assert.notEqual(notBlocked?.block, true, "no verified worker backend means the main session must be allowed to edit");
+
+  // Verified worker backend: planner/worker isolation is real and enforced.
+  noteWorkerBackend(true);
+  const blocked = await events.get("tool_call")({ type: "tool_call", toolCallId: "read-1", toolName: "read", input: { path: "templates/about.html" } }, context);
+  assert.equal(blocked.block, true);
+  assert.match(blocked.reason, /fresh worker/);
+  resetWorkerBackendLatch();
 });
 
 test("blueprint-force avoids same-session packet prompt blasting", async () => {
@@ -399,10 +410,12 @@ test("normal interactive input triggers router lifecycle hook via the real Pi in
   // Header diet: model sees the goal first, then imperative directives only - routing
   // telemetry (mode/discipline/confidence) lives in the TUI widget, not the model message.
   assert.match(result.text, /User request: add a \/hello command/);
-  assert.match(result.text, /Cheater plan/);
-  assert.match(result.text, /planner only/i);
+  assert.match(result.text, /Cheater flow/);
   assert.match(result.text, /cheater_reliability_start/);
   assert.match(result.text, /cheater_commitlet_next/);
+  // The instruction no longer claims "planner only, do not edit" - that deadlocked complex
+  // tasks on local backends that cannot spawn sub-sessions (the model IS the worker there).
+  assert.doesNotMatch(result.text, /planner only/i);
   assert.doesNotMatch(result.text, /confidence:|executionDiscipline/);
 });
 

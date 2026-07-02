@@ -10,7 +10,7 @@ import { formatAutopilotDecision } from "./autopilot/ui.js";
 import { registerBlueprintCommands } from "./blueprint/commands.js";
 import { registerBlueprintTools } from "./blueprint/tools.js";
 import { defaultBlueprintState } from "./blueprint/state.js";
-import { compactThresholdTokens, effectiveAgentTokenCap, isBlueprintWorkerSession } from "./blueprint/worker.js";
+import { contextCompactRatio, isBlueprintWorkerSession, mainSessionContextCap, workerBackendState } from "./blueprint/worker.js";
 import { defaultMissionStore } from "./mission/store.js";
 import { registerMissionCommands } from "./mission/commands.js";
 import { registerMissionTools } from "./mission/tools.js";
@@ -50,7 +50,12 @@ const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 // adds redundant tool-choice ambiguity for a weak model. Blueprint tools are deliberately in
 // no mode: blueprint planning runs INSIDE cheater_reliability_start, not via model calls.
 export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", string[]> = {
-  answer_only: ["cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
+  // cheater_reliability_start stays visible even in answer_only: routing is heuristic and
+  // sometimes wrong, and a misroute must NEVER hard-lock the model out of starting the flow.
+  // (Observed live: "proceed" after an approval question routed answer_only, masked the
+  // planner tool away, and the model - narrating "launching the planner now" - could only
+  // emit bug_memory_search five times in a row. The mask is guidance, not a cage.)
+  answer_only: ["cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
   planner: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
   execute: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
@@ -313,14 +318,14 @@ function buildEnvBlock(cwd: string): string {
   return lines.join("\n");
 }
 
-function cheaterCapPrompt(cap: number, threshold: number): string {
-  return [
-    `CHEATER HARD SESSION CAP: keep this LLM session under ${cap} context tokens.`,
-    `When estimated context reaches ${threshold} tokens, compact immediately or stop with a compact handoff.`,
-    "In blueprint_orchestrator mode, the current session is the planner only: it must not read, grep, list, shell, edit, or write project files.",
-    "Use cheater_reliability_start (it plans internally), then cheater_commitlet_next after each commitlet. Each file change runs in a fresh worker session.",
-    "One file change means one worker. If a second file is needed, finish the commitlet and let cheater_commitlet_next dispatch the next fresh worker."
-  ].join("\n");
+// A soft, non-alarming context note for the MAIN session. The old version shouted "HARD
+// SESSION CAP under 12000 tokens" and unconditionally pasted blueprint-planner-only rules
+// into every session - which made a large-context model panic about budget and agonize over
+// whether it was "in blueprint_orchestrator mode" (it usually is not). Pi already
+// auto-compacts; the working-set capsule already restates the goal afterward. So this is now
+// a single quiet line, and only when the cap is meaningfully below the model's window.
+function cheaterCapPrompt(cap: number): string {
+  return `You have room to work: aim to keep this session under about ${cap} context tokens; Cheater and Pi compact automatically when needed, so do not ration your work or cut scope to save budget.`;
 }
 
 function inputRecordValue(input: Record<string, unknown> | undefined, keys: string[]): string {
@@ -373,8 +378,6 @@ function extractMessageText(message: { role?: string; content?: unknown } | unde
 
 export default function cheaterExtension(pi: ExtensionAPI) {
   const config = loadConfig();
-  const agentTokenCap = effectiveAgentTokenCap(config);
-  const defaultCompactThreshold = compactThresholdTokens(config);
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
   let gitBaseline: Map<string, string> | null = null;
@@ -469,8 +472,50 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       };
     }
 
+    // Bare acknowledgements ("proceed", "yes", "go ahead") must NEVER be re-classified: with
+    // no plan active yet they used to route as unknown -> answer_only, which masked
+    // cheater_reliability_start away and hard-locked the model out of ever starting.
+    const previous = defaultAutopilotState.get();
+    if (!looksLikeNewGoal(message) && previous.lastDecision && previous.currentGoal) {
+      // Case 1: the previous decision was blocked pending approval - the ack IS the approval.
+      // Re-route the ORIGINAL goal with the approval recorded so policy skips the block.
+      if (previous.lastDecision.executionDiscipline === "blocked_needs_user") {
+        const approved = routeAutopilot({ cwd: ctx.cwd, message: previous.currentGoal, repoHints: { userApprovedHighRisk: true } });
+        defaultAutopilotState.setDecision(previous.currentGoal, approved);
+        applyToolMask(pi, config, approved.executionMode === "answer_only" ? "answer_only" : approved.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+        ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(approved).split("\n"), { placement: "aboveEditor" });
+        liveSessionState.reset(previous.currentGoal);
+        liveSessionState.setLastUserGoal(previous.currentGoal);
+        return {
+          action: "transform",
+          text: [
+            `User request: ${message}`,
+            "",
+            `Cheater: the user just approved the previously blocked request. Original goal: ${previous.currentGoal.slice(0, 400)}`,
+            buildAutopilotInstruction(approved, previous.currentGoal)
+          ].join("\n")
+        };
+      }
+      // Case 2: any other prior code-mode decision - the ack means "go", so re-issue the
+      // prior instruction and mask instead of re-classifying the ack itself.
+      if (previous.lastDecision.executionMode !== "answer_only") {
+        const prior = previous.lastDecision;
+        applyToolMask(pi, config, prior.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+        liveSessionState.setLastUserGoal(previous.currentGoal);
+        return {
+          action: "transform",
+          text: [
+            `User request: ${message}`,
+            "",
+            `Cheater: the user confirmed the previous request. Goal: ${previous.currentGoal.slice(0, 400)}`,
+            buildAutopilotInstruction(prior, previous.currentGoal)
+          ].join("\n")
+        };
+      }
+    }
+
     const atFiles = resolveAtFiles(ctx.cwd, message);
-    const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined });
+    const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined, requireApproval: config.requireApprovalForHighRisk === true });
     defaultAutopilotState.setDecision(message, decision);
     applyToolMask(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
     ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(decision).split("\n"), { placement: "aboveEditor" });
@@ -490,7 +535,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     if (!text) return;
     const events = liveSessionState.observeAssistantText(text, config);
     for (const evt of events) {
-      ctx.ui.notify?.(evt.message, evt.terminal ? "error" : "warning");
+      // Only terminal text-loop verdicts surface as chat notifications; non-terminal ones
+      // would inject chat lines mid-stream and jump the viewport (see tool_call above).
+      if (evt.terminal) ctx.ui.notify?.(evt.message, "error");
     }
   });
 
@@ -504,21 +551,22 @@ export default function cheaterExtension(pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event: { systemPrompt: string }, ctx: any) => {
     const usage = ctx.getContextUsage?.();
-    const cap = effectiveAgentTokenCap(config, usage?.contextWindow);
-    const threshold = compactThresholdTokens(config, usage?.contextWindow);
+    // The MAIN session breathes up to (near) the model's real context window - NOT the tiny
+    // per-worker packet budget. Only compact when genuinely near that real ceiling.
+    const cap = mainSessionContextCap(config, usage?.contextWindow);
+    const threshold = Math.floor(cap * contextCompactRatio(config));
     const shouldCompact = typeof usage?.tokens === "number" && usage.tokens >= threshold;
     if (shouldCompact) {
       ctx.compact?.({
         customInstructions: [
           `Cheater session reached the ${threshold}/${cap} token compaction threshold.`,
-          "Preserve the user goal, current mode, active blueprint packet statuses, files touched, verification results, and blockers.",
+          "Preserve the user goal, current mode, active plan/packet statuses, files touched, verification results, and blockers.",
           "Drop repeated file reads, stale tool outputs, and duplicated planner narration."
         ].join(" ")
       });
-      ctx.ui.notify?.(`Cheater requested compaction at ${usage.tokens} tokens (threshold ${threshold}, cap ${cap}).`, "warning");
     }
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${buildSystemPrompt(config)}\n\n${buildEnvBlock(ctx.cwd)}\n\n${cheaterCapPrompt(cap || agentTokenCap, threshold || defaultCompactThreshold)}`,
+      systemPrompt: `${event.systemPrompt}\n\n${buildSystemPrompt(config)}\n\n${buildEnvBlock(ctx.cwd)}\n\n${cheaterCapPrompt(cap)}`,
       message: shouldCompact ? {
         customType: "cheater-context-cap",
         content: `Cheater requested compaction because this session reached ${threshold} tokens.`,
@@ -532,16 +580,23 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const commitletBlock = blockCommitletScopeViolation(event);
     if (commitletBlock) return commitletBlock;
 
-    // Planner/worker isolation is its own config flag; it must be enforced regardless of
-    // whether the loop governor is enabled (it used to be skipped by the governor's early
-    // return, so loopGovernorEnabled:false silently disabled planner file-tool blocking).
-    if (config.blueprintBlockPlannerFileTools !== false && !isBlueprintWorkerSession()) {
+    // Planner/worker isolation only makes sense when real fresh workers can actually spawn.
+    // On a local backend that can't spawn sub-sessions (the common case), reliability_start
+    // hands the packet to THIS session to execute - so blocking its file tools here would
+    // deadlock every complex task (told to edit, forbidden to touch files). The commitlet
+    // scope guard above already keeps edits inside the allowed file, so this legacy planner
+    // block is only enforced when the backend is confirmed able to run isolated workers.
+    if (
+      config.blueprintBlockPlannerFileTools !== false
+      && !isBlueprintWorkerSession()
+      && workerBackendState() === "available"
+    ) {
       const plan = defaultBlueprintState.get().currentPlan;
       const activeBlueprint = Boolean(plan && plan.workPackets.some((packet) => packet.status === "pending" || packet.status === "running"));
       if (activeBlueprint && PLANNER_BLOCKED_TOOLS.has(event.toolName)) {
         return {
           block: true,
-          reason: "Cheater blueprint planner sessions cannot use file or shell tools. Call cheater_blueprint_next_packet to spawn a fresh worker LLM session for the next packet/file change."
+          reason: "Cheater blueprint planner sessions cannot use file or shell tools. Call cheater_commitlet_next to run the next file change in a fresh worker."
         };
       }
     }
@@ -558,8 +613,11 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       command: command || undefined
     }, config);
     for (const evt of events) {
-      ctx.ui.notify?.(evt.message, evt.terminal ? "error" : "warning");
+      // Non-terminal warnings are delivered in-band on the tool's own result text; notifying
+      // here as well injected a chat line MID-STREAM on every flagged tool call (Pi's notify
+      // appends to the chat container), which forcibly jumped the terminal viewport.
       if (evt.terminal) {
+        ctx.ui.notify?.(evt.message, "error");
         ctx.ui.setWidget?.("cheater-lifecycle", [evt.message, "Cheater blocked this action because the session is stalled. Stop and report the blocker."], { placement: "aboveEditor" });
         return {
           block: true,
@@ -620,7 +678,10 @@ export default function cheaterExtension(pi: ExtensionAPI) {
         failureClass
       }, config);
       for (const evt of events) {
-        ctx.ui.notify?.(evt.message, evt.terminal ? "error" : "warning");
+        // Delivered in-band on the tool result below; a chat notification per flagged tool
+        // result injected mid-stream chat lines and jumped the viewport. Terminal verdicts
+        // still notify - the user must see a hard stop.
+        if (evt.terminal) ctx.ui.notify?.(evt.message, "error");
         extraNotice += `\n\n[${evt.message}${evt.nonProgress ? `; ${evt.nonProgress.recovery.description}` : ""}]`;
       }
     }

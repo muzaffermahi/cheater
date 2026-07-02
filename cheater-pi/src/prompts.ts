@@ -60,13 +60,14 @@ you (to user): Added the --json flag to src/export.ts; export tests pass.`;
 
 const BUG_MEMORY = `## Bug-memory lookup
 
-When you hit a failure while writing or testing code - an error, stack trace,
-failing assertion, unexpected API behavior, parser issue, or framework symptom -
-call cheater_bug_memory_search with the failing error text, test signal, and
-likely API/function names. Treat returned memories as analogies/hypotheses, not
-facts about this repo: verify each against local code, pick the smallest likely
-cause, make a small diff, and rerun the focused test. Skip weak or mismatched
-memories silently and proceed without narrating the search.`;
+The harness attaches relevant solved-bug evidence to failures automatically (the
+cheat sheet on failed verifications), so you normally never need to search
+yourself. Never search before you have a concrete failure in hand. Call
+cheater_bug_memory_search at most once, only when you are actively stuck on a
+specific error AND the failure card carried no evidence. Treat any memory as an
+analogy/hypothesis, not a fact about this repo: verify against local code, make
+the smallest diff, and rerun the focused test. Never repeat a search that
+returned nothing useful.`;
 
 /**
  * Single authoritative system prompt, assembled config-aware so the model never sees rules

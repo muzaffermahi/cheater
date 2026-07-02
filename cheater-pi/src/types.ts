@@ -18,7 +18,15 @@ export interface CheaterConfig {
   oracleRunBroadTests?: "never" | "ask" | "always";
   oracleRunAllChecks?: boolean;
   maxContextTokens?: number;
+  // Explicit ceiling for the MAIN interactive session's context (planner/orchestrator).
+  // Unset (default) means "breathe up to ~90% of the model's real context window" - do not
+  // confuse this with the tiny per-worker packet budget (maxContextTokens/blueprintMaxAgentTokens).
+  maxSessionContextTokens?: number;
   contextCompactRatio?: number;
+  // When true, a high-risk request (destructive intent) stops and asks the user before
+  // editing. Default false: Cheater is autonomous - one prompt runs to completion, and
+  // destructive intent is surfaced as a caution the model proceeds through, not a hard stop.
+  requireApprovalForHighRisk?: boolean;
   maxEvidenceItems?: number;
   maxMissionRawLogChars?: number;
   gymEnabled?: boolean;
@@ -96,6 +104,9 @@ export interface CheaterConfig {
   // otherwise. 1 (default) = today's single attempt; 2-3 recommended for small local models
   // where samples are cheap and pass@1 is weak.
   commitletCandidateSamples?: number;
+  // Wall-clock limit per fresh-worker attempt (ms). A wedged worker on a slow local backend
+  // is aborted at this deadline instead of hanging the main session forever. Default 10min.
+  commitletWorkerTimeoutMs?: number;
   // Experience store: harness-written bug memory. Cards are saved only on verified
   // fail->pass transitions and recalled in-band inside failure cards. Local-only JSONL.
   experienceStoreEnabled?: boolean;

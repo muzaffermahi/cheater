@@ -4,11 +4,15 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  effectiveAgentTokenCap,
   isBackendError,
+  mainSessionContextCap,
   noteWorkerBackend,
   probeWorkerBackend,
   resetWorkerBackendLatch,
   workerBackendState,
+  workerPrompt,
+  WORKER_TOOLS,
   type FreshAgentPacketRunner
 } from "../src/blueprint/worker.js";
 import { wantsRealWorker } from "../src/commitlet/tools.js";
@@ -55,6 +59,72 @@ function makePlan(cwd: string, commitlet: Commitlet): CommitletPlan {
     globalConstraints: []
   } as unknown as CommitletPlan;
 }
+
+// --- workers can actually create files, and the terminal narrates -------------------------
+
+test("fresh workers have the write tool - a from-scratch packet's primary operation", () => {
+  // Without `write`, a worker asked to CREATE a file gets cornered into bash heredocs /
+  // node -e (Pi's edit errors ENOENT on new files; cheater_line_edit needs an existing
+  // file), whose quoting explodes on Windows Git Bash. Observed live as a 29k-token retry
+  // loop that hung the whole session.
+  assert.ok(WORKER_TOOLS.includes("write"));
+  assert.ok(WORKER_TOOLS.includes("read"));
+  assert.ok(WORKER_TOOLS.includes("edit"));
+  assert.ok(WORKER_TOOLS.includes("cheater_line_edit"));
+});
+
+test("the worker prompt commands write-for-new-files and forbids heredoc file creation", () => {
+  const packet: any = {
+    id: "p1", title: "create src/commands.ts", type: "implement", status: "pending", dependsOn: [],
+    estimatedModelCalls: 1, maxModelCalls: 1,
+    filesToInspect: [], filesToTouch: [{ path: "src/commands.ts", reason: "create" }],
+    allowedTools: [], forbiddenActions: [], promptContract: "", acceptanceCriteria: [],
+    verification: [], simulationChecks: [], risk: "low"
+  };
+  const plan: any = { userGoal: "build the app", workPackets: [packet] };
+  const prompt = workerPrompt(plan, packet, "packet body", 12000, "@@END_PATCH@@");
+  assert.match(prompt, /use the write tool \(path \+ full content\) in ONE call/i);
+  assert.match(prompt, /Never create files via bash heredocs, echo, cat, or node -e/);
+  assert.match(prompt, /If a tool fails twice the same way, STOP/);
+});
+
+test("resampling narrates progress: attempt start, finish with duration, verdict", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const plan = makePlan(cwd, commitlet);
+  const progress: string[] = [];
+  const runner: FreshAgentPacketRunner = {
+    async runPacket() {
+      writeFileSync(join(cwd, "target.txt"), "good\n", "utf8");
+      return { ok: true, summary: "edited" };
+    }
+  };
+  await runResampledWorker(plan, commitlet, { commitletCandidateSamples: 2 }, runner, undefined, (message) => progress.push(message));
+  assert.ok(progress.some((m) => /worker attempt 1\/2 for c1/.test(m)), `missing start message in: ${progress.join(" | ")}`);
+  assert.ok(progress.some((m) => /finished in \d+s/.test(m)), "missing finish-with-duration message");
+  assert.ok(progress.some((m) => /PASSED guard\+health\+verification/.test(m)), "missing verdict message");
+});
+
+// --- the main session breathes; only workers stay tiny ------------------------------------
+
+test("the main session breathes up to ~90% of the real model window, NOT the per-worker cap", () => {
+  // The bug: the 12k per-worker packet budget was applied to the main planner session, so a
+  // 100k-context model believed it had 12k tokens and rationed its work.
+  const workerBudget = { maxContextTokens: 12000, blueprintMaxAgentTokens: 12000 };
+  assert.equal(effectiveAgentTokenCap(workerBudget, 128000), 12000, "workers stay small on purpose");
+  const mainCap = mainSessionContextCap(workerBudget, 128000);
+  assert.ok(mainCap >= 100000, `main session must breathe near the model window, got ${mainCap}`);
+  assert.equal(mainCap, Math.floor(128000 * 0.9));
+});
+
+test("main session cap falls back to a generous default when the window is unknown", () => {
+  assert.equal(mainSessionContextCap({}, undefined), 100000);
+});
+
+test("an explicit maxSessionContextTokens is honored but never exceeds the real window", () => {
+  assert.equal(mainSessionContextCap({ maxSessionContextTokens: 40000 }, 128000), 40000);
+  assert.equal(mainSessionContextCap({ maxSessionContextTokens: 999999 }, 64000), 64000, "cannot exceed the real window");
+});
 
 // --- fresh-worker auto-enable: verified evidence only -------------------------------------
 

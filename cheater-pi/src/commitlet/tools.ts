@@ -90,6 +90,24 @@ function resolveModelName(config: CheaterConfig, ctx: ExtensionContext): string 
   return ctx?.model?.id ?? config.model;
 }
 
+/**
+ * Live terminal narration for fresh-worker runs. A local model streams for minutes per
+ * attempt; without this the user stared at a bare spinner with zero indication of what
+ * Cheater was doing (observed live: "it's been in cheater_reliability_start a VERY long
+ * time"). Milestones go to the chat via notify (they are minutes apart, not per-tool), and
+ * the working spinner text is updated so the current activity is always visible.
+ */
+function workerProgress(ctx: ExtensionContext, plan: CommitletPlan, commitlet: Commitlet): (message: string) => void {
+  const position = `${plan.commitlets.findIndex((c) => c.id === commitlet.id) + 1}/${plan.commitlets.length}`;
+  return (message: string) => {
+    const line = `Cheater [commitlet ${position}] ${message}`;
+    try {
+      ctx?.ui?.setWorkingMessage?.(line);
+      ctx?.ui?.notify?.(line, "info");
+    } catch { /* narration must never break the run */ }
+  };
+}
+
 interface GradeResult {
   advance: boolean;
   message: string;
@@ -285,7 +303,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       spawnFreshWorker: Type.Optional(Type.Boolean({ description: "When true, spawn a real isolated worker session instead of returning a prompt to the current session." }))
     }),
     async execute(_id: string, params: { userGoal: string; useActiveBlueprint?: boolean; spawnFreshWorker?: boolean }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
-      const decision = routeAutopilot({ cwd: ctx.cwd, message: params.userGoal });
+      const decision = routeAutopilot({ cwd: ctx.cwd, message: params.userGoal, requireApproval: deps.config.requireApprovalForHighRisk === true });
       const decisionSummary = [
         `mode=${decision.executionMode}`,
         `discipline=${decision.executionDiscipline}`,
@@ -303,6 +321,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         ].join("\n"), { decision, noEdit: true });
       }
 
+      ctx?.ui?.setWorkingMessage?.("Cheater: planning commitlets (routing, candidates, packet decomposition)...");
       const activeBlueprint = params.useActiveBlueprint === false
         ? undefined
         : defaultBlueprintState.get().currentPlan ?? undefined;
@@ -326,6 +345,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       defaultCommitletState.setPlan(plan);
       liveSessionState.reset(params.userGoal);
       liveSessionState.ensure(deps.config, params.userGoal);
+      ctx?.ui?.notify?.(`Cheater plan ready: ${plan.commitlets.length} commitlet(s) - ${plan.commitlets.map((c) => c.title).slice(0, 5).join("; ")}${plan.commitlets.length > 5 ? "; ..." : ""}`, "info");
 
       const index = plan.commitlets.findIndex((commitlet) => commitlet.status === "pending");
       const next = index >= 0 ? plan.commitlets[index] : undefined;
@@ -348,7 +368,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       let fallbackNotice = "";
 
       if (wantRealWorker) {
-        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model);
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared));
         const workerResult = resample.workerResult;
         // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
         // real fresh workers) is recorded from ground truth, never model prose.
@@ -457,7 +477,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       let fallbackNotice = "";
 
       if (wantRealWorker) {
-        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model);
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared));
         const workerResult = resample.workerResult;
         // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
         // real fresh workers) is recorded from ground truth, never model prose.

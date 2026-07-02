@@ -155,15 +155,20 @@ export async function runResampledWorker(
   commitlet: Commitlet,
   config: CheaterConfig,
   runner: FreshAgentPacketRunner = sdkFreshAgentPacketRunner,
-  model?: unknown
+  model?: unknown,
+  onProgress?: (message: string) => void
 ): Promise<ResampleOutcome> {
   const requested = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? 1));
   const canResample = Boolean(commitlet.rollbackPoint?.snapshotDir);
   const samples = canResample ? requested : 1;
   const attempts: CandidateAttempt[] = [];
+  const files = commitlet.allowedFiles.filter((file) => !file.startsWith("(")).join(", ") || "(inspect)";
 
   for (let i = 0; i < samples; i += 1) {
+    const startedAt = Date.now();
+    onProgress?.(`worker attempt ${i + 1}/${samples} for ${commitlet.id} (${files}) - streaming on the local model, this can take minutes`);
     const workerResult = await spawnFreshWorkerForCommitlet(plan, commitlet, config, runner, i + 1, model);
+    onProgress?.(`worker attempt ${i + 1}/${samples} finished in ${Math.round((Date.now() - startedAt) / 1000)}s${workerResult.ok ? "" : ` (${workerResult.error ?? "failed"})`}; scoring candidate...`);
     if (workerResult.error === "worker_backend_unavailable" && i === 0) {
       // The backend cannot even create a session; resampling would fail N identical times.
       return {
@@ -180,6 +185,7 @@ export async function runResampledWorker(
     const attempt: CandidateAttempt = { index: i + 1, workerResult, score, snapshot };
     attempts.push(attempt);
     if (score.passed) {
+      onProgress?.(`attempt ${attempt.index} PASSED guard+health+verification - applying it`);
       return {
         workerResult,
         attemptsRun: attempts.length,
@@ -193,6 +199,7 @@ export async function runResampledWorker(
             : "single attempt passed verification"
       };
     }
+    onProgress?.(`attempt ${attempt.index} did not pass (${score.summary.slice(0, 100)})${i < samples - 1 ? "; reverting and resampling fresh" : ""}`);
     if (i < samples - 1) {
       revertRollbackPoint(plan.repoRoot, commitlet);
     }

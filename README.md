@@ -24,6 +24,17 @@ refactor the memory search
 add a /hello command
 ```
 
+Cheater is **autonomous by default**: one prompt runs to completion. There is
+no approval step - a request like "build a whole app from scratch" plans and
+builds in a single turn. Destructive intent (deleting files, dropping a
+database, dependency/lockfile churn) is surfaced to the model as a caution it
+proceeds through, not a stop. Set `"requireApprovalForHighRisk": true` to make
+genuinely destructive requests pause and ask first.
+
+The main session breathes up to ~90% of the model's real context window (set
+`maxSessionContextTokens` to cap it lower). Only the small per-file worker
+packets are deliberately tiny - the planner is never told to ration its work.
+
 Autopilot classifies the request and then drives **one flow** for every
 code-changing task:
 
@@ -166,6 +177,8 @@ Project config overrides global config. Supported keys:
   "reliabilityModeEnabled": true,
   "autopilotEnabled": true,
   "autopilotRouteAllCodeTasks": true,
+  "requireApprovalForHighRisk": false,
+  "maxSessionContextTokens": null,
   "missionControlEnabled": false,
   "freshCallPacketsEnabled": true,
   "packetOneFilePerWorkerEnabled": true,
