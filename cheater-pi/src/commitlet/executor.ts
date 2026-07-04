@@ -7,15 +7,21 @@ import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgent
 import { createRollbackPoint } from "./rollback.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
+import { sidecarScheduler } from "../sidecar/scheduler.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
+import { analyzePromptShape, recordWorkerPromptShape } from "../runtime/promptShape.js";
 import { activeTaskRun, type TaskRunState } from "../runstate/runState.js";
-import { buildPromptCapsule, type PromptCapsule } from "../runstate/promptCapsule.js";
+import { buildPromptCapsule, renderCapsulePrompt, type PromptCapsule } from "../runstate/promptCapsule.js";
 import { recallHarnessLessons, selectRulePacks } from "../runstate/rulePacks.js";
-import { collectFragmentsForWorker, fragmentMeta, renderFragmentBundle, type ContextFragment } from "../runstate/contextFragments.js";
+import { collectFragmentsForWorker, fragmentMeta, type ContextFragment } from "../runstate/contextFragments.js";
 import { checkCapsuleInvariants } from "../runstate/invariants.js";
 import { buildWorkerSpawnSpec, roleForCommitlet } from "../runstate/workerSpawn.js";
 import { planToolExposure, workerModeForCommitlet } from "../runstate/toolExposure.js";
 import { appendRunEvent } from "../runstate/runDir.js";
+import { operatingRulesFor } from "../reliability/packetPrompt.js";
+import { inferModelClass } from "../reliability/modelProfile.js";
+import { effectiveMode } from "./types.js";
+import { isManifestPath } from "../blueprint/scaffold.js";
 import type { CheaterConfig } from "../types.js";
 
 export type FreshWorkerMode = "simulated" | "real";
@@ -67,12 +73,39 @@ export function observedFailureForAttempt(observedFailure: string | undefined, a
   return sheetStart > 0 ? observedFailure.slice(0, sheetStart).trimEnd() : observedFailure;
 }
 
+/** The bounded repo facts for a commitlet (same derivation the worker packet uses). Exported so a
+ *  sidecar prefetch can compress them ahead of time for the NEXT commitlet during an idle window. */
+export function commitletRepoFacts(repoRoot: string, commitlet: Commitlet): string[] {
+  const boundedFiles = commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")).slice(0, 3);
+  const graph = buildRepoConstraintGraph(repoRoot, boundedFiles);
+  return boundedFiles.flatMap((file) => queryConstraintFacts(graph, file).slice(0, 4)).slice(0, 8);
+}
+
 export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Commitlet, previousState: string[] = [], freshWorkerMode: FreshWorkerMode = "simulated", attempt = 1, modelName?: string): CommitletExecutionPrompt {
-  const packetPlan = commitletPlanAsBlueprint(plan, commitlet);
   const spec = commitlet.spec;
+  // Scaffold lane: return ONE coherent in-session phase prompt with no bounded-worker "stop and hand
+  // off / one edit then stop" language and no separate-worker notice - so a small model never
+  // receives two contradictory instruction sets at once (the core cause of the FounderOS thrash).
+  if (effectiveMode(plan, commitlet) === "scaffold") {
+    return buildScaffoldPhasePrompt(plan, commitlet);
+  }
   const boundedFiles = commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")).slice(0, 3);
   const graph = buildRepoConstraintGraph(plan.repoRoot, boundedFiles);
   const constraintFacts = boundedFiles.flatMap((file) => queryConstraintFacts(graph, file).slice(0, 4)).slice(0, 8);
+  // Sidecar working AHEAD: if it prepared this commitlet's context in an earlier window, use the
+  // prepared bundle - compressed facts, a couple of orientation notes, and a prioritized order of
+  // this commitlet's OWN files. Otherwise the deterministic facts. Additive - no prefetch means
+  // byte-identical behavior, so nothing changes when the sidecar is off.
+  const prepared = sidecarScheduler.peek<{ facts: string[]; files?: string[]; orientation?: string[] }>(`capsule:${commitlet.id}`, commitlet.id);
+  const repoFacts = [
+    ...(prepared?.facts?.length ? prepared.facts : constraintFacts),
+    ...((prepared?.orientation ?? []).map((note) => `orientation: ${note}`))
+  ].slice(0, 10);
+  // Advisory file prioritization: slice snippets from the sidecar-preferred files first. This only
+  // ever REORDERS the commitlet's own allowedFiles - the clerk never widens access.
+  const prioritizedFiles = prepared?.files?.length
+    ? [...prepared.files.filter((file) => boundedFiles.includes(file)), ...boundedFiles.filter((file) => !prepared.files!.includes(file))]
+    : boundedFiles;
   // Slice the actual target symbol (function/class whose name overlaps the task terms) rather
   // than the first 40 lines of imports. Repair commitlets seed terms from the observed failure.
   const sliceTerms = [
@@ -81,9 +114,86 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
     ...(spec?.acceptanceCriteria ?? []),
     spec?.observedFailure ?? ""
   ].filter(Boolean);
-  const sliceCandidates = boundedFiles.slice(0, 2);
+  const sliceCandidates = prioritizedFiles.slice(0, 2);
   const perFileSnippets = sliceCandidates.map((file) => symbolSnippet(plan.repoRoot, file, sliceTerms) || compactSnippet(file, fileSnippet(plan.repoRoot, file, 800)));
   const snippets = perFileSnippets.filter(Boolean);
+  const workerNotice = freshWorkerMode === "real"
+    ? "freshWorkerMode: real (this commitlet runs in a separate isolated worker session)"
+    : "freshWorkerMode: simulated (this prompt is returned to the current agent session; no separate context boundary is created)";
+  const verificationCommand = commitlet.focusedVerification.find((step) => step.command)?.command;
+  const finalInstruction = "Before editing, rollback must exist. After editing, stop for diff guard, focused verification, health score, and test audit.";
+  // CRITICAL for multi-file builds in simulated/in-session mode: the packet's per-worker rules
+  // ("stop and hand off", "do not continue to another file", "make one bounded edit then stop")
+  // are written for an ISOLATED worker that an outer loop resumes. But in simulated mode the MAIN
+  // model IS the whole build - there is no separate worker/planner to hand off to. Without this
+  // override a small model reads "stop and hand off", ends its turn after ONE file, and the build
+  // never completes (the classic "harness never finishes the project"). This last line reframes
+  // every "stop" as "call cheater_commitlet_next and keep going", and it is placed LAST so a weak
+  // model weights it most.
+  const continuationInstruction = freshWorkerMode === "simulated"
+    ? [
+        "=== IN-SESSION MODE - YOU DRIVE THE WHOLE BUILD ===",
+        "You are executing this yourself; there is NO separate worker or planner to hand off to.",
+        "Any rule above that says 'stop and hand off', 'do not continue to another file', or 'make one",
+        "edit then stop' means ONE thing here: finish THIS file, then IMMEDIATELY call",
+        "cheater_commitlet_next to grade it and receive the NEXT file's instructions.",
+        "Keep going file by file - do NOT end your turn, summarize, or wait for the user - until",
+        "cheater_finish_gate reports ALLOWED. The task is NOT done until every planned commitlet is built."
+      ].join("\n")
+    : "";
+
+  // Canonical path: when a durable run is active, the prompt capsule IS the worker context.
+  // Every input (goal, contract, observed failure, stance, snippets, repo facts, run-state
+  // truth, rules) enters the capsule as a typed, capped field, and the prompt is rendered
+  // FROM the capsule - one context format, persisted and size-instrumented, with no nested
+  // second packet prompt duplicating the same file's code.
+  const run = activeTaskRun();
+  if (run) {
+    const { capsule } = buildRunCapsule(run, plan, commitlet, {
+      snippets: sliceCandidates.map((file, index) => ({ path: file, snippet: perFileSnippets[index] })),
+      repoFacts,
+      previousState,
+      attempt,
+      modelName
+    });
+    const rendered = renderCapsulePrompt(capsule);
+    const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or Pi's edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
+    const verifyLine = verificationCommand
+      ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
+      : "No verification command is configured; state explicitly what you checked manually.";
+    // Prompt shape (measurement only - does not change the prompt below). The fixed operating rules
+    // sit AFTER the big dynamic capsule, so they are not a reusable leading prefix; recorded so the
+    // receipt can show worker-prompt size and cache-friendliness. See runtime/promptShape.ts.
+    recordWorkerPromptShape(analyzePromptShape([
+      { name: "kernel-header", content: "Cheater Reliability Kernel commitlet.", stable: true },
+      { name: "commitlet-ids", content: `commitletId: ${commitlet.id}\ntitle: ${commitlet.title}\n${workerNotice}\nmaxDiffLines: ${commitlet.maxDiffLines}`, stable: false },
+      { name: "capsule", content: rendered, stable: false },
+      { name: "operating-rules", content: [editGuidance, verifyLine, finalInstruction, continuationInstruction].filter(Boolean).join("\n"), stable: true }
+    ]));
+    return {
+      commitletId: commitlet.id,
+      freshWorkerMode,
+      capsule,
+      prompt: [
+        "Cheater Reliability Kernel commitlet.",
+        `commitletId: ${commitlet.id}`,
+        `title: ${commitlet.title}`,
+        workerNotice,
+        `maxDiffLines: ${commitlet.maxDiffLines}`,
+        "",
+        rendered,
+        "",
+        editGuidance,
+        verifyLine,
+        finalInstruction,
+        continuationInstruction
+      ].filter(Boolean).join("\n")
+    };
+  }
+
+  // Fallback (no durable run active, e.g. runStateEnabled=false): the legacy assembly with
+  // the nested fresh-call packet. Kept isolated here; the canonical path above never uses it.
+  const packetPlan = commitletPlanAsBlueprint(plan, commitlet);
   // Files this block already sliced must not be re-embedded as a raw head excerpt by the
   // nested fresh-call packet below - that used to duplicate the same file's code twice
   // (roughly a third of the packet) inside one worker prompt.
@@ -94,26 +204,9 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
     packetMaxFilesToTouch: 1,
     model: modelName
   }, { skipSnippetsForFiles: filesAlreadySliced })[0]?.prompt ?? "";
-  const workerNotice = freshWorkerMode === "real"
-    ? "freshWorkerMode: real (this commitlet runs in a separate isolated LLM session via sdkFreshAgentPacketRunner)"
-    : "freshWorkerMode: simulated (this prompt is returned to the current agent session; no separate context boundary is created)";
-  // Durable-run augmentation: when a task run is active, record this worker's whole context
-  // as a prompt capsule (persisted + size-instrumented) and append the compact run-state
-  // block (phase, contract, mutation/validation truth, prior reports, rules). Built from the
-  // SAME bounded inputs as the prompt - never from the parent session's transcript or logs.
-  const run = activeTaskRun();
-  const built = run
-    ? buildRunCapsule(run, plan, commitlet, {
-      snippets: sliceCandidates.map((file, index) => ({ path: file, snippet: perFileSnippets[index] })),
-      repoFacts: constraintFacts
-    })
-    : undefined;
-  const capsule = built?.capsule;
-  const runStateBlock = built ? built.runStateBlock : "";
   return {
     commitletId: commitlet.id,
     freshWorkerMode,
-    capsule,
     prompt: [
       "Cheater Reliability Kernel commitlet.",
       `commitletId: ${commitlet.id}`,
@@ -123,7 +216,7 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
       `forbiddenFiles: ${commitlet.forbiddenFiles.join(", ") || "(none)"}`,
       `maxDiffLines: ${commitlet.maxDiffLines}`,
       `focusedVerification: ${commitlet.focusedVerification.map((step) => step.command ?? step.purpose).join("; ") || "manual review"}`,
-      constraintFacts.length ? `constraintFacts:\n- ${constraintFacts.join("\n- ")}` : "constraintFacts: none",
+      repoFacts.length ? `constraintFacts:\n- ${repoFacts.join("\n- ")}` : "constraintFacts: none",
       snippets.length ? `relevantSnippets:\n${snippets.join("\n")}` : "relevantSnippets: none",
       previousState.length ? `previousState:\n- ${previousState.slice(-3).join("\n- ")}` : "previousState: none",
       spec ? [
@@ -140,29 +233,92 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
         ...(observedFailureForAttempt(spec.observedFailure, attempt) ? [`observedFailure:\n${observedFailureForAttempt(spec.observedFailure, attempt)}`] : [])
       ].join("\n") : "",
       attemptStance(attempt),
-      runStateBlock,
       "",
       prompt,
       "",
-      "Before editing, rollback must exist. After editing, stop for diff guard, focused verification, health score, and test audit."
+      finalInstruction,
+      continuationInstruction
     ].filter(Boolean).join("\n")
   };
 }
 
 /**
- * Build and persist the prompt capsule for one commitlet worker, assembled from TYPED
- * context fragments (phase, contract, ledger summaries, protections, rules, world-state
- * diff) - never ad hoc string piles, never the parent session's chat or logs. The fragment
- * ids land in capsule metadata so what entered this worker's context is auditable from the
- * run directory.
+ * The scaffold lane's single, self-consistent phase prompt. One instruction set: create THIS phase's
+ * files in-session, run install if the manifest is here, then advance. Deliberately contains NO
+ * bounded-worker language ("stop and hand off", "one edit then stop") and NO separate-worker notice,
+ * because in a from-scratch build the main model IS the whole build and there is nothing to reverse.
+ */
+function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): CommitletExecutionPrompt {
+  const allPhaseFiles = commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/"));
+  // Phase A: files the harness already stamped from a stack template are NOT for the model to author.
+  // Drop them from the "create these" list and list them as already-existing (with their export
+  // contracts) so the model imports them. hasManifest is computed BEFORE the drop so the install step
+  // survives even when package.json was stamped.
+  const stamp = activeTaskRun()?.scaffoldStamp;
+  const stampedPaths = new Set((stamp?.stamped ?? []).map((entry) => entry.path));
+  const files = allPhaseFiles.filter((file) => !stampedPaths.has(file));
+  const phaseIndex = plan.commitlets.findIndex((entry) => entry.id === commitlet.id) + 1;
+  const total = plan.commitlets.length;
+  const hasManifest = allPhaseFiles.some(isManifestPath);
+  const constraints = (plan.globalConstraints ?? []).slice(0, 6);
+  const createBlock = files.length
+    ? ["Create these files now (this phase only):", ...files.map((file) => `- ${file}`)]
+    : ["Every file in this phase already exists (the harness wrote them) - do not recreate them."];
+  const stampNote = stamp?.stamped.length
+    ? [
+        "",
+        "=== FILES THE HARNESS ALREADY WROTE (do NOT recreate or rewrite these) ===",
+        ...stamp.stamped.map((entry) => entry.exportsSummary ? `- ${entry.path} - ${entry.exportsSummary}` : `- ${entry.path}`),
+        "Import from these; author only the files listed above. Need another library? Add it to package.json and re-run `npm install`."
+      ]
+    : [];
+  const prompt = [
+    `Cheater from-scratch build - phase ${phaseIndex}/${total}: ${commitlet.title}`,
+    "",
+    "You are building this project yourself, in THIS session. There is no separate worker; this is one coherent build.",
+    `Goal: ${plan.userGoal.slice(0, 400)}`,
+    "",
+    ...createBlock,
+    ...stampNote,
+    "",
+    hasManifest ? "After the manifest exists, run `npm install` and confirm it exits 0." : "",
+    "Rules:",
+    "- BE FAST: do NOT write long planning narration or restate the plan between files - every sentence you generate costs real seconds on a local model. Write each file's code directly and move on.",
+    "- Use the write tool to create each new file (never heredocs or echo/cat redirection).",
+    "- To FIX a file that already exists (e.g. a build error), use cheater_replace (literal find/replace) or cheater_line_edit - do NOT rewrite the whole file.",
+    "- The phases are a suggested ORDER, not a cage: you MAY edit ANY file to wire the app together (e.g. import your new components into App.tsx). The scope guard will not stop you.",
+    "- Keep App.tsx THIN: put each feature's UI in its own component file and import it - do NOT inline every feature into one giant file (a huge file becomes impossible to build-fix).",
+    ...constraints.map((constraint) => `- ${constraint}`),
+    "",
+    "When every file above exists, call cheater_commitlet_next to advance to the next phase. Keep going",
+    "phase by phase - do not stop, summarize, or wait for the user - until cheater_finish_gate reports",
+    "ALLOWED. Before finishing, run the project's build to confirm it succeeds."
+  ].filter(Boolean).join("\n");
+  return { commitletId: commitlet.id, freshWorkerMode: "simulated", prompt };
+}
+
+/**
+ * Build and persist the prompt capsule for one commitlet worker. The capsule is the CANONICAL
+ * worker context: every input (goal, contract, observed failure, attempt stance, snippets,
+ * repo facts, run-state truth, rules) is a typed, capped field - never ad hoc string piles,
+ * never the parent session's chat or logs. Typed fragments are still collected for the
+ * audit trail (capsule metadata records exactly what entered this worker's context) and to
+ * extract the world-state delta.
  */
 function buildRunCapsule(
   run: TaskRunState,
   plan: CommitletPlan,
   commitlet: Commitlet,
-  extras: { snippets: Array<{ path: string; snippet: string }>; repoFacts: string[] }
-): { capsule: PromptCapsule; runStateBlock: string; fragments: ContextFragment[] } {
+  extras: {
+    snippets: Array<{ path: string; snippet: string }>;
+    repoFacts: string[];
+    previousState?: string[];
+    attempt?: number;
+    modelName?: string;
+  }
+): { capsule: PromptCapsule; fragments: ContextFragment[] } {
   const spec = commitlet.spec;
+  const attempt = extras.attempt ?? 1;
   const packSeed = `${plan.userGoal} ${commitlet.allowedFiles.join(" ")}`;
   const rules = [
     ...selectRulePacks(packSeed).flatMap((pack) => pack.rules).slice(0, 8),
@@ -173,6 +329,7 @@ function buildRunCapsule(
     ruleLines: rules,
     priorReports: run.recentReportLines()
   });
+  const worldDiffFragment = fragments.find((fragment) => fragment.kind === "world_state_diff");
   const guardLine = run.guard.warningLine();
   const capsule = buildPromptCapsule({
     taskId: run.taskId,
@@ -183,26 +340,35 @@ function buildRunCapsule(
       ...(spec?.acceptanceCriteria ?? []),
       ...run.contract.checklist.slice(0, 4)
     ],
+    // The repair worker's single most important input, as a typed field. Which portion
+    // renders varies per resample attempt (attempt 3 withholds the cheat sheet so attempts
+    // do not converge on the same evidence-suggested fix).
+    observedFailure: observedFailureForAttempt(spec?.observedFailure, attempt),
+    attemptStance: attemptStance(attempt) || undefined,
+    operatingRules: operatingRulesFor(inferModelClass(extras.modelName ?? "")),
+    worldDiff: worldDiffFragment ? worldDiffFragment.text.split(/\r?\n/).slice(1) : undefined,
     relevantFiles: extras.snippets
       .filter((entry) => entry.snippet)
       .map((entry) => ({ path: entry.path, reason: "commitlet target", snippet: entry.snippet })),
     allowedFiles: commitlet.allowedFiles,
     forbiddenFiles: commitlet.forbiddenFiles,
     repoFacts: extras.repoFacts,
-    constraints: plan.globalConstraints,
+    constraints: [
+      ...plan.globalConstraints,
+      ...(spec?.behaviorMustHold ?? []).map((item) => `must hold: ${item}`),
+      ...(spec?.behaviorMustNotChange ?? []).map((item) => `must not change: ${item}`)
+    ],
     riskWarnings: guardLine ? [guardLine] : [],
     validationPlan: commitlet.focusedVerification.map((step) => step.command ?? step.purpose),
     workspaceDigest: run.refreshDigest(),
     mutationSummary: run.mutations.renderSummaryLines(),
-    priorWorkerReports: run.recentReportLines(),
+    priorWorkerReports: [...run.recentReportLines(), ...(extras.previousState ?? []).slice(-3)],
     phaseLines: run.phase.capsuleLines(),
     rulePack: rules,
     fragments: fragmentMeta(fragments)
   });
   run.noteCapsule(capsule);
-  const runStateBlock = renderFragmentBundle(fragments, "=== CHEATER RUN STATE (durable truth for this run) ===")
-    + `\nrun dir: .cheater/runs/${run.taskId}/ (digest: workspace-digest.md)`;
-  return { capsule, runStateBlock, fragments };
+  return { capsule, fragments };
 }
 
 export async function spawnFreshWorkerForCommitlet(
@@ -211,7 +377,8 @@ export async function spawnFreshWorkerForCommitlet(
   config: CheaterConfig,
   runner: FreshAgentPacketRunner = sdkFreshAgentPacketRunner,
   attempt = 1,
-  model?: unknown
+  model?: unknown,
+  onHeartbeat?: (elapsedMs: number) => void
 ): Promise<FreshAgentPacketResult> {
   const packetPlan = commitletPlanAsBlueprint(plan, commitlet);
   const packet = packetPlan.workPackets[0];
@@ -262,7 +429,8 @@ export async function spawnFreshWorkerForCommitlet(
       config,
       model,
       tools: exposure.workerTools,
-      thinkingLevel: attemptThinkingLevel(attempt)
+      thinkingLevel: attemptThinkingLevel(attempt),
+      onHeartbeat
     });
   } catch (err) {
     // A worker backend that cannot even create a session (no provider configured, model

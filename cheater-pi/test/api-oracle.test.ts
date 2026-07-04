@@ -125,7 +125,7 @@ test("cheat sheet carries the oracle card for a library API failure - offline, n
   const root = tmpRepo();
   installFakePackage(root, "fakepkg", FAKE_DTS);
   writeFileSync(join(root, "empty-corpus.jsonl"), "", "utf8");
-  const sheet = await buildCheatSheet(root, "TypeError: fakepkg.sendGreeting is not a function at src/app.ts:12", DEFAULT_CONFIG, { memoryPath: join(root, "empty-corpus.jsonl") });
+  const sheet = await buildCheatSheet(root, "TypeError: fakepkg.sendGreeting is not a function at src/app.ts:12", { ...DEFAULT_CONFIG, bugMemoryEnabled: true }, { memoryPath: join(root, "empty-corpus.jsonl") });
   assert.ok(sheet, "a classified library_api_error with an installed package must produce a sheet");
   const oracle = sheet!.cards.find((card) => card.source === "api_oracle");
   assert.ok(oracle, "the oracle card must be present");
@@ -138,7 +138,7 @@ test("cheat sheet oracle card outranks corpus/doc evidence in card order", async
   installFakePackage(root, "fakepkg", FAKE_DTS);
   writeFileSync(join(root, "README.md"), "We use fakepkg for greetings.\n", "utf8");
   writeFileSync(join(root, "empty-corpus.jsonl"), "", "utf8");
-  const sheet = await buildCheatSheet(root, "TypeError: fakepkg.greet is not a function", DEFAULT_CONFIG, { memoryPath: join(root, "empty-corpus.jsonl") });
+  const sheet = await buildCheatSheet(root, "TypeError: fakepkg.greet is not a function", { ...DEFAULT_CONFIG, bugMemoryEnabled: true }, { memoryPath: join(root, "empty-corpus.jsonl") });
   assert.ok(sheet);
   const oracleIndex = sheet!.cards.findIndex((card) => card.source === "api_oracle");
   const docsIndex = sheet!.cards.findIndex((card) => card.source === "local_docs");

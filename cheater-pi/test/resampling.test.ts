@@ -86,6 +86,25 @@ test("failed attempt is reverted and a later fresh sample wins", async () => {
   assert.equal(observed[1], "original", "second worker must see the reverted original file");
 });
 
+test("the liveness heartbeat callback is threaded down to the worker runner", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const plan = makePlan(cwd, commitlet);
+  let received: ((ms: number) => void) | undefined;
+  const runner: FreshAgentPacketRunner = {
+    async runPacket(params: { onHeartbeat?: (ms: number) => void }) {
+      received = params.onHeartbeat;
+      params.onHeartbeat?.(21_000); // simulate a mid-stream tick
+      writeFileSync(join(cwd, "target.txt"), "good hb\n", "utf8");
+      return { ok: true, summary: "done" };
+    }
+  };
+  const beats: number[] = [];
+  await runResampledWorker(plan, commitlet, {}, runner, undefined, undefined, (ms) => beats.push(ms));
+  assert.equal(typeof received, "function", "the worker runner must receive an onHeartbeat callback so a streaming local run never looks hung");
+  assert.deepEqual(beats, [21_000], "the heartbeat forwards elapsed ms to the caller's spinner updater");
+});
+
 test("when nothing passes, the best-ranked candidate stays applied for the repair path", async () => {
   const cwd = makeRepo();
   const commitlet = makeCommitlet(cwd);

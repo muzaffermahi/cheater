@@ -27,6 +27,7 @@ import { runFocusedVerification } from "./verification.js";
 import { buildCommitletDiff } from "./diffUtil.js";
 import { revertRollbackPoint } from "./rollback.js";
 import { spawnFreshWorkerForCommitlet } from "./executor.js";
+import { maxWorkerConcurrency, parallelResamplingAvailable } from "./workerPool.js";
 import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgentPacketRunner } from "../blueprint/worker.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import type { CheaterConfig } from "../types.js";
@@ -191,11 +192,19 @@ export async function runResampledWorker(
   config: CheaterConfig,
   runner: FreshAgentPacketRunner = sdkFreshAgentPacketRunner,
   model?: unknown,
-  onProgress?: (message: string) => void
+  onProgress?: (message: string) => void,
+  onHeartbeat?: (elapsedMs: number) => void
 ): Promise<ResampleOutcome> {
   const requested = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? 1));
   const canResample = Boolean(commitlet.rollbackPoint?.snapshotDir);
   const samples = canResample ? requested : 1;
+  // WorkerPool seam: on a single serialized GPU, N concurrent attempts just contend, so we run
+  // them sequentially and say why. The batching parallel path (runPool over isolated worktrees)
+  // engages only when parallelResamplingAvailable() is ok.
+  if (samples > 1 && maxWorkerConcurrency(config) > 1) {
+    const parallel = parallelResamplingAvailable(config, plan.repoRoot);
+    if (!parallel.ok) onProgress?.(`running ${samples} attempts sequentially - ${parallel.reason}`);
+  }
   const attempts: CandidateAttempt[] = [];
   const files = commitlet.allowedFiles.filter((file) => !file.startsWith("(")).join(", ") || "(inspect)";
   const untrackedBaseline = untrackedFiles(plan.repoRoot);
@@ -203,7 +212,7 @@ export async function runResampledWorker(
   for (let i = 0; i < samples; i += 1) {
     const startedAt = Date.now();
     onProgress?.(`worker attempt ${i + 1}/${samples} for ${commitlet.id} (${files}) - streaming on the local model, this can take minutes`);
-    const workerResult = await spawnFreshWorkerForCommitlet(plan, commitlet, config, runner, i + 1, model);
+    const workerResult = await spawnFreshWorkerForCommitlet(plan, commitlet, config, runner, i + 1, model, onHeartbeat);
     onProgress?.(`worker attempt ${i + 1}/${samples} finished in ${Math.round((Date.now() - startedAt) / 1000)}s${workerResult.ok ? "" : ` (${workerResult.error ?? "failed"})`}; scoring candidate...`);
     if (workerResult.error === "worker_backend_unavailable" && i === 0) {
       // The backend cannot even create a session; resampling would fail N identical times.

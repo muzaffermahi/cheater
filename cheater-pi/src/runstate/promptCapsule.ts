@@ -27,6 +27,18 @@ export interface PromptCapsule {
   nonGoals: string[];
   /** Compact contract + acceptance lines - the literal terms of done. */
   acceptanceContract: string[];
+  /**
+   * Repair workers: the compressed failure card (plus any harness-retrieved cheat sheet)
+   * this worker exists to fix. A typed field, not appended prose - the single most
+   * important input a repair worker has.
+   */
+  observedFailure?: string;
+  /** Resample-attempt steering ("smallest fix" / "root cause" / "clean rewrite"). */
+  attemptStance?: string;
+  /** Model-class operating rules (small/medium/large) - how THIS model should work. */
+  operatingRules?: string[];
+  /** World-state delta since the previous worker - "what changed", never the whole past. */
+  worldDiff?: string[];
   relevantFiles: FileBrief[];
   allowedFiles: string[];
   forbiddenFiles: string[];
@@ -65,6 +77,14 @@ export interface CapsuleSizeReport {
 export const CAPSULE_TARGET_TOKENS = 4000;
 export const CAPSULE_WARN_TOKENS = 8000;
 
+// Lean mode (Track 3 - prefill reduction): cap the growing/fixed fields harder so each worker prompt
+// is smaller, cutting the main model's per-commitlet prefill (the "main works too hard" bottleneck).
+// Set per-run from config (leanWorkerPromptEnabled); OFF = the exact caps below, byte-identical. No
+// field is DROPPED - only capped tighter - so nothing load-bearing (contract, failure, scope) is lost.
+let leanMode = false;
+export function setLeanCapsule(enabled: boolean): void { leanMode = enabled; }
+export function leanCapsuleEnabled(): boolean { return leanMode; }
+
 const DEFAULT_OUTPUT_INSTRUCTIONS = [
   "files changed (exact paths)",
   "commands run and their outcomes",
@@ -93,6 +113,10 @@ export interface BuildCapsuleInput {
   workerGoal: string;
   nonGoals?: string[];
   acceptanceContract?: string[];
+  observedFailure?: string;
+  attemptStance?: string;
+  operatingRules?: string[];
+  worldDiff?: string[];
   relevantFiles?: FileBrief[];
   allowedFiles?: string[];
   forbiddenFiles?: string[];
@@ -122,10 +146,16 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
     workerGoal: clampText(input.workerGoal, 500),
     nonGoals: clampList(input.nonGoals, 5, 120),
     acceptanceContract: clampList(input.acceptanceContract, 10, 160),
-    relevantFiles: (input.relevantFiles ?? []).slice(0, 6).map((file) => ({
+    // 2600 chars: enough for a compressed failure card plus a <=1.3KB cheat sheet. Learned
+    // live: clipping this to 1400 chopped the evidence out of repair packets.
+    observedFailure: input.observedFailure?.trim() ? clampText(input.observedFailure, 2600) : undefined,
+    attemptStance: input.attemptStance?.trim() ? clampText(input.attemptStance, 300) : undefined,
+    operatingRules: input.operatingRules?.length ? clampList(input.operatingRules, leanMode ? 4 : 6, 160) : undefined,
+    worldDiff: input.worldDiff?.length ? clampList(input.worldDiff, leanMode ? 5 : 8, 160) : undefined,
+    relevantFiles: (input.relevantFiles ?? []).slice(0, leanMode ? 4 : 6).map((file) => ({
       path: file.path,
       reason: clampText(file.reason, 100),
-      snippet: file.snippet ? clampText(file.snippet, 1600) : undefined
+      snippet: file.snippet ? clampText(file.snippet, leanMode ? 1100 : 1600) : undefined
     })),
     allowedFiles: clampList(input.allowedFiles, 8, 200),
     forbiddenFiles: clampList(input.forbiddenFiles, 8, 200),
@@ -133,12 +163,12 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
     constraints: clampList(input.constraints, 8, 160),
     riskWarnings: clampList(input.riskWarnings, 4, 200),
     validationPlan: clampList(input.validationPlan, 5, 160),
-    workspaceDigest: clampText(input.workspaceDigest, 1500),
-    mutationSummary: clampList(input.mutationSummary, 6, 160),
-    priorWorkerReports: clampList(input.priorWorkerReports, 3, 240),
+    workspaceDigest: clampText(input.workspaceDigest, leanMode ? 900 : 1500),
+    mutationSummary: clampList(input.mutationSummary, leanMode ? 4 : 6, 160),
+    priorWorkerReports: clampList(input.priorWorkerReports, leanMode ? 2 : 3, 240),
     outputInstructions: clampList(input.outputInstructions ?? DEFAULT_OUTPUT_INSTRUCTIONS, 8, 120),
     phaseLines: clampList(input.phaseLines, 4, 160),
-    rulePack: clampList(input.rulePack, 12, 140),
+    rulePack: clampList(input.rulePack, leanMode ? 7 : 12, 140),
     tokenBudgetHint: input.tokenBudgetHint ?? CAPSULE_TARGET_TOKENS,
     fragments: input.fragments?.slice(0, 20)
   };
@@ -151,10 +181,14 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
   lines.push("Your only job:");
   lines.push(capsule.workerGoal);
   lines.push("");
-  lines.push("Do not solve unrelated problems.");
-  lines.push("Do not inspect the whole repo unless a listed file requires it.");
-  lines.push("Do not refactor outside allowed files.");
-  lines.push("Do not perform broad rewrites.");
+  if (leanMode) {
+    lines.push("Stay strictly in scope: only the listed files, no unrelated fixes, no broad rewrites or refactors.");
+  } else {
+    lines.push("Do not solve unrelated problems.");
+    lines.push("Do not inspect the whole repo unless a listed file requires it.");
+    lines.push("Do not refactor outside allowed files.");
+    lines.push("Do not perform broad rewrites.");
+  }
   if (capsule.nonGoals.length) {
     lines.push("Non-goals:");
     for (const nonGoal of capsule.nonGoals) lines.push(`- ${nonGoal}`);
@@ -163,6 +197,15 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
     lines.push("");
     lines.push("Acceptance contract (literal - do not rename or approximate):");
     for (const term of capsule.acceptanceContract) lines.push(`- ${term}`);
+  }
+  if (capsule.observedFailure) {
+    lines.push("");
+    lines.push("Observed failure (fix exactly this):");
+    lines.push(capsule.observedFailure);
+  }
+  if (capsule.attemptStance) {
+    lines.push("");
+    lines.push(capsule.attemptStance);
   }
   if (capsule.allowedFiles.length) {
     lines.push("");
@@ -210,10 +253,20 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
     lines.push("Changes so far:");
     for (const mutation of capsule.mutationSummary) lines.push(`- ${mutation}`);
   }
+  if (capsule.worldDiff?.length) {
+    lines.push("");
+    lines.push("Since the last worker:");
+    for (const line of capsule.worldDiff) lines.push(`- ${line}`);
+  }
   if (capsule.priorWorkerReports.length) {
     lines.push("");
     lines.push("Prior worker reports (compact):");
     for (const report of capsule.priorWorkerReports) lines.push(`- ${report}`);
+  }
+  if (capsule.operatingRules?.length) {
+    lines.push("");
+    lines.push("Operating rules for this model class:");
+    for (const rule of capsule.operatingRules) lines.push(`- ${rule}`);
   }
   if (capsule.rulePack.length) {
     lines.push("");

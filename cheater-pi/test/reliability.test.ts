@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
 import { LoopGovernor } from "../src/reliability/loopGovernor.js";
-import { modelProfile } from "../src/reliability/modelProfile.js";
+import { modelProfile, inferModelClass, inferParamBillions } from "../src/reliability/modelProfile.js";
+import { operatingRulesFor } from "../src/reliability/packetPrompt.js";
 import { renderFreshCallPacket, freshCallPacketFromWorkPacket } from "../src/reliability/packetPrompt.js";
 import { stripSentinel } from "../src/reliability/sentinels.js";
 import { runReliabilityBenchmark } from "../src/reliability/bench.js";
@@ -128,9 +129,65 @@ test("fresh-call packet and splitter enforce one file per worker", () => {
   assert.match(renderFreshCallPacket(fresh), /Do not continue to another file/);
 });
 
-test("model profile uses small defaults for 9b and larger MoE context", () => {
+test("model profile uses small defaults for 9b and larger context for 30b+", () => {
   assert.equal(modelProfile("qwen-9b", DEFAULT_BLUEPRINT_CONFIG).hardContextCeiling, 12000);
   assert.equal(modelProfile("mixtral-30b", DEFAULT_BLUEPRINT_CONFIG).hardContextCeiling, 24000);
+});
+
+test("inferModelClass covers the whole 7-35B target band, not just three sizes", () => {
+  // Small (<=10B).
+  for (const name of ["qwen2.5-coder-7b-instruct", "deepseek-coder-6.7b", "codegemma-7b", "gemma-2-9b-it", "llama-3.1-8b"]) {
+    assert.equal(inferModelClass(name), "small", name);
+  }
+  // Medium (11-23B): the previously-uncovered sweet spot - Qwen2.5-Coder-14B, Codestral-22B,
+  // StarCoder2-15B, CodeLlama-13B - all used to fall to "unknown".
+  for (const name of ["qwen2.5-coder-14b-instruct", "codestral-22b", "starcoder2-15b", "codellama-13b", "phi-4-14b", "internlm2-20b"]) {
+    assert.equal(inferModelClass(name), "medium", name);
+  }
+  // Sizeless "codestral" resolves via the tiny family fallback (22B -> medium).
+  assert.equal(inferModelClass("codestral-latest"), "medium");
+  // Large (24B+): Gemma-2-27B, Qwen2.5-Coder-32B, DeepSeek-Coder-33B, Mistral-Small-24B.
+  for (const name of ["gemma-2-27b-it", "qwen2.5-coder-32b-instruct", "deepseek-coder-33b-instruct", "mistral-small-24b", "yi-34b"]) {
+    assert.equal(inferModelClass(name), "large", name);
+  }
+});
+
+test("inferParamBillions is not fooled by quantization tags or version numbers", () => {
+  // Quant suffixes must never be read as a parameter count.
+  assert.equal(inferParamBillions("qwen2.5-coder-14b-instruct-q4_k_m"), 14);
+  assert.equal(inferParamBillions("qwen2.5-coder-7b-instruct-q8_0"), 7);
+  assert.equal(inferParamBillions("deepseek-coder-33b-instruct.Q4_K_M.gguf"), 33);
+  assert.equal(inferParamBillions("codellama-13b-4bit"), 13);
+  assert.equal(inferParamBillions("gemma-2-27b-it-fp16"), 27);
+  // A bare quant string with no size token yields no false positive.
+  assert.equal(inferParamBillions("my-local-model-q4_k_m"), null);
+  // These stay classified correctly end to end despite the quant tag.
+  assert.equal(inferModelClass("qwen2.5-coder-14b-instruct-q4_k_m"), "medium");
+});
+
+test("inferParamBillions reads sparse-MoE NxMb ids by effective size, not the expert size", () => {
+  // Mixtral-8x7b is a big model; reading the bare "7b" as small was the trap.
+  assert.equal(inferModelClass("mixtral-8x7b-instruct"), "medium");
+  assert.equal(inferModelClass("mixtral-8x22b"), "large");
+});
+
+test("unrecognized model names stay 'unknown' with neutral rules, never assumed weak", () => {
+  assert.equal(inferModelClass("my-custom-finetune"), "unknown");
+  assert.equal(inferParamBillions("default"), null);
+  // Unknown keeps the tight budget (never over-feed) but neutral (not small-specific) rules.
+  assert.equal(modelProfile("default", DEFAULT_BLUEPRINT_CONFIG).packetContextBudget, DEFAULT_BLUEPRINT_CONFIG.packetContextBudgetTokens9B);
+  assert.deepEqual(operatingRulesFor("unknown"), [
+    "Keep context narrow and execute only this packet.",
+    "Stop when acceptance criteria are met or a blocker is found."
+  ]);
+});
+
+test("medium tier gets its own budget between small and large", () => {
+  const medium = modelProfile("qwen2.5-coder-14b", DEFAULT_BLUEPRINT_CONFIG);
+  assert.equal(medium.class, "medium");
+  assert.ok(medium.packetContextBudget > modelProfile("qwen-7b", DEFAULT_BLUEPRINT_CONFIG).packetContextBudget);
+  assert.ok(medium.packetContextBudget < modelProfile("qwen-32b", DEFAULT_BLUEPRINT_CONFIG).packetContextBudget);
+  assert.equal(medium.paramsBillions, 14);
 });
 
 test("reliability benchmark records offline metrics", () => {

@@ -39,9 +39,25 @@ Autopilot classifies the request and then drives **one flow** for every
 code-changing task:
 
 ```text
+cheater_run   (closed loop: the harness drives the whole chain)
+  -> route -> plan -> spawn bounded worker -> grade in code -> repair -> repeat
+  -> final review -> finish gate -> deterministic receipt
+```
+
+or, when no real fresh-worker backend is available, the classic handoff flow:
+
+```text
 cheater_reliability_start -> edit only the allowed files -> cheater_commitlet_next
   (repeat) -> cheater_verification_run -> cheater_finish_gate
 ```
+
+### Closed-loop execution
+
+`cheater_run` lets Cheater drive the whole commitlet chain deterministically when
+real fresh workers are available. The model edits only bounded worker packets; the
+harness plans, grades, repairs, advances, verifies, and gates completion. If fresh
+workers are unavailable, Cheater degrades honestly to simulated handoff mode
+(returning the first worker prompt) instead of claiming it executed the task.
 
 `cheater_reliability_start` routes, builds a commitlet plan with a rollback point,
 and hands back a small single-file worker prompt. `cheater_commitlet_next` grades
@@ -95,6 +111,7 @@ A weak model's worst skill is multi-tool orchestration, so Cheater masks the
 
 | Tool | Purpose |
 | --- | --- |
+| `cheater_run` | Closed loop: plan, spawn workers, grade, repair, review, gate, receipt - all in one deterministic call |
 | `cheater_reliability_start` | Route, plan commitlets, take a rollback point, return the first single-file worker prompt |
 | `cheater_commitlet_next` | Grade the current edit in code (guard/health/audit/verify), then prepare the next commitlet or run the final review |
 | `cheater_line_edit` | Apply a bounded, stale-safe line/range edit |

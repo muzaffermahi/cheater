@@ -1,4 +1,4 @@
-import { HIGH_RISK_INTENT } from "./classifier.js";
+import { elevatesToHighRisk } from "./classifier.js";
 import type { AutopilotDecision, ExecutionDiscipline, ExecutionMode, RoutePolicyInput } from "./types.js";
 
 export function decideExecutionMode(input: RoutePolicyInput): Omit<AutopilotDecision, "userVisibleSummary"> {
@@ -21,6 +21,18 @@ export function decideExecutionMode(input: RoutePolicyInput): Omit<AutopilotDeci
     executionMode = "blueprint_orchestrator";
   } else if (explicitFast && input.risk !== "high" && input.complexitySignals.length <= 1) {
     executionMode = "careful_repro";
+  } else if (
+    ["feature_addition", "refactor"].includes(input.taskKind)
+    && input.complexitySignals.length === 0
+    && input.confidence < 0.85
+    && input.risk !== "high"
+  ) {
+    // A feature/refactor with ZERO structural complexity signals - and not a high-confidence
+    // from-scratch spec (those score >=0.85) - is a bounded change, not a multi-subsystem
+    // project. Skip the blueprint engine (orientation scan + 3 candidates + scoring: seconds of
+    // latency a 20-30 t/s local session cannot spare, and a long chain a small model handles
+    // worse than one bounded commitlet) and take Pi's fast single-commitlet path.
+    executionMode = "vanilla_pi";
   } else if (highComplexity || ["feature_addition", "refactor", "tooling", "migration", "benchmark"].includes(input.taskKind)) {
     executionMode = "blueprint_orchestrator";
   } else if (input.taskKind === "docs") {
@@ -49,7 +61,7 @@ function decideExecutionDiscipline(mode: ExecutionMode, input: RoutePolicyInput,
   // INTENT is required (shared definition with the classifier) and an explicit approval
   // clears it. Without opt-in, high-risk work still routes to a careful mode below - it just
   // never stops to ask.
-  if (input.requireApproval && input.risk === "high" && !input.repoHints?.userApprovedHighRisk && HIGH_RISK_INTENT.test(input.message)) {
+  if (input.requireApproval && input.risk === "high" && !input.repoHints?.userApprovedHighRisk && elevatesToHighRisk(input.message.toLowerCase())) {
     return "blocked_needs_user";
   }
   if (mode === "blueprint_orchestrator") return "blueprint_backed_commitlet_chain";

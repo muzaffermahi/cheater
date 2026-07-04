@@ -41,7 +41,7 @@ export function buildBlueprintIntelligencePack(params: {
     modelClass: profile.class,
     plannerTokens: params.config.maxContextTokens,
     workerTokens: profile.packetContextBudget,
-    maxFactsPerPacket: profile.class === "9b" ? 4 : Math.max(5, Math.min(8, params.config.blueprintMaxDocsFacts)),
+    maxFactsPerPacket: profile.class === "small" ? 4 : profile.class === "medium" ? 5 : Math.max(5, Math.min(8, params.config.blueprintMaxDocsFacts)),
     maxFilesPerWorker: params.config.packetMaxFilesToTouch,
     maxOutputTokens: profile.maxOutputTokens,
     compressionRules: [
@@ -50,9 +50,9 @@ export function buildBlueprintIntelligencePack(params: {
       "Compress completed packet state into one acceptance/result sentence.",
       "Do not include raw docs pages or full memory cards in worker prompts.",
       "Carry only the web evidence cards whose appliesTo matches this packet; never the full web evidence list.",
-      profile.class === "9b"
-        ? "For 9B-class models, use one target file, one command, and one acceptance proof per packet."
-        : "For MoE/local-medium models, allow slightly richer repo facts but keep edits one file at a time."
+      profile.class === "small"
+        ? "For small (<=10B) models, use one target file, one command, and one acceptance proof per packet."
+        : "For 11B+ local models, allow slightly richer repo facts but keep edits one file at a time."
     ]
   };
   return {

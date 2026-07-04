@@ -127,6 +127,21 @@ test("six identical consecutive calls become a terminal block with preserved-sta
   liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
 });
 
+test("driver tools (cheater_commitlet_next) are exempt from the identical-call and non-progress detectors", () => {
+  // Repeatedly calling cheater_commitlet_next IS the intended chain driver - each call advances the
+  // plan. It must NOT trip the "you're stuck" detectors that fired falsely in the FounderOS run.
+  liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
+  const all: ReturnType<typeof liveSessionState.observeToolCall> = [];
+  for (let i = 0; i < 6; i += 1) {
+    all.push(...liveSessionState.observeToolCall({ toolCallId: `d${i}`, toolName: "cheater_commitlet_next", input: {} }, { loopGovernorEnabled: true }));
+    all.push(...liveSessionState.observeToolResult({ toolCallId: `d${i}`, toolName: "cheater_commitlet_next", ok: true }, { loopGovernorEnabled: true }));
+  }
+  assert.equal(all.filter((e) => /identical calls/.test(e.message)).length, 0, "no identical-call warning for the driver loop");
+  assert.equal(all.filter((e) => e.kind === "non_progress").length, 0, "no non-progress stall for the driver loop");
+  assert.equal(all.filter((e) => e.terminal).length, 0, "no terminal block for the driver loop");
+  liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
+});
+
 // --- project rules (.clinerules) --------------------------------------------------------------
 
 test("project rules load from .cheater/rules.md or .clinerules, bounded, and are optional", () => {
@@ -187,4 +202,24 @@ test("stray out-of-scope files created by a failing attempt are removed (git rep
   const outcome = await runResampledWorker(plan, commitlet, { commitletCandidateSamples: 2 }, runner);
   assert.equal(outcome.passed, true);
   assert.equal(existsSync(join(cwd, "debug_helper.js")), false, "the failed attempt's stray file must not survive");
+});
+
+// --- loop governor: content-based patch key (iterating on one file is not a loop) -----------
+
+test("editing one file several times with DIFFERENT content does not trip 'same patch'; a byte-identical repeat does", () => {
+  liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
+  const write = (i: number, content: string) =>
+    liveSessionState.observeToolCall(
+      { toolCallId: `w${i}`, toolName: "write", path: "src/App.tsx", input: { path: "src/App.tsx", content } },
+      { loopGovernorEnabled: true }
+    );
+  // 5 genuinely different edits to the same file - the normal "fix build errors one by one" pattern.
+  const distinct = [1, 2, 3, 4, 5].flatMap((i) => write(i, `version ${i}`));
+  assert.equal(distinct.filter((e) => /same patch/.test(e.message)).length, 0, "different edits to one file are normal iteration, not a loop");
+
+  // Byte-identical repeats (a fix that never lands) still trip the governor.
+  liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
+  const same = [1, 2, 3, 4, 5].flatMap((i) => write(i + 10, "IDENTICAL"));
+  assert.ok(same.some((e) => /same patch/.test(e.message)), "a byte-identical repeated patch is still caught");
+  liveSessionState.beginInteractiveTurn({ loopGovernorEnabled: true });
 });

@@ -33,6 +33,11 @@ export interface FreshAgentPacketRunner {
     // temperature option (verified against its type declarations), so thinking level is the
     // one sampling knob a caller can vary; Pi clamps it to the model's capabilities.
     thinkingLevel?: "off" | "low" | "medium" | "high";
+    // Spinner-only liveness callback fired periodically WHILE the worker streams. A local model
+    // at 20-30 t/s can stream a bounded edit for minutes; without this the spinner freezes on
+    // one line and the run looks hung (a documented near-quit incident). Callers wire this to a
+    // setWorkingMessage-style updater ONLY - never a chat notify, which would spam the viewport.
+    onHeartbeat?: (elapsedMs: number) => void;
   }): Promise<FreshAgentPacketResult>;
 }
 
@@ -43,17 +48,34 @@ let workerDepth = 0;
 // failure we remember it so heuristic real-worker defaults degrade instantly instead of
 // paying that cost per commitlet. An explicit spawnFreshWorker=true request still retries.
 let backendLatch: "unknown" | "available" | "unavailable" = "unknown";
+let backendReason = "worker backend not yet probed";
 
 export function workerBackendState(): "unknown" | "available" | "unavailable" {
   return backendLatch;
 }
 
-export function noteWorkerBackend(ok: boolean): void {
+/** HTTP idle timeout (ms) for Cheater-created sessions. Default 30 min so a slow local model's
+ *  prefill is not killed by Pi's 5-min default; 0 = no timeout. Shared with the main-session
+ *  launcher setting so worker/sidecar prefill gets the same generous window. */
+export function piIdleTimeoutMs(config: CheaterConfig = {}): number {
+  const value = config.httpIdleTimeoutMs;
+  return typeof value === "number" && value >= 0 ? Math.trunc(value) : 1_800_000;
+}
+
+/** The human-readable reason for the current backend state - surfaced loudly on degradation (R5). */
+export function workerBackendReason(): string {
+  return backendReason;
+}
+
+export function noteWorkerBackend(ok: boolean, reason?: string): void {
   backendLatch = ok ? "available" : "unavailable";
+  if (reason) backendReason = reason;
+  else if (ok) backendReason = "worker backend verified (a real fresh worker resolved a model)";
 }
 
 export function resetWorkerBackendLatch(): void {
   backendLatch = "unknown";
+  backendReason = "worker backend not yet probed";
 }
 
 export interface WorkerBackendProbeResult {
@@ -73,26 +95,50 @@ export interface WorkerBackendProbeResult {
  */
 export async function probeWorkerBackend(
   cwd: string,
-  createFn: (options: Record<string, unknown>) => Promise<{ session: { model?: { id?: string }; dispose?: () => void } }> = createAgentSession as any
+  createFn: (options: Record<string, unknown>) => Promise<{ session: { model?: { id?: string }; dispose?: () => void } }> = createAgentSession as any,
+  timeoutMs = 12_000
 ): Promise<WorkerBackendProbeResult> {
   if (backendLatch !== "unknown") {
     return { ok: backendLatch === "available", reason: `already latched: ${backendLatch}` };
   }
   try {
-    const settingsManager = SettingsManager.inMemory({}, { projectTrusted: true });
+    const settingsManager = SettingsManager.inMemory({ httpIdleTimeoutMs: piIdleTimeoutMs() }, { projectTrusted: true });
     const sessionManager = SessionManager.create(cwd, undefined, { id: `cheater-backend-probe-${process.pid.toString(36)}` });
-    const { session } = await createFn({ cwd, sessionManager, settingsManager, noTools: "all" });
+    // The probe MUST be bounded. createAgentSession has to reach the provider to resolve a
+    // model, and against a cold/loading/wedged local endpoint (LM Studio, Ollama) that call
+    // can block for tens of seconds to minutes - which, un-timed, freezes the user's very first
+    // task on a bare spinner. On timeout we latch "unavailable" and degrade to the in-session
+    // (simulated) flow, which is a fully functional path and actually kinder to a single-GPU
+    // local box than spawning contending sub-sessions. A later-resolving session is disposed.
+    const created = createFn({ cwd, sessionManager, settingsManager, noTools: "all" });
+    const TIMED_OUT = Symbol("probe-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), Math.max(1, timeoutMs));
+    });
+    const raced = await Promise.race([created, timeout]);
+    if (timer) clearTimeout(timer);
+    if (raced === TIMED_OUT) {
+      void Promise.resolve(created).then((r) => { try { r?.session?.dispose?.(); } catch { /* best-effort */ } }).catch(() => { /* ignore */ });
+      const reason = `worker backend probe timed out after ${Math.round(timeoutMs / 1000)}s (cold/loading local model?); running the in-session flow`;
+      noteWorkerBackend(false, reason);
+      return { ok: false, reason };
+    }
+    const { session } = raced as { session: { model?: { id?: string }; dispose?: () => void } };
     const modelId = session.model?.id;
     try { session.dispose?.(); } catch { /* probe cleanup is best-effort */ }
     if (modelId) {
-      noteWorkerBackend(true);
-      return { ok: true, reason: `worker backend verified: model ${modelId} resolved with auth`, modelId };
+      const reason = `worker backend verified: model ${modelId} resolved with auth`;
+      noteWorkerBackend(true, reason);
+      return { ok: true, reason, modelId };
     }
-    noteWorkerBackend(false);
-    return { ok: false, reason: "no model/auth resolvable for fresh worker sessions" };
+    const reason = "no model/auth resolvable for fresh worker sessions (configure a provider/model)";
+    noteWorkerBackend(false, reason);
+    return { ok: false, reason };
   } catch (err) {
-    noteWorkerBackend(false);
-    return { ok: false, reason: `worker backend probe failed: ${(err as Error).message}` };
+    const reason = `worker backend probe failed: ${(err as Error).message}`;
+    noteWorkerBackend(false, reason);
+    return { ok: false, reason };
   }
 }
 
@@ -240,7 +286,7 @@ function compactSentinelBody(text: string | undefined, sentinel: string, fallbac
 }
 
 export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
-  async runPacket({ cwd, plan, packet, prompt, config, model, tools, thinkingLevel }) {
+  async runPacket({ cwd, plan, packet, prompt, config, model, tools, thinkingLevel, onHeartbeat }) {
     // Exposure may only reduce: a caller-provided tool list is honored only when it is a
     // subset of the battle-tested default; anything unknown or broader falls back safely.
     const workerTools = tools?.length && tools.every((tool) => WORKER_TOOLS.includes(tool)) ? tools : WORKER_TOOLS;
@@ -263,7 +309,8 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
         const settingsManager = SettingsManager.inMemory({
           compaction: compactSettingsForCap(undefined, cap, threshold),
           steeringMode: "one-at-a-time",
-          followUpMode: "one-at-a-time"
+          followUpMode: "one-at-a-time",
+          httpIdleTimeoutMs: piIdleTimeoutMs(config)
         }, { projectTrusted: true });
         const sessionManager = SessionManager.create(cwd, undefined, { id: packetSessionId(packet) });
         ({ session } = await createAgentSession({
@@ -309,6 +356,12 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
         timedOut = true;
         try { session.abort?.(); } catch { /* best-effort */ }
       }, timeoutMs);
+      // Liveness heartbeat: update the spinner every 20s while the worker streams so a
+      // multi-minute local run never looks hung. Spinner-only by contract (see onHeartbeat).
+      const startedAt = Date.now();
+      const heartbeat = onHeartbeat ? setInterval(() => {
+        try { onHeartbeat(Date.now() - startedAt); } catch { /* heartbeat must never break the run */ }
+      }, 20_000) : undefined;
       try {
         const contextWindow = session.model?.contextWindow;
         const effectiveCap = effectiveAgentTokenCap(config, contextWindow);
@@ -384,6 +437,7 @@ export const sdkFreshAgentPacketRunner: FreshAgentPacketRunner = {
         };
       } finally {
         clearTimeout(deadline);
+        if (heartbeat) clearInterval(heartbeat);
         session.dispose();
       }
     });

@@ -2,32 +2,33 @@ import { Type } from "typebox";
 import { routeAutopilot } from "../autopilot/router.js";
 import { createAutonomousBlueprint } from "../blueprint/autonomous.js";
 import { defaultBlueprintState } from "../blueprint/state.js";
-import { createCleanupCommitlet, createCommitletPlan, createRepairCommitlet } from "./planner.js";
-import { commitletConfig } from "./config.js";
+import { createCommitletPlan } from "./planner.js";
 import { defaultCommitletState } from "./state.js";
 import { buildCommitletExecutionPrompt, prepareCommitlet } from "./executor.js";
 import { runResampledWorker } from "./resampling.js";
-import { saveVerifiedFix } from "../reliability/experience.js";
-import { buildCheatSheet, renderCheatSheet } from "../reliability/cheatSheet.js";
-import { runDiffGuard, countDiffLines } from "./guard.js";
-import { scorePatchHealth } from "./health.js";
-import { auditTestChanges } from "./testAudit.js";
-import { runCommitletFinalReview } from "./reviewer.js";
-import { formatCommitletFinalReview, formatCommitletPlan, formatGuardHealthAudit, formatPlanChecklist } from "./ui.js";
-import { telemetryFromPlan, writeTelemetry } from "./telemetry.js";
+import { formatPlanChecklist } from "./ui.js";
 import { cleanupOldRollbackSnapshots, listRollbackSnapshotFiles, revertRollbackPoint } from "./rollback.js";
-import { runFocusedVerification } from "./verification.js";
-import { buildCommitletDiff } from "./diffUtil.js";
-import { probeWorkerBackend, resetWorkerBackendLatch, workerBackendState } from "../blueprint/worker.js";
 import { liveSessionState } from "../reliability/sessionState.js";
-import { classifyFailure, ledgerAllowsFinish } from "../reliability/lifecycle.js";
+import { resolveSidecarClient } from "../sidecar/client.js";
 import { runVerification } from "../reliability/verificationRunner.js";
 import { detectProjectCommands } from "../reliability/projectCommands.js";
-import { activeTaskRun, beginTaskRun, type TaskRunState } from "../runstate/runState.js";
-import { writeControllerFile } from "../runstate/workerPlans.js";
-import { artifactReread } from "../runstate/recipes.js";
-import type { Commitlet, CommitletPlan } from "./types.js";
+import { activeTaskRun, beginTaskRun } from "../runstate/runState.js";
+import { runClosedLoopCommitlets } from "./closedLoop.js";
+import {
+  finalizePlan,
+  finishVerdict,
+  gradeCommitlet,
+  resolveModelName,
+  resolveRealWorkerMode,
+  updateControllerFile,
+  wantsRealWorker,
+  workerProgress,
+  workerHeartbeat
+} from "./kernel.js";
 import type { CheaterConfig } from "../types.js";
+
+// Back-compat: wantsRealWorker moved into the shared kernel; existing importers keep working.
+export { wantsRealWorker };
 
 type ExtensionAPI = any;
 type ExtensionContext = any;
@@ -36,340 +37,48 @@ function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text", text }], details };
 }
 
-/**
- * Real fresh workers (context isolation per file change) default on only from VERIFIED
- * evidence, never a guess: explicit param > config > "a real fresh worker already spawned
- * successfully earlier in this process" (the backend latch in blueprint/worker.ts, set only
- * by an actual createAgentSession success). A filesystem heuristic (does Pi have auth on
- * disk?) was tried and rejected: it cannot distinguish "this process can spawn a working
- * worker" from "someone once logged into Pi on this machine", so it defaulted tool-harness
- * and test contexts into slow, doomed real-worker attempts. This self-discovering default
- * costs nothing extra when unset (starts "unknown" -> false) and upgrades automatically the
- * moment any commitlet actually proves the backend works, without the user re-passing the
- * flag - and unlike the disk heuristic, it can never produce a false positive.
- */
-export function wantsRealWorker(params: { spawnFreshWorker?: boolean }, config: CheaterConfig, _ctx: ExtensionContext): boolean {
-  if (params.spawnFreshWorker !== undefined) {
-    // An explicit request also clears the latch so the user can force a retry after fixing
-    // their backend without restarting the session.
-    if (params.spawnFreshWorker) resetWorkerBackendLatch();
-    return params.spawnFreshWorker;
-  }
-  if (config.commitletFreshWorkerDefault !== undefined) return config.commitletFreshWorkerDefault;
-  return workerBackendState() === "available";
-}
-
-/**
- * Resolve the fresh-worker mode for this call, running the one-time backend probe when
- * needed. The latch alone had a bootstrap deadlock: real workers auto-enable only from the
- * latch, but the latch only flipped after a real worker ran - which never happened because
- * the default was off. The probe (a throwaway session whose resolved model is the verified
- * evidence; zero model tokens) breaks the loop. It runs only when: no explicit param, no
- * config override, latch still unknown, and the CURRENT session has a live model (offline
- * and test contexts have none, so they never probe).
- */
-async function resolveRealWorkerMode(params: { spawnFreshWorker?: boolean }, config: CheaterConfig, ctx: ExtensionContext): Promise<boolean> {
-  if (
-    params.spawnFreshWorker === undefined
-    && config.commitletFreshWorkerDefault === undefined
-    && workerBackendState() === "unknown"
-    && ctx?.model?.id
-  ) {
-    await probeWorkerBackend(ctx.cwd);
-  }
-  return wantsRealWorker(params, config, ctx);
-}
-
-/**
- * The model name for packet operating-rule selection (9b/moe30b/moe35b/unknown), preferring
- * the live session's actual model over the static config default. Without this,
- * buildCommitletExecutionPrompt never learned the real model and modelClass was always
- * "unknown" - silently dropping the model-specific operating rules (including the only rule
- * that told a moe-class worker to run its own focused verification command).
- */
-function resolveModelName(config: CheaterConfig, ctx: ExtensionContext): string | undefined {
-  return ctx?.model?.id ?? config.model;
-}
-
-/**
- * Live terminal narration for fresh-worker runs. A local model streams for minutes per
- * attempt; without this the user stared at a bare spinner with zero indication of what
- * Cheater was doing (observed live: "it's been in cheater_reliability_start a VERY long
- * time"). Milestones go to the chat via notify (they are minutes apart, not per-tool), and
- * the working spinner text is updated so the current activity is always visible.
- */
-function workerProgress(ctx: ExtensionContext, plan: CommitletPlan, commitlet: Commitlet): (message: string) => void {
-  const position = `${plan.commitlets.findIndex((c) => c.id === commitlet.id) + 1}/${plan.commitlets.length}`;
-  return (message: string) => {
-    const line = `Cheater [commitlet ${position}] ${message}`;
-    try {
-      ctx?.ui?.setWorkingMessage?.(line);
-      ctx?.ui?.notify?.(line, "info");
-    } catch { /* narration must never break the run */ }
-  };
-}
-
-interface GradeResult {
-  advance: boolean;
-  message: string;
-  details: unknown;
-}
-
-/**
- * Keep controller.md in step with the plan: the durable file a respawned controller (or a
- * human) reads to learn the decomposition, statuses, phase, and next step. Best-effort.
- */
-function updateControllerFile(run: TaskRunState, plan: CommitletPlan, status: string, nextStep: string): void {
-  try {
-    writeControllerFile(run.runDir, {
-      taskId: run.taskId,
-      goal: plan.userGoal,
-      contractSummary: run.contractSummaryText(),
-      planSummary: plan.summary,
-      workerDecomposition: plan.commitlets.map((commitlet) => ({ role: commitlet.id, goal: commitlet.title, status: commitlet.status })),
-      globalConstraints: plan.globalConstraints,
-      phaseLine: run.phase.capsuleLines()[0] ?? "",
-      status,
-      nextStep
-    });
-  } catch {
-    // controller.md must never break the run
-  }
-}
-
-/**
- * Runs diff guard, patch health, test audit, and focused verification for the currently
- * running commitlet in code, instead of trusting the model to call separate guard/verify
- * tools honestly. Returns advance=true when the plan may move on to the next commitlet
- * (passed, or a bounded repair commitlet was just queued); advance=false stops the chain
- * (guard/health/audit rejection, or a repair attempt also failed).
- */
-async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig, overrides: { allowLargeDeletion?: boolean } = {}): Promise<GradeResult> {
-  const observedEdits = liveSessionState.consumeCommitletEdits();
-  const candidateFiles = [...new Set([...commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")), ...observedEdits])];
-  const { diffText, touchedFiles } = buildCommitletDiff(cwd, candidateFiles, commitlet.rollbackPoint?.snapshotDir);
-
-  const guard = runDiffGuard(commitlet, { touchedFiles, diffText }, { allowLargeDeletion: overrides.allowLargeDeletion });
-  const health = scorePatchHealth({ diffText, filesTouched: touchedFiles, threshold: config.healthScoreThreshold, hardRejectThreshold: config.hardRejectHealthThreshold });
-  const isTestChange = touchedFiles.some((file) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(file));
-  const audit = isTestChange ? auditTestChanges(diffText, commitlet.spec?.acceptanceCriteria ?? []) : { passed: true, warnings: [], blockingIssues: [] };
-  const guardOk = guard.passed && health.passed && audit.passed;
-
-  if (!guardOk) {
-    const issues = [...guard.blockingIssues, ...health.blockingIssues, ...audit.blockingIssues];
-    const observed = {
-      filesChanged: touchedFiles,
-      diffLines: countDiffLines(diffText),
-      testsRun: [],
-      verificationPassed: false,
-      healthPassed: health.passed,
-      rollbackAvailable: Boolean(commitlet.rollbackPoint),
-      summary: `Guard failed: ${issues.join("; ")}`,
-      issues
-    };
-    if (commitlet.rollbackPoint) {
-      const reverted = revertRollbackPoint(cwd, commitlet);
-      defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `Guard failed: ${issues.join("; ")}; ${reverted.reason}`, observed);
-    } else {
-      defaultCommitletState.updateCommitlet(commitlet.id, "failed", `Guard failed: ${issues.join("; ")}`, observed);
-    }
-    activeTaskRun()?.integrateWorkerReport({
-      workerRole: commitlet.id,
-      summary: `Guard/health/test audit blocked this commitlet: ${issues.slice(0, 3).join("; ")}`,
-      filesChanged: touchedFiles,
-      commandsRun: [],
-      validationResults: ["guard/health/test audit: fail"],
-      problems: issues.slice(0, 4),
-      recommendedNextAction: "narrow the change to the allowed files and retry",
-      contractSatisfied: "no"
-    });
-    return {
-      advance: false,
-      message: [`Commitlet ${commitlet.id} blocked by guard/health/test audit.`, formatGuardHealthAudit({ guard, health, audit })].join("\n"),
-      details: { guard, health, audit }
-    };
-  }
-
-  const verify = runFocusedVerification(cwd, commitlet);
-  const ledger = liveSessionState.getLedger();
-  if (ledger) {
-    for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
-    ledger.recordVerificationStage({
-      stage: "focused_tests",
-      status: verify.passed ? "ok" : "failed",
-      summary: verify.summary,
-      failureClass: verify.passed ? "unknown" : classifyFailure({ exitCode: 1, stdout: "", stderr: verify.failures.join("\n") }),
-      artifacts: [],
-      signals: { commitletId: commitlet.id }
-    });
-  }
-
-  // Durable run state: record what this verification proved (pinned to the files it covered,
-  // so later mutations can stale it), file the commitlet's worker report, and keep
-  // controller.md current. A fresh evaluator-mirroring pass also protects its artifacts.
-  const run = activeTaskRun();
-  if (run) {
-    run.recordValidation({
-      name: `focused_verification:${commitlet.id}`,
-      command: commitlet.focusedVerification.find((step) => step.command)?.command,
-      actor: commitlet.id,
-      validates: touchedFiles,
-      status: verify.passed ? "pass" : "fail",
-      outputSummary: verify.summary
-    });
-    run.integrateWorkerReport({
-      workerRole: commitlet.id,
-      summary: verify.summary,
-      filesChanged: touchedFiles,
-      commandsRun: verify.commandsRun,
-      validationResults: [`focused verification: ${verify.passed ? "pass" : "fail"}`],
-      problems: verify.passed ? [] : verify.failures.slice(0, 3),
-      recommendedNextAction: verify.passed ? "advance to the next commitlet" : "run the bounded repair commitlet",
-      contractSatisfied: verify.passed ? "yes" : "no"
-    });
-    if (verify.passed) run.phase.advanceTo("implement");
-    const currentPlan = defaultCommitletState.get().currentPlan;
-    if (currentPlan) updateControllerFile(run, currentPlan, currentPlan.status, verify.passed ? "next commitlet or final review" : "bounded repair");
-  }
-
-  if (verify.passed) {
-    // Verified fail->pass transition: a repair commitlet just passed the verification its
-    // original failed. The harness knows the observed failure AND the diff that fixed it -
-    // ground truth, no model claim - so it writes the experience card itself. Future
-    // matching failures get this fix recalled in-band inside their failure cards.
-    if (config.experienceStoreEnabled !== false && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
-      saveVerifiedFix(cwd, {
-        failureText: commitlet.spec.observedFailure,
-        diffText,
-        files: touchedFiles,
-        goal: defaultCommitletState.get().currentPlan?.userGoal
-      });
-    }
-    defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
-      filesChanged: touchedFiles,
-      diffLines: countDiffLines(diffText),
-      testsRun: verify.commandsRun,
-      verificationPassed: true,
-      healthPassed: health.passed,
-      rollbackAvailable: Boolean(commitlet.rollbackPoint),
-      summary: verify.summary,
-      issues: []
-    });
-    return {
-      advance: true,
-      message: [`Commitlet ${commitlet.id} passed guard, health, and focused verification.`, verify.summary].join("\n"),
-      details: { guard, health, audit, verify }
-    };
-  }
-
-  // The Cheat Layer: the harness (not the model) classifies this failure, retrieves compact
-  // evidence from every source it owns, and injects the sheet exactly where the failure is
-  // being handed to a model - into the repair commitlet's observedFailure (which flows into
-  // every repair worker/resample packet) and into the grade message the orchestrating
-  // session reads. No search tool call is required or possible here.
-  const sheet = await buildCheatSheet(cwd, [verify.summary, ...verify.failures].join("\n"), config);
-  const renderedSheet = sheet ? renderCheatSheet(sheet, commitlet.focusedVerification.find((step) => step.command)?.command) : "";
-  const failureWithEvidence = renderedSheet ? `${verify.summary}\n${renderedSheet}` : verify.summary;
-  if (sheet && ledger) {
-    // Receipt truthfulness: record WHICH evidence sources were injected, so the completion
-    // receipt can say "cheat evidence used (experience, api_oracle)" from ground truth.
-    ledger.addEntry("cheat_evidence", `trigger ${sheet.trigger}`, { sources: sheet.cards.map((card) => card.source), commitletId: commitlet.id });
-  }
-
-  const alreadyRepair = /-repair$/.test(commitlet.id);
-  if (!alreadyRepair) {
-    const repair = createRepairCommitlet(commitlet, failureWithEvidence);
-    const plan = defaultCommitletState.get().currentPlan;
-    if (plan) {
-      defaultCommitletState.setPlan({
-        ...plan,
-        commitlets: plan.commitlets.flatMap((item) => item.id === commitlet.id ? [{
-          ...item,
-          status: "failed" as const,
-          result: {
-            filesChanged: touchedFiles.length ? touchedFiles : item.expectedFilesTouched,
-            diffLines: countDiffLines(diffText),
-            testsRun: verify.commandsRun,
-            verificationPassed: false,
-            healthPassed: health.passed,
-            rollbackAvailable: Boolean(item.rollbackPoint),
-            summary: verify.summary,
-            issues: verify.failures
-          }
-        }, repair] : [item])
-      });
-    }
-    return {
-      advance: true,
-      message: [failureWithEvidence, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
-      details: { guard, health, audit, verify, repair, cheatSheet: sheet ?? undefined }
-    };
-  }
-
-  if (commitlet.rollbackPoint) {
-    const reverted = revertRollbackPoint(cwd, commitlet);
-    defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${verify.summary}; ${reverted.reason}`);
-    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted, cheatSheet: sheet ?? undefined } };
-  }
-  defaultCommitletState.updateCommitlet(commitlet.id, "failed", verify.summary);
-  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify, cheatSheet: sheet ?? undefined } };
-}
-
-function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {
-  if (review.accepted) return false;
-  if (plan.commitlets.some((commitlet) => /cleanup-health$/.test(commitlet.id))) return false;
-  return review.blockingIssues.length > 0 && review.blockingIssues.every((issue) => /below preferred threshold|cleanup commitlet required/i.test(issue));
-}
-
-function finalizePlan(cwd: string, plan: CommitletPlan, config: CheaterConfig): { text: string; details: unknown } {
-  // Reconstruct the real accumulated diff (each commitlet's pre-edit snapshot vs current)
-  // so the final review scores actual changes instead of an empty string.
-  const accumulatedDiff = plan.commitlets
-    .filter((commitlet) => commitlet.rollbackPoint?.snapshotDir)
-    .map((commitlet) => buildCommitletDiff(
-      cwd,
-      commitlet.result?.filesChanged?.length ? commitlet.result.filesChanged : commitlet.allowedFiles,
-      commitlet.rollbackPoint?.snapshotDir
-    ).diffText)
-    .filter(Boolean)
-    .join("\n");
-  const review = runCommitletFinalReview(plan, accumulatedDiff);
-  const cfg = commitletConfig(config);
-  const cleanup = cfg.autoCleanupLowRiskHealthIssues && shouldCreateCleanupCommitlet(plan, review)
-    ? createCleanupCommitlet(plan, review.blockingIssues.join("; ") || review.warnings.join("; "))
-    : undefined;
-  const updated = cleanup
-    ? { ...plan, finalReview: review, status: "running" as const, commitlets: [...plan.commitlets, cleanup], currentIndex: plan.commitlets.length }
-    : { ...plan, finalReview: review, status: review.accepted ? "complete" as const : "failed" as const };
-  defaultCommitletState.setPlan(updated);
-  const run = activeTaskRun();
-  if (run) {
-    // Implementation is over: the run moves (monotonically) into VALIDATE - broad edits from
-    // here on draw phase warnings, and RESERVE will follow as the budget drains.
-    run.phase.advanceTo("validate");
-    run.setNextAction(review.accepted ? "run cheater_finish_gate" : "resolve final-review blockers");
-    updateControllerFile(run, updated, updated.status, review.accepted ? "finish gate" : "final review blockers");
-    if (updated.status !== "running") run.setStatus(updated.status === "complete" ? "complete" : "failed");
-    run.refreshDigest();
-  }
-  const telemetryFile = config.telemetryEnabled === false ? undefined : writeTelemetry(cwd, telemetryFromPlan(updated));
-  return {
-    text: [
-      "No pending commitlets. Ran automatic final review.",
-      formatCommitletFinalReview(review),
-      cleanup ? `Created cleanup commitlet: ${cleanup.id} (${cleanup.title})` : ""
-    ].filter(Boolean).join("\n"),
-    details: { review, telemetryFile, cleanup, plan: updated }
-  };
-}
-
 export function registerCommitletTools(pi: ExtensionAPI, deps: { config: CheaterConfig }): void {
+  pi.registerTool({
+    name: "cheater_run",
+    label: "Cheater Run (closed loop)",
+    description: "Do the whole code task in ONE call: the harness plans, makes each edit in a bounded step, grades and repairs it, verifies, and reports. Call this once for any code change (you do not call cheater_commitlet_next after it), then follow the instructions in its result. Pass a SHORT one-line goal - the harness does all planning.",
+    parameters: Type.Object({
+      userGoal: Type.String({ description: "The goal in ONE short IMPERATIVE sentence that KEEPS its action verb (Create/Add/Fix/Build...) - ideally the user's own words. The verb is what lets the harness tell a build from a question, so never drop it (write \"Create a Vite+React todo app\", never the bare \"Vite+React todo app\"). Do NOT restate requirements, list files, or expand into a spec - the harness plans every detail itself, and on a local model each token you type here costs real seconds for nothing." }),
+      spawnFreshWorker: Type.Optional(Type.Boolean({ description: "Force real isolated worker sessions on/off; default follows config and the verified backend probe." })),
+      maxCommitlets: Type.Optional(Type.Number({ description: "Hard cap on commitlets (incl. repairs) the loop may run. Default: plan length + repair budget, min 12." })),
+      maxRepairRounds: Type.Optional(Type.Number({ description: "Hard cap on repair commitlets across the run. Default: repairAttemptsPerCommitlet or 3." })),
+      approveLargeDeletion: Type.Optional(Type.Boolean({ description: "Approve an intended large deletion that the diff guard would otherwise block." }))
+    }),
+    async execute(_id: string, params: { userGoal: string; spawnFreshWorker?: boolean; maxCommitlets?: number; maxRepairRounds?: number; approveLargeDeletion?: boolean }, _sig: unknown, _upd: unknown, ctx: ExtensionContext) {
+      const result = await runClosedLoopCommitlets({
+        cwd: ctx.cwd,
+        userGoal: params.userGoal,
+        config: deps.config,
+        ctx,
+        spawnFreshWorker: params.spawnFreshWorker,
+        maxCommitlets: params.maxCommitlets,
+        maxRepairRounds: params.maxRepairRounds,
+        approveLargeDeletion: params.approveLargeDeletion
+      });
+      return textResult(result.summary, {
+        ok: result.ok,
+        status: result.status,
+        freshWorkerMode: result.freshWorkerMode,
+        steps: result.steps,
+        plan: result.plan,
+        receipt: result.receipt,
+        error: result.error,
+        details: result.details
+      });
+    }
+  });
+
   pi.registerTool({
     name: "cheater_reliability_start",
     label: "Cheater Reliability Start",
-    description: "Route autopilot, create a commitlet plan, prepare the first commitlet with rollback, and return a fresh-call prompt. By default the fresh-worker handoff is simulated (prompt returned to the current session). Set spawnFreshWorker=true to spawn a real isolated LLM session via sdkFreshAgentPacketRunner.",
+    description: "Plan the task and return the first commitlet's execution prompt with a rollback point. Do exactly what that prompt says, then call cheater_commitlet_next to grade the edit and get the next step. Pass a SHORT one-line goal - the harness does all planning.",
     parameters: Type.Object({
-      userGoal: Type.String(),
+      userGoal: Type.String({ description: "The goal in ONE short IMPERATIVE sentence that KEEPS its action verb (Create/Add/Fix/Build...) - ideally the user's own words; the verb is what lets the harness tell a build from a question. Do NOT restate requirements or list files - the harness plans every detail, and on a local model each token you type here costs real seconds for nothing." }),
       useActiveBlueprint: Type.Optional(Type.Boolean()),
       spawnFreshWorker: Type.Optional(Type.Boolean({ description: "When true, spawn a real isolated worker session instead of returning a prompt to the current session." }))
     }),
@@ -422,8 +131,10 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         // from the plan's own per-commitlet tool budgets unless configured explicitly.
         // A session-reincarnated run stays active instead: its contract, ledgers, and
         // protections are the continuing truth; a fresh run dir would orphan them.
+        // Generous: the main model drives the whole build in-session and needs far more actions
+        // than a bounded worker's per-commitlet estimate (see closedLoop.ts for the rationale).
         const actionBudget = deps.config.runStateActionBudget
-          ?? plan.commitlets.reduce((sum, commitlet) => sum + commitlet.maxToolCalls, 0) + 20;
+          ?? Math.max(300, plan.commitlets.reduce((sum, commitlet) => sum + commitlet.maxToolCalls, 0) * 3 + 60);
         const existing = activeTaskRun();
         const run = existing?.resumed && existing.status === "running"
           ? existing
@@ -449,12 +160,13 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       liveSessionState.setPacketId(prepared.id);
       liveSessionState.beginCommitlet();
       activeTaskRun()?.setActiveCommitlet(prepared.id);
-      const wantRealWorker = await resolveRealWorkerMode(params, deps.config, ctx);
+      // Sticky lane: a scaffold plan stays in-session for the whole build (see cheater_commitlet_next).
+      const wantRealWorker = updated.buildMode === "scaffold" ? false : await resolveRealWorkerMode(params, deps.config, ctx);
       let prompt = buildCommitletExecutionPrompt(updated, prepared, [], wantRealWorker ? "real" : "simulated", 1, resolveModelName(deps.config, ctx));
       let fallbackNotice = "";
 
       if (wantRealWorker) {
-        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared));
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared), workerHeartbeat(ctx, updated, prepared));
         const workerResult = resample.workerResult;
         // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
         // real fresh workers) is recorded from ground truth, never model prose.
@@ -484,7 +196,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
           ].join("\n"), { decision, plan: defaultCommitletState.get().currentPlan, commitlet: prepared, workerResult, resample, freshWorkerMode: "real" });
         } else {
           const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
-          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
+          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config, { sidecar: resolveSidecarClient(deps.config, ctx) });
           return textResult([
             "Cheater Reliability Start (real fresh worker)",
             `autopilot: ${decisionSummary}`,
@@ -537,7 +249,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       const running = plan.commitlets.find((commitlet) => commitlet.status === "running");
       let gradeReport = "";
       if (running) {
-        const grade = await gradeCommitlet(ctx.cwd, running, deps.config, { allowLargeDeletion: params.approveLargeDeletion });
+        const grade = await gradeCommitlet(ctx.cwd, running, deps.config, { allowLargeDeletion: params.approveLargeDeletion, sidecar: resolveSidecarClient(deps.config, ctx) });
         plan = defaultCommitletState.get().currentPlan!;
         if (!grade.advance) return textResult(grade.message, grade.details);
         // The grade verdict (including any injected cheat sheet on a failure that spawned a
@@ -559,12 +271,15 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       liveSessionState.beginCommitlet();
       activeTaskRun()?.setActiveCommitlet(prepared.id);
       const previousState = plan.commitlets.filter((commitlet) => commitlet.result?.summary).map((commitlet) => `${commitlet.id}: ${commitlet.result?.summary}`);
-      const wantRealWorker = await resolveRealWorkerMode(params, deps.config, ctx);
+      // Sticky lane: a scaffold plan runs the WHOLE build in-session on the warm cache. commitlet_next
+      // must NOT re-probe the backend and flip to cold per-file fresh workers mid-chain (the exact
+      // slowdown the scaffold design avoids), so honor the plan's lane instead of resolving afresh.
+      const wantRealWorker = updated.buildMode === "scaffold" ? false : await resolveRealWorkerMode(params, deps.config, ctx);
       let prompt = buildCommitletExecutionPrompt(updated, prepared, previousState, wantRealWorker ? "real" : "simulated", 1, resolveModelName(deps.config, ctx));
       let fallbackNotice = "";
 
       if (wantRealWorker) {
-        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared));
+        const resample = await runResampledWorker(updated, prepared, deps.config, undefined, ctx?.model, workerProgress(ctx, updated, prepared), workerHeartbeat(ctx, updated, prepared));
         const workerResult = resample.workerResult;
         // Receipt truthfulness: the resample outcome (attempts, winner, verified or not,
         // real fresh workers) is recorded from ground truth, never model prose.
@@ -584,7 +299,17 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
           return textResult([`Fresh worker failed for commitlet ${prepared.id}.`, resample.note, workerResult.summary].join("\n"), { commitlet: prepared, workerResult, resample, freshWorkerMode: "real" });
         } else {
           const gradedCommitlet = defaultCommitletState.get().currentPlan?.commitlets.find((commitlet) => commitlet.id === prepared.id) ?? prepared;
-          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config);
+          const grade = await gradeCommitlet(ctx.cwd, gradedCommitlet, deps.config, { sidecar: resolveSidecarClient(deps.config, ctx) });
+          if (!grade.advance) {
+            // The worker's output did not verify (e.g. it claimed success but changed nothing, now
+            // caught by gradeCommitlet's real-work gate). NEVER print a "workerStatus: ok" header over
+            // a failed grade - that contradictory receipt is exactly what confuses a small model.
+            return textResult([
+              `Cheater Commitlet Next (real fresh worker): ${prepared.title} — did NOT verify`,
+              resample.note,
+              grade.message
+            ].join("\n"), { commitlet: prepared, workerResult, resample, grade: grade.details, freshWorkerMode: "real" });
+          }
           return textResult([
             `Cheater Commitlet Next (real fresh worker): ${prepared.title}`,
             "workerStatus: ok",
@@ -667,7 +392,7 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
   pi.registerTool({
     name: "cheater_finish_gate",
     label: "Cheater Finish Gate",
-    description: "Check the completion ledger and block finishing a task without verification evidence. Returns allowed=false when verification is missing or failures are unresolved. Pass waiver=<reason> to explicitly and traceably skip verification (recorded in the ledger) instead of quietly claiming it was skipped.",
+    description: "Call this before telling the user a task is done: it returns allowed=true only when verification evidence exists and no failures are unresolved. If verification genuinely cannot run, pass waiver=<reason> to record an honest skip.",
     parameters: Type.Object({
       summary: Type.Optional(Type.String({ description: "Proposed finish summary" })),
       waiver: Type.Optional(Type.String({ description: "Explicit reason to finish without full verification; recorded in the ledger as a tracked skip." }))
@@ -686,51 +411,18 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
           "This skip is tracked in the completion ledger; tell the user verification was skipped and why."
         ].join("\n"), { allowed: true, reason: "waived", waiver: params.waiver });
       }
-      const verdict = ledgerAllowsFinish(ledger);
-      // Staleness gate: the completion ledger records that verification ran, but not whether
-      // the files it proved were edited again afterwards. The run-state validation ledger
-      // does - a finish whose only evidence is stale (or proxy-only when the contract names
-      // exact artifacts) is downgraded to BLOCKED with the exact re-run instructions.
-      const run = deps.config.runStateEnabled !== false ? activeTaskRun() : null;
-      let recipeNote = "";
-      if (run && run.contract.outputPaths.length && run.validations.summary().freshExactPasses === 0) {
-        // CodeMode-lite: before judging, deterministically reread the exact artifacts the
-        // contract names (parse JSON, check CSV headers) - the cheapest evaluator-mirroring
-        // evidence available, produced by the harness itself, no model turn spent.
-        const reread = artifactReread(run);
-        recipeNote = `artifact reread (harness recipe):\n${reread.digest}`;
-      }
-      const freshness = run?.finishCheck();
-      const allowed = verdict.allowed && (!freshness || freshness.ok);
-      const state = ledger.get();
-      const lines = [
-        `Cheater Finish Gate: ${allowed ? "ALLOWED" : "BLOCKED"}`,
-        `reason: ${verdict.allowed && !allowed ? "validation evidence is stale or proxy-only" : verdict.reason}`,
-        `changedFiles: ${state.changedFiles.length} (${state.changedFiles.slice(0, 5).join(", ") || "none"})`,
-        `commandsRun: ${state.commandsRun.length}`,
-        `verificationStages: ${state.verification.length} (${state.verification.filter((v) => v.status === "ok").length} ok)`,
-        `unresolvedFailures: ${state.unresolvedFailures.length}`,
-        params.summary ? `proposedSummary: ${params.summary}` : ""
-      ].filter(Boolean);
-      if (recipeNote) lines.push("", recipeNote);
-      if (freshness && !freshness.ok) {
-        lines.push("", "Run-state freshness check:", ...freshness.warnings.map((warning) => `- ${warning}`));
-      }
-      if (run) {
-        const checklist = run.contract.checklist;
-        if (checklist.length && !allowed) lines.push("", "Contract checklist (validate these exactly):", ...checklist.slice(0, 5).map((item) => `- ${item}`));
-      }
-      if (!allowed) {
-        lines.push("", "Finish blocked. Run cheater_verification_run to collect evidence, or resolve the listed failures before finishing.");
-      }
-      return textResult(lines.join("\n"), { allowed, reason: verdict.reason, freshness, ledger: state });
+      // Shared kernel verdict: completion-ledger gate + run-state staleness gate + the
+      // automatic exact-artifact reread. The closed-loop executor uses the SAME function -
+      // one finish truth, never two.
+      const verdict = finishVerdict(deps.config, { summary: params.summary })!;
+      return textResult(verdict.lines.join("\n"), { allowed: verdict.allowed, reason: verdict.reason, freshness: verdict.freshness, ledger: verdict.ledgerState });
     }
   });
 
   pi.registerTool({
     name: "cheater_verification_run",
     label: "Cheater Verification Run",
-    description: "Detect project dev/test/score commands, start owned services on a clean port, probe workspace identity, run smoke/focused/full/scoring checks, collect artifacts, stop owned services, and feed the completion ledger.",
+    description: "Detect and run the project's test/verification commands and record the results as evidence for the finish gate.",
     parameters: Type.Object({
       planKind: Type.Optional(Type.Union([Type.Literal("webapp"), Type.Literal("cli")])),
       port: Type.Optional(Type.Number({ description: "Optional fixed port; otherwise a free port is selected" }))

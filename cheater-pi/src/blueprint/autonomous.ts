@@ -16,6 +16,7 @@ import { searchBugMemories } from "../bug-memory.js";
 import { buildRepoConstraintGraph, buildPlannerGraph, queryConstraintFacts, selectFilesByGoalFromGraph, symbolClustersForGoal } from "../commitlet/constraintGraph.js";
 import type { BlueprintPlan } from "./types.js";
 import { splitPacketsByTouchedFile } from "../reliability/perFilePackets.js";
+import { isCheaterOwnRepo } from "../runstate/repoIdentity.js";
 import { runWebScout } from "./webScout.js";
 import { detectSearchTriggers, shouldSearchWeb } from "./webScout.js";
 
@@ -137,7 +138,7 @@ export async function createAutonomousBlueprint(params: {
         "all packets complete",
         "forbidden actions avoided",
         "tests/build verified or blocker reported",
-        "Cheater remains a Pi wrapper/distribution"
+        ...(isCheaterOwnRepo(params.cwd) ? ["Cheater remains a Pi wrapper/distribution"] : ["changes match the project's own stack and conventions"])
       ],
       required: true
     },

@@ -10,12 +10,16 @@ import { selectSingleFileForGoal } from "./constraintGraph.js";
 import type { Commitlet, CommitletHealthBudget, CommitletPlan, CommitletPlanInput, VerificationStep } from "./types.js";
 import { verificationFromBlueprint, workPacketToAllowedFiles } from "./types.js";
 import { emptyHealthReport } from "./health.js";
+import { globalConstraintsFor } from "../runstate/repoIdentity.js";
+import { isManifestPath, type ScaffoldFile } from "../blueprint/scaffold.js";
 
 export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
   const projectTestCommand = defaultVerificationCommand(input.repoRoot);
-  const commitlets = input.blueprintPlan
-    ? commitletsFromBlueprint(input.blueprintPlan, input.autopilotDecision)
-    : commitletsFromDecision(input.userGoal, input.autopilotDecision, projectTestCommand, input.repoRoot);
+  const commitlets = input.commitlets && input.commitlets.length
+    ? input.commitlets
+    : input.blueprintPlan
+      ? commitletsFromBlueprint(input.blueprintPlan, input.autopilotDecision)
+      : commitletsFromDecision(input.userGoal, input.autopilotDecision, projectTestCommand, input.repoRoot);
   const finalVerification = mergeFinalVerification(commitlets);
   const plan: CommitletPlan = {
     id: `commitlet-plan-${Date.now().toString(36)}`,
@@ -26,12 +30,9 @@ export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
     commitlets,
     currentIndex: 0,
     status: "planning",
-    globalConstraints: [
-      "Cheater remains a Pi wrapper/distribution.",
-      "Pi owns TUI, shell, file reading, editing, sessions, and base agent loop.",
-      "Each file-change commitlet runs in a fresh worker session.",
-      "Rollback is required before editing."
-    ],
+    // Cheater-dev constraints (Pi wrapper, Pi owns the loop) apply ONLY to Cheater's own repo; any
+    // other project gets stack-agnostic guidance so the model builds THAT app, not a Pi extension.
+    globalConstraints: globalConstraintsFor(input.repoRoot),
     finalVerification,
     finalReview: {
       accepted: false,
@@ -45,7 +46,8 @@ export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
     },
     risk: input.autopilotDecision.risk,
     autopilotDecision: input.autopilotDecision,
-    blueprintPlanId: input.blueprintPlan?.id
+    blueprintPlanId: input.blueprintPlan?.id,
+    buildMode: input.buildMode ?? "surgical"
   };
   return {
     ...plan,
@@ -62,11 +64,15 @@ export function commitletsFromBlueprint(plan: BlueprintPlan, decision: Autopilot
 }
 
 export function createRepairCommitlet(failed: Commitlet, failureSummary: string): Commitlet {
-  // Evidence (the cheat sheet appended to a graded failure) belongs ONLY in observedFailure.
-  // The purpose/acceptance slices must be built from the bare failure, or evidence headers
-  // pollute acceptance criteria and leak into attempts that deliberately withhold evidence.
-  const sheetStart = failureSummary.indexOf("=== CHEATER CHEAT SHEET");
-  const bareFailure = (sheetStart > 0 ? failureSummary.slice(0, sheetStart) : failureSummary).trim();
+  // Evidence (the cheat sheet, and the sidecar-distilled "Repair focus" block) belongs ONLY in
+  // observedFailure. The purpose/acceptance slices must be built from the bare failure, or
+  // evidence headers pollute acceptance criteria and leak into attempts that deliberately
+  // withhold evidence. Strip at whichever evidence marker appears first.
+  const evidenceStart = ["=== CHEATER CHEAT SHEET", "Repair focus (distilled):"]
+    .map((marker) => failureSummary.indexOf(marker))
+    .filter((index) => index > 0)
+    .sort((a, b) => a - b)[0];
+  const bareFailure = (evidenceStart !== undefined ? failureSummary.slice(0, evidenceStart) : failureSummary).trim();
   return {
     ...failed,
     id: `${failed.id}-repair`,
@@ -143,6 +149,110 @@ export function createCleanupCommitlet(plan: CommitletPlan, healthSummary: strin
       ]
     }
   };
+}
+
+/**
+ * Build create-commitlets for a from-scratch build from the MODEL-proposed file list (blueprint/
+ * scaffold.ts - there is NO per-framework template). Files are GROUPED INTO ORDERED PHASES (config
+ * -> foundation -> features -> validation), ONE commitlet per phase, so a 20-file app becomes ~5
+ * commitlets instead of 20 one-file round-trips (each of which, in the old shape, forced a cold
+ * fresh-worker prefill and a grade pass). Each phase allows exactly its own files and runs
+ * in-session; the config phase may edit the manifest + lockfile. Pass these to createCommitletPlan
+ * via its `commitlets` override together with buildMode:"scaffold".
+ */
+export function buildScaffoldCommitlets(files: ScaffoldFile[], userGoal: string, decision: AutopilotDecision): Commitlet[] {
+  const phases = groupScaffoldFilesIntoPhases(files);
+  return phases.map((phase, index) => {
+    const paths = phase.files.map((file) => file.path);
+    const hasManifest = paths.some(isManifestPath);
+    const hasTest = paths.some((path) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(path));
+    const manifestNote = hasManifest ? " and run `npm install`" : "";
+    const base = makeCommitlet({
+      id: `c${index + 1}-scaffold-${phase.key}`,
+      title: `Create ${phase.label} (${paths.length} file${paths.length === 1 ? "" : "s"})`,
+      purpose: `Create the ${phase.label} for: ${userGoal.slice(0, 100)}`,
+      scope: "scaffold",
+      allowedFiles: paths,
+      expectedFilesTouched: paths,
+      focusedVerification: [{ purpose: `Create ${phase.label}${manifestNote}`, required: false }],
+      risk: "medium",
+      allowTestEdits: hasTest || phase.key === "validation"
+    });
+    // A whole phase of new files is a big pure-addition; scale the diff cap with the file count and
+    // let the phase touch all of its own files. The config phase edits the manifest + lockfile.
+    base.maxFilesTouched = Math.max(1, paths.length);
+    base.maxDiffLines = Math.max(4000, paths.length * 1500);
+    base.healthBudget.allowDependencyEdits = hasManifest;
+    base.healthBudget.allowLockfileEdits = hasManifest;
+    return { ...base, spec: forgeCommitletSpec(base, decision.taskKind, userGoal) };
+  });
+}
+
+interface ScaffoldPhase { key: "config" | "foundation" | "features" | "entry" | "validation"; label: string; files: ScaffoldFile[]; }
+
+const SCAFFOLD_PHASE_LABEL: Record<ScaffoldPhase["key"], string> = {
+  config: "project config",
+  foundation: "app foundation",
+  features: "feature modules",
+  entry: "app entry & wiring",
+  validation: "tests / validation"
+};
+
+/**
+ * Bucket the model's ordered file list into ordered phases (config -> foundation -> features ->
+ * entry -> validation), preserving within-phase order, and split any oversize phase (mainly
+ * `features`) into chunks so no single commitlet builds too many files at once. Deterministic.
+ *
+ * The `entry` phase (App.tsx / main.tsx - the app SHELL that imports everything) comes AFTER
+ * `features` on purpose: if App is built first (the old order) the components it should import do not
+ * exist yet, so the model inlines every feature into one giant unbuildable App.tsx AND leaves the
+ * component files unused. Building entry last means the components already exist -> the model imports
+ * them -> a thin App and focused, debuggable component files.
+ */
+export function groupScaffoldFilesIntoPhases(files: ScaffoldFile[], maxFilesPerPhase = 8): ScaffoldPhase[] {
+  const order: ScaffoldPhase["key"][] = ["config", "foundation", "features", "entry", "validation"];
+  const buckets = new Map<ScaffoldPhase["key"], ScaffoldFile[]>();
+  for (const file of files) {
+    const key = classifyScaffoldFile(file.path);
+    let bucket = buckets.get(key);
+    if (!bucket) { bucket = []; buckets.set(key, bucket); }
+    bucket.push(file);
+  }
+  const phases: ScaffoldPhase[] = [];
+  for (const key of order) {
+    const bucket = buckets.get(key);
+    if (!bucket || !bucket.length) continue;
+    const split = bucket.length > maxFilesPerPhase;
+    for (let i = 0; i < bucket.length; i += maxFilesPerPhase) {
+      const chunk = bucket.slice(i, i + maxFilesPerPhase);
+      const label = split ? `${SCAFFOLD_PHASE_LABEL[key]} ${Math.floor(i / maxFilesPerPhase) + 1}` : SCAFFOLD_PHASE_LABEL[key];
+      phases.push({ key, label, files: chunk });
+    }
+  }
+  // Degenerate fallback: classification should never drop every file (a manifest is guaranteed
+  // present), but if it did, put everything in one config phase so the build still runs.
+  if (!phases.length && files.length) phases.push({ key: "config", label: SCAFFOLD_PHASE_LABEL.config, files });
+  return phases;
+}
+
+/**
+ * Which scaffold phase a file belongs to, by path/name. Manifest + build/config files -> config;
+ * tests/validation -> validation; the app entry/shell (main.*, App.*, root index.*) -> entry (built
+ * LAST so it imports the components instead of inlining them); UI feature dirs -> features; everything
+ * else (styles, types, data, hooks, store, lib, utils) -> foundation.
+ */
+export function classifyScaffoldFile(path: string): ScaffoldPhase["key"] {
+  const p = path.toLowerCase().replace(/\\/g, "/");
+  const base = p.split("/").pop() ?? p;
+  if (isManifestPath(path)) return "config";
+  // Tests + validation come before the generic *.config.* rule so vitest/jest configs land here.
+  if (/(^|\/)(test|tests|__tests__|spec|e2e|cypress)(\/|$)|\.(test|spec)\.[jt]sx?$|^(vitest|jest)\.config\.[jt]s$|^validate[\w.-]*\.[jt]s$/i.test(p) || /^(vitest|jest)\.config\.[jt]s$/i.test(base)) return "validation";
+  if (/\.config\.[jt]s$/i.test(base) || /^(tsconfig[\w.-]*\.json|jsconfig\.json|index\.html|\.gitignore|\.npmrc|\.eslintrc[\w.-]*|\.prettierrc[\w.-]*|components\.json)$/i.test(base) || /^\.env/i.test(base)) return "config";
+  // The app entry/shell: the wiring hub that imports the rest. Built AFTER features so its imports
+  // already exist. (index.html is config, handled above; a subdir barrel index.ts is NOT entry.)
+  if (/^main\.[jt]sx?$/i.test(base) || /^app\.[jt]sx?$/i.test(base) || /^src\/index\.[jt]sx$/i.test(p)) return "entry";
+  if (/(^|\/)(components?|pages?|views?|features?|routes?|screens?|widgets?|containers?|sections?|modules?)(\/|$)/i.test(p)) return "features";
+  return "foundation";
 }
 
 function commitletFromPacket(packet: WorkPacket, index: number, decision: AutopilotDecision): Commitlet {
