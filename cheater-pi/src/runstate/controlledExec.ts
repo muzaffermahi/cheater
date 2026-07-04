@@ -117,9 +117,15 @@ export function preExecPolicy(input: ExecPolicyInput): ExecPolicy {
     if (guardVerdict.verdict === "warn") { base.verdict = "warn"; base.message = guardVerdict.message; }
   }
 
-  // Reserve phase: no installs, no destructive git, no fresh artifact generation.
-  if (input.phase === "reserve" && (kind === "install" || kind === "git_destructive")) {
-    return { ...base, verdict: "block", message: `RESERVE phase: ${kind === "install" ? "dependency installs" : "destructive git operations"} are blocked; preserve the current result and run final cheap checks only.` };
+  // Reserve phase: block only genuinely destructive git. Dependency installs are LEGITIMATE build
+  // actions - a from-scratch app cannot run without its node_modules - so they warn, never block.
+  // Hard-blocking `npm install` in RESERVE was a top "the build never finishes" cause.
+  if (input.phase === "reserve" && kind === "git_destructive") {
+    return { ...base, verdict: "block", message: "RESERVE phase: destructive git operations are blocked; preserve the current result and run final cheap checks only." };
+  }
+  if (input.phase === "reserve" && kind === "install" && base.verdict === "allow") {
+    base.verdict = "warn";
+    base.message = "RESERVE phase: late-stage dependency install - proceeding (a build may legitimately need it), but avoid churning dependencies now.";
   }
   if (input.phase === "reserve" && kind === "artifact_generation") {
     return { ...base, verdict: "warn", message: "RESERVE phase: regenerating artifacts now risks overwriting acceptable output." };

@@ -161,6 +161,28 @@ test("probe latches UNAVAILABLE on session-creation failure and runs at most onc
   resetWorkerBackendLatch();
 });
 
+test("probe latches UNAVAILABLE (not hang) when session creation stalls past the timeout", async () => {
+  resetWorkerBackendLatch();
+  // A cold/wedged local endpoint can leave createAgentSession pending for tens of seconds; the
+  // probe must not block the user's first task on it. A never-resolving createFn + tiny timeout
+  // must degrade to the in-session flow instead of hanging.
+  let disposed = false;
+  const stalls = () => new Promise<{ session: { model?: { id?: string }; dispose?: () => void } }>((resolve) => {
+    // Resolve much later than the probe's timeout so the race is decided by the timer; the
+    // late session must still be disposed (no leak).
+    setTimeout(() => resolve({ session: { model: { id: "late" }, dispose() { disposed = true; } } }), 200);
+  });
+  const started = Date.now();
+  const probe = await probeWorkerBackend("C:/anywhere", stalls, 40);
+  assert.equal(probe.ok, false);
+  assert.match(probe.reason, /timed out/);
+  assert.equal(workerBackendState(), "unavailable");
+  assert.ok(Date.now() - started < 150, "probe must return on the timeout, not wait for the stalled session");
+  await new Promise((r) => setTimeout(r, 220));
+  assert.equal(disposed, true, "a late-resolving probe session is disposed, not leaked");
+  resetWorkerBackendLatch();
+});
+
 test("explicit config and explicit param always beat the latch", () => {
   resetWorkerBackendLatch();
   noteWorkerBackend(true);

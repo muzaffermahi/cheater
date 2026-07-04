@@ -73,6 +73,11 @@ class LauncherConfig:
     theme_enabled: bool = True
     debug: bool = False
     show_startup_card: bool = True
+    # HTTP idle timeout (ms) Cheater ensures in Pi's settings so a slow local model's PREFILL is
+    # not killed. Pi's default is 300000 (5 min): a big prompt on a CPU-offloaded model sends no
+    # response bytes for longer than that, so Pi's idle timeout disconnects and auto-retries
+    # forever - the model never even starts. 0 means "no timeout". Default 30 min.
+    http_idle_timeout_ms: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,13 +112,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if legacy:
         sys.stderr.write(
             f"cheater: `{legacy}` was part of the old Python agent CLI and is no longer "
-            "a primary Cheater command.\n"
-            "Run `cheater` to open the Cheater-flavored Pi TUI, or use Pi slash "
-            "commands such as /mission, /fix, /orient, /repro, /evidence, /verify, /learn, /test, /map, /skills, and /doctor.\n"
+            "a Cheater command.\n"
+            "Run `cheater` to open the Cheater-flavored Pi TUI and just describe what you "
+            "want; inside the TUI, run /cheater to see the current slash commands.\n"
         )
         return 2
 
     command = build_pi_command(cfg, args)
+    # Give a slow local model time to finish prefill before Pi's HTTP idle timeout kills the
+    # request. Without this, a large prompt on a CPU-offloaded model loops forever (disconnect
+    # at 5 min -> retry -> disconnect ...) and never produces a single token.
+    ensure_pi_http_idle_timeout(cfg)
     if args.print_pi_command or args.debug or cfg.debug:
         print(format_command(command))
         if args.print_pi_command:
@@ -239,7 +248,48 @@ def load_config() -> LauncherConfig:
         show_startup_card=bool(
             data.get("showStartupCard", data.get("show_startup_card", True))
         ),
+        http_idle_timeout_ms=_coerce_int(data.get("httpIdleTimeoutMs")),
     )
+
+
+def _pi_agent_dir() -> Path:
+    """Pi's agent config dir (matches the SDK's getAgentDir: $PI_CODING_AGENT_DIR or ~/.pi/agent)."""
+    env_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if env_dir:
+        return Path(os.path.expanduser(env_dir))
+    return Path.home() / ".pi" / "agent"
+
+
+def ensure_pi_http_idle_timeout(cfg: LauncherConfig) -> None:
+    """Raise Pi's httpIdleTimeoutMs in its settings.json IF the user has not set one.
+
+    Root cause of the "runs for 5 min, does nothing, retries forever" bug: Pi's default HTTP idle
+    timeout is 300000ms. During prefill a local model sends no response bytes, so on slow
+    (CPU-offloaded) hardware a big prompt exceeds 5 min of silence, Pi disconnects and auto-retries,
+    and the model never emits a token. A generous idle timeout lets prefill complete. Respectful:
+    only sets the key when absent, never overrides an explicit user value; best-effort, never blocks
+    launch.
+    """
+    timeout_ms = cfg.http_idle_timeout_ms if cfg.http_idle_timeout_ms is not None else 1_800_000
+    try:
+        settings_path = _pi_agent_dir() / "settings.json"
+        data: dict[str, object] = {}
+        if settings_path.is_file():
+            try:
+                loaded = json.loads(settings_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return  # never rewrite a malformed user settings file
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                return
+        if "httpIdleTimeoutMs" in data:
+            return  # respect the user's explicit choice
+        data["httpIdleTimeoutMs"] = int(timeout_ms)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # best-effort; a settings write failure must never block the TUI
 
 
 def build_pi_command(cfg: LauncherConfig, opts: LaunchOptions) -> list[str]:
@@ -379,8 +429,14 @@ Cheater options:
   --print-pi-command   Print the exact Pi command and exit
   --help, -h           Show this help
 
-Useful Cheater slash commands inside Pi:
-  /cheater  /mission  /fix  /orient  /repro  /evidence  /playbook  /verify  /learn  /delta-bench  /test  /map  /remember  /skills  /traces  /history  /settings  /doctor
+Cheater routes normal requests automatically - just describe what you want:
+  add a --json flag to the export command
+  fix this failing test
+  refactor the memory search
+
+Useful slash commands inside Pi (run /cheater for the full, current list):
+  /cheater  /reliability-status  /commitlet-status  /rollback-status
+  /test  /map  /bug-memory  /remember  /skills  /settings  /doctor
 """
     )
 
@@ -415,6 +471,16 @@ def _coerce_command(value: object) -> list[str] | None:
 
 def _coerce_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _coerce_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
 
 
 def _pi_candidates() -> list[str]:

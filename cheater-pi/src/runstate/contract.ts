@@ -172,9 +172,15 @@ function extractOutputFormat(text: string): string[] {
 
 function extractForbidden(text: string): string[] {
   const forbidden: string[] = [];
+  const re = /\b(do not|do n't|don'?t|must not|never|avoid|no extra|without (?:modifying|changing|touching))\b/i;
   for (const sentence of sentences(text)) {
-    if (/\b(do not|don'?t|must not|never|avoid|no extra|without (?:modifying|changing|touching))\b/i.test(sentence)) {
-      forbidden.push(sentence.slice(0, 140));
+    const match = sentence.match(re);
+    if (match && match.index !== undefined) {
+      // Slice the clause STARTING at the prohibition keyword, not the sentence prefix. A compressed
+      // goal joins many requirements into one long comma-list, so the "do not X" is often buried and
+      // the prefix (e.g. "Implementation: organize code cleanly...") is the WRONG thing to record as
+      // forbidden (observed live: implementation requirements landed in the forbidden field).
+      forbidden.push(sentence.slice(match.index, match.index + 140).trim());
     }
   }
   return dedupe(forbidden, 5);

@@ -21,6 +21,10 @@ import { liveSessionState } from "../src/reliability/sessionState.js";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { BugMemorySearchHit } from "../src/bug-memory.js";
 
+// The Cheat Layer / bug-memory feature is OFF by default now (bugMemoryEnabled). This suite tests
+// the feature itself, so it opts in; the master-gate default-off behavior is covered separately.
+const CHEAT_ON = { ...DEFAULT_CONFIG, bugMemoryEnabled: true };
+
 // The Cheat Layer contract: the HARNESS observes a failure, classifies it, retrieves compact
 // evidence, and injects at most three hypothesis cards where the failure is handed to a
 // model. The model never calls a search tool; unrelated failures get no noise; the verifier
@@ -88,15 +92,22 @@ test("trigger classifier maps common failure shapes and extracts package/symbol 
 
 test("no noise: an unclassifiable failure with no verified experience produces NO sheet", async () => {
   const cwd = tmpRepo();
-  const sheet = await buildCheatSheet(cwd, "something vague happened", DEFAULT_CONFIG);
+  const sheet = await buildCheatSheet(cwd, "something vague happened", CHEAT_ON);
   assert.equal(sheet, null);
 });
 
 test("cheatSheetEnabled=false disables the layer entirely", async () => {
   const cwd = tmpRepo();
   saveVerifiedFix(cwd, { failureText: "TypeError: x.split is not a function", diffText: "-a\n+b", files: ["x.ts"] });
-  const sheet = await buildCheatSheet(cwd, "TypeError: x.split is not a function", { ...DEFAULT_CONFIG, cheatSheetEnabled: false });
+  const sheet = await buildCheatSheet(cwd, "TypeError: x.split is not a function", { ...CHEAT_ON, cheatSheetEnabled: false });
   assert.equal(sheet, null);
+});
+
+test("bug memory is OFF by default: no cheat sheet is recalled even with a matching verified fix", async () => {
+  const cwd = tmpRepo();
+  saveVerifiedFix(cwd, { failureText: "TypeError: x.split is not a function", diffText: "-a\n+b", files: ["x.ts"] });
+  // DEFAULT_CONFIG leaves bugMemoryEnabled unset (off), so the model is never handed recalled evidence.
+  assert.equal(await buildCheatSheet(cwd, "TypeError: x.split is not a function", DEFAULT_CONFIG), null, "master gate off by default");
 });
 
 test("verified experience becomes the first, high-confidence card - no tool call involved", async () => {
@@ -107,7 +118,7 @@ test("verified experience becomes the first, high-confidence card - no tool call
     files: ["src/mathutils.py"],
     goal: "fix off-by-one"
   });
-  const sheet = await buildCheatSheet(cwd, "AssertionError: expected sum_range(2, 4) to equal 9 but got 5", DEFAULT_CONFIG);
+  const sheet = await buildCheatSheet(cwd, "AssertionError: expected sum_range(2, 4) to equal 9 but got 5", CHEAT_ON);
   assert.ok(sheet);
   assert.equal(sheet!.cards[0].source, "experience");
   assert.equal(sheet!.cards[0].confidence, "high");
@@ -120,7 +131,7 @@ test("bug corpus contributes a medium-confidence analogy card when relevant", as
   const sheet = await buildCheatSheet(
     cwd,
     "AttributeError: 'Response' object has no attribute 'get_json' in tests/test_routes.py",
-    DEFAULT_CONFIG,
+    CHEAT_ON,
     { memoryPath: corpus }
   );
   assert.ok(sheet, "a classified library_api_error with a matching corpus card must produce a sheet");
@@ -156,7 +167,7 @@ test("cards are bounded: at most 3, each field compact, total render capped", as
   const sheet = await buildCheatSheet(
     cwd,
     "AttributeError: 'werkzeug' object has no attribute 'get_json'",
-    DEFAULT_CONFIG,
+    CHEAT_ON,
     { memoryPath: corpus }
   );
   assert.ok(sheet);
@@ -191,7 +202,7 @@ test("web/docs disabled (default): the cascade still works from local sources on
   const cwd = tmpRepo();
   const corpus = fakeCorpus(cwd, [RELEVANT_CORPUS_CARD]);
   // DEFAULT_CONFIG has blueprintOfficialDocsSearchEnabled: false - nothing may reach the network.
-  const sheet = await buildCheatSheet(cwd, "AttributeError: 'Response' object has no attribute 'get_json'", DEFAULT_CONFIG, { memoryPath: corpus });
+  const sheet = await buildCheatSheet(cwd, "AttributeError: 'Response' object has no attribute 'get_json'", CHEAT_ON, { memoryPath: corpus });
   assert.ok(sheet);
   assert.ok(sheet!.cards.every((card) => card.source !== "official_docs"), "no official-docs card without explicit opt-in");
 });
@@ -217,7 +228,7 @@ test("repair commitlets carry the cheat sheet into their spec (and thus into eve
   });
 
   const tools = new Map<string, any>();
-  registerCommitletTools({ registerTool: (def: any) => tools.set(def.name, def) } as any, { config: DEFAULT_CONFIG });
+  registerCommitletTools({ registerTool: (def: any) => tools.set(def.name, def) } as any, { config: CHEAT_ON });
   const commitlet: any = {
     id: "c1-single", title: "fix totals", purpose: "fix totals", status: "running", scope: "bug_fix",
     allowedFiles: ["calc.py"], forbiddenFiles: [], allowedActions: ["edit"], forbiddenActions: [],
@@ -253,7 +264,7 @@ test("repair commitlets carry the cheat sheet into their spec (and thus into eve
 test("verifier authority is preserved: a cheat sheet never satisfies the finish gate", async () => {
   const cwd = tmpRepo();
   saveVerifiedFix(cwd, { failureText: "TypeError: boom in x", diffText: "-a\n+b", files: ["x.ts"] });
-  const sheet = await buildCheatSheet(cwd, "TypeError: boom in x", DEFAULT_CONFIG);
+  const sheet = await buildCheatSheet(cwd, "TypeError: boom in x", CHEAT_ON);
   assert.ok(sheet, "sheet exists");
   const ledger = new CompletionLedger("goal");
   ledger.recordFileChange("x.ts");

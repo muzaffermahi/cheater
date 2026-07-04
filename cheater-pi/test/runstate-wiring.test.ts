@@ -113,8 +113,11 @@ test("building a worker prompt with an active run persists the capsule + worker 
   const plan = samplePlan(repo);
   const result = buildCommitletExecutionPrompt(plan, sampleCommitlet(), [], "real", 1, "test-model");
   assert.ok(result.capsule, "an active run must produce a persisted capsule");
-  assert.match(result.prompt, /CHEATER RUN STATE/, "the worker prompt must carry the compact run-state block");
+  // Prompt Capsule is the canonical worker context: the prompt IS the capsule render (plus
+  // the thin kernel header), never a second ad hoc context format.
+  assert.match(result.prompt, /You are a focused c1 worker for Cheater/, "the worker prompt must be rendered from the capsule");
   assert.match(result.prompt, /phase: EXPLORE/i);
+  assert.doesNotMatch(result.prompt, /Cheater Reliability Mode fresh-call packet/, "the nested packet prompt format is gone");
   assert.ok(existsSync(join(run.runDir, "capsules", "c1-capsule.json")), "the capsule must be persisted for reincarnation");
   assert.ok(existsSync(join(run.runDir, "workers", "c1.md")), "the durable worker plan must be written");
   const planMd = readFileSync(join(run.runDir, "workers", "c1.md"), "utf8");
@@ -137,7 +140,7 @@ test("the capsule prompt never contains parent-session content, only run-state t
   const result = buildCommitletExecutionPrompt(plan, sampleCommitlet(), ["c0: earlier packet summary"], "real", 1, "test-model");
   // The only cross-worker context allowed is compact summaries: prior packet one-liners and
   // ledger digests. Raw transcripts/logs have no path into this prompt.
-  assert.match(result.prompt, /changes so far: no mutations recorded|changes so far: none/);
+  assert.match(result.prompt, /Changes so far:\n- no mutations recorded/);
   assert.ok(result.prompt.length < 40_000, "the whole worker prompt stays bounded");
   endTaskRun();
 });

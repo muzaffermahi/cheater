@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { isAbsolute, relative, resolve } from "node:path";
 import { Type } from "typebox";
 import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
+import type { CheaterConfig } from "./types.js";
 
 type ExtensionAPI = any;
 type ExtensionContext = any;
@@ -143,10 +144,13 @@ export function createCheaterBugMemorySearchTool() {
     label: "Cheater Bug Memory Search",
     description: "Search the compacted solved-bug memory corpus for highly relevant analogies without loading the full corpus into RAM.",
     promptSnippet: "cheater_bug_memory_search - find compacted solved-bug analogies relevant to the current failure.",
+    // Aligned with the authoritative BUG_MEMORY system section (prompts.ts): the harness
+    // auto-attaches evidence to failures, so this is a rare last resort - NOT "use it whenever a
+    // failure looks distinctive" (that contradiction made a weak model over-search).
     promptGuidelines: [
-      "Use cheater_bug_memory_search when a failure has a distinctive error, API behavior, parser issue, framework symptom, or test signal.",
-      "Treat returned memories as analogies, not facts about the current repo. Verify against local code before editing.",
-      "Prefer the top 1-3 memories and ignore weak or mismatched ones."
+      "The harness auto-attaches solved-bug evidence to failures, so you rarely need this.",
+      "Only call it when stuck on a specific error AND the failure carried no evidence; never pre-emptively.",
+      "Treat any memory as an analogy to verify against local code, not a fact about this repo."
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Bug description, error text, failing test, or likely API/function names" }),
@@ -174,7 +178,66 @@ export function createCheaterBugMemorySearchTool() {
   };
 }
 
-export function registerCheaterTools(pi: ExtensionAPI): void {
+/**
+ * Literal find-and-replace across a file WITHOUT reading or rewriting the whole thing. This is the
+ * cheap-token fix for the reported pattern where the model re-generates a 600-1000 line file just to
+ * change a few repeated tokens (e.g. a bad `\u{...}` escape in many places): it sends ~50 tokens
+ * (find + replace) instead of regenerating ~10k. Also sidesteps the exact-oldText edit failures that
+ * wedged the session.
+ */
+export function createCheaterReplaceTool() {
+  return {
+    name: "cheater_replace",
+    label: "Cheater Replace",
+    description: "Literal find-and-replace across an existing file without reading or rewriting it. Use this to fix a repeated token (e.g. a bad escape) instead of regenerating a large file.",
+    promptSnippet: "cheater_replace - literal find/replace across a file; far cheaper than rewriting a big file to fix repeated tokens.",
+    promptGuidelines: [
+      "Prefer this over rewriting a whole file when the same literal must change in one or more places.",
+      "find is a LITERAL string (whitespace- and case-sensitive), NOT a regex. Replaces every occurrence unless first:true.",
+      "If it reports 0 occurrences, re-check the exact text with grep before trying again."
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "Repo-relative path to an existing file" }),
+      find: Type.String({ description: "Literal text to find (not a regex)" }),
+      replace: Type.String({ description: "Replacement text" }),
+      first: Type.Optional(Type.Boolean({ description: "Replace only the first occurrence (default: replace all)" }))
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { path: string; find: string; replace: string; first?: boolean },
+      _signal: AbortSignal | undefined,
+      _onUpdate: unknown,
+      ctx: ExtensionContext
+    ) {
+      if (!params.find) return textResult("replace refused: empty find string", { ok: false });
+      if (params.find.length > 2000 || (params.replace?.length ?? 0) > 8000) {
+        return textResult("replace refused: find/replace too large; use cheater_line_edit for big blocks", { ok: false });
+      }
+      let target: string;
+      try {
+        target = safeRepoPath(ctx.cwd, params.path);
+      } catch (err) {
+        return textResult(`replace refused: ${(err as Error).message}`, { ok: false });
+      }
+      if (!existsSync(target)) return textResult(`replace refused: file not found: ${params.path}`, { ok: false });
+      const original = readFileSync(target, "utf8");
+      const occurrences = original.split(params.find).length - 1;
+      if (occurrences === 0) {
+        return textResult(`replace: 0 occurrences of that exact literal in ${params.path} (find is whitespace/case-sensitive). Re-check with grep.`, { ok: false, replacements: 0 });
+      }
+      if (occurrences > 1000) {
+        return textResult(`replace refused: ${occurrences} occurrences exceeds the 1000 cap; narrow the find string`, { ok: false });
+      }
+      const next = params.first ? original.replace(params.find, params.replace ?? "") : original.split(params.find).join(params.replace ?? "");
+      if (next === original) return textResult(`replace: no change (replacement identical) in ${params.path}`, { ok: false, replacements: 0 });
+      writeFileSync(target, next, "utf8");
+      const count = params.first ? 1 : occurrences;
+      return textResult(`replaced ${count} occurrence(s) in ${params.path}`, { ok: true, path: params.path, replacements: count });
+    }
+  };
+}
+
+export function registerCheaterTools(pi: ExtensionAPI, config: CheaterConfig = {}): void {
   pi.registerTool({
     name: "cheater_project_brief",
     label: "Cheater Project Brief",
@@ -201,6 +264,7 @@ export function registerCheaterTools(pi: ExtensionAPI): void {
   // would only ever appear to a model if masking failed - exactly when extra tool choices
   // hurt most.
   pi.registerTool(createCheaterLineEditTool());
+  pi.registerTool(createCheaterReplaceTool());
 
   pi.registerTool({
     name: "cheater_memory_search",
@@ -223,7 +287,10 @@ export function registerCheaterTools(pi: ExtensionAPI): void {
     }
   });
 
-  pi.registerTool(createCheaterBugMemorySearchTool());
+  // Bug-memory search is registered ONLY when the (default-off) feature is explicitly enabled. When
+  // off it does not exist at all, so a masking slip can never expose it and the model sees nothing
+  // about a bug-memory tool. Re-enable with bugMemoryEnabled:true to A/B test it later.
+  if (config.bugMemoryEnabled === true) pi.registerTool(createCheaterBugMemorySearchTool());
   // cheater_skill_search was removed: it ignored its own query param and just dumped the
   // static skill list, which Pi already surfaces natively via --skill progressive disclosure.
 }

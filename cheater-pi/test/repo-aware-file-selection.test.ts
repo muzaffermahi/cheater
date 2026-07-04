@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { routeAutopilot } from "../src/autopilot/router.js";
 import { createCommitletPlan } from "../src/commitlet/planner.js";
 import { buildRepoConstraintGraph, selectFilesByGoalFromGraph, selectSingleFileForGoal } from "../src/commitlet/constraintGraph.js";
+import { runDiffGuard, hasResolvedScope, fileMatchesScope } from "../src/commitlet/guard.js";
 
 // Audit finding: for a generic bug-fix/feature request with no blueprint (the single most
 // common routing path - "fix the off-by-one in sum_range"), the planner used to guess from a
@@ -59,6 +60,40 @@ test("with no repo match, the plan still falls back to the honest inspect-first 
   const decision = routeAutopilot({ cwd: root, message: "fix the weird onboarding glitch" });
   const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the weird onboarding glitch", autopilotDecision: decision });
   assert.match(plan.commitlets[0].allowedFiles.join(","), /select one target file after inspection/);
+});
+
+test("a placeholder-only commitlet is self-localizing: the diff guard does NOT block its edit as out-of-scope", () => {
+  const root = tmpRepo();
+  const decision = routeAutopilot({ cwd: root, message: "fix the weird onboarding glitch" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the weird onboarding glitch", autopilotDecision: decision });
+  const commitlet = plan.commitlets[0];
+  assert.equal(hasResolvedScope(commitlet.allowedFiles), false, "the placeholder is not a resolved scope");
+  // Before this fix, the model was told to edit but every edit was rejected here as "outside
+  // allowedFiles" - a hard deadlock. Now the self-localized edit passes scope (health/verify
+  // still gate it), and maxFilesTouched keeps it to one file.
+  const guard = runDiffGuard(commitlet, { touchedFiles: ["src/onboarding.ts"], diffText: "--- a\n+++ b\n+const fixed = true;\n" });
+  assert.equal(guard.blockingIssues.some((issue) => /outside allowedFiles/.test(issue)), false);
+});
+
+test("a resolved-scope commitlet still blocks an out-of-scope edit", () => {
+  const root = tmpRepo();
+  mkdirSync(join(root, "src"), { recursive: true });
+  writeFileSync(join(root, "src", "widgets.ts"), "export function renderWidget() {}\n", "utf8");
+  const decision = routeAutopilot({ cwd: root, message: "renderWidget crashes, fix it" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "renderWidget crashes, fix it", autopilotDecision: decision });
+  const commitlet = plan.commitlets[0];
+  assert.equal(hasResolvedScope(commitlet.allowedFiles), true);
+  const guard = runDiffGuard(commitlet, { touchedFiles: ["src/unrelated.ts"], diffText: "+x\n" });
+  assert.equal(guard.blockingIssues.some((issue) => /outside allowedFiles/.test(issue)), true);
+});
+
+test("fileMatchesScope honors exact files and directory scopes", () => {
+  assert.equal(fileMatchesScope("src/export.ts", "src/export.ts"), true);
+  assert.equal(fileMatchesScope("pkg/src/export.ts", "src/export.ts"), true, "suffix match for nested layouts");
+  assert.equal(fileMatchesScope("src/other.ts", "src/export.ts"), false);
+  assert.equal(fileMatchesScope("test/a.spec.ts", "test/"), true, "directory scope covers files beneath it");
+  assert.equal(fileMatchesScope("src/a.ts", "test/"), false);
+  assert.equal(fileMatchesScope("anything.ts", "(select one target file after inspection)"), false, "placeholder is never a scope");
 });
 
 test("constraint graph extracts Python def/class as symbols and exports (not just signatures)", () => {

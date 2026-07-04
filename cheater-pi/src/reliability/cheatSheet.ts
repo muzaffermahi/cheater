@@ -230,6 +230,9 @@ export interface CheatSheetOptions {
  * evidence is worse for a small model than none.
  */
 export async function buildCheatSheet(cwd: string, failureText: string, config: CheaterConfig = {}, opts: CheatSheetOptions = {}): Promise<CheatSheet | null> {
+  // Master gate: the entire bug-memory / Cheat-Layer feature is OFF by default, so no recalled
+  // evidence is ever appended to a failure card the model reads. Enable with bugMemoryEnabled:true.
+  if (config.bugMemoryEnabled !== true) return null;
   if (config.cheatSheetEnabled === false) return null;
   const text = (failureText ?? "").trim();
   if (!text) return null;

@@ -34,7 +34,10 @@ The live product path is the TypeScript Pi extension at `cheater-pi/src/extensio
 - `registerBlueprintCommands` (inspection commands only; blueprint has NO model-facing tools -
   planning runs inside `cheater_reliability_start`)
 - `registerCommitletCommands` / `registerCommitletTools`
-  - tools: `cheater_reliability_start`, `cheater_commitlet_next` (grades the
+  - tools: `cheater_run` (the deterministic closed-loop executor: the harness
+    plans, spawns bounded workers, grades, repairs, finalizes, and gates in one
+    call - see `commitlet/closedLoop.ts`; the shared grading/finish kernel lives
+    in `commitlet/kernel.ts`), `cheater_reliability_start`, `cheater_commitlet_next` (grades the
     running commitlet in code - diff guard, patch health, test audit, focused
     verification - then prepares the next one or runs the final review),
     `cheater_finish_gate`, `cheater_verification_run`, `cheater_ledger_status`,

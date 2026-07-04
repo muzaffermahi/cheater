@@ -120,7 +120,7 @@ test("packet execution prompts are isolated fresh-agent handoffs", () => {
       packetFacts: [{ packetId: "implement-src-commands-ts", file: "src/commands.ts", facts: ["src/commands.ts registers commands"] }],
       webEvidence: [],
       webSearchTriggers: [],
-      contextBudget: { modelName: "qwen3.6-9b", modelClass: "9b", plannerTokens: 12000, workerTokens: 10000, maxFactsPerPacket: 4, maxFilesPerWorker: 1, maxOutputTokens: 500, compressionRules: [] },
+      contextBudget: { modelName: "qwen3.6-9b", modelClass: "small", plannerTokens: 12000, workerTokens: 10000, maxFactsPerPacket: 4, maxFilesPerWorker: 1, maxOutputTokens: 500, compressionRules: [] },
       webSearch: { required: true, provider: "official_allowlist", queries: ["react hooks"], allowedDomains: ["react.dev"], status: "completed" },
       workerBrief: "BLUEPRINT INTELLIGENCE PACK\nImplementation invariants:\n- Workers stay isolated."
     },
@@ -137,7 +137,7 @@ test("packet execution prompts are isolated fresh-agent handoffs", () => {
   assert.ok(prompts.every((prompt) => /compact handoff summary/.test(prompt.prompt)));
   assert.ok(prompts.some((prompt) => /https:\/\/react\.dev\/reference\/react/.test(prompt.prompt)));
   assert.ok(prompts.some((prompt) => /BLUEPRINT INTELLIGENCE PACK/.test(prompt.prompt)));
-  assert.ok(prompts.some((prompt) => /modelClass: 9b/.test(prompt.prompt)));
+  assert.ok(prompts.some((prompt) => /modelClass: small/.test(prompt.prompt)));
   assert.ok(prompts.some((prompt) => /Read at most one target file region/.test(prompt.prompt)));
 });
 
@@ -155,7 +155,7 @@ test("fresh worker packets include model-budgeted target snippets", async () => 
   assert.match(commandPrompt!.prompt, /relevantSnippets:/);
   assert.match(commandPrompt!.prompt, /--- src\/commands\.ts excerpt ---/);
   assert.match(commandPrompt!.prompt, /registerCheaterCommands/);
-  assert.match(commandPrompt!.prompt, /modelClass: 9b/);
+  assert.match(commandPrompt!.prompt, /modelClass: small/);
 });
 
 test("worker token cap clamps to configured/model window and never exceeds 100000", () => {
@@ -270,7 +270,7 @@ test("autonomous blueprint creates internal plan and final review blocks unfinis
   assert.match(plan.artifactMarkdown, /## Packet Runbook/);
   assert.equal(plan.roleSeparation.plannerRole, "blueprint_planner");
   assert.equal(plan.roleSeparation.workerRole, "fresh_code_worker");
-  assert.equal(plan.intelligence!.contextBudget.modelClass, "moe35b");
+  assert.equal(plan.intelligence!.contextBudget.modelClass, "large");
   assert.equal(plan.qualityGate.passed, true);
   assert.ok(plan.qualityGate.score >= 72);
   assert.match(plan.artifactMarkdown, /## Local Model Execution Profile/);

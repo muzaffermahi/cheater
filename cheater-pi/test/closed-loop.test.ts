@@ -1,0 +1,384 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { runClosedLoopCommitlets, type ClosedLoopDeps } from "../src/commitlet/closedLoop.js";
+import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
+import { defaultCommitletState } from "../src/commitlet/state.js";
+import { liveSessionState } from "../src/reliability/sessionState.js";
+import { steeringControl } from "../src/runstate/steering.js";
+import { beginTaskRun, endTaskRun, resetTaskRunForTests } from "../src/runstate/runState.js";
+import { checkCapsuleInvariants } from "../src/runstate/invariants.js";
+import type { Commitlet, CommitletPlan } from "../src/commitlet/types.js";
+import type { CheaterConfig } from "../src/types.js";
+
+// The closed-loop executor is the architecture change that removes the model from the
+// orchestration bus: the harness prepares, spawns, grades, repairs, advances, finalizes, and
+// gates - the model only implements inside bounded workers. These tests prove the state
+// machine (multi-commitlet advance, stop-on-failure, automatic repair, honest degradation)
+// with injected deps; the DEFAULT deps are the one real kernel, pinned by the existing
+// commitlet-kernel/live-wiring suites.
+
+function tmpRepo(): string {
+  return mkdtempSync(join(tmpdir(), "cheater-closed-loop-"));
+}
+
+const CONFIG: CheaterConfig = { runStateEnabled: false, telemetryEnabled: false };
+
+function commitletFixture(id: string, title: string): Commitlet {
+  return {
+    id,
+    title,
+    purpose: title,
+    status: "pending",
+    scope: "code",
+    allowedFiles: ["src/app.ts"],
+    forbiddenFiles: [],
+    allowedActions: ["inspect", "edit", "run_test", "stop_blocked"],
+    forbiddenActions: [],
+    maxFilesTouched: 1,
+    maxDiffLines: 120,
+    maxToolCalls: 10,
+    maxModelCalls: 1,
+    expectedFilesTouched: ["src/app.ts"],
+    focusedVerification: [{ command: "npm test", purpose: "focused", required: true }],
+    broaderVerification: [],
+    healthBudget: {
+      maxComplexityIncrease: 5,
+      maxDuplicationIncrease: 5,
+      maxFunctionLengthIncrease: 30,
+      allowNewLargeFunction: false,
+      allowTestEdits: false,
+      allowDependencyEdits: false,
+      allowLockfileEdits: false
+    },
+    spec: {
+      behaviorMustHold: [title],
+      behaviorMustNotChange: [],
+      edgeCases: [],
+      acceptanceCriteria: [title],
+      temporaryTestsAllowed: false,
+      permanentTestsAllowed: false,
+      nonGoals: []
+    },
+    risk: "low"
+  };
+}
+
+function planFixture(repoRoot: string, commitlets: Commitlet[]): CommitletPlan {
+  return {
+    id: "closed-loop-plan",
+    createdAt: new Date().toISOString(),
+    repoRoot,
+    userGoal: "fix the widget",
+    summary: `${commitlets.length} commitlet(s)`,
+    commitlets,
+    currentIndex: 0,
+    status: "planning",
+    globalConstraints: [],
+    finalVerification: [],
+    finalReview: {
+      accepted: false,
+      summary: "",
+      commitlets: [],
+      finalVerification: [],
+      health: { score: 100, passed: true, warnings: [], blockingIssues: [], metrics: { diffLines: 0, filesTouched: 0, duplicationDelta: 0, complexityDelta: 0, largeFunctionDelta: 0, assertionDelta: 0 } },
+      blockingIssues: [],
+      warnings: [],
+      suggestedFollowups: []
+    },
+    risk: "low"
+  };
+}
+
+const CODE_DECISION = {
+  executionMode: "vanilla_pi",
+  executionDiscipline: "single_commitlet",
+  taskKind: "bug_fix",
+  risk: "low",
+  confidence: 0.9,
+  needsBlueprint: false,
+  needsRepro: false,
+  complexitySignals: [],
+  reason: "test",
+  userVisibleSummary: "test"
+} as any;
+
+interface FakeKernel {
+  deps: Partial<ClosedLoopDeps>;
+  workerRuns: string[];
+  gradeCalls: string[];
+}
+
+/**
+ * A fake kernel that mimics the REAL kernel's state transitions (grade marks statuses in
+ * defaultCommitletState; finalize sets the plan terminal) without filesystem diffs or a
+ * model backend. gradeBehavior decides per-commitlet what the grader observed.
+ */
+function fakeKernel(repoRoot: string, commitlets: Commitlet[], opts: {
+  realWorkers?: boolean;
+  workerResult?: (commitlet: Commitlet) => { ok: boolean; summary: string; error?: string };
+  gradeBehavior?: (commitlet: Commitlet) => "pass" | "fail_stop" | "fail_create_repair";
+  finishAllowed?: boolean;
+} = {}): FakeKernel {
+  const workerRuns: string[] = [];
+  const gradeCalls: string[] = [];
+  const gradeBehavior = opts.gradeBehavior ?? (() => "pass");
+  const deps: Partial<ClosedLoopDeps> = {
+    route: (() => CODE_DECISION) as any,
+    createPlan: (() => planFixture(repoRoot, commitlets)) as any,
+    prepare: ((_cwd: string, commitlet: Commitlet) => ({ ...commitlet, status: "running" as const })) as any,
+    resolveWorkerMode: (async () => opts.realWorkers !== false) as any,
+    runWorker: (async (_plan: CommitletPlan, commitlet: Commitlet) => {
+      workerRuns.push(commitlet.id);
+      const result = opts.workerResult?.(commitlet) ?? { ok: true, summary: `worker done: ${commitlet.id}` };
+      return { workerResult: result, attemptsRun: 1, samplesRequested: 1, appliedAttempt: 1, passed: result.ok, note: `resample note ${commitlet.id}` };
+    }) as any,
+    grade: (async (_cwd: string, commitlet: Commitlet) => {
+      gradeCalls.push(commitlet.id);
+      const behavior = gradeBehavior(commitlet);
+      if (behavior === "pass") {
+        defaultCommitletState.updateCommitlet(commitlet.id, "passed", "verified");
+        return { advance: true, message: `Commitlet ${commitlet.id} passed guard, health, and focused verification.`, details: {} };
+      }
+      if (behavior === "fail_create_repair") {
+        const repair = { ...commitletFixture(`${commitlet.id}-repair`, `repair ${commitlet.title}`), spec: { ...commitletFixture(`${commitlet.id}-repair`, "r").spec!, observedFailure: "TypeError: boom" } };
+        const plan = defaultCommitletState.get().currentPlan!;
+        defaultCommitletState.setPlan({
+          ...plan,
+          commitlets: plan.commitlets.flatMap((item) => item.id === commitlet.id ? [{ ...item, status: "failed" as const }, repair] : [item])
+        });
+        return { advance: true, message: `focused verification failed\nCreated bounded repair commitlet: ${commitlet.id}-repair`, details: {} };
+      }
+      defaultCommitletState.updateCommitlet(commitlet.id, "failed", "guard blocked");
+      return { advance: false, message: `Commitlet ${commitlet.id} blocked by guard/health/test audit.`, details: {} };
+    }) as any,
+    finalize: ((_cwd: string, plan: CommitletPlan) => {
+      const review = { ...plan.finalReview, accepted: true, summary: "accepted", commitlets: plan.commitlets.map((c) => c.id) };
+      const updated = { ...plan, finalReview: review, status: "complete" as const };
+      defaultCommitletState.setPlan(updated);
+      return { text: "final review accepted", details: { review, plan: updated } };
+    }) as any,
+    finish: (() => (opts.finishAllowed === false
+      ? { allowed: false, reason: "verification missing", lines: ["Cheater Finish Gate: BLOCKED"], ledgerState: liveSessionState.getLedger()!.get() }
+      : { allowed: true, reason: "verified", lines: ["Cheater Finish Gate: ALLOWED"], ledgerState: liveSessionState.getLedger()!.get() })) as any
+  };
+  return { deps, workerRuns, gradeCalls };
+}
+
+function reset(): void {
+  defaultCommitletState.clear();
+  liveSessionState.reset();
+  resetTaskRunForTests();
+}
+
+test("closed loop executes a multi-commitlet chain with ZERO model orchestration calls", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first"), commitletFixture("c2", "second")]);
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "complete");
+  assert.equal(result.ok, true);
+  assert.equal(result.freshWorkerMode, "real");
+  assert.deepEqual(kernel.workerRuns, ["c1", "c2"], "the harness ran BOTH workers itself - no cheater_commitlet_next call existed anywhere");
+  assert.deepEqual(kernel.gradeCalls, ["c1", "c2"], "every worker output was graded in code before advancing");
+  assert.equal(result.steps.filter((step) => step.outcome === "passed").length, 2);
+  assert.ok(result.receipt, "a finish-gate-approved run produces the deterministic receipt");
+  assert.match(result.summary, /Cheater Closed Loop: COMPLETE/);
+  assert.equal(defaultCommitletState.get().currentPlan?.status, "complete");
+});
+
+test("steering channel queues corrections and a stop, and resets cleanly", () => {
+  steeringControl.reset();
+  assert.equal(steeringControl.stopRequested(), false);
+  steeringControl.pushCorrection("use library X not Y");
+  steeringControl.pushCorrection("");                       // empty is ignored
+  assert.equal(steeringControl.pendingCount(), 1);
+  assert.deepEqual(steeringControl.drainCorrections(), ["use library X not Y"]);
+  assert.equal(steeringControl.pendingCount(), 0);
+  assert.equal(steeringControl.appliedCount(), 1);
+  steeringControl.requestStop();
+  assert.equal(steeringControl.stopRequested(), true);
+  steeringControl.reset();
+  assert.equal(steeringControl.stopRequested(), false);
+});
+
+test("mid-run /steer stop halts the closed loop with preserved (non-complete) state", async () => {
+  reset();
+  steeringControl.reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first"), commitletFixture("c2", "second")]);
+  // Simulate the user typing /steer stop mid-run: request it right after c1 is graded.
+  const origGrade = kernel.deps.grade!;
+  kernel.deps.grade = (async (cwd: string, c: Commitlet, cfg: CheaterConfig, o: any) => {
+    const r = await (origGrade as any)(cwd, c, cfg, o);
+    if (c.id === "c1") steeringControl.requestStop();
+    return r;
+  }) as any;
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial");
+  assert.match(result.summary, /Stopped by \/steer stop/);
+  assert.notEqual(defaultCommitletState.get().currentPlan?.status, "complete", "state is preserved, not finalized");
+  steeringControl.reset();
+});
+
+test("mid-run /steer <correction> folds into the plan's global constraints for upcoming commitlets", async () => {
+  reset();
+  steeringControl.reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first"), commitletFixture("c2", "second")]);
+  const origGrade = kernel.deps.grade!;
+  kernel.deps.grade = (async (cwd: string, c: Commitlet, cfg: CheaterConfig, o: any) => {
+    const r = await (origGrade as any)(cwd, c, cfg, o);
+    if (c.id === "c1") steeringControl.pushCorrection("always handle the empty input case");
+    return r;
+  }) as any;
+  await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.ok(
+    (defaultCommitletState.get().currentPlan?.globalConstraints ?? []).some((g) => /always handle the empty input case/.test(g)),
+    "the mid-run correction became a global constraint the later commitlets see"
+  );
+  steeringControl.reset();
+});
+
+test("RESILIENCE: a grade failure on one file does NOT abort the build - it records the failure and keeps building", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first"), commitletFixture("c2", "second")], {
+    gradeBehavior: (commitlet) => (commitlet.id === "c1" ? "fail_stop" : "pass")
+  });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial", "one file's failure yields partial, not a whole-build abort");
+  assert.deepEqual(kernel.workerRuns, ["c1", "c2"], "the build CONTINUED to c2 after c1 failed");
+  assert.equal(defaultCommitletState.get().currentPlan?.commitlets.find((c) => c.id === "c2")?.status, "passed", "c2 was built");
+  assert.deepEqual(((result.details as { failedCommitlets?: Array<{ id: string }> }).failedCommitlets ?? []).map((f) => f.id), ["c1"], "the failed file is recorded");
+  assert.match(result.summary, /could not be completed/, "the report names what still needs fixing");
+});
+
+test("repair commitlets queued by grading are picked up and executed automatically", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")], {
+    gradeBehavior: (commitlet) => (/-repair$/.test(commitlet.id) ? "pass" : "fail_create_repair")
+  });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "complete");
+  assert.deepEqual(kernel.workerRuns, ["c1", "c1-repair"], "the loop automatically continued into the repair worker");
+  const outcomes = result.steps.map((step) => `${step.commitletId}:${step.outcome}`);
+  assert.ok(outcomes.includes("c1:repair_created"));
+  assert.ok(outcomes.includes("c1-repair:passed"));
+});
+
+test("repair budget is bounded: an exhausted repair is skipped and the build finishes partial, never loops", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")], {
+    gradeBehavior: (commitlet) => (/-repair$/.test(commitlet.id) ? "pass" : "fail_create_repair")
+  });
+  // Explicit maxRepairRounds:0 forces the budget-exhausted path on the very first repair.
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG, maxRepairRounds: 0 }, kernel.deps);
+  assert.equal(result.status, "partial", "budget exhausted -> partial, not a whole-build abort");
+  assert.deepEqual(kernel.workerRuns, ["c1"], "the repair worker did not run past the budget");
+  assert.ok(result.steps.some((step) => step.outcome === "skipped_repair_budget"), "the skipped repair is recorded");
+  assert.match(result.summary, /could not be completed/);
+});
+
+test("simulated fallback is honest: no backend means partial + handoff prompt, never a fake completion", async () => {
+  reset();
+  const repo = tmpRepo();
+  mkdirSync(join(repo, "src"), { recursive: true });
+  writeFileSync(join(repo, "src", "app.ts"), "export const app = 1;\n", "utf8");
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")], { realWorkers: false });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial");
+  assert.equal(result.ok, false);
+  assert.equal(result.freshWorkerMode, "simulated");
+  assert.equal(kernel.workerRuns.length, 0, "no worker was (or could be) spawned");
+  assert.ok(result.handoffPrompt, "the session gets the first worker prompt to execute via the classic flow");
+  assert.match(result.handoffPrompt!, /Cheater Reliability Kernel commitlet/);
+  assert.match(result.summary, /simulated handoff required/);
+  assert.ok(!result.receipt, "no verification happened, so no receipt may exist");
+});
+
+test("mid-run backend loss degrades honestly instead of faking progress", async () => {
+  reset();
+  const repo = tmpRepo();
+  mkdirSync(join(repo, "src"), { recursive: true });
+  writeFileSync(join(repo, "src", "app.ts"), "export const app = 1;\n", "utf8");
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")], {
+    workerResult: () => ({ ok: false, summary: "backend gone", error: "worker_backend_unavailable" })
+  });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial");
+  assert.equal(result.freshWorkerMode, "simulated");
+  assert.ok(result.handoffPrompt);
+  assert.equal(result.error, "fresh worker backend became unavailable");
+  assert.ok(!result.receipt);
+});
+
+test("a failed worker (no verified candidate) is recorded and the build continues to the next file", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first"), commitletFixture("c2", "second")], {
+    workerResult: (commitlet) => (commitlet.id === "c1" ? { ok: false, summary: "worker timed out", error: "worker_timeout" } : { ok: true, summary: "done" })
+  });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial", "one worker's failure does not abort the whole build");
+  assert.deepEqual(kernel.workerRuns, ["c1", "c2"], "c1's worker failure did not stop c2 from building");
+  assert.ok(result.steps.some((step) => step.outcome === "worker_failed"));
+  assert.deepEqual(((result.details as { failedCommitlets?: Array<{ id: string }> }).failedCommitlets ?? []).map((f) => f.id), ["c1"]);
+  assert.equal(defaultCommitletState.get().currentPlan?.commitlets.find((c) => c.id === "c1")?.status, "failed");
+});
+
+test("answer-only routes return a no-edit result without planning anything", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")]);
+  kernel.deps.route = (() => ({ ...CODE_DECISION, executionMode: "answer_only", executionDiscipline: "none" })) as any;
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "what does this repo do?", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "complete");
+  assert.equal(result.freshWorkerMode, "none");
+  assert.equal(kernel.workerRuns.length, 0);
+  assert.match(result.summary, /answer-only/);
+});
+
+test("finish gate blocking downgrades an accepted final review to PARTIAL - the model may not claim done", async () => {
+  reset();
+  const repo = tmpRepo();
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "first")], { finishAllowed: false });
+  const result = await runClosedLoopCommitlets({ cwd: repo, userGoal: "fix the widget", config: CONFIG }, kernel.deps);
+  assert.equal(result.status, "partial");
+  assert.equal(result.ok, false);
+  assert.ok(!result.receipt, "no receipt when the finish gate blocks");
+  assert.match(result.summary, /finish gate is not satisfied|BLOCKED/i);
+});
+
+// ---------------------------------------------------------------------------
+// Part B proof: the capsule is the canonical worker context, including repairs.
+// ---------------------------------------------------------------------------
+
+test("repair worker prompts carry the observed failure as a typed capsule field", () => {
+  reset();
+  const repo = tmpRepo();
+  beginTaskRun(repo, "fix the widget", { taskId: "closed-loop-capsule" });
+  const repair = {
+    ...commitletFixture("c1-repair", "repair first"),
+    spec: { ...commitletFixture("c1-repair", "repair first").spec!, observedFailure: "TypeError: boom at parser.ts:12\n=== CHEATER CHEAT SHEET (evidence) ===\ncard: prior fix" }
+  };
+  const plan = planFixture(repo, [repair]);
+  const result = buildCommitletExecutionPrompt(plan, repair, [], "real", 1, "qwen-2.5-32b-instruct");
+  assert.ok(result.capsule, "a run is active, so the capsule must exist");
+  assert.equal(typeof result.capsule!.observedFailure, "string");
+  assert.match(result.capsule!.observedFailure!, /TypeError: boom/);
+  assert.match(result.prompt, /Observed failure \(fix exactly this\):/);
+  assert.match(result.prompt, /TypeError: boom/);
+  // Attempt 3 (root-cause stance) withholds the cheat sheet so attempts stay diverse.
+  const attempt3 = buildCommitletExecutionPrompt(plan, repair, [], "real", 3, "qwen-2.5-32b-instruct");
+  assert.ok(!/CHEATER CHEAT SHEET/.test(attempt3.capsule!.observedFailure ?? ""), "attempt 3 re-derives from the raw failure");
+  assert.match(attempt3.capsule!.attemptStance ?? "", /root cause/i);
+  // The capsule invariants still hold: no logs, contract/phase/validation present.
+  const invariants = checkCapsuleInvariants(result.capsule!);
+  assert.equal(invariants.ok, true, invariants.failures.join("; "));
+  endTaskRun();
+});

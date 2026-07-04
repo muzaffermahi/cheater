@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import cheaterExtension, { CHEATER_TOOL_MODES } from "../src/extension.js";
-import { classifyAutopilotTask, HIGH_RISK_INTENT } from "../src/autopilot/classifier.js";
-import { routeAutopilot } from "../src/autopilot/router.js";
+import cheaterExtension, { CHEATER_TOOL_MODES, cheaterToolsForMode } from "../src/extension.js";
+import { classifyAutopilotTask, HIGH_RISK_INTENT, elevatesToHighRisk } from "../src/autopilot/classifier.js";
+import { routeAutopilot, buildAutopilotInstruction } from "../src/autopilot/router.js";
+import { buildSystemPrompt } from "../src/prompts.js";
+import { registerCheaterTools } from "../src/tools.js";
 import { defaultAutopilotState } from "../src/autopilot/status.js";
 import { defaultCommitletState } from "../src/commitlet/state.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
@@ -47,6 +49,36 @@ test("high-risk intent still blocks: destructive verbs aimed at repo/file/data o
   assert.equal(HIGH_RISK_INTENT.test("create/edit/delete tasks with priority fields"), false);
   assert.equal(HIGH_RISK_INTENT.test("tag as bug, feature, praise, churn-risk"), false);
   assert.equal(HIGH_RISK_INTENT.test("users can delete their own comments"), false);
+});
+
+test("a feature that DELETES end-user data is not the same as destroying the repo (no approval block)", () => {
+  // These describe app behavior to BUILD; the destructive verb is the feature, not a command
+  // aimed at the working repo. Under opt-in approval they must NOT hard-lock asking permission.
+  for (const message of [
+    "add a feature to permanently delete all archived files older than 30 days",
+    "build a UI to delete files from the uploads folder",
+    "add a 'wipe everything' button that clears all data",
+    "let users delete all their files at once",
+    "add a button to purge the cache directory"
+  ]) {
+    assert.equal(elevatesToHighRisk(message.toLowerCase()), false, message);
+    const decision = routeAutopilot({ cwd: process.cwd(), message, requireApproval: true });
+    assert.notEqual(decision.executionDiscipline, "blocked_needs_user", message);
+  }
+});
+
+test("a genuine destructive action on THIS repo still blocks under opt-in approval", () => {
+  const decision = routeAutopilot({ cwd: process.cwd(), message: "delete all files in the temp folder and start fresh", requireApproval: true });
+  assert.equal(elevatesToHighRisk("delete all files in the temp folder and start fresh"), true);
+  assert.equal(decision.executionDiscipline, "blocked_needs_user");
+});
+
+test("standalone 'tag as bug' is a labeling feature, not a bug fix", () => {
+  const tagging = classifyAutopilotTask({ message: "tag incoming feedback items as bug, feature, or praise", cwd: process.cwd() });
+  assert.equal(tagging.taskKind, "feature_addition", "product-vocabulary 'bug' in a label list must not route as bug_fix");
+  // A real defect report still classifies as a bug fix.
+  assert.equal(classifyAutopilotTask({ message: "there is a bug in the parser", cwd: process.cwd() }).taskKind, "bug_fix");
+  assert.equal(classifyAutopilotTask({ message: "fix the bug, then add tests", cwd: process.cwd() }).taskKind, "bug_fix");
 });
 
 test("autonomy by default: even a destructive request does NOT block for approval", () => {
@@ -141,4 +173,81 @@ test("live wiring: a bare ack after a normal code decision re-issues that decisi
   assert.ok(activeTools.includes("cheater_reliability_start"));
   defaultAutopilotState.clear();
   defaultCommitletState.clear();
+});
+
+// --- prefill economy: lean preamble + prefix stability -------------------------------------------
+
+test("lean autopilot preamble is a tight pointer (not the full flow block), keeping per-turn prefill small", () => {
+  const decision = routeAutopilot({ cwd: process.cwd(), message: "add a /hello command with tests" });
+  const full = buildAutopilotInstruction(decision, "", false);
+  const lean = buildAutopilotInstruction(decision, "", true);
+  assert.match(full, /Cheater flow/, "the full form carries the explicit 5-line flow block");
+  assert.doesNotMatch(lean, /Cheater flow/, "the lean form drops the verbose block (the flow lives in the system prompt)");
+  assert.match(lean, /cheater_run ONCE/, "lean still names the entry tool");
+  assert.match(lean, /cheater_finish_gate/, "lean still names the completion gate");
+  assert.ok(lean.length < full.length, "lean is materially shorter than the full block");
+  // A plain question already reduces to one short line - identical lean or full.
+  const q = routeAutopilot({ cwd: process.cwd(), message: "what is a closure?" });
+  assert.equal(buildAutopilotInstruction(q, "", true), buildAutopilotInstruction(q, "", false));
+});
+
+test("stable tool surface: after a code task, a follow-up question keeps the code tools visible (KV-cache prefix stability)", async () => {
+  const { pi, events, activeTools } = makePi();
+  defaultAutopilotState.clear();
+  defaultCommitletState.clear();
+  liveSessionState.reset();
+  cheaterExtension(pi as any);
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-stable-surface-"));
+  const input = events.get("input");
+
+  await input({ type: "input", text: "add a /hello command with tests", source: "interactive" }, fakeCtx(cwd));
+  assert.ok(activeTools.includes("cheater_commitlet_next"), "a code task exposes the execute/planner surface");
+
+  // A follow-up question routes answer_only (which would drop commitlet_next). With stablePromptPrefix
+  // default-on, the tool surface stays put so the local KV-cache prompt prefix is not invalidated; the
+  // answer_only INSTRUCTION still routes the model to just answer.
+  const q = await input({ type: "input", text: "what does that command print?", source: "interactive" }, fakeCtx(cwd));
+  assert.match(q.text, /question, not a code change/, "the instruction still routes the model to just answer");
+  assert.ok(activeTools.includes("cheater_commitlet_next"), "the code tool surface stays stable across the follow-up question");
+  defaultAutopilotState.clear();
+  defaultCommitletState.clear();
+});
+
+test("stable system-prompt prefix: the volatile git status trails the stable content (cache-friendly ordering)", async () => {
+  const { pi, events } = makePi();
+  cheaterExtension(pi as any);
+  const before = events.get("before_agent_start");
+  assert.ok(before, "before_agent_start handler registered");
+  const result = await before({ systemPrompt: "PI-BASE-SYSTEM" }, fakeCtx(process.cwd()));
+  const text: string = result.systemPrompt;
+  assert.match(text, /## Environment/, "the stable environment block is present");
+  assert.match(text, /git:/, "git status is still shown to the model");
+  assert.match(text, /room to work/, "the context-cap line is present");
+  // Ordering: stable env + cap come first, the volatile git line LAST, so the long prefix stays cacheable.
+  assert.ok(text.indexOf("## Environment") < text.indexOf("git:"), "stable env precedes the git line");
+  assert.ok(text.indexOf("room to work") < text.indexOf("git:"), "the git line trails the stable cap line");
+});
+
+// --- minimal system prompt + bug memory off by default -------------------------------------------
+
+test("minimal system prompt is the default: the one flow, but no worked example and no bug-memory section", () => {
+  const def = buildSystemPrompt({});
+  assert.match(def, /The one Cheater flow/, "the flow is always present");
+  assert.doesNotMatch(def, /Worked example/, "the exemplar is dropped by default (minimal)");
+  assert.doesNotMatch(def, /Bug-memory/, "no bug-memory guidance is shown by default");
+  // Both are restorable via config for later A/B testing.
+  assert.match(buildSystemPrompt({ minimalSystemPrompt: false }), /Worked example/, "the exemplar returns when minimal is off");
+  assert.match(buildSystemPrompt({ bugMemoryEnabled: true }), /Bug-memory/, "the bug-memory section returns when enabled");
+});
+
+test("bug-memory tool is hidden by default: not registered and filtered from every mask", () => {
+  const off = new Map<string, any>();
+  registerCheaterTools({ registerTool: (def: any) => off.set(def.name, def) } as any, {});
+  assert.equal(off.has("cheater_bug_memory_search"), false, "not registered by default");
+  const on = new Map<string, any>();
+  registerCheaterTools({ registerTool: (def: any) => on.set(def.name, def) } as any, { bugMemoryEnabled: true });
+  assert.equal(on.has("cheater_bug_memory_search"), true, "registered when the feature is enabled");
+  // The mask filter matches the registration gate, so applyToolMask never activates a missing tool.
+  assert.equal(cheaterToolsForMode("execute", {}).includes("cheater_bug_memory_search"), false, "filtered from the mask by default");
+  assert.equal(cheaterToolsForMode("execute", { bugMemoryEnabled: true }).includes("cheater_bug_memory_search"), true, "in the mask when enabled");
 });

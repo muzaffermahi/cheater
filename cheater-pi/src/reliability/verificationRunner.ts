@@ -190,17 +190,21 @@ export async function runVerification(input: VerificationRunInput): Promise<Veri
     }
   }
 
-  const passed = stages.every((stage) => stage.status === "ok" || stage.status === "skipped");
+  // Verification passes when no BLOCKING stage failed. An advisory stage (a non-required dev-server
+  // smoke/identity check) that fails is reported but never fails the run - a clean build is the gate.
+  const passed = stages.every((stage) => stage.status === "ok" || stage.status === "skipped" || stage.advisory === true);
   const okCount = stages.filter((stage) => stage.status === "ok").length;
-  const failCount = stages.filter((stage) => stage.status === "failed" || stage.status === "timed_out").length;
+  const blockingFailCount = stages.filter((stage) => (stage.status === "failed" || stage.status === "timed_out") && !stage.advisory).length;
+  const advisoryFailCount = stages.filter((stage) => (stage.status === "failed" || stage.status === "timed_out") && stage.advisory).length;
+  const advisoryNote = advisoryFailCount ? `, ${advisoryFailCount} advisory (non-blocking)` : "";
   stopAllOwnedProcesses(ctx);
-  ledger.finalize(passed, passed ? `verification passed: ${okCount} ok` : `verification failed: ${failCount} failed`, passed ? "high" : "low");
+  ledger.finalize(passed, passed ? `verification passed: ${okCount} ok${advisoryNote}` : `verification failed: ${blockingFailCount} blocking failure(s)`, passed ? "high" : "low");
   return {
     stages,
     ledger,
     registry,
     passed,
-    summary: `verification ${passed ? "passed" : "failed"}: ${okCount} ok, ${failCount} fail`,
+    summary: `verification ${passed ? "passed" : "failed"}: ${okCount} ok, ${blockingFailCount} fail${advisoryNote}`,
     artifacts,
     mismatches
   };
@@ -226,34 +230,57 @@ interface StageRunContext {
 
 function runStage(spec: WebappVerificationStageSpec, ctx: StageRunContext): VerificationStageResult {
   const base: VerificationStageResult = { stage: spec.stage, status: "running", summary: "", failureClass: "unknown", artifacts: [], signals: {} };
+  let result: VerificationStageResult;
   try {
     switch (spec.stage) {
       case "prepare_env":
-        return runPrepareEnv(spec, ctx);
+        result = runPrepareEnv(spec, ctx); break;
+      case "build":
+        result = runBuildStage(spec, ctx); break;
       case "start_services":
-        return runStartServices(spec, ctx);
+        result = runStartServices(spec, ctx); break;
       case "workspace_identity":
-        return runWorkspaceIdentity(spec, ctx);
+        result = runWorkspaceIdentity(spec, ctx); break;
       case "smoke":
-        return runSmoke(spec, ctx);
+        result = runSmoke(spec, ctx); break;
       case "focused_tests":
-        return runTestStage(spec, ctx, ctx.cmds.focusedTestCommand ?? ctx.cmds.testCommand, "focused tests");
+        result = runTestStage(spec, ctx, ctx.cmds.focusedTestCommand ?? ctx.cmds.testCommand, "focused tests"); break;
       case "full_tests":
-        return runTestStage(spec, ctx, ctx.cmds.testCommand, "full tests");
+        result = runTestStage(spec, ctx, ctx.cmds.testCommand, "full tests"); break;
       case "scoring":
-        return runTestStage(spec, ctx, ctx.cmds.scoreCommand, "scoring");
+        result = runTestStage(spec, ctx, ctx.cmds.scoreCommand, "scoring"); break;
       case "collect_artifacts":
-        return runCollectArtifacts(spec, ctx);
+        result = runCollectArtifacts(spec, ctx); break;
       case "stop_services":
-        return runStopServices(spec, ctx);
+        result = runStopServices(spec, ctx); break;
       case "summarize":
-        return runSummarize(spec, ctx);
+        result = runSummarize(spec, ctx); break;
       default:
-        return { ...base, status: "skipped", summary: `unknown stage ${spec.stage}` };
+        result = { ...base, status: "skipped", summary: `unknown stage ${spec.stage}` };
     }
   } catch (err) {
-    return { ...base, status: "failed", summary: `handler crashed: ${(err as Error).message}`, failureClass: "unknown" };
+    result = { ...base, status: "failed", summary: `handler crashed: ${(err as Error).message}`, failureClass: "unknown" };
   }
+  // A non-required (advisory) stage that fails is reported for visibility but is NOT a blocking
+  // failure: it never fails the overall verification or records an unresolved failure in the ledger.
+  if (!spec.required && (result.status === "failed" || result.status === "timed_out")) {
+    result.advisory = true;
+  }
+  return result;
+}
+
+function runBuildStage(spec: WebappVerificationStageSpec, ctx: StageRunContext): VerificationStageResult {
+  const cmd = ctx.cmds.buildCommand;
+  if (!cmd) {
+    return { stage: spec.stage, status: "skipped", summary: "no build command detected", failureClass: "unknown", artifacts: [], signals: {} };
+  }
+  const outcome = ctx.runCommand(cmd, { cwd: ctx.cwd, timeoutSeconds: spec.timeoutSeconds });
+  const status: VerificationStatus = outcome.timedOut ? "timed_out" : outcome.returncode === 0 ? "ok" : "failed";
+  const failureClass = outcome.returncode === 0 ? "unknown" : classifyFailure({ exitCode: outcome.returncode, stdout: outcome.stdout, stderr: outcome.stderr, timedOut: outcome.timedOut });
+  recordOwnedCommand(ctx, cmd, "verify", outcome);
+  ctx.ledger.recordCommand(cmd);
+  const failCard = status === "ok" ? "" : compressFailureOutput(cmd, outcome.stdout, outcome.stderr, outcome.returncode || 1);
+  return { stage: spec.stage, status, summary: status === "ok" ? `build ok (${cmd})` : `build failed exit=${outcome.returncode}; ${failureClass}\n${failCard}`, failureClass, artifacts: [], signals: { exitCode: outcome.returncode } };
 }
 
 function runPrepareEnv(spec: WebappVerificationStageSpec, ctx: StageRunContext): VerificationStageResult {
@@ -280,6 +307,14 @@ function runPrepareEnv(spec: WebappVerificationStageSpec, ctx: StageRunContext):
 }
 
 function runStartServices(spec: WebappVerificationStageSpec, ctx: StageRunContext): VerificationStageResult {
+  // A green build is the authoritative gate for a buildable webapp, and a headless dev-server smoke is
+  // environment-flaky (Vite ignores PORT so the curl to 127.0.0.1:PORT always times out) AND actively
+  // wastes model turns as it "debugs" a port mismatch it cannot fix. So skip the whole dev-server
+  // sub-pipeline (start_services -> smoke naturally skips with no running process) when a build command
+  // exists; run it only as a fallback signal when there is nothing to build.
+  if (ctx.cmds.buildCommand) {
+    return { stage: spec.stage, status: "skipped", summary: "skipped: a green build is the gate for this webapp; dev-server smoke not needed", failureClass: "unknown", artifacts: [], signals: { skippedForBuild: true } };
+  }
   const devCmd = ctx.cmds.devCommand;
   if (!devCmd) {
     return { stage: spec.stage, status: "ok", summary: "no dev server command; nothing to start", failureClass: "unknown", artifacts: [], signals: { port: ctx.port } };
@@ -354,7 +389,7 @@ function runSmoke(spec: WebappVerificationStageSpec, ctx: StageRunContext): Veri
   const status: VerificationStatus = outcome.timedOut ? "timed_out" : outcome.returncode === 0 ? "ok" : "failed";
   const failureClass = outcome.returncode === 0 ? "unknown" : classifyFailure({ exitCode: outcome.returncode, stdout: outcome.stdout, stderr: outcome.stderr, timedOut: outcome.timedOut });
   const httpCode = (outcome.stdout ?? "").trim();
-  recordOwnedCommand(ctx, cmd, "verify", outcome);
+  recordOwnedCommand(ctx, cmd, "verify", outcome, spec.required);
   ctx.ledger.recordCommand(cmd);
   return { stage: spec.stage, status, summary: status === "ok" ? `smoke ok: ${healthUrl} -> ${httpCode}` : `smoke failed: ${healthUrl}`, failureClass, artifacts: [], signals: { httpCode, url: healthUrl } };
 }
@@ -399,7 +434,7 @@ function runSummarize(spec: WebappVerificationStageSpec, ctx: StageRunContext): 
   return { stage: spec.stage, status: "ok", summary: `verification summary: ${okCount} ok, ${failCount} fail`, failureClass: "unknown", artifacts: [], signals: { ok: okCount, fail: failCount } };
 }
 
-function recordOwnedCommand(ctx: StageRunContext, cmd: string, kind: CommandKind, outcome: { returncode: number; stdout: string; stderr: string; timedOut: boolean }): void {
+function recordOwnedCommand(ctx: StageRunContext, cmd: string, kind: CommandKind, outcome: { returncode: number; stdout: string; stderr: string; timedOut: boolean }, blocking = true): void {
   const status: ProcessStatus = outcome.timedOut ? "timed_out" : outcome.returncode === 0 ? "succeeded" : "failed";
   const owned: OwnedCommand = {
     cmdId: newId("cmd"),
@@ -417,7 +452,9 @@ function recordOwnedCommand(ctx: StageRunContext, cmd: string, kind: CommandKind
     parentProcessId: null
   };
   ctx.registry.recordCommand(owned);
-  if (status === "failed" || status === "timed_out") {
+  // Advisory (non-blocking) stage commands are kept in history but never latch an unresolved failure
+  // in the completion ledger - a flaky dev-server smoke curl must not block the finish gate.
+  if (blocking && (status === "failed" || status === "timed_out")) {
     ctx.ledger.recordFailure(`${cmd} -> ${status}`, classifyFailure({ exitCode: outcome.returncode, stdout: outcome.stdout, stderr: outcome.stderr, timedOut: outcome.timedOut }));
   }
 }

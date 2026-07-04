@@ -25,6 +25,7 @@ const PUBLIC_COMMAND_NAMES = [
   "constraint-graph",
   "bench-report",
   "model-profile",
+  "provider-probe",
   "gym",
   "gym-list",
   "gym-run",
@@ -40,6 +41,9 @@ const PUBLIC_COMMAND_NAMES = [
   "skills",
   "traces",
   "history",
+  "dev",
+  "sidecar",
+  "steer",
   "settings",
   "doctor"
 ];

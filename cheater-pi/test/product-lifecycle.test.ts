@@ -8,7 +8,7 @@ import { registerCommitletTools } from "../src/commitlet/tools.js";
 import { defaultCommitletState } from "../src/commitlet/state.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
-import { CompletionLedger, ledgerAllowsFinish, NonProgressDetector, classifyCommand, classifyFailure, workspaceIdentityCheck, ProcessRegistry, isTerminalVerified } from "../src/reliability/lifecycle.js";
+import { CompletionLedger, ledgerAllowsFinish, NonProgressDetector, classifyCommand, classifyFailure, workspaceIdentityCheck, ProcessRegistry, isTerminalVerified, commandFingerprint, isExploratoryCommand } from "../src/reliability/lifecycle.js";
 import { detectProjectCommands, focusTestCommand } from "../src/reliability/projectCommands.js";
 import { runVerification } from "../src/reliability/verificationRunner.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
@@ -243,6 +243,68 @@ test("webapp playbook uses owned service metadata", async () => {
   assert.equal(stopStage.status, "ok");
 });
 
+test("webapp verification: with a build command, the dev-server smoke is SKIPPED and the build is the gate (terminal-verified)", async () => {
+  // Regression (speed6-9): a Vite dev-server smoke curl always times out (Vite ignores PORT) - it does
+  // not just fail-advisory, it wastes model turns "debugging a port mismatch". With a build command the
+  // whole dev-server sub-pipeline is skipped; a green build alone reaches terminal-verified.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-build-gate-"));
+  writeFileSync(join(cwd, "package.json"), JSON.stringify({
+    name: "webapp",
+    scripts: { dev: "vite", build: "tsc && vite build" },
+    devDependencies: { vite: "^5.0.0", typescript: "^5.0.0" }
+  }), "utf8");
+  const cmds = detectProjectCommands(cwd);
+  assert.ok(cmds.buildCommand, "webapp must have a build command");
+  const result = await runVerification({
+    cwd,
+    userGoal: "Create a Vite React app that builds",
+    planKind: "webapp",
+    projectCommands: cmds,
+    hooks: {
+      runCommand: (cmd) => {
+        if (cmd.includes("curl")) return { returncode: 28, stdout: "", stderr: "", timedOut: true }; // (never reached now)
+        return { returncode: 0, stdout: "", stderr: "", timedOut: false }; // install + build ok
+      },
+      startService: () => ({ pid: 4242 }),
+      servedWorkspaceProbe: () => null
+    }
+  });
+  const buildStage = result.stages.find((s) => s.stage === "build");
+  const startStage = result.stages.find((s) => s.stage === "start_services");
+  const smokeStage = result.stages.find((s) => s.stage === "smoke");
+  assert.equal(buildStage?.status, "ok", "the build stage ran and passed");
+  assert.equal(startStage?.status, "skipped", "start_services is skipped because a build command is the gate");
+  assert.equal(startStage?.signals?.skippedForBuild, true, "skip is recorded as build-gated");
+  assert.equal(smokeStage?.status, "skipped", "smoke is skipped (no running dev server to hit)");
+  assert.equal(result.passed, true, "verification PASSES on the build alone");
+  assert.equal(isTerminalVerified(result.ledger.get().verification), true, "a green build with skipped dev-server IS terminal-verified");
+  assert.equal(result.ledger.get().unresolvedFailures.length, 0, "no blocking unresolved failure");
+});
+
+test("webapp verification: a real build failure STILL blocks (the gate stays honest)", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-build-fail-"));
+  writeFileSync(join(cwd, "package.json"), JSON.stringify({
+    name: "webapp", scripts: { dev: "vite", build: "tsc && vite build" }, devDependencies: { vite: "^5.0.0" }
+  }), "utf8");
+  const cmds = detectProjectCommands(cwd);
+  const result = await runVerification({
+    cwd, userGoal: "Create a Vite app", planKind: "webapp", projectCommands: cmds,
+    hooks: {
+      runCommand: (cmd) => {
+        if (cmd.includes("curl")) return { returncode: 0, stdout: "200", stderr: "", timedOut: false };
+        if (cmd.includes("build")) return { returncode: 2, stdout: "", stderr: "src/App.tsx: error TS2304", timedOut: false };
+        return { returncode: 0, stdout: "", stderr: "", timedOut: false };
+      },
+      startService: () => ({ pid: 1 }),
+      servedWorkspaceProbe: () => null
+    }
+  });
+  const buildStage = result.stages.find((s) => s.stage === "build");
+  assert.equal(buildStage?.status, "failed", "a broken build fails the build stage");
+  assert.equal(result.passed, false, "a real build failure blocks verification (honest gate)");
+  assert.ok(result.ledger.get().unresolvedFailures.length > 0, "a real build failure IS a blocking unresolved failure");
+});
+
 test("stale served workspace is detected through a mocked probe", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-stale-ws-"));
   writeFileSync(join(cwd, "package.json"), JSON.stringify({
@@ -335,6 +397,85 @@ test("completion ledger records verification stages and blocks fake completion",
   assert.equal(ledgerAllowsFinish(ledger).allowed, true, "verified ledger with no unresolved failures must allow finish");
 });
 
+test("a project with no runnable verification command finishes honestly-unverified, not forever-blocked", () => {
+  const ledger = new CompletionLedger("edit a plain script folder");
+  ledger.recordFileChange("run.sh");
+  // The harness determined there is no test/typecheck/build to run and recorded that fact.
+  ledger.recordVerificationStage({
+    stage: "smoke",
+    status: "skipped",
+    summary: "no runnable verification command found (no test/typecheck/build detected in this project)",
+    failureClass: "unknown",
+    artifacts: [],
+    signals: { auto: true, noCommandAvailable: true }
+  });
+  const verdict = ledgerAllowsFinish(ledger);
+  assert.equal(verdict.allowed, true, "impossible-to-verify must not block the finish gate forever");
+  assert.match(verdict.reason, /no runnable verification command|unverified/);
+});
+
+test("a real later failure still blocks finish even after a no-command marker", () => {
+  const ledger = new CompletionLedger("edit then a check fails");
+  ledger.recordFileChange("app.py");
+  ledger.recordVerificationStage({
+    stage: "smoke", status: "skipped", summary: "no command", failureClass: "unknown", artifacts: [], signals: { noCommandAvailable: true }
+  });
+  // A command the model DID run later fails: the no-command escape must not mask it.
+  ledger.recordVerificationStage({
+    stage: "focused_tests", status: "failed", summary: "AssertionError", failureClass: "app_bug", artifacts: [], signals: {}
+  });
+  assert.equal(ledgerAllowsFinish(ledger).allowed, false, "a real failed stage overrides the no-command escape");
+});
+
+test("a self-corrected cd-prefixed command clears the earlier failure latch (a shell path typo does not wedge finish)", () => {
+  // Regression: the model ran `cd C:\..\proj && npm install` (Windows backslashes in bash) -> the whole
+  // command failed; it then ran the corrected `cd /c/../proj && npm install` which succeeded. The
+  // success must clear the failure latch (same operation), not leave the finish gate blocked forever.
+  const ledger = new CompletionLedger("build the app");
+  ledger.recordCommandResult("cd C:\\Users\\me\\proj && npm install", false, "unknown");
+  assert.ok(ledger.get().unresolvedFailures.length > 0, "the failed install latches a finish blocker");
+  ledger.recordCommandResult("cd /c/Users/me/proj && npm install", true, "unknown");
+  assert.equal(ledger.get().unresolvedFailures.length, 0, "the corrected-path success clears the latch (same operation)");
+});
+
+test("commandFingerprint strips a leading cd/pushd wrapper so it fingerprints the operation, not the path", () => {
+  assert.equal(commandFingerprint("cd C:\\a\\b && npm install"), commandFingerprint("npm install"));
+  assert.equal(commandFingerprint("cd /c/a/b && npm install"), commandFingerprint("cd C:\\a\\b && npm install"));
+  assert.notEqual(commandFingerprint("cd x && npm install"), commandFingerprint("cd x && npm run build"), "different operations still differ");
+});
+
+test("a failed exploratory shell command (ls/Move-Item) does NOT latch a finish-blocker, but a real check failure does", () => {
+  // Regression: the model fumbled `ls C:\..` (backslashes stripped) and `Move-Item ..` (PowerShell in
+  // bash); both failed but are self-corrected fumbles, not project failures. They must not block finish.
+  const ledger = new CompletionLedger("build the app");
+  ledger.recordCommandResult("ls C:UsersLENOVODesktopproj", false, "unknown");
+  ledger.recordCommandResult("Move-Item public/index.html index.html", false, "unknown");
+  assert.equal(ledger.get().unresolvedFailures.length, 0, "exploratory shell fumbles never latch a finish blocker");
+  ledger.recordCommandResult("npm run build", false, "app_bug");
+  assert.ok(ledger.get().unresolvedFailures.length > 0, "a genuine build/check failure still blocks");
+});
+
+test("a passing BUILD verification stage clears a stray manual-command failure (fixed tsc, re-verified via npm run build)", () => {
+  // Regression (speed8): the model ran `npx tsc --noEmit` -> a real syntax error it then FIXED, but it
+  // re-verified with `npm run build` (a different command fingerprint), so the tsc failure stayed
+  // latched and blocked finish. A green build compiles the whole app, so it must clear that stray.
+  const ledger = new CompletionLedger("build the app");
+  ledger.recordCommandResult("npx tsc --noEmit", false, "app_bug");
+  assert.ok(ledger.get().unresolvedFailures.length > 0, "the tsc failure latches");
+  ledger.recordVerificationStage({ stage: "build", status: "ok", summary: "build ok", failureClass: "unknown", artifacts: [], signals: {} });
+  assert.equal(ledger.get().unresolvedFailures.length, 0, "a green build clears the stray already-fixed tsc failure");
+});
+
+test("isExploratoryCommand flags navigation/file commands but not build/test runners", () => {
+  assert.equal(isExploratoryCommand("ls -la /c/x"), true);
+  assert.equal(isExploratoryCommand("cd /c/x && mv a b"), true);
+  assert.equal(isExploratoryCommand("Move-Item a b"), true);
+  assert.equal(isExploratoryCommand("Get-ChildItem"), true);
+  assert.equal(isExploratoryCommand("npm run build"), false);
+  assert.equal(isExploratoryCommand("cd /c/x && npm run build"), false);
+  assert.equal(isExploratoryCommand("tsc --noEmit"), false);
+});
+
 test("non-progress detector fires after stall window and produces a recovery capsule", () => {
   const detector = new NonProgressDetector(3, 5);
   const event0 = detector.observe({ action: "read", argsSig: "src/a.ts", filesRead: ["src/a.ts"], filesChanged: [] });
@@ -409,6 +550,19 @@ test("isTerminalVerified requires at least one ok stage", () => {
   assert.equal(isTerminalVerified([{ stage: "smoke", status: "skipped", summary: "", failureClass: "unknown", artifacts: [], signals: {} }]), false);
   assert.equal(isTerminalVerified([{ stage: "smoke", status: "ok", summary: "", failureClass: "unknown", artifacts: [], signals: {} }]), true);
   assert.equal(isTerminalVerified([{ stage: "smoke", status: "ok", summary: "", failureClass: "unknown", artifacts: [], signals: {} }, { stage: "focused_tests", status: "failed", summary: "", failureClass: "unknown", artifacts: [], signals: {} }]), false);
+});
+
+test("isTerminalVerified: a green build with an ADVISORY smoke timeout IS terminal-verified (the flaky dev-server never blocks finish)", () => {
+  // Regression (speed9): build ok + advisory smoke timed_out -> the finish gate must reach terminal-
+  // verified. An advisory failure must be ignored; a NON-advisory failed stage still blocks.
+  const stages = [
+    { stage: "build" as const, status: "ok" as const, summary: "build ok", failureClass: "unknown" as const, artifacts: [], signals: {} },
+    { stage: "smoke" as const, status: "timed_out" as const, summary: "smoke failed", failureClass: "unknown" as const, artifacts: [], signals: {}, advisory: true }
+  ];
+  assert.equal(isTerminalVerified(stages), true, "advisory smoke timeout does not block terminal-verified");
+  // But a NON-advisory failed stage still blocks (no silent masking of a real failure).
+  const withRealFail = [...stages, { stage: "full_tests" as const, status: "failed" as const, summary: "tests failed", failureClass: "app_bug" as const, artifacts: [], signals: {} }];
+  assert.equal(isTerminalVerified(withRealFail), false, "a real (non-advisory) stage failure still blocks");
 });
 
 test("verification run tool feeds the completion ledger", async () => {
