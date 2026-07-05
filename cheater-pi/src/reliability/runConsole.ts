@@ -12,6 +12,7 @@ import { sidecarScheduler } from "../sidecar/scheduler.js";
 import { steeringControl } from "../runstate/steering.js";
 import { workerBackendReason, workerBackendState } from "../blueprint/worker.js";
 import { mascotSpinnerFrames, type MascotState } from "../ui/mascot.js";
+import { setMascot } from "../ui/mascotUi.js";
 
 export interface RunConsoleSnapshot {
   status: string;
@@ -35,7 +36,7 @@ function progressBar(done: number, total: number): string {
 }
 
 /** The mascot's mood for the run console, derived from the run's live status. */
-function consoleMascotState(snapshot: RunConsoleSnapshot): MascotState {
+export function consoleMascotState(snapshot: RunConsoleSnapshot): MascotState {
   if (snapshot.unresolvedFailures > 0) return "blocked";
   if (/complete|done|finished|allowed|verified/i.test(snapshot.status)) return "success";
   if (snapshot.lastVerification) {
@@ -112,7 +113,14 @@ export function registerRunConsole(pi: ExtensionAPI): void {
   const refresh = (_event: unknown, ctx: any) => {
     try {
       const snapshot = runConsoleSnapshot();
-      if (snapshot) ctx?.ui?.setWidget?.("cheater-run-console", renderRunConsole(snapshot), { placement: "aboveEditor" });
+      if (snapshot) {
+        ctx?.ui?.setWidget?.("cheater-run-console", renderRunConsole(snapshot), { placement: "aboveEditor" });
+        // Drive the animated spinner mascot from here too: on a single-GPU local box everything runs
+        // in-session (no fresh workers), so the worker-progress spinner never fires - this makes the
+        // reactive cat show during ordinary local work as well. pi controls when the spinner is
+        // visible; we only set the frames. No-op in JSON/headless.
+        setMascot(ctx, consoleMascotState(snapshot));
+      }
     } catch {
       // the console must never break a turn
     }
