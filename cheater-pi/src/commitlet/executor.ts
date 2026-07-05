@@ -160,7 +160,7 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
     const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or Pi's edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
     const verifyLine = verificationCommand
       ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
-      : "No verification command is configured; state explicitly what you checked manually.";
+      : "No test exists yet, so you have NO way to know when you are done. Before finishing: WRITE a test file (test_<module>.py) that asserts the spec on the normal cases AND every edge case a careful engineer checks - empty/zero input, a single element, boundaries, invalid input (does it raise?), negatives, ties, ordering/precedence, large values - then run `python -m pytest -q` and iterate until it is GREEN. A passing edge-case test is your signal to STOP; do not keep rewriting code that already passes.";
     // Prompt shape (measurement only - does not change the prompt below). The fixed operating rules
     // sit AFTER the big dynamic capsule, so they are not a reusable leading prefix; recorded so the
     // receipt can show worker-prompt size and cache-friendliness. See runtime/promptShape.ts.

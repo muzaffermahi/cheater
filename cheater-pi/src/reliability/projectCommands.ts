@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export interface ProjectCommands {
@@ -291,18 +291,39 @@ interface CommandCacheFile {
  * mtimes so it re-runs only when a manifest actually changes. This replaces ad-hoc
  * `detectProjectCommands` calls and the old hardcoded `npm test` defaults.
  */
+/**
+ * A test file the model just wrote (test_foo.py) with NO pytest config/manifest is invisible to
+ * manifest-based detection - so verification skips every test stage and "passes" on ZERO real checks,
+ * leaving the model with no oracle to know when it is done (it then thrashes / never terminates). If a
+ * bare pytest file exists and no test command was otherwise detected, run pytest on it so the model's
+ * own test actually gates completion. Computed at read-time (not cached) because writing a test file
+ * does not change the manifest signature the cache is keyed on.
+ */
+function augmentWithBareTests(cmds: ProjectCommands, root: string): ProjectCommands {
+  if (cmds.testCommand || cmds.focusedTestCommand) return cmds;
+  let hasPyTest = false;
+  try {
+    hasPyTest = readdirSync(root).some((f) => /^test_.+\.py$/i.test(f) || /.+_test\.py$/i.test(f));
+  } catch {
+    // unreadable dir - leave commands unchanged
+  }
+  if (!hasPyTest) return cmds;
+  const cmd = "python -m pytest -q";
+  return { ...cmds, testCommand: cmd, focusedTestCommand: cmd, evidence: [...cmds.evidence, "bare pytest file discovered (no manifest)"] };
+}
+
 export function loadProjectCommands(cwd: string): ProjectCommands {
   const root = resolve(cwd);
   const sig = manifestSignature(root);
   const cached = memo.get(root);
-  if (cached && cached.sig === sig) return cached.cmds;
+  if (cached && cached.sig === sig) return augmentWithBareTests(cached.cmds, root);
 
   const cacheFile = join(root, ".cheater", "commands.json");
   try {
     const disk = JSON.parse(readFileSync(cacheFile, "utf8")) as CommandCacheFile;
     if (disk && disk.sig === sig && disk.cmds) {
       memo.set(root, { sig, cmds: disk.cmds });
-      return disk.cmds;
+      return augmentWithBareTests(disk.cmds, root);
     }
   } catch {
     // no usable disk cache
@@ -316,7 +337,7 @@ export function loadProjectCommands(cwd: string): ProjectCommands {
   } catch {
     // best-effort persistence
   }
-  return cmds;
+  return augmentWithBareTests(cmds, root);
 }
 
 /** Best available default verification command for a repo, or null if none was detected. */

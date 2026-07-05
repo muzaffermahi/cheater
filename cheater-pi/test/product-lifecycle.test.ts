@@ -9,7 +9,7 @@ import { defaultCommitletState } from "../src/commitlet/state.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
 import { CompletionLedger, ledgerAllowsFinish, NonProgressDetector, classifyCommand, classifyFailure, workspaceIdentityCheck, ProcessRegistry, isTerminalVerified, commandFingerprint, isExploratoryCommand } from "../src/reliability/lifecycle.js";
-import { detectProjectCommands, focusTestCommand } from "../src/reliability/projectCommands.js";
+import { detectProjectCommands, focusTestCommand, loadProjectCommands } from "../src/reliability/projectCommands.js";
 import { runVerification } from "../src/reliability/verificationRunner.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
 import { createCommitletPlan } from "../src/commitlet/planner.js";
@@ -185,6 +185,19 @@ test("verification command detection works for Python repos", () => {
   const cmds = detectProjectCommands(cwd);
   assert.equal(cmds.framework, "pytest");
   assert.match(cmds.testCommand ?? "", /pytest/);
+});
+
+test("loadProjectCommands discovers a bare model-written test with no manifest (test-oracle fix)", () => {
+  // Spec-only task: the model writes test_thing.py in a dir with NO pyproject/pytest.ini. Manifest
+  // detection finds no test command -> verification would skip every stage and 'pass' on zero checks.
+  // The read-time bare-test probe must find it so pytest actually gates completion. This also proves
+  // the probe works AFTER the (manifest-mtime-keyed) command cache is already populated.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-bare-test-"));
+  assert.equal(loadProjectCommands(cwd).testCommand, null, "empty dir: no test command, and this caches it");
+  writeFileSync(join(cwd, "test_thing.py"), "def test_ok():\n    assert 1 == 1\n", "utf8");
+  const cmds2 = loadProjectCommands(cwd); // manifest sig unchanged -> cache hit, but probe still runs
+  assert.match(cmds2.testCommand ?? "", /pytest/, "a bare test_*.py must make pytest the test command");
+  assert.match(cmds2.focusedTestCommand ?? "", /pytest/);
 });
 
 test("verification command detection works for Cargo and Go repos", () => {
