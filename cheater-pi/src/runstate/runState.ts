@@ -44,6 +44,12 @@ export interface FinishCheck {
   warnings: string[];
 }
 
+/** Files the harness pre-stamped from a stack template (Phase A boilerplate acceleration), with
+ *  each file's export contract. Read by the scaffold phase prompt to tell the model they exist. */
+export interface ScaffoldStampLedger {
+  stamped: Array<{ path: string; exportsSummary: string }>;
+}
+
 export class TaskRunState {
   readonly repoRoot: string;
   readonly taskId: string;
@@ -58,6 +64,8 @@ export class TaskRunState {
   /** True when this run was reactivated from disk (session reincarnation). */
   readonly resumed: boolean;
   activeCommitletId?: string;
+  /** Files pre-stamped from a stack template this run; surfaced to the scaffold phase prompt. */
+  scaffoldStamp?: ScaffoldStampLedger;
   /** Bounded history of observed commands, for world state. */
   commandsRun: string[] = [];
   private readonly filesRead = new Set<string>();
@@ -124,6 +132,10 @@ export class TaskRunState {
   /** A file was created/modified/deleted. Stales dependent validations, feeds the ledger. */
   recordFileMutation(path: string, action: MutationAction, actor: string, source: string, reason?: string): void {
     if (!path) return;
+    // A file the run itself CREATED or MODIFIED counts as "seen" for read-before-write: overwriting
+    // a file you just wrote is not destroying unseen code. Without this, a from-scratch build that
+    // creates a file then fleshes it out with a second write is hard-blocked ("was never read").
+    this.noteFileRead(path);
     this.mutations.record({ actor, action, paths: [path], source: source.slice(0, 120), reason });
     const newlyStale = this.validations.markStaleForPaths([path]);
     if (newlyStale.length) {
@@ -150,6 +162,11 @@ export class TaskRunState {
   /** Files whose content a capsule carried count as read for its worker. */
   registerCapsuleFiles(paths: string[]): void {
     for (const path of paths) this.noteFileRead(path);
+  }
+
+  /** Record the stack-template files stamped for this run (Phase A boilerplate acceleration). */
+  setScaffoldStamp(ledger: ScaffoldStampLedger): void {
+    this.scaffoldStamp = ledger;
   }
 
   bumpTelemetry(key: keyof RunTelemetry, by = 1): void {

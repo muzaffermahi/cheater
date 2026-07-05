@@ -1,5 +1,16 @@
 import { buildSystemPrompt } from "./prompts.js";
 import { registerCheaterCommands } from "./commands.js";
+import { registerDevLog } from "./dev/devLog.js";
+import { registerSidecarCommands } from "./sidecar/command.js";
+import { registerProviderCommands } from "./providers/command.js";
+import { assessCommandSafety } from "./reliability/commandSafety.js";
+import { registerRunConsole } from "./reliability/runConsole.js";
+import { registerSteeringCommands } from "./runstate/steering.js";
+import { registerEmptyTurnDetector } from "./reliability/emptyTurnDetector.js";
+import { shouldNudgeToAct, firstUserGoal, ANSWERED_WITHOUT_ACTING_NUDGE } from "./reliability/actGuard.js";
+
+/** Tool names that execute a shell command (subject to the safety boundary). */
+const SHELL_TOOL_NAMES = new Set(["bash", "run_command", "run", "shell", "exec"]);
 import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
 import { loadConfig } from "./config.js";
@@ -15,6 +26,8 @@ import { registerReliabilityCommands } from "./reliability/commands.js";
 import { registerCommitletCommands } from "./commitlet/commands.js";
 import { registerCommitletTools } from "./commitlet/tools.js";
 import { defaultCommitletState } from "./commitlet/state.js";
+import { hasResolvedScope, fileMatchesScope } from "./commitlet/guard.js";
+import { effectiveMode } from "./commitlet/types.js";
 import { formatPlanChecklist } from "./commitlet/ui.js";
 import { liveSessionState } from "./reliability/sessionState.js";
 import { ledgerAllowsFinish } from "./reliability/lifecycle.js";
@@ -27,6 +40,8 @@ import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
 import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
 import { activeTaskRun, endTaskRun, resumeTaskRun } from "./runstate/runState.js";
+import { ensureCheaterDirIgnored } from "./runstate/runDir.js";
+import { buildCompletionReceipt } from "./commitlet/kernel.js";
 import { preToolUse, postToolUse, bridgeLoopEvents } from "./runstate/hooks.js";
 import { listUnfinishedRuns } from "./runstate/worldState.js";
 import { reconstructRunState, renderReincarnationBrief } from "./runstate/workerPlans.js";
@@ -38,7 +53,10 @@ import type { CheaterConfig } from "./types.js";
 type ExtensionAPI = any;
 
 const PLANNER_BLOCKED_TOOLS = new Set(["read", "edit", "write", "grep", "find", "ls", "bash"]);
-const EDIT_TOOLS = new Set(["edit", "write", "cheater_line_edit"]);
+const EDIT_TOOLS = new Set(["edit", "write", "cheater_line_edit", "cheater_replace"]);
+// Read-only tools are NEVER hard-blocked by the loop/non-progress detectors: they are how the model
+// diagnoses why it is stuck and breaks out. Locking them out is the exact deadlock we are fixing.
+const READONLY_TOOLS = new Set(["read", "read_file", "cat", "grep", "search", "search_code", "find", "glob", "ls"]);
 const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 
 // Mode-scoped cheater tool sets. Pi-native tools are never touched (we only ever filter the
@@ -52,19 +70,23 @@ const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 // adds redundant tool-choice ambiguity for a weak model. Blueprint tools are deliberately in
 // no mode: blueprint planning runs INSIDE cheater_reliability_start, not via model calls.
 export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", string[]> = {
-  // cheater_reliability_start stays visible even in answer_only: routing is heuristic and
-  // sometimes wrong, and a misroute must NEVER hard-lock the model out of starting the flow.
-  // (Observed live: "proceed" after an approval question routed answer_only, masked the
-  // planner tool away, and the model - narrating "launching the planner now" - could only
-  // emit bug_memory_search five times in a row. The mask is guidance, not a cage.)
-  answer_only: ["cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
-  planner: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
-  execute: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
+  // cheater_run/cheater_reliability_start stay visible even in answer_only: routing is
+  // heuristic and sometimes wrong, and a misroute must NEVER hard-lock the model out of
+  // starting the flow. (Observed live: "proceed" after an approval question routed
+  // answer_only, masked the planner tool away, and the model - narrating "launching the
+  // planner now" - could only emit bug_memory_search five times in a row. The mask is
+  // guidance, not a cage.)
+  answer_only: ["cheater_run", "cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
+  planner: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
+  execute: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_replace", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
 
 /** The cheater tools visible in a mode. Every registered cheater tool appears in a mode. */
-export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", _config: CheaterConfig): string[] {
-  return [...CHEATER_TOOL_MODES[mode]];
+export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", config: CheaterConfig): string[] {
+  const tools = CHEATER_TOOL_MODES[mode];
+  // The bug-memory tool is filtered from every mask unless the (default-off) feature is enabled -
+  // matching its gated registration, so applyToolMask never activates an unregistered tool name.
+  return config.bugMemoryEnabled === true ? [...tools] : tools.filter((name) => name !== "cheater_bug_memory_search");
 }
 
 // getActiveTools/setActiveTools live on the ExtensionAPI (`pi`) object, NOT on the per-event
@@ -77,6 +99,25 @@ function applyToolMask(pi: ExtensionAPI, config: CheaterConfig, mode: "answer_on
   // mode map so masking is reversible across turns.
   const piNative = active.filter((name) => !name.startsWith("cheater_"));
   pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode, config)]);
+}
+
+// KV-cache stability: once a session has entered a code mask (planner/execute), keep the cheater
+// tool SURFACE stable for the rest of the session even on a follow-up that routes answer_only. The
+// answer_only INSTRUCTION still tells the model to just answer; but shrinking the tool list mid-
+// session would change the prompt's tool-schema prefix and force the local engine to re-prefill the
+// whole conversation on the next turn. The mask is guidance not a cage (see CHEATER_TOOL_MODES), so
+// keeping code tools visible during a question is harmless. Per-process; a pure-question session that
+// never touches code stays on the minimal answer_only surface.
+let sessionEnteredCodeMask = false;
+// KV-cache stability during a from-scratch/in-session build: the system prompt is computed ONCE per
+// plan and reused byte-for-byte on every turn, so the local engine's cached prefix never changes and
+// each turn only prefills the NEW conversation tokens (measured: a stable prefix prefills ~200x faster
+// than a cold one on this box). Recomputed on a new plan / cleared outside a build.
+let frozenBuildPrompt: { planId: string; text: string } | null = null;
+function applyToolMaskStable(pi: ExtensionAPI, config: CheaterConfig, mode: "answer_only" | "planner" | "execute"): void {
+  if (mode === "planner" || mode === "execute") sessionEnteredCodeMask = true;
+  const effective = mode === "answer_only" && sessionEnteredCodeMask && config.stablePromptPrefix !== false ? "execute" : mode;
+  applyToolMask(pi, config, effective);
 }
 
 /**
@@ -105,31 +146,10 @@ function buildWorkingSetCapsule(): string | null {
   ].filter(Boolean).join("\n");
 }
 
-/** Compact, code-generated completion receipt: what the harness actually observed. */
-export function buildCompletionReceipt(ledger: CompletionLedger): string {
-  const s = ledger.get();
-  const okStages = s.verification.filter((v) => v.status === "ok").map((v) => v.stage);
-  const lines = [
-    "Cheater: done - verified",
-    `changed: ${s.changedFiles.slice(0, 6).join(", ") || "(none)"}`,
-    `ran: ${s.commandsRun.slice(-3).join(" | ") || "(none)"}`,
-    `verified: ${okStages.join(", ") || "(none)"}`
-  ];
-  // Resampling and evidence facts come from ledger entries the harness itself recorded -
-  // the receipt reports what actually happened, including degraded fresh-worker modes.
-  const resamples = s.entries.filter((entry) => entry.kind === "resample");
-  if (resamples.length) {
-    const last = resamples.at(-1)!;
-    const x = last.extra as { attemptsRun?: number; samplesRequested?: number; appliedAttempt?: number; passed?: boolean; freshWorkerMode?: string };
-    lines.push(`resampling: attempt ${x.appliedAttempt}/${x.attemptsRun} applied (${x.passed ? "verified pass" : "best failing candidate"}); workers: ${x.freshWorkerMode ?? "real"}`);
-  }
-  const evidence = s.entries.filter((entry) => entry.kind === "cheat_evidence");
-  if (evidence.length) {
-    const sources = [...new Set(evidence.flatMap((entry) => ((entry.extra as { sources?: string[] })?.sources ?? [])))];
-    lines.push(`evidence: cheat sheet used (${sources.join(", ")})`);
-  }
-  return lines.join("\n");
-}
+// The completion receipt moved into the shared reliability kernel (commitlet/kernel.ts) so
+// the closed-loop executor and the agent_end path render the SAME receipt; re-exported here
+// for existing importers.
+export { buildCompletionReceipt };
 
 function runCommandAsync(cmd: string, cwd: string, timeoutMs: number): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
@@ -169,7 +189,24 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
   const state = ledger.get();
   if (!state.changedFiles.length) return false;
   const picked = pickAutoVerifyCommand(loadProjectCommands(cwd));
-  if (!picked) return false;
+  if (!picked) {
+    // No test/typecheck/build command exists in this project: verification is IMPOSSIBLE, not
+    // skipped by laziness. Record that fact once so the finish gate can allow an honest
+    // unverified finish instead of nagging every turn for a command that does not exist - a
+    // weak local model would never remember to manually waive it. A real check the model runs
+    // later still overrides this.
+    if (!state.verification.some((v) => (v.signals as Record<string, unknown> | undefined)?.noCommandAvailable)) {
+      ledger.recordVerificationStage({
+        stage: "smoke",
+        status: "skipped",
+        summary: "no runnable verification command found (no test/typecheck/build detected in this project)",
+        failureClass: "unknown",
+        artifacts: [],
+        signals: { auto: true, noCommandAvailable: true }
+      });
+    }
+    return true;
+  }
   const { cmd, stage, kind } = picked;
   ctx?.ui?.notify?.(`Cheater verifying: ${cmd}`, "info");
   const r = await runCommandAsync(cmd, cwd, 90000);
@@ -181,7 +218,7 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
     // enabled), and attaches at most three hypothesis cards - no model search tool involved.
     const sheet = await buildCheatSheet(cwd, summary, config ?? {});
     if (sheet) summary = `${summary}\n${renderCheatSheet(sheet, cmd)}`;
-  } else if (config?.experienceStoreEnabled !== false) {
+  } else if (config?.bugMemoryEnabled === true && config?.experienceStoreEnabled !== false) {
     // Verified fail->pass inside one session: the harness itself observed the earlier failed
     // stage and now the pass, and git shows what changed - write the experience card.
     const priorFailure = state.verification.filter((v) => v.status === "failed").at(-1);
@@ -322,7 +359,7 @@ export function projectRules(cwd: string): string {
   return "";
 }
 
-function buildEnvBlock(cwd: string): string {
+function buildEnvBlock(cwd: string, opts: { includeGit?: boolean } = {}): string {
   const cmds = loadProjectCommands(cwd);
   const lines: string[] = ["## Environment"];
   const shellNote = process.platform === "win32"
@@ -330,7 +367,11 @@ function buildEnvBlock(cwd: string): string {
     : "";
   lines.push(`platform: ${process.platform}${shellNote}`);
   lines.push(`cwd: ${cwd}`);
-  lines.push(gitStatusLine(cwd));
+  // Git status is VOLATILE (changes every time the model touches a file). When stablePromptPrefix is
+  // on it is lifted OUT of this block and appended AFTER all stable content, so the local engine's
+  // KV-cache prefix (Pi system + Cheater rules + stable env + cap) survives across turns instead of
+  // being invalidated at this line every turn.
+  if (opts.includeGit !== false) lines.push(gitStatusLine(cwd));
   const cmdParts = [
     cmds.testCommand && `test: ${cmds.testCommand}`,
     cmds.focusedTestCommand && cmds.focusedTestCommand !== cmds.testCommand && `focused: ${cmds.focusedTestCommand}`,
@@ -382,9 +423,18 @@ function resultText(content: Array<{ type: string; text?: string }> | undefined)
 
 // A short acknowledgement continues the active plan; a longer/imperative message is treated
 // as a possible new goal and re-routed. Deliberately conservative so real new requests route.
-function looksLikeNewGoal(message: string): boolean {
+export function looksLikeNewGoal(message: string): boolean {
   const trimmed = message.trim();
   if (/^(ok(ay)?|yes|yep|yeah|sure|go|go ahead|continue|proceed|next|do it|please continue|keep going|carry on|and\b.*)$/i.test(trimmed)) return false;
+  // A short imperative that names a target ("fix the parser", "delete temp.txt", "add dark
+  // mode", "refactor auth.ts") is a genuinely NEW goal, not an acknowledgement. The old
+  // length-only gate (<=24 chars) misclassified every such message as an ack and re-issued the
+  // PREVIOUS goal - handing a weak local model contradictory context (new text, old goal) it
+  // cannot recover from. Only a bare "verb + pronoun" with nothing else ("fix it", "run it")
+  // stays a continuation of the active work.
+  const hasActionVerb = /\b(fix|add|implement|create|build|write|refactor|rename|remove|delete|update|change|make|support|enable|migrate|convert|port|wire|register|document|debug|repair|optimize|improve|swap|replace)\b/i.test(trimmed);
+  const bareContinuation = /^\s*(fix|do|try|redo|retry|run|test|check|verify|build|make)\s+(it|that|this|them|again)\s*$/i.test(trimmed);
+  if (hasActionVerb && !bareContinuation) return true;
   if (trimmed.length <= 24) return false;
   return true;
 }
@@ -405,6 +455,10 @@ function extractMessageText(message: { role?: string; content?: unknown } | unde
 
 export default function cheaterExtension(pi: ExtensionAPI) {
   const config = loadConfig();
+  // Fresh registration = fresh session: the sticky code-mask latch starts clear so a pure-question
+  // session keeps the minimal answer_only surface (and test files that re-register stay isolated).
+  sessionEnteredCodeMask = false;
+  frozenBuildPrompt = null;
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
   let gitBaseline: Map<string, string> | null = null;
@@ -420,7 +474,20 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   let runSeenFingerprints = new Map<string, string>();
 
   registerCheaterCommands(pi, config);
-  registerCheaterTools(pi);
+  registerCheaterTools(pi, config);
+  // Silent dev trace: /dev toggles harness-owned logging of reasoning, commands, and timing.
+  // Taps only pure-notification events, so it is invisible to the model and never interferes.
+  registerDevLog(pi);
+  // /sidecar: configure the 2-4B clerk model (offload + work-ahead). Auto-enables when a model is set.
+  registerSidecarCommands(pi, config);
+  // /provider-probe: measure LM Studio native stateful chat + TTFT stats (standalone fetch, off-path).
+  registerProviderCommands(pi, config);
+  // Live run console: a real-time status widget (mode, commitlet progress, verify, sidecar, backend).
+  registerRunConsole(pi);
+  // /steer: mid-run steering (correct or gracefully stop a running task without killing it).
+  registerSteeringCommands(pi);
+  // Surface a clear diagnostic when the model produces nothing repeatedly (e.g. prefill timeout).
+  registerEmptyTurnDetector(pi);
   if (config.autopilotEnabled !== false) {
     registerAutopilotCommands(pi);
   }
@@ -443,6 +510,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event: unknown, ctx: any) => {
+    // Hide cheater's own .cheater/ working-state dir from git so the model never mistakes the
+    // harness's untracked files for user content to recover/commit (finding #6).
+    try { ensureCheaterDirIgnored(ctx.cwd); } catch { /* best-effort */ }
     ctx.ui.setTitle?.(`Cheater - ${ctx.cwd}`);
     ctx.ui.setStatus?.("cheater", ctx.ui.theme?.fg ? ctx.ui.theme.fg("accent", "Cheater") : "Cheater");
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
@@ -481,7 +551,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
             : `Cheater: resuming unfinished run ${target.taskId}`,
           "info"
         );
-        applyToolMask(pi, config, "execute");
+        applyToolMaskStable(pi, config, "execute");
         return {
           action: "transform",
           text: [
@@ -521,7 +591,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
 
     if (continuingPlan && activePlan && activeCommitlet) {
       const done = activePlan.commitlets.filter((c) => ["passed", "skipped", "repaired"].includes(c.status)).length;
-      applyToolMask(pi, config, "execute");
+      applyToolMaskStable(pi, config, "execute");
       ctx.ui.notify?.(`Continuing active plan (${done}/${activePlan.commitlets.length})`, "info");
       return {
         action: "transform",
@@ -544,7 +614,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       if (previous.lastDecision.executionDiscipline === "blocked_needs_user") {
         const approved = routeAutopilot({ cwd: ctx.cwd, message: previous.currentGoal, repoHints: { userApprovedHighRisk: true } });
         defaultAutopilotState.setDecision(previous.currentGoal, approved);
-        applyToolMask(pi, config, approved.executionMode === "answer_only" ? "answer_only" : approved.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+        applyToolMaskStable(pi, config, approved.executionMode === "answer_only" ? "answer_only" : approved.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
         ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(approved).split("\n"), { placement: "aboveEditor" });
         liveSessionState.reset(previous.currentGoal);
         liveSessionState.setLastUserGoal(previous.currentGoal);
@@ -554,7 +624,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
             `User request: ${message}`,
             "",
             `Cheater: the user just approved the previously blocked request. Original goal: ${previous.currentGoal.slice(0, 400)}`,
-            buildAutopilotInstruction(approved, previous.currentGoal)
+            buildAutopilotInstruction(approved, previous.currentGoal, config.leanAutopilotInstruction !== false)
           ].join("\n")
         };
       }
@@ -562,7 +632,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       // prior instruction and mask instead of re-classifying the ack itself.
       if (previous.lastDecision.executionMode !== "answer_only") {
         const prior = previous.lastDecision;
-        applyToolMask(pi, config, prior.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+        applyToolMaskStable(pi, config, prior.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
         liveSessionState.setLastUserGoal(previous.currentGoal);
         return {
           action: "transform",
@@ -570,7 +640,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
             `User request: ${message}`,
             "",
             `Cheater: the user confirmed the previous request. Goal: ${previous.currentGoal.slice(0, 400)}`,
-            buildAutopilotInstruction(prior, previous.currentGoal)
+            buildAutopilotInstruction(prior, previous.currentGoal, config.leanAutopilotInstruction !== false)
           ].join("\n")
         };
       }
@@ -579,12 +649,12 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const atFiles = resolveAtFiles(ctx.cwd, message);
     const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined, requireApproval: config.requireApprovalForHighRisk === true });
     defaultAutopilotState.setDecision(message, decision);
-    applyToolMask(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
+    applyToolMaskStable(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
     ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(decision).split("\n"), { placement: "aboveEditor" });
     ctx.ui.notify?.(decision.userVisibleSummary, "info");
     return {
       action: "transform",
-      text: `User request: ${message}\n\n${buildAutopilotInstruction(decision, message)}${atFiles.block}`
+      text: `User request: ${message}\n\n${buildAutopilotInstruction(decision, message, config.leanAutopilotInstruction !== false)}${atFiles.block}`
     };
   });
 
@@ -616,7 +686,14 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     // The MAIN session breathes up to (near) the model's real context window - NOT the tiny
     // per-worker packet budget. Only compact when genuinely near that real ceiling.
     const cap = mainSessionContextCap(config, usage?.contextWindow);
-    const threshold = Math.floor(cap * contextCompactRatio(config));
+    const plan = config.stablePromptPrefix !== false ? defaultCommitletState.get().currentPlan : null;
+    const inBuild = Boolean(plan);
+    // DURING A BUILD, compaction is the enemy: the local KV cache reuses a stable prefix (a repeated
+    // prefix prefills ~200x faster here), and compaction rewrites the whole transcript into a summary
+    // - invalidating the cache and forcing a full, minutes-long cold re-prefill. So only compact near
+    // TRUE window overflow (~0.97) during a build, versus the normal 0.85 elsewhere.
+    const compactRatio = inBuild ? Math.max(contextCompactRatio(config), 0.97) : contextCompactRatio(config);
+    const threshold = Math.floor(cap * compactRatio);
     const shouldCompact = typeof usage?.tokens === "number" && usage.tokens >= threshold;
     if (shouldCompact) {
       ctx.compact?.({
@@ -626,19 +703,52 @@ export default function cheaterExtension(pi: ExtensionAPI) {
           "Drop repeated file reads, stale tool outputs, and duplicated planner narration."
         ].join(" ")
       });
+      frozenBuildPrompt = null; // the transcript just changed; the frozen prompt must be recomputed
     }
+    const compactionNotice = shouldCompact ? {
+      customType: "cheater-context-cap",
+      content: `Cheater requested compaction because this session reached ${threshold} tokens.`,
+      display: true,
+      details: usage
+    } : undefined;
+    // During a build, FREEZE the whole system prompt (computed once per plan; NO volatile git status or
+    // project-commands line, which change the moment a file is written) so the KV-cache prefix is
+    // byte-identical on every turn of the build -> each turn only prefills the NEW tokens instead of
+    // re-prefilling the entire growing conversation (the difference between seconds and minutes per
+    // turn on a slow local model). Outside a build, keep pass-23's git-trails-the-stable-content order.
+    if (inBuild && plan) {
+      if (!frozenBuildPrompt || frozenBuildPrompt.planId !== plan.id) {
+        frozenBuildPrompt = {
+          planId: plan.id,
+          text: `${event.systemPrompt}\n\n${buildSystemPrompt(config)}\n\n${buildEnvBlock(ctx.cwd, { includeGit: false })}\n\n${cheaterCapPrompt(cap)}`
+        };
+      }
+      return { systemPrompt: frozenBuildPrompt.text, message: compactionNotice };
+    }
+    frozenBuildPrompt = null;
+    // Prefix stability (no build): keep the VOLATILE git-status line after the stable content so the
+    // local model reuses the KV cache for the long stable prefix across turns. Off => old order.
+    const stablePrefix = config.stablePromptPrefix !== false;
+    const envBlock = buildEnvBlock(ctx.cwd, { includeGit: !stablePrefix });
+    const gitTail = stablePrefix ? `\n\n${gitStatusLine(ctx.cwd)}` : "";
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${buildSystemPrompt(config)}\n\n${buildEnvBlock(ctx.cwd)}\n\n${cheaterCapPrompt(cap)}`,
-      message: shouldCompact ? {
-        customType: "cheater-context-cap",
-        content: `Cheater requested compaction because this session reached ${threshold} tokens.`,
-        display: true,
-        details: usage
-      } : undefined
+      systemPrompt: `${event.systemPrompt}\n\n${buildSystemPrompt(config)}\n\n${envBlock}\n\n${cheaterCapPrompt(cap)}${gitTail}`,
+      message: compactionNotice
     };
   });
 
   pi.on("tool_call", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown> }, ctx: any) => {
+    // Security boundary FIRST: hard-block the handful of shell actions a local model must never
+    // take (fetch-and-run pipes, disk/root destruction, secret exfiltration) regardless of the
+    // autonomy setting. Destructive-but-legitimate commands only hard-block under requireApproval.
+    if (SHELL_TOOL_NAMES.has(event.toolName)) {
+      const command = String((event.input as { command?: unknown } | undefined)?.command ?? "");
+      const safety = assessCommandSafety(command, { requireApproval: config.requireApprovalForHighRisk === true });
+      if (safety.verdict === "block") {
+        try { ctx.ui?.notify?.(`Cheater blocked a ${safety.category} command: ${safety.message}`, "error"); } catch { /* best-effort */ }
+        return { block: true, reason: `Cheater safety: blocked a ${safety.category} command (${safety.message}). If this was intentional and safe, run it yourself outside the agent.` };
+      }
+    }
     const commitletBlock = blockCommitletScopeViolation(event);
     if (commitletBlock) return commitletBlock;
 
@@ -709,17 +819,27 @@ export default function cheaterExtension(pi: ExtensionAPI) {
       // Non-terminal warnings are delivered in-band on the tool's own result text; notifying
       // here as well injected a chat line MID-STREAM on every flagged tool call (Pi's notify
       // appends to the chat container), which forcibly jumped the viewport.
-      if (evt.terminal) {
-        // Graceful-stop semantics (ported from Cline): a hard stop must tell the model AND
-        // the user that nothing is lost and exactly how to resume.
-        const preserved = "Session state is preserved: the plan, rollback snapshots, and ledger are intact. Send a new instruction to resume, or /commitlet-revert to roll back.";
-        ctx.ui.notify?.(evt.message, "error");
-        ctx.ui.setWidget?.("cheater-lifecycle", [evt.message, preserved], { placement: "aboveEditor" });
-        return {
-          block: true,
-          reason: `${evt.message} ${preserved}`
-        };
+      if (!evt.terminal) continue;
+      // NEVER hard-lock the model out via a read-only tool (it needs reads/greps/ls to diagnose why
+      // it is looping and to break the loop) or during an IN-SESSION build where the model IS the
+      // driver (a hard stop mid-build has no outer loop to hand off to - it just wedges the whole
+      // build, the exact deadlock reported). Downgrade to an in-band warning on the tool's result
+      // so the guidance still reaches the model, but the action proceeds.
+      const readOnly = READONLY_TOOLS.has(event.toolName);
+      const inSessionBuild = Boolean(defaultCommitletState.get().currentPlan);
+      if (readOnly || inSessionBuild) {
+        liveSessionState.queueLoopWarning(event.toolCallId, evt);
+        continue;
       }
+      // Genuine hard stop: a runaway main session with no active build to preserve. Graceful-stop
+      // semantics (ported from Cline): tell the model AND the user nothing is lost and how to resume.
+      const preserved = "Session state is preserved: the plan, rollback snapshots, and ledger are intact. Send a new instruction to resume, or /commitlet-revert to roll back.";
+      ctx.ui.notify?.(evt.message, "error");
+      ctx.ui.setWidget?.("cheater-lifecycle", [evt.message, preserved], { placement: "aboveEditor" });
+      return {
+        block: true,
+        reason: `${evt.message} ${preserved}`
+      };
     }
     return {};
   });
@@ -727,7 +847,15 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   pi.on("tool_result", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown>; content?: Array<{ type: string; text?: string }>; isError?: boolean }, ctx: any) => {
     const warning = liveSessionState.consumeLoopWarning(event.toolCallId);
     let extraNotice = "";
-    if (warning) extraNotice += `\n\n[${warning.message}]`;
+    if (warning) {
+      // Re-reading/re-grepping a file to fix build errors is NORMAL during an in-session build - it
+      // is not a stuck loop. Suppress read/search-repeat warnings while a commitlet plan is active so
+      // they don't clutter every result and derail the model mid-debug. Patch/failed-command/total-
+      // call loop warnings (the ones that signal genuine spinning) still surface.
+      const readNoise = /same file read too often|same search query/.test(warning.message);
+      const inSessionBuild = Boolean(defaultCommitletState.get().currentPlan);
+      if (!(readNoise && inSessionBuild)) extraNotice += `\n\n[${warning.message}]`;
+    }
 
     // Deliver run-state hints raised at tool_call time in-band on this tool's own result.
     const runHints = pendingRunHints.get(event.toolCallId);
@@ -862,6 +990,26 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event: { messages?: Array<{ stopReason?: string }> }, ctx: any) => {
+    // Finding #5: the model ANSWERED an actionable task in chat and called ZERO tools - the agent is
+    // about to end with nothing done (no file written, no command run). Nudge it ONCE to actually do
+    // the work. Distinct from the empty-turn detector (a frozen no-text model) and from the
+    // finish-gate nudge below (which requires files to have changed). A genuine question, an
+    // aborted/errored run, or an already-queued nudge is skipped.
+    if (liveSessionState.canNudge()) {
+      const lastMsg = (event.messages as Array<{ stopReason?: string }> | undefined)?.at(-1);
+      const goal = firstUserGoal(event.messages) || liveSessionState.getLastUserGoal();
+      if (lastMsg?.stopReason !== "aborted" && lastMsg?.stopReason !== "error"
+          && !ctx.hasPendingMessages?.()
+          && shouldNudgeToAct({ enabled: config.nudgeAnsweredWithoutActing !== false, messages: event.messages, goal })) {
+        liveSessionState.recordNudge();
+        pi.sendMessage({
+          customType: "cheater-act-not-answer",
+          content: ANSWERED_WITHOUT_ACTING_NUDGE,
+          display: true
+        }, { deliverAs: "followUp" });
+        return;
+      }
+    }
     const ledger = liveSessionState.getLedger();
     if (!ledger) return;
     const state = ledger.get();
@@ -878,8 +1026,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     // model's only remaining job is fixing a failure it is handed - the task it does best.
     if (config.autoVerifyOnFinish !== false && !ledgerAllowsFinish(ledger).allowed) {
       const ran = await harnessAutoVerify(ctx.cwd, ledger, ctx, config);
-      if (ran && ledgerAllowsFinish(ledger).allowed) {
-        ctx.ui.notify?.("Cheater auto-verified the changes; finish gate is satisfied.", "info");
+      const afterVerify = ledgerAllowsFinish(ledger);
+      if (ran && afterVerify.allowed) {
+        ctx.ui.notify?.(`Cheater: ${afterVerify.reason}.`, "info");
         return;
       }
     }
@@ -922,11 +1071,22 @@ export function blockCommitletScopeViolation(event: any): { block: boolean; reas
   const path = extractPath(event.input);
   if (!path) return undefined;
   const normalized = path.replace(/\\/g, "/");
-  const allowed = running.allowedFiles.some((file) => !file.startsWith("(") && (normalized === file || normalized.endsWith(`/${file}`)));
+  // Scaffold lane: a from-scratch build is building the WHOLE directory in-session, so there is
+  // nothing to protect and blocking any write is pure friction. The reported case blocked
+  // tailwind.config.js (not in the model's initial file list) and derailed the build. safeRepoPath
+  // already keeps writes inside the project; let the model create whatever the build needs.
+  if (plan && effectiveMode(plan, running) === "scaffold") return undefined;
+  const scopeFiles = running.allowedFiles;
+  // No resolved target yet (placeholder-only allowedFiles): the commitlet is self-localizing,
+  // so the model must be free to edit the file it finds - blocking every edit here is a hard
+  // deadlock. The diff guard, health score, focused verification, and maxFilesTouched=1 still
+  // gate the result downstream.
+  if (!hasResolvedScope(scopeFiles)) return undefined;
+  const allowed = scopeFiles.some((file) => fileMatchesScope(normalized, file));
   if (!allowed) {
     return {
       block: true,
-      reason: `Cheater Commitlet guard blocked ${event.toolName} outside allowed files for ${running.id}. Allowed: ${running.allowedFiles.join(", ") || "(none)"}. -> Edit only those files for this commitlet; to change ${path}, finish this commitlet and call cheater_commitlet_next for the next one.`
+      reason: `Cheater Commitlet guard blocked ${event.toolName} outside allowed files for ${running.id}. Allowed: ${scopeFiles.join(", ") || "(none)"}. -> Edit only those files for this commitlet; to change ${path}, finish this commitlet and call cheater_commitlet_next for the next one.`
     };
   }
   if (running.forbiddenFiles.some((file) => normalized === file || normalized.endsWith(`/${file}`))) {

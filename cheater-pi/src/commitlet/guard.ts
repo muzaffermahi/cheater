@@ -7,21 +7,58 @@ export interface DiffInput {
 
 export interface DiffGuardOverrides {
   allowLargeDeletion?: boolean;
+  /** Effective allow-set to enforce instead of commitlet.allowedFiles (the scaffold lane passes the
+   *  plan-wide union so a from-scratch build may touch any planned file, not just the current phase's). */
+  allowedScope?: string[];
+}
+
+/** A concrete scope is a real path/dir, not the "(select one target file...)" placeholder. */
+export function isConcreteScope(file: string): boolean {
+  return Boolean(file) && !file.startsWith("(");
+}
+
+/** True once the commitlet has at least one real target (not just a placeholder). */
+export function hasResolvedScope(allowedFiles: string[]): boolean {
+  return allowedFiles.some(isConcreteScope);
+}
+
+/** Whether a (forward-slash) file path falls under an allowed scope (exact file or `dir/`). */
+export function fileMatchesScope(normalizedFile: string, scope: string): boolean {
+  if (!isConcreteScope(scope)) return false;
+  if (scope.endsWith("/")) {
+    const dir = scope.replace(/\/+$/, "");
+    return normalizedFile === dir || normalizedFile.startsWith(`${dir}/`) || normalizedFile.includes(`/${dir}/`);
+  }
+  return normalizedFile === scope || normalizedFile.endsWith(`/${scope}`);
 }
 
 export function runDiffGuard(commitlet: Commitlet, input: DiffInput, overrides: DiffGuardOverrides = {}): DiffGuardReport {
-  const allowed = new Set(commitlet.allowedFiles);
   const touchedFiles = [...new Set(input.touchedFiles)];
   const diffLines = countDiffLines(input.diffText);
   const blockingIssues: string[] = [];
   const warnings: string[] = [];
-  const allowedList = commitlet.allowedFiles.join(", ") || "(none)";
-  const outside = touchedFiles.filter((file) => !allowed.has(file));
+  // The scope enforced here is the effective allow-set: normally the commitlet's own files, but the
+  // scaffold lane passes the plan-wide union so building any planned file is never "out of scope".
+  const scope = overrides.allowedScope?.length ? overrides.allowedScope : commitlet.allowedFiles;
+  const allowedList = scope.join(", ") || "(none)";
+  // A commitlet whose allowedFiles are ONLY the "(select a target after inspection)" placeholder
+  // has no resolved scope yet - it is self-localizing. Flagging its self-localized edit as
+  // "outside allowedFiles" (combined with the tool_call scope guard blocking the edit outright)
+  // is a hard deadlock for the common "fix this failing test" / generic-bug path, where the goal
+  // terms don't lexically match a source symbol so file selection returns the placeholder. Once
+  // any concrete target exists we enforce scope normally; maxFilesTouched still caps sprawl to
+  // one file, and the dependency/test/generated-artifact rules below still apply.
+  const outside = hasResolvedScope(scope)
+    ? touchedFiles.filter((file) => !scope.some((entry) => fileMatchesScope(file.replace(/\\/g, "/"), entry)))
+    : [];
   if (outside.length) blockingIssues.push(`Touched files outside allowedFiles: ${outside.join(", ")}. -> Edit only ${allowedList} for this commitlet; to change another file, finish this commitlet and call cheater_commitlet_next.`);
   const forbidden = touchedFiles.filter((file) => commitlet.forbiddenFiles.includes(file));
   if (forbidden.length) blockingIssues.push(`Touched forbidden files: ${forbidden.join(", ")}. -> Revert those files and keep the change inside ${allowedList}.`);
   if (touchedFiles.length > commitlet.maxFilesTouched) blockingIssues.push(`Touched ${touchedFiles.length} files, max is ${commitlet.maxFilesTouched}. -> Split this into one commitlet per file; revert all but one and call cheater_commitlet_next for the rest.`);
-  if (diffLines > commitlet.maxDiffLines) blockingIssues.push(`Diff has ${diffLines} changed lines, max is ${commitlet.maxDiffLines}. -> Make a smaller, more focused change or split it across commitlets.`);
+  // Creating a NEW file (a pure-addition diff) is expected to be large - the whole file is "added" -
+  // so a from-scratch component/module should not be blocked by the edit-tuned maxDiffLines cap.
+  const effectiveMaxDiff = isCreationDiff(input.diffText) ? Math.max(commitlet.maxDiffLines, 2000) : commitlet.maxDiffLines;
+  if (diffLines > effectiveMaxDiff) blockingIssues.push(`Diff has ${diffLines} changed lines, max is ${effectiveMaxDiff}. -> Make a smaller, more focused change or split it across commitlets.`);
   if (touchedFiles.some(isDependencyFile) && !commitlet.healthBudget.allowDependencyEdits) blockingIssues.push("Dependency/manifest edit is not allowed for this commitlet. -> Revert the manifest change; if a dependency is truly required, tell the user and get explicit approval first.");
   if (touchedFiles.some(isLockfile) && !commitlet.healthBudget.allowLockfileEdits) blockingIssues.push("Lockfile edit is not allowed for this commitlet. -> Revert the lockfile; let the package manager regenerate it only after an approved dependency change.");
   if (touchedFiles.some(isTestFile) && !commitlet.healthBudget.allowTestEdits) blockingIssues.push("Test edit is not allowed for this commitlet. -> Revert the test change and fix the source instead; only edit tests when the task is explicitly about them.");
@@ -50,6 +87,17 @@ export function runDiffGuard(commitlet: Commitlet, input: DiffInput, overrides: 
 
 export function countDiffLines(diffText = ""): number {
   return diffText.split(/\r?\n/).filter((line) => /^[+-]/.test(line) && !/^\+\+\+|---/.test(line)).length;
+}
+
+/** A pure-addition diff = a newly-created file (or a clean append) - a big one is expected, not risky. */
+export function isCreationDiff(diffText = ""): boolean {
+  let added = 0;
+  let removed = 0;
+  for (const line of diffText.split(/\r?\n/)) {
+    if (/^\+(?!\+\+)/.test(line)) added += 1;
+    else if (/^-(?!--)/.test(line)) removed += 1;
+  }
+  return added > 0 && removed === 0;
 }
 
 function isTestFile(file: string): boolean {

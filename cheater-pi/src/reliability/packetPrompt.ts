@@ -106,8 +106,10 @@ function trimToBudget(text: string, budgetTokens: number): string {
 }
 
 function relevantSnippets(plan: BlueprintPlan, packet: WorkPacket, modelClass: ReturnType<typeof modelProfile>["class"], skipFiles: string[] = []): string[] {
-  const maxFiles = modelClass === "9b" ? 1 : 2;
-  const maxChars = modelClass === "9b" ? 900 : 1400;
+  // One file per worker is universal; the tier only widens how much of that file (and, for the
+  // strongest in-range models, whether a second supporting file) rides in the packet.
+  const maxFiles = modelClass === "large" ? 2 : 1;
+  const maxChars = modelClass === "large" ? 1400 : modelClass === "medium" ? 1200 : 900;
   const skip = new Set(skipFiles);
   const files = [
     ...packet.filesToTouch.map((file) => file.path),
@@ -126,8 +128,8 @@ function isSnippetSafeFile(file: string): boolean {
   return /\.(ts|tsx|js|jsx|py|md|json|toml|yml|yaml|html|css|scss|vue|svelte|go|rs)$/i.test(file);
 }
 
-function operatingRulesFor(modelClass: ReturnType<typeof modelProfile>["class"]): string[] {
-  if (modelClass === "9b") {
+export function operatingRulesFor(modelClass: ReturnType<typeof modelProfile>["class"]): string[] {
+  if (modelClass === "small") {
     return [
       "Read at most one target file region before editing.",
       "Make one bounded edit, then stop for verification.",
@@ -135,7 +137,15 @@ function operatingRulesFor(modelClass: ReturnType<typeof modelProfile>["class"])
       "If a second file is needed, stop with BLOCKED_NEXT_FILE."
     ];
   }
-  if (modelClass === "moe30b" || modelClass === "moe35b") {
+  if (modelClass === "medium") {
+    return [
+      "Use the packet facts first; read only the smallest target region you still need.",
+      "Make one bounded edit to the allowed file, then stop for verification.",
+      "Run the focused verification command yourself before broad tests.",
+      "If a second file is needed, stop with BLOCKED_NEXT_FILE instead of editing it."
+    ];
+  }
+  if (modelClass === "large") {
     return [
       "Use the packet facts first, then inspect only the smallest missing local region.",
       "Keep one touched file per worker even if reasoning spans multiple files.",

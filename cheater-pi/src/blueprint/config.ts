@@ -63,7 +63,7 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   blueprintCandidateCount: 3,
   blueprintShowInternalPlanSummary: true,
   blueprintRequireApproval: "high_risk_only",
-  blueprintMaxPackets: 8,
+  blueprintMaxPackets: 24,
   blueprintMaxCallsPerPacket: 1,
   blueprintMaxDebugRounds: 3,
   blueprintReplanAfterFailedDebug: true,

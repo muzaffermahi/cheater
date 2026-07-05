@@ -168,10 +168,12 @@ test("commands are classified: test/install/dev server/git destructive/shell edi
   assert.ok(isLongRunning("npm run dev"));
 });
 
-test("reserve phase blocks installs; long-running servers draw a warning; output is capped head+tail", () => {
-  const blocked = preExecPolicy({ command: "npm install lodash", phase: "reserve" });
-  assert.equal(blocked.verdict, "block");
-  assert.match(blocked.message ?? "", /RESERVE/);
+test("reserve phase WARNS on installs (a build legitimately needs them) but still blocks destructive git; servers warn; output capped", () => {
+  const install = preExecPolicy({ command: "npm install lodash", phase: "reserve" });
+  assert.equal(install.verdict, "warn", "installs are legitimate build actions - warn, never hard-block");
+  assert.match(install.message ?? "", /RESERVE/);
+  const destructive = preExecPolicy({ command: "git reset --hard HEAD~2", phase: "reserve" });
+  assert.equal(destructive.verdict, "block", "destructive git is still blocked in reserve");
   const server = preExecPolicy({ command: "npm run dev", phase: "implement" });
   assert.equal(server.verdict, "warn");
   assert.match(server.message ?? "", /long-running/i);
@@ -210,6 +212,13 @@ test("read-before-write: overwriting an existing unread file is blocked; reading
   run2.registerCapsuleFiles(["cap.ts"]);
   const viaCapsule = preToolUse({ toolName: "write", toolCallId: "t3", cwd: repo2, path: "cap.ts" }, run2);
   assert.ok(!viaCapsule.some((decision) => decision.action === "block"));
+  // A file the run itself CREATED counts as seen - re-writing it to flesh it out is not blocked
+  // (a from-scratch build creates a file, then a second write must not be walled off as "unread").
+  const { run: run3, repo: repo3 } = freshRun("hook-rbw3");
+  writeFileSync(join(repo3, "made.ts"), "export const m = 1;\n", "utf8");
+  run3.recordFileMutation("made.ts", "file_created", "main-session", "write");
+  const reWrite = preToolUse({ toolName: "write", toolCallId: "t4", cwd: repo3, path: "made.ts" }, run3);
+  assert.ok(!reWrite.some((decision) => decision.action === "block"), "a file the run created is re-writable");
   endTaskRun();
 });
 

@@ -144,11 +144,14 @@ test("agent_end nudges toward verification, is bounded per turn, skips aborts, a
 
   await tools.get("cheater_reliability_start").execute("start", { userGoal: "change one typo in README" }, undefined, undefined, context);
   liveSessionState.getLedger()!.recordFileChange("README.md");
-  liveSessionState.getLedger()!.recordCommand("node -e \"process.exit(0)\"");
+  // Genuinely-blocked state: a real verification stage FAILED, so finishing must be nudged until
+  // it passes. (A project with NO runnable check at all is the separate honest-unverified path,
+  // which deliberately does NOT nudge - see product-lifecycle's no-runnable-command test.)
+  liveSessionState.getLedger()!.recordVerificationStage({ stage: "focused_tests", status: "failed", summary: "assertion failed", failureClass: "app_bug", artifacts: [], signals: {} });
 
   const normalMessage = { messages: [{ stopReason: "stop" }] };
   await events.get("agent_end")(normalMessage, context);
-  assert.equal(customMessages.length, 1, "unverified work with a real ledger must trigger exactly one nudge");
+  assert.equal(customMessages.length, 1, "unverified (failing) work with a real ledger must trigger exactly one nudge");
   assert.match(customMessages[0].message.content, /Cheater Finish Gate/);
   assert.equal(customMessages[0].options.deliverAs, "followUp");
 

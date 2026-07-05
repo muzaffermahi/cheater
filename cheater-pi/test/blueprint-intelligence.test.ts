@@ -288,7 +288,7 @@ test("quality gate flags missing test signal, vague criteria, and risky API gues
         { packetId: "implement-src-feature", file: "src/feature.ts", facts: ["src/feature.ts registers commands"] }
       ],
       contextBudget: {
-        modelName: "qwen-9b", modelClass: "9b", plannerTokens: 12000, workerTokens: 10000,
+        modelName: "qwen-9b", modelClass: "small", plannerTokens: 12000, workerTokens: 10000,
         maxFactsPerPacket: 4, maxFilesPerWorker: 1, maxOutputTokens: 500, compressionRules: []
       },
       webSearch: { required: false, provider: "local", queries: [], allowedDomains: [], status: "local_only" },
@@ -360,7 +360,7 @@ test("quality gate blocks evidence-required web tasks without remote evidence", 
       webEvidence: [],
       webSearchTriggers: ["user_requested_search=3", "version_sensitive=3"],
       contextBudget: {
-        modelName: "qwen-9b", modelClass: "9b", plannerTokens: 12000, workerTokens: 10000,
+        modelName: "qwen-9b", modelClass: "small", plannerTokens: 12000, workerTokens: 10000,
         maxFactsPerPacket: 4, maxFilesPerWorker: 1, maxOutputTokens: 500, compressionRules: []
       },
       webSearch: {

@@ -141,6 +141,9 @@ function overLimit(records: ToolCallRecord[], kind: ToolCallRecord["kind"], limi
  */
 function structuralKey(record: ToolCallRecord): string {
   if (record.kind === "failed_command" || record.kind === "other") return commandSignature(record.value);
+  // A patch repeats only when its CONTENT signature repeats (see mapObservationToRecord), so
+  // editing one file several times with different fixes is normal iteration, not a loop.
+  if (record.kind === "patch") return normalize(record.signature ?? record.value);
   return normalize(record.value);
 }
 

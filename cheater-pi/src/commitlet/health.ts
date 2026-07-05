@@ -1,4 +1,4 @@
-import { countDiffLines } from "./guard.js";
+import { countDiffLines, isCreationDiff } from "./guard.js";
 import type { PatchHealthReport } from "./types.js";
 
 export function scorePatchHealth(params: {
@@ -15,12 +15,21 @@ export function scorePatchHealth(params: {
   const assertionDelta = countMatches(diff, /^\+.*\b(assert|expect|should|equal|throws)\b/gm) - countMatches(diff, /^-.*\b(assert|expect|should|equal|throws)\b/gm);
   const warnings: string[] = [];
   const blockingIssues: string[] = [];
+  // Creating a NEW file (pure-addition diff) is expected to be large - the whole file is added - so do
+  // not punish it by line count or big added-runs the way an edit to existing code is punished (that
+  // is what dropped a from-scratch 460-line component below the hard-reject threshold). Real quality
+  // penalties (duplication, TODO/HACK, broad catch, globals) still apply to new code.
+  const created = isCreationDiff(diff);
   let score = 100;
-  score -= Math.max(0, diffLines - 80) * 0.2;
+  if (created) {
+    score -= Math.max(0, diffLines - 800) * 0.05; // only gently penalize a truly enormous new file
+  } else {
+    score -= Math.max(0, diffLines - 80) * 0.2;
+    score -= largeFunctionDelta * 10;
+  }
   score -= Math.max(0, params.filesTouched.length - 2) * 8;
   score -= duplicationDelta * 8;
   score -= complexityDelta * 2;
-  score -= largeFunctionDelta * 10;
   if (/^\+.*\b(TODO|HACK|FIXME)\b/gim.test(diff)) score -= 8;
   if (/^\+.*\bcatch\s*\([^)]*\)\s*\{|except\s+Exception\b/gim.test(diff)) score -= 10;
   if (/^\+.*\b(globalThis|global\s+|window\.)\b/gim.test(diff)) score -= 6;

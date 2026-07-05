@@ -32,13 +32,18 @@ export function inferFilePlans(goal: string, orientation: RepoOrientation, graph
   }
   const touchableFromGraph = new Set((graphTargets ?? []).filter((t) => t.role === "touch").map((t) => t.path));
   const frontendGoal = /\b(frontend|ui|ux|modern|style|styles|css|html|template|templates|page|layout|responsive)\b/.test(lower);
+  // These fallbacks are Cheater-repo-SHAPED filenames. ONLY suggest one when it actually EXISTS in the
+  // target repo - otherwise an empty/foreign repo (a from-scratch app) had "src/commands.ts" /
+  // "src/config.ts" injected (Cheater's OWN filenames), which is exactly how "build a web app" ended up
+  // editing a Pi command module. From-scratch builds get a model-derived file plan instead (Track B).
+  const existsInRepo = (relPath: string) => Boolean(orientation.repoRoot) && existsSync(join(orientation.repoRoot, relPath));
   const needsCommand = /\bcommand|slash|cli\b/.test(lower) && !touchableFromGraph.has("src/commands.ts") && !plans.some((plan) => /command registration/.test(plan.reason));
   const needsTool = /\btool|schema\b/.test(lower) && !touchableFromGraph.has("src/tools.ts") && !plans.some((plan) => /tool registration/.test(plan.reason));
   const needsConfig = /\bconfig|setting|defaults?\b/.test(lower) && !plans.some((plan) => /config definition/.test(plan.reason));
-  if (needsCommand) add("src/commands.ts", "fallback: command registration and help text pattern");
-  if (needsTool) add("src/tools.ts", "fallback: tool registration pattern");
-  if (needsConfig) add("src/config.ts", "fallback: configuration loading/defaults");
-  if (/\bprompt|system prompt|startup\b/.test(lower)) add("src/prompts.ts", "Cheater prompt contract");
+  if (needsCommand && existsInRepo("src/commands.ts")) add("src/commands.ts", "fallback: command registration and help text pattern");
+  if (needsTool && existsInRepo("src/tools.ts")) add("src/tools.ts", "fallback: tool registration pattern");
+  if (needsConfig && existsInRepo("src/config.ts")) add("src/config.ts", "fallback: configuration loading/defaults");
+  if (/\bprompt|system prompt|startup\b/.test(lower) && existsInRepo("src/prompts.ts")) add("src/prompts.ts", "Cheater prompt contract");
   if (/\bdocs?|readme\b/.test(lower)) add("README.md", "user-facing documentation");
   if (frontendGoal) {
     for (const path of [...orientation.importantPaths, ...orientation.entrypoints]) {

@@ -14,7 +14,14 @@ import type { CheaterConfig } from "../types.js";
 const MAX_NUDGES_PER_TURN = 2;
 
 const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
-const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_patch", "cheater_line_edit"]);
+const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_patch", "cheater_line_edit", "cheater_replace"]);
+// Driver tools ORCHESTRATE the commitlet chain; calling them repeatedly with no args is the intended
+// pattern (each call grades and advances). They are not "work" steps, so they are exempt from the
+// identical-call guard and the non-progress detector - which otherwise fire a false "you're stuck" on
+// a perfectly healthy build loop. Real progress is measured by the read/write/command steps around
+// them; if the model truly does nothing, the loop governor's total-call cap and the closed loop's
+// iteration cap still bound it.
+const DRIVER_TOOLS = new Set(["cheater_commitlet_next", "cheater_run", "cheater_reliability_start"]);
 
 export interface LiveToolCallObservation {
   toolCallId: string;
@@ -124,6 +131,10 @@ class LiveSessionState {
     this.lastUserGoal = goal;
   }
 
+  getLastUserGoal(): string {
+    return this.lastUserGoal;
+  }
+
   ensure(config: CheaterConfig, userGoal = "current session"): { ledger: CompletionLedger; governor: LoopGovernor; detector: NonProgressDetector } {
     this.config = config;
     if (!this.ledger) this.ledger = new CompletionLedger(userGoal);
@@ -177,6 +188,14 @@ class LiveSessionState {
     return warning;
   }
 
+  /** Queue a loop/non-progress event for in-band delivery on the tool's result instead of hard-
+   *  blocking the call. Used to DOWNGRADE a terminal verdict that must never lock the model out:
+   *  read-only tools (the model needs them to diagnose) and in-session builds (the model IS the
+   *  driver - there is no outer loop to hand off to, so a hard stop just wedges the build). */
+  queueLoopWarning(toolCallId: string | undefined, event: LiveLifecycleEvent): void {
+    if (toolCallId) this.pendingLoopWarnings.set(toolCallId, event);
+  }
+
   /**
    * Call-side observation: runs before the tool executes. Pushes a provisional record
    * (success/failure of command-family tools is not known yet) and checks the loop
@@ -202,19 +221,23 @@ class LiveSessionState {
     // Identical-consecutive-call guard (ported from Cline): the exact same tool with the
     // exact same canonicalized args cannot produce a different result. Warn in-band on the
     // third identical call; hard-block on the sixth. This is fully generic - it also covers
-    // cheater_* tools that the per-kind limits below never classified.
-    const signature = canonicalCallSignature(obs.toolName, obs.input ?? { path: obs.path, query: obs.query, command: obs.command });
-    this.identicalCallCount = signature === this.lastCallSignature ? this.identicalCallCount + 1 : 1;
-    this.lastCallSignature = signature;
-    if (this.identicalCallCount >= 3) {
-      const terminal = this.identicalCallCount >= 6;
-      const event: LiveLifecycleEvent = {
-        kind: "loop_break",
-        message: `Cheater: ${this.identicalCallCount} consecutive identical calls to ${obs.toolName} - the result will not change. Try a different approach, or stop and report what is blocking you.`,
-        terminal
-      };
-      events.push(event);
-      if (!terminal) this.pendingLoopWarnings.set(obs.toolCallId, event);
+    // cheater_* tools that the per-kind limits below never classified. Driver tools are exempt:
+    // repeatedly calling cheater_commitlet_next IS the intended chain driver, and each call really
+    // does advance the plan, so it is never a "the result will not change" loop.
+    if (!DRIVER_TOOLS.has(obs.toolName)) {
+      const signature = canonicalCallSignature(obs.toolName, obs.input ?? { path: obs.path, query: obs.query, command: obs.command });
+      this.identicalCallCount = signature === this.lastCallSignature ? this.identicalCallCount + 1 : 1;
+      this.lastCallSignature = signature;
+      if (this.identicalCallCount >= 3) {
+        const terminal = this.identicalCallCount >= 6;
+        const event: LiveLifecycleEvent = {
+          kind: "loop_break",
+          message: `Cheater: ${this.identicalCallCount} consecutive identical calls to ${obs.toolName} - the result will not change. Try a different approach, or stop and report what is blocking you.`,
+          terminal
+        };
+        events.push(event);
+        if (!terminal) this.pendingLoopWarnings.set(obs.toolCallId, event);
+      }
     }
 
     const loopEvent = governor.observeTools(this.toolRecords);
@@ -269,7 +292,10 @@ class LiveSessionState {
       failureClass: obs.failureClass,
       ok: obs.ok
     };
-    const npEvent = detector.observe(step);
+    // Driver tools are orchestration, not work steps: skip the non-progress detector for them so an
+    // advancing chain-driver loop (cheater_commitlet_next between phases) is never counted as a stall.
+    // Progress is measured by the read/write/command steps in between.
+    const npEvent = DRIVER_TOOLS.has(obs.toolName) ? undefined : detector.observe(step);
     if (npEvent) {
       const event: LiveLifecycleEvent = { kind: "non_progress", nonProgress: npEvent, message: `Cheater non-progress: ${npEvent.reason}`, terminal: npEvent.terminal };
       events.push(event);
@@ -313,9 +339,22 @@ function mapObservationToRecord(obs: LiveToolCallObservation): ToolCallRecord {
     return { kind: "other", value: obs.command ?? tool };
   }
   if (EDIT_TOOLS.has(tool)) {
-    return { kind: "patch", value: obs.path ?? tool };
+    // CONTENT signature, not just the path: two DIFFERENT edits to the same file (the normal way a
+    // build gets fixed error-by-error) must not read as "same patch generated again". Only a
+    // byte-identical repeat collapses to the same signature and can trip the governor.
+    return { kind: "patch", value: obs.path ?? tool, signature: `${obs.path ?? tool}#${hashInput(obs.input)}` };
   }
   return { kind: "other", value: tool };
+}
+
+/** Tiny stable hash (djb2) of a tool call's input, used to tell distinct edits apart from a
+ *  byte-identical repeat. Not cryptographic - only needs to differ when the edit content differs. */
+function hashInput(input: unknown): string {
+  let json = "";
+  try { json = JSON.stringify(input ?? {}); } catch { json = String(input); }
+  let hash = 5381;
+  for (let i = 0; i < json.length; i += 1) hash = ((hash << 5) + hash + json.charCodeAt(i)) >>> 0;
+  return hash.toString(36);
 }
 
 export const liveSessionState = new LiveSessionState();

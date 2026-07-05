@@ -46,12 +46,25 @@ function summarizeDecision(mode: AutopilotDecision["executionMode"], reason: str
 // (mode/discipline/risk/confidence live in the TUI widget and /autopilot-status). A small
 // model attends to the top of the message, so the goal keeps positional primacy and this
 // block is short.
-export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: string): string {
+export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: string, lean = false): string {
   if (decision.executionMode === "answer_only") {
-    return "Cheater: this is a question, not a code change. Answer directly. Do not edit files or start a commitlet plan.";
+    // Do NOT flatly forbid editing: "this is a question, do not edit files" was told to actionable
+    // tasks the classifier under-recognized ("Write me data.comp", "Save your regex to a file") and
+    // the model then answered in chat and produced nothing. Answer a real question directly, but if
+    // the task actually asks to produce/modify a file or run commands, DO it with tools.
+    return "Cheater: if this is genuinely a question, answer it directly. But if the task asks you to produce or modify a file, run commands, or otherwise DO something, perform it NOW with your tools (write/edit/bash) - a chat answer does not complete a task. Don't start a heavy commitlet plan for something small; just do it and verify.";
   }
   if (decision.executionDiscipline === "blocked_needs_user") {
     return "Cheater: this looks high-risk (dependency/lockfile/destructive change). Stop before editing and ask the user for explicit approval.";
+  }
+  // Lean preamble: the authoritative step-by-step flow already lives ONCE in the system prompt
+  // (prompts.ts FLOW_WITH_AUTOPILOT + EXEMPLAR), so re-sending the full 5-line block on EVERY code
+  // message just re-prefills ~155 tokens each turn on a local model. The lean form is a tight
+  // pointer (~70 tokens) that still names the entry tool and the completion gate - no information
+  // the model does not already have in the system prompt. Default on for code-changing turns.
+  if (lean) {
+    const repro = decision.executionMode === "careful_repro" ? "Reproduce the bug and gather evidence first, then: " : "";
+    return `${repro}Cheater: call cheater_run ONCE, passing the goal as ONE short line that KEEPS its action verb (e.g. "Create a Vite+React todo app", never the bare "Vite+React todo app"; do NOT restate requirements or list files - the harness plans that), and follow the flow through to cheater_finish_gate. If it reports a simulated handoff, drive it yourself (cheater_reliability_start -> edit allowed files -> cheater_commitlet_next, repeat -> cheater_finish_gate). Do not tell the user it is done until the finish gate reports ALLOWED.`;
   }
   // One flow for every code mode. cheater_reliability_start returns a prompt describing the
   // first commitlet; depending on the backend it either runs a fresh worker automatically or
@@ -65,7 +78,8 @@ export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: st
   }
   lines.push(
     "Cheater flow (run it start to finish without pausing to ask):",
-    "1. Call cheater_reliability_start with the full goal; it plans and returns the first commitlet's prompt.",
+    "Preferred: call cheater_run ONCE, passing the goal as ONE short line that KEEPS its action verb (e.g. \"Create a Vite+React todo app\", never the bare \"Vite+React todo app\"; do NOT restate requirements or list files - the harness plans that) - it spawns bounded workers, grades, repairs, verifies, and gates completion deterministically. If its result says a simulated handoff is required, continue with the classic steps below.",
+    "1. Call cheater_reliability_start with the goal in one short line, keeping its action verb; it plans and returns the first commitlet's prompt.",
     "2. Do exactly what that prompt says (edit the allowed file, or note the worker already did), then call cheater_commitlet_next - it grades in code and hands you the next commitlet. Repeat until it reports the final review.",
     "3. Call cheater_verification_run then cheater_finish_gate before telling the user it is done. If verification cannot run, say so explicitly."
   );

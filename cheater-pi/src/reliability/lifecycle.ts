@@ -29,9 +29,11 @@ export type VerificationStatus =
 
 export type VerificationStageName =
   | "prepare_env"
+  | "build"
   | "start_services"
   | "workspace_identity"
   | "smoke"
+  | "typecheck"
   | "focused_tests"
   | "full_tests"
   | "scoring"
@@ -92,6 +94,10 @@ export interface VerificationStageResult {
   failureClass: FailureClass;
   artifacts: string[];
   signals: Record<string, unknown>;
+  // Advisory stages (a non-required stage that failed, e.g. a flaky dev-server smoke check) are
+  // reported for visibility but MUST NOT record a blocking unresolved failure - otherwise a clean
+  // build is blocked forever by an environment-flaky probe the model cannot fix.
+  advisory?: boolean;
 }
 
 export interface RecoveryCapsule {
@@ -356,6 +362,12 @@ export class CompletionLedger {
       if (this.state.unresolvedFailures.length < before) this.addEntry("recovery", command.slice(0, 120), { commandSig: sig });
       return;
     }
+    // Never wedge the finish gate on a self-corrected shell fumble (a failed `ls`/`mv`/`Move-Item`, a
+    // mistyped path, a PowerShell cmdlet in bash). Record it for visibility but do NOT latch it.
+    if (isExploratoryCommand(command)) {
+      this.addEntry("failure", `${command.slice(0, 160)} (advisory - exploratory command, not a build blocker)`, { failureClass, commandSig: sig });
+      return;
+    }
     this.state.unresolvedFailures.push({ summary: `${command} -> failed`, failureClass, commandSig: sig });
     this.addEntry("failure", command.slice(0, 200), { failureClass, commandSig: sig });
   }
@@ -385,7 +397,7 @@ export class CompletionLedger {
     // A re-run of the same stage supersedes any earlier unresolved failure it recorded,
     // otherwise a passing re-run can never clear the latch and finish stays blocked forever.
     this.state.unresolvedFailures = this.state.unresolvedFailures.filter((f) => f.stage !== result.stage);
-    if (result.status === "failed" || result.status === "timed_out") {
+    if ((result.status === "failed" || result.status === "timed_out") && !result.advisory) {
       this.state.unresolvedFailures.push({ summary: `${result.stage}: ${result.summary}`, failureClass: result.failureClass, stage: result.stage });
     } else if (result.status === "ok" && TEST_STAGES.has(result.stage)) {
       // A real test/smoke/scoring stage passing means the end state is good; drop stray
@@ -438,11 +450,49 @@ export class CompletionLedger {
   }
 }
 
-const TEST_STAGES = new Set<VerificationStageName>(["smoke", "focused_tests", "full_tests", "scoring"]);
+// Stages whose PASS means the end state is good, so stray manual-command failures the model already
+// fixed (a `tsc --noEmit` it corrected then re-verified via `npm run build`, a mistyped path) are
+// cleared. "build" is included: a green `npm run build` compiles the whole app, so it subsumes an
+// earlier fixed typecheck/compile failure the model happened to re-verify with a different command.
+const TEST_STAGES = new Set<VerificationStageName>(["build", "smoke", "focused_tests", "full_tests", "scoring"]);
 
 /** Flag-insensitive, number-insensitive command signature; equivalent commands share a key. */
+// A failed exploratory/navigation/file command (a mistyped path, a PowerShell cmdlet run in the POSIX
+// bash tool, a `cd` to a Windows backslash path) is a self-corrected fumble, NOT a project failure, so
+// it must never latch a finish-blocking "unresolved failure". Build/test/typecheck runners are
+// deliberately NOT listed, so a genuine check failure still blocks. Matches the leading command word
+// after an optional `cd <path> &&` prefix.
+const EXPLORATORY_WORDS = /^\s*(?:cd|pushd|popd|ls|dir|pwd|echo|printf|cat|type|head|tail|less|more|find|grep|rg|ag|sed|awk|which|where|whereis|mkdir|rmdir|rm|del|mv|move|cp|copy|touch|stat|file|wc|sort|uniq|tree|clear|export|set|env|nl|basename|dirname|realpath|readlink|move-item|get-childitem|gci|copy-item|remove-item|new-item|set-location|get-content|get-location|select-string|test-path|write-host|write-output)\b/i;
+// Read-only INSPECTION commands: the model probing state (does the cert exist? what's in the log?).
+// When these FAIL - typically because the file they inspect does not exist YET (the model checks
+// before it creates) - that is a precondition probe, NOT a task failure, so it must never latch a
+// finish-blocking "unresolved failure". (A failed early `openssl x509 -in /app/ssl/server.crt`
+// before the cert was generated wedged the openssl-cert task's finish gate on a phantom failure
+// the model then wasted turns fighting and could only clear with a waiver.) Anything that WRITES
+// (openssl genrsa/... -out, git commit/merge/cherry-pick) is deliberately excluded and still latches.
+const READ_ONLY_GIT = /^git\s+(?:-C\s+\S+\s+)?(?:show|log|diff|status|reflog|fsck|branch|rev-parse|cat-file|blame|describe|ls-files|ls-tree|remote|shortlog|whatchanged|for-each-ref|show-ref|tag\s+-l|config\s+--get)\b/i;
+const READ_ONLY_OPENSSL = /^openssl\s+(?:x509|rsa|pkey|ec|dsa|dhparam|verify|asn1parse|crl|s_client|version)\b(?![^\n]*\s-out\b)/i;
+export function isReadOnlyProbe(cmd: string): boolean {
+  const stripped = cmd.replace(/^\s*(?:cd|pushd|popd)\s+[^&;]+(?:&&|;)\s*/i, "").trim();
+  return READ_ONLY_GIT.test(stripped) || READ_ONLY_OPENSSL.test(stripped);
+}
+export function isExploratoryCommand(cmd: string): boolean {
+  // Classify the ACTUAL operation, not a leading `cd <path> &&` wrapper (which may prefix a REAL check
+  // like `cd x && npm run build`): strip the wrapper first, then test the remainder. A command that is
+  // ONLY a `cd`/navigation is itself exploratory; a check runner (npm/tsc/pytest/...) is not listed.
+  const stripped = cmd.replace(/^\s*(?:cd|pushd|popd)\s+[^&;]+(?:&&|;)\s*/i, "").trim();
+  if (!stripped) return true;
+  return EXPLORATORY_WORDS.test(stripped) || isReadOnlyProbe(cmd);
+}
+
 export function commandFingerprint(cmd: string): string {
-  return cmd
+  // Strip a leading directory-change prefix (`cd <path> &&`/`;`, `pushd <path> &&`) so the fingerprint
+  // reflects the actual OPERATION, not the shell wrapper. Without this, a command the model retried
+  // from a corrected path (a Windows `cd C:\..` that failed in bash vs the fixed `cd /c/..`)
+  // fingerprints differently from its own successful retry, so the success never clears the earlier
+  // failure latch and the finish gate stays BLOCKED on a self-corrected shell typo.
+  const stripped = cmd.replace(/^\s*(?:cd|pushd)\s+[^&;]+(?:&&|;)\s*/i, "").trim();
+  return (stripped || cmd)
     .toLowerCase()
     .split(/\s+/)
     .filter((token) => token && !token.startsWith("-"))
@@ -456,6 +506,11 @@ export function isTerminalVerified(results: VerificationStageResult[]): boolean 
   for (const r of results) {
     if (r.status === "ok") continue;
     if (r.status === "skipped") continue;
+    // An ADVISORY failure (a non-required, environment-flaky dev-server smoke/identity check that
+    // timed out) must NOT prevent terminal-verified status - the build is the gate. Without this, a
+    // green build still can't finish because the advisory smoke timeout blocks the finish gate (the
+    // model then wastes turns "debugging" a port mismatch it cannot fix, and finishes only by waiver).
+    if (r.advisory) continue;
     return false;
   }
   return results.some((r) => r.status === "ok");
@@ -473,6 +528,18 @@ export function ledgerAllowsFinish(ledger: CompletionLedger): FinishGateVerdict 
   }
   if (s.unresolvedFailures.length) {
     return { allowed: false, reason: `unresolved failures: ${s.unresolvedFailures.map((f) => f.failureClass).join(", ")}` };
+  }
+  // The harness itself determined no runnable verification command exists in this project (no
+  // test/typecheck/build). That is "impossible to verify", not "skipped by laziness": allow an
+  // honest unverified finish rather than block forever - but ONLY when nothing failed and no
+  // real check is available to have passed. Any real stage (ok or failed) reverts to the normal
+  // rules below, so this can never mask a genuine failure.
+  const noRunnableCheck =
+    s.verification.some((v) => (v.signals as Record<string, unknown> | undefined)?.noCommandAvailable)
+    && !s.verification.some((v) => v.status === "failed")
+    && !s.verification.some((v) => v.status === "ok");
+  if (noRunnableCheck) {
+    return { allowed: true, reason: "no runnable verification command exists in this project; finishing unverified" };
   }
   if (!s.verification.length) {
     return { allowed: false, reason: "no verification was run; refusing fake completion" };
@@ -586,9 +653,14 @@ export interface WebappVerificationStageSpec {
 export function defaultWebappPlan(): WebappVerificationStageSpec[] {
   return [
     { stage: "prepare_env", required: true, timeoutSeconds: 60, successSignal: "stage_specific", description: "install / sync project deps so the workspace is buildable" },
-    { stage: "start_services", required: true, timeoutSeconds: 30, successSignal: "stage_specific", description: "start the dev server owned by the harness" },
-    { stage: "workspace_identity", required: true, timeoutSeconds: 15, successSignal: "workspace_match", description: "confirm the running server is serving THIS workspace" },
-    { stage: "smoke", required: true, timeoutSeconds: 15, successSignal: "exit_zero", description: "smoke check: app responds, no obvious errors in startup logs" },
+    // The BUILD is the primary, reliable success signal for a webapp ("it builds with npm run build").
+    // It is the required gate; the dev-server stages below are advisory best-effort (a headless dev
+    // server is environment-flaky - e.g. Vite ignores PORT and binds localhost/::1, so a curl smoke
+    // check to 127.0.0.1:PORT spuriously times out - and must NEVER block a clean build).
+    { stage: "build", required: true, timeoutSeconds: 240, successSignal: "exit_zero", description: "build the app (e.g. npm run build) - the primary success signal" },
+    { stage: "start_services", required: false, timeoutSeconds: 20, successSignal: "stage_specific", description: "best-effort: start the dev server owned by the harness (advisory)" },
+    { stage: "workspace_identity", required: false, timeoutSeconds: 10, successSignal: "workspace_match", description: "best-effort: confirm the running server serves THIS workspace (advisory)" },
+    { stage: "smoke", required: false, timeoutSeconds: 8, successSignal: "exit_zero", description: "best-effort: app responds over HTTP (advisory; a headless dev server often will not)" },
     { stage: "focused_tests", required: false, timeoutSeconds: 60, successSignal: "exit_zero", description: "run the tests most likely to cover the changed code" },
     { stage: "full_tests", required: false, timeoutSeconds: 180, successSignal: "exit_zero", description: "run the full project test suite" },
     { stage: "scoring", required: false, timeoutSeconds: 60, successSignal: "exit_zero", description: "run the project's scoring / grading command if one exists" },

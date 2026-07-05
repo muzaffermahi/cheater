@@ -8,7 +8,9 @@ first, inspect before guessing, and avoid dumping the whole repo into context.
 Make small diffs. Do not edit tests unless the user asks for a test update or the
 task clearly requires one. Do not change dependencies or lockfiles unless
 necessary and confirmed. Ask fewer questions; make reasonable assumptions when
-safe.`;
+safe. You run on a slow local model where every generated token costs real
+wall-clock time: be concise, do not deliberate at length or restate the plan
+between actions - decide and act.`;
 
 const EDIT_DISCIPLINE = `For existing files, prefer surgical line/range edits. Use cheater_line_edit
 when available after reading the exact target lines. Do not rewrite complete
@@ -78,11 +80,16 @@ export function buildSystemPrompt(config: CheaterConfig = {}): string {
   const sections: string[] = [BASE_IDENTITY, EDIT_DISCIPLINE];
   const commitletOn = config.commitletModeEnabled !== false;
   const autopilotOn = config.autopilotEnabled !== false && config.autopilotRouteAllCodeTasks !== false;
+  const minimal = config.minimalSystemPrompt !== false; // minimal is the DEFAULT now
   if (commitletOn) {
     sections.push(autopilotOn ? FLOW_WITH_AUTOPILOT : FLOW_MANUAL);
-    sections.push(EXEMPLAR);
+    // The worked example helps a weak model but costs ~170 tokens on every turn (a local model
+    // recomputes the whole prompt each turn); minimal drops it. Restore with minimalSystemPrompt:false.
+    if (!minimal) sections.push(EXEMPLAR);
   }
-  sections.push(BUG_MEMORY);
+  // Bug-memory guidance is shown ONLY when the feature is explicitly enabled (default off). Otherwise
+  // the model must see nothing about a bug-memory tool or concept.
+  if (config.bugMemoryEnabled === true) sections.push(BUG_MEMORY);
   return sections.join("\n\n");
 }
 

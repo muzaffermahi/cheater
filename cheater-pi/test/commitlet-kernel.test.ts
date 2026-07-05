@@ -23,6 +23,7 @@ import { createCleanupCommitlet, createRepairCommitlet } from "../src/commitlet/
 import { registerCommitletTools } from "../src/commitlet/tools.js";
 import { telemetryFromPlan } from "../src/commitlet/telemetry.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
+import { beginTaskRun, endTaskRun, resetTaskRunForTests } from "../src/runstate/runState.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -91,7 +92,10 @@ test("automatic reliability start prepares first tiny edit commitlet", async () 
   assert.match(result.content[0].text, /rollback: rollback-/);
   assert.match(result.content[0].text, /fresh-call prompt:/);
   assert.match(result.content[0].text, /Cheater Reliability Kernel commitlet/);
-  assert.match(result.content[0].text, /Cheater Reliability Mode fresh-call packet/);
+  // Prompt Capsule is the canonical worker context: the capsule-rendered sections are
+  // present and the old nested fresh-call packet format is GONE (one context format, not two).
+  assert.match(result.content[0].text, /Acceptance contract \(literal/);
+  assert.doesNotMatch(result.content[0].text, /Cheater Reliability Mode fresh-call packet/);
   assert.equal(result.details.commitlet.id, first?.id);
   assert.equal(result.details.prompt.commitletId, first?.id);
 });
@@ -127,28 +131,37 @@ test("commitlet fresh-call prompt includes bounded snippets and graph facts", ()
   const decision = routeAutopilot({ cwd: root, message: "add a /hello command" });
   const plan = createCommitletPlan({ repoRoot: root, userGoal: "add a /hello command", autopilotDecision: decision });
   const commitlet = { ...plan.commitlets[0], allowedFiles: ["src/commands.ts"], expectedFilesTouched: ["src/commands.ts"] };
+  resetTaskRunForTests();
+  beginTaskRun(root, "add a /hello command", { taskId: "kernel-prompt-facts" });
   const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, commitlet, ["one", "two", "three", "four"]).prompt;
-  assert.match(prompt, /constraintFacts:\n-/);
+  // Canonical capsule sections carry the same bounded context the old dual format did.
+  assert.match(prompt, /Repo facts:/);
   assert.match(prompt, /src\/commands\.ts registers commands/);
-  // Snippet is now a symbol slice (or head fallback), both labeled with the file path.
-  assert.match(prompt, /relevantSnippets:\n--- src\/commands\.ts \((?:relevant symbol|head)\) ---/);
-  assert.match(prompt, /previousState:\n- two\n- three\n- four/);
+  // Snippet is a symbol slice (or head fallback), labeled with the file path, inside the capsule.
+  assert.match(prompt, /--- src\/commands\.ts \((?:relevant symbol|head)\) ---/);
+  assert.match(prompt, /- two\n- three\n- four/);
   assert.doesNotMatch(prompt, /value79/);
-  // The nested fresh-call packet must not re-embed src/commands.ts as a raw head excerpt -
-  // it was already given a symbol-aware slice one section above in the same prompt.
+  // One context format: no nested fresh-call packet, and the sliced file's code appears
+  // exactly once (the old dual path embedded the same file twice in one prompt).
+  assert.doesNotMatch(prompt, /Cheater Reliability Mode fresh-call packet/);
   assert.doesNotMatch(prompt, /--- src\/commands\.ts excerpt ---/);
+  assert.equal(prompt.split("--- src/commands.ts (").length - 1, 1, "the target file's snippet must appear exactly once");
+  endTaskRun();
 });
 
 test("buildCommitletExecutionPrompt resolves a real modelClass and unlocks its operating rules", () => {
   const root = mkdtempSync(join(tmpdir(), "cheater-commitlet-model-"));
   const decision = routeAutopilot({ cwd: root, message: "fix the bug" });
   const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the bug", autopilotDecision: decision });
+  resetTaskRunForTests();
+  beginTaskRun(root, "fix the bug", { taskId: "kernel-model-rules" });
   const unknownPrompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0]).prompt;
-  assert.match(unknownPrompt, /modelClass: unknown/);
+  assert.match(unknownPrompt, /Operating rules for this model class:/);
+  assert.match(unknownPrompt, /Keep context narrow and execute only this packet/);
 
   const moePrompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0], [], "simulated", 1, "qwen-2.5-32b-instruct").prompt;
-  assert.match(moePrompt, /modelClass: moe30b/);
   assert.match(moePrompt, /Run the focused verification command before broad tests/, "moe-class operating rules must ship once modelClass resolves");
+  endTaskRun();
 });
 
 test("fresh-call packet renders the verification command as an explicit run-it-yourself instruction", () => {
@@ -162,17 +175,41 @@ test("fresh-call packet renders the verification command as an explicit run-it-y
     allowedFiles: ["src/a.ts"],
     focusedVerification: [{ command: "npm test -- a.test.ts", purpose: "focused", required: true }]
   };
+  resetTaskRunForTests();
+  beginTaskRun(root, "update config", { taskId: "kernel-verify-imperative" });
   const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, commitlet).prompt;
-  assert.match(prompt, /verificationCommand: npm test -- a\.test\.ts - run this yourself via bash/);
+  assert.match(prompt, /Run the focused verification YOURSELF with the bash tool before finishing and report its real output: npm test -- a\.test\.ts/);
+  endTaskRun();
 });
 
 test("fresh-call packet no longer tells the worker to use Pi-native tools only, contradicting cheater_line_edit", () => {
   const root = mkdtempSync(join(tmpdir(), "cheater-commitlet-tool-contradiction-"));
   const decision = routeAutopilot({ cwd: root, message: "fix the bug" });
   const plan = createCommitletPlan({ repoRoot: root, userGoal: "fix the bug", autopilotDecision: decision });
+  resetTaskRunForTests();
+  beginTaskRun(root, "fix the bug", { taskId: "kernel-tool-guidance" });
   const prompt = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0]).prompt;
   assert.doesNotMatch(prompt, /Use Pi native tools only/);
   assert.match(prompt, /cheater_line_edit/);
+  endTaskRun();
+});
+
+test("simulated/in-session packet tells the DRIVER to continue (call cheater_commitlet_next), not stop after one file", () => {
+  const root = mkdtempSync(join(tmpdir(), "cheater-continuation-"));
+  const decision = routeAutopilot({ cwd: root, message: "build a todo app from scratch" });
+  const plan = createCommitletPlan({ repoRoot: root, userGoal: "build a todo app from scratch", autopilotDecision: decision });
+  resetTaskRunForTests();
+  beginTaskRun(root, "build a todo app from scratch", { taskId: "continuation" });
+  // Simulated mode: the MAIN model IS the whole build, so it must be told to keep going.
+  const simulated = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0], [], "simulated").prompt;
+  assert.match(simulated, /IN-SESSION MODE/);
+  assert.match(simulated, /cheater_commitlet_next/);
+  assert.match(simulated, /do NOT end your turn/i);
+  assert.match(simulated, /NOT done until every planned commitlet is built/i);
+  // Real-worker mode: an outer loop drives continuation, so the override is (correctly) absent.
+  const real = buildCommitletExecutionPrompt({ ...plan, repoRoot: root }, plan.commitlets[0], [], "real").prompt;
+  assert.doesNotMatch(real, /IN-SESSION MODE/);
+  endTaskRun();
 });
 
 test("commitlet planner creates specs and converts blueprint-free tasks", () => {

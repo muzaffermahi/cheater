@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import cheaterExtension from "../src/extension.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
+import { defaultCommitletState } from "../src/commitlet/state.js";
+import { liveSessionState } from "../src/reliability/sessionState.js";
 import { noteWorkerBackend, resetWorkerBackendLatch } from "../src/blueprint/worker.js";
 import type { BlueprintPlan } from "../src/blueprint/types.js";
 
@@ -168,9 +170,12 @@ test("normal interactive input triggers router lifecycle hook via the real Pi in
   // Header diet: model sees the goal first, then imperative directives only - routing
   // telemetry (mode/discipline/confidence) lives in the TUI widget, not the model message.
   assert.match(result.text, /User request: add a \/hello command/);
-  assert.match(result.text, /Cheater flow/);
+  // Lean preamble (default): a tight pointer that still names the entry tool and the drive sequence
+  // (the authoritative step-by-step flow lives once in the system prompt, not re-sent every turn).
+  assert.match(result.text, /cheater_run ONCE/);
   assert.match(result.text, /cheater_reliability_start/);
   assert.match(result.text, /cheater_commitlet_next/);
+  assert.match(result.text, /cheater_finish_gate/);
   // The instruction no longer claims "planner only, do not edit" - that deadlocked complex
   // tasks on local backends that cannot spawn sub-sessions (the model IS the worker there).
   assert.doesNotMatch(result.text, /planner only/i);
@@ -190,4 +195,72 @@ test("/blueprint-show is inspection only and no manual slash command is required
   const context = ctx();
   await commands.get("blueprint-show").handler("", context);
   assert.ok(context.widgets.has("cheater-blueprint"));
+});
+
+test("loop-governor terminal verdict never locks out reads, and never hard-blocks an in-session build", async () => {
+  const { pi, events } = makePi();
+  defaultBlueprintState.clear();
+  cheaterExtension(pi);
+  const toolCall = events.get("tool_call");
+  assert.ok(toolCall, "tool_call handler registered");
+
+  // An active in-session scaffold build: the model IS the driver, so a terminal loop/identical-call
+  // verdict must be DOWNGRADED to a warning, never a hard block (the reported deadlock).
+  defaultCommitletState.setPlan({
+    id: "p", createdAt: new Date().toISOString(), repoRoot: ".", userGoal: "build", summary: "s",
+    commitlets: [{ id: "c1-scaffold-config", status: "running", scope: "scaffold", allowedFiles: ["src/App.tsx"] }],
+    currentIndex: 0, status: "running", globalConstraints: [], finalVerification: [],
+    finalReview: { accepted: false, summary: "", commitlets: [], finalVerification: [], health: { score: 0, passed: false, warnings: [], blockingIssues: [], metrics: { diffLines: 0, filesTouched: 0, duplicationDelta: 0, complexityDelta: 0, largeFunctionDelta: 0, assertionDelta: 0 } }, blockingIssues: [], warnings: [], suggestedFollowups: [] },
+    risk: "low", buildMode: "scaffold"
+  } as any);
+  liveSessionState.reset("build");
+
+  // Hammer byte-identical writes to drive the detectors terminal.
+  let writeResult: any = {};
+  for (let i = 0; i < 9; i += 1) {
+    writeResult = await events.get("tool_call")({ toolName: "write", toolCallId: `w${i}`, input: { path: "src/App.tsx", content: "SAME" } }, ctx());
+  }
+  assert.ok(!writeResult?.block, "an in-session build is warned in-band, never hard-locked, on a loop verdict");
+
+  // A read is NEVER blocked - it is the escape hatch the model needs to diagnose and break the loop.
+  const readResult: any = await events.get("tool_call")({ toolName: "read", toolCallId: "r1", input: { path: "src/App.tsx" } }, ctx());
+  assert.ok(!readResult?.block, "read-only tools are never blocked by the loop governor");
+  defaultCommitletState.clear();
+});
+
+test("read-repeat loop warnings are suppressed during an in-session build, but still delivered otherwise", async () => {
+  const { pi, events } = makePi();
+  defaultBlueprintState.clear();
+  cheaterExtension(pi);
+  const toolCall = events.get("tool_call");
+  const toolResult = events.get("tool_result");
+
+  const hammerReads = async (): Promise<string[]> => {
+    liveSessionState.reset("x");
+    const texts: string[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      const id = `rd${i}`;
+      await toolCall({ toolName: "read", toolCallId: id, input: { path: "src/App.tsx" } }, ctx());
+      const res: any = await toolResult({ toolName: "read", toolCallId: id, input: { path: "src/App.tsx" }, content: [{ type: "text", text: "contents" }] }, ctx());
+      texts.push((res?.content ?? []).map((c: any) => c.text ?? "").join(" "));
+    }
+    return texts;
+  };
+
+  // In-session build active -> re-reading a file to fix build errors is normal, so the noise is gone.
+  defaultCommitletState.setPlan({
+    id: "p", createdAt: new Date().toISOString(), repoRoot: ".", userGoal: "build", summary: "s",
+    commitlets: [{ id: "c1-scaffold-config", status: "running", scope: "scaffold", allowedFiles: ["src/App.tsx"] }],
+    currentIndex: 0, status: "running", globalConstraints: [], finalVerification: [],
+    finalReview: { accepted: false, summary: "", commitlets: [], finalVerification: [], health: { score: 0, passed: false, warnings: [], blockingIssues: [], metrics: { diffLines: 0, filesTouched: 0, duplicationDelta: 0, complexityDelta: 0, largeFunctionDelta: 0, assertionDelta: 0 } }, blockingIssues: [], warnings: [], suggestedFollowups: [] },
+    risk: "low", buildMode: "scaffold"
+  } as any);
+  const withBuild = await hammerReads();
+  assert.equal(withBuild.filter((t) => /same file read too often/.test(t)).length, 0, "read-loop noise is suppressed during an in-session build");
+
+  // No active build -> the warning still surfaces (the suppression is conditional, not a blanket mute).
+  defaultCommitletState.clear();
+  const withoutBuild = await hammerReads();
+  assert.ok(withoutBuild.some((t) => /same file read too often/.test(t)), "outside a build the read-loop warning still surfaces");
+  defaultCommitletState.clear();
 });
