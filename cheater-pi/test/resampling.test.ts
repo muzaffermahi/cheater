@@ -197,6 +197,21 @@ test("guard allows editing a source file named in the verification command, bloc
   assert.match(testGuard.blockingIssues.join(" "), /verification target/i);
 });
 
+test("manifest edit is blocked by default, but allowed when the task is explicitly about a dependency (M1)", () => {
+  const cwd = makeRepo();
+  const base = makeCommitlet(cwd);
+  const diff = "+  \"axios\": \"^1.6.0\"";
+  // An ordinary commitlet that happens to touch package.json is still blocked (supply-chain safety).
+  const blocked = runDiffGuard({ ...base, allowedFiles: ["package.json"], title: "edit target", purpose: "make target good" }, { touchedFiles: ["package.json"], diffText: diff });
+  assert.equal(blocked.passed, false);
+  assert.match(blocked.blockingIssues.join(" "), /Dependency\/manifest edit is not allowed/);
+  // A task explicitly about adding a dependency may edit the manifest (warned, not a dead-end).
+  const depTask = { ...base, allowedFiles: ["package.json"], title: "add axios", purpose: "add the axios package and use it in api.ts" };
+  const allowed = runDiffGuard(depTask, { touchedFiles: ["package.json"], diffText: diff });
+  assert.equal(allowed.passed, true, "an 'add axios' task may edit the manifest instead of hard-failing");
+  assert.match(allowed.warnings.join(" "), /adding a dependency/);
+});
+
 test("ranking prefers edits, then guard-passing, then fewer failures, then health", () => {
   const base = { index: 1, workerResult: { ok: true, summary: "" }, snapshot: new Map() };
   const mk = (over: Partial<any>) => ({ ...base, score: { touchedFiles: ["x"], diffLines: 10, guardPassed: true, healthPassed: true, healthScore: 90, verifyPassed: false, verifyFailureCount: 1, passed: false, summary: "", ...over } }) as any;
