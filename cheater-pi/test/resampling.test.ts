@@ -67,6 +67,32 @@ test("first verified pass accepts immediately with no wasted samples", async () 
   assert.match(readFileSync(join(cwd, "target.txt"), "utf8"), /good v1/);
 });
 
+test("adaptive compute (P1a) raises the sample count for a HARD commitlet", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const plan = { ...makePlan(cwd, commitlet), risk: "high", autopilotDecision: { taskKind: "bug_fix" } } as unknown as CommitletPlan;
+  const runner = scriptedRunner(cwd, [() => writeFileSync(join(cwd, "target.txt"), "bad\n", "utf8")]); // never passes -> runs every sample
+  const outcome = await runResampledWorker(plan, commitlet, { adaptiveComputeEnabled: true, adaptiveMaxSamples: 8 }, runner);
+  assert.ok(outcome.samplesRequested >= 4, `hard commitlet should request several samples, got ${outcome.samplesRequested}`);
+  assert.equal(outcome.attemptsRun, outcome.samplesRequested, "all samples run when none pass");
+});
+
+test("adaptive compute (P1a) keeps k=1 for a trivial commitlet; OFF path ignores hardness", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const trivialPlan = { ...makePlan(cwd, commitlet), risk: "low", autopilotDecision: { taskKind: "trivial" } } as unknown as CommitletPlan;
+  const runner = scriptedRunner(cwd, [() => writeFileSync(join(cwd, "target.txt"), "bad\n", "utf8")]);
+  const adaptive = await runResampledWorker(trivialPlan, commitlet, { adaptiveComputeEnabled: true }, runner);
+  assert.equal(adaptive.samplesRequested, 1, "trivial commitlet -> k=1 even with adaptive on");
+
+  const cwd2 = makeRepo();
+  const c2 = makeCommitlet(cwd2);
+  const hardOffPlan = { ...makePlan(cwd2, c2), risk: "high", autopilotDecision: { taskKind: "bug_fix" } } as unknown as CommitletPlan;
+  const runner2 = scriptedRunner(cwd2, [() => writeFileSync(join(cwd2, "target.txt"), "bad\n", "utf8")]);
+  const off = await runResampledWorker(hardOffPlan, c2, { commitletCandidateSamples: 2 }, runner2);
+  assert.equal(off.samplesRequested, 2, "adaptive OFF -> static commitletCandidateSamples, hardness ignored");
+});
+
 test("failed attempt is reverted and a later fresh sample wins", async () => {
   const cwd = makeRepo();
   const commitlet = makeCommitlet(cwd);

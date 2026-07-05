@@ -31,6 +31,7 @@ import { maxWorkerConcurrency, parallelResamplingAvailable } from "./workerPool.
 import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgentPacketRunner } from "../blueprint/worker.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import type { CheaterConfig } from "../types.js";
+import { computeBudget } from "../runtime/computeBudget.js";
 
 export interface CandidateScore {
   touchedFiles: string[];
@@ -195,7 +196,16 @@ export async function runResampledWorker(
   onProgress?: (message: string) => void,
   onHeartbeat?: (elapsedMs: number) => void
 ): Promise<ResampleOutcome> {
-  const requested = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? 1));
+  // Adaptive test-time compute (P5): the best-of-N sample count scales with this commitlet's
+  // hardness (task kind, risk, files in scope, repair) when adaptiveComputeEnabled; otherwise this
+  // is exactly config.commitletCandidateSamples ?? 1 (today's static behavior).
+  const budget = computeBudget({
+    taskKind: plan.autopilotDecision?.taskKind,
+    risk: String(plan.risk ?? ""),
+    filesInScope: editableFiles(commitlet).length,
+    isRepair: /-repair$/.test(commitlet.id) || Boolean(commitlet.spec?.observedFailure)
+  }, config);
+  const requested = budget.samples;
   const canResample = Boolean(commitlet.rollbackPoint?.snapshotDir);
   const samples = canResample ? requested : 1;
   // WorkerPool seam: on a single serialized GPU, N concurrent attempts just contend, so we run

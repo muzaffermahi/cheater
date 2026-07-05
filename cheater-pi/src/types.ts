@@ -102,6 +102,22 @@ export interface CheaterConfig {
   // otherwise. 1 (default) = today's single attempt; 2-3 recommended for small local models
   // where samples are cheap and pass@1 is weak.
   commitletCandidateSamples?: number;
+  // Adaptive test-time-compute (roadmap P5): when true, the per-commitlet best-of-N sample count,
+  // self-debug rounds, and localization depth scale with a cheap HARDNESS signal (task kind, risk,
+  // files in scope, repair, first-sample-verified) instead of the static commitletCandidateSamples.
+  // Easy commitlets get k=1 (near-vanilla speed); hard ones get up to adaptiveMaxSamples. OFF by
+  // default -> byte-identical static behavior. See runtime/computeBudget.ts.
+  adaptiveComputeEnabled?: boolean;
+  // Upper bound on adaptive best-of-N samples for the hardest commitlet (default 8), sized so a hard
+  // commitlet still fits the ~15-min wall-clock target at ~25 tok/s (sequential on one GPU).
+  adaptiveMaxSamples?: number;
+  // Upper bound on adaptive self-debug / bounded-repair rounds (default 2; research: two rounds
+  // capture 76-95% of the gain).
+  adaptiveMaxDebugRounds?: number;
+  // Disciplined SKILL memory (roadmap P3), SEPARATE from the disabled bugMemoryEnabled bug-corpus.
+  // Only execution-verified fail->pass transitions are admitted; retrieval is event-driven and
+  // similarity-gated; the bank is bounded + compacted. OFF by default until A/B-validated net-positive.
+  skillMemoryEnabled?: boolean;
   // Max fresh-worker attempts to run AT ONCE (WorkerPool). Default 1 (sequential) - correct on a
   // single GPU, which serializes concurrent model calls anyway. >1 only helps on a batching backend
   // (vLLM/TGI) AND needs workerBackendBatches:true; otherwise Cheater runs sequentially and says why.
