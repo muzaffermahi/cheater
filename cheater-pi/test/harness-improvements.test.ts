@@ -94,6 +94,31 @@ test("isReentryGoal is false without work and false once the ledger is finalized
   assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), false, "a finalized task is not an open re-entry");
 });
 
+// Over-write thrash nudge: rewriting one file many times (the csvparse failure mode - 15 rewrites of
+// an already-correct parser, never finishing) gets an advisory nudge to verify-and-finish. Fires even
+// when the model works "raw" without cheater tools, because observeToolResult sees every write.
+test("over-write nudge fires (advisory) after too many writes to the SAME file", () => {
+  liveSessionState.reset("build a csv parser");
+  let nudge = null;
+  for (let i = 1; i <= 8; i++) {
+    const events = liveSessionState.observeToolResult({ toolCallId: `w${i}`, toolName: "write", ok: true, path: "csvparse.py" }, {});
+    const hit = events.find((e) => /written csvparse\.py 8 times/.test(e.message ?? ""));
+    if (hit) nudge = hit;
+  }
+  assert.ok(nudge, "a nudge must fire at the write threshold");
+  assert.equal(nudge!.terminal, false, "the over-write nudge is ADVISORY, never a hard block");
+});
+
+test("over-write nudge does NOT fire for a few writes spread across different files", () => {
+  liveSessionState.reset("build a small app");
+  let fired = false;
+  for (let i = 1; i <= 5; i++) {
+    const events = liveSessionState.observeToolResult({ toolCallId: `f${i}`, toolName: "write", ok: true, path: `file${i}.py` }, {});
+    if (events.some((e) => /If it already works, STOP editing/.test(e.message ?? ""))) fired = true;
+  }
+  assert.equal(fired, false, "distinct files, each written once, must never trigger the over-write nudge");
+});
+
 test("a passing test stage clears stray exploratory failures so the gate is satisfiable", () => {
   const ledger = new CompletionLedger("fix the thing");
   ledger.recordFileChange("src/a.ts");

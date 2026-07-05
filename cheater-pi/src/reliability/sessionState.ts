@@ -30,6 +30,11 @@ const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_
 // iteration cap still bound it.
 const DRIVER_TOOLS = new Set(["cheater_commitlet_next", "cheater_run", "cheater_reliability_start"]);
 
+// A model that rewrites the SAME file this many times (with different content each time, so the
+// identical-call guard never fires) is almost always second-guessing code that already works. It
+// gets one advisory nudge to verify-and-finish at the limit, and a firmer one a few writes later.
+const SAME_FILE_WRITE_NUDGE_LIMIT = 8;
+
 export interface LiveToolCallObservation {
   toolCallId: string;
   toolName: string;
@@ -93,6 +98,8 @@ class LiveSessionState {
   // last tool call, and how many times in a row the exact same call was made.
   private lastCallSignature = "";
   private identicalCallCount = 0;
+  // Per-path count of successful edit-tool writes this session, for the over-write thrash nudge.
+  private readonly fileWriteCounts = new Map<string, number>();
 
   /**
    * Is the current ledger a RE-ENTRY for `userGoal` - i.e. it belongs to the same task, already
@@ -129,6 +136,7 @@ class LiveSessionState {
     this.pendingLoopWarnings.clear();
     this.lastCallSignature = "";
     this.identicalCallCount = 0;
+    this.fileWriteCounts.clear();
   }
 
   /**
@@ -148,6 +156,7 @@ class LiveSessionState {
     this.pendingLoopWarnings.clear();
     this.lastCallSignature = "";
     this.identicalCallCount = 0;
+    this.fileWriteCounts.clear();
     if (this.ledger) {
       const state = this.ledger.get();
       if (state.done || isTerminalVerified(state.verification)) this.ledger = null;
@@ -311,6 +320,22 @@ class LiveSessionState {
     }
 
     const events: LiveLifecycleEvent[] = [];
+    // Over-write thrash guard: rewriting one file many times (each write a bit different, so the
+    // identical-call guard never fires) is the csvparse failure mode - the model kept rewriting a
+    // parser that ALREADY passed, never finishing, and ballooned the run. Nudge it (advisory, never
+    // a hard block) to verify once and finish. Fires even when the model works "raw" without
+    // cheater's tools, because observeToolResult sees every write.
+    if (obs.ok && obs.path && EDIT_TOOLS.has(obs.toolName)) {
+      const writes = (this.fileWriteCounts.get(obs.path) ?? 0) + 1;
+      this.fileWriteCounts.set(obs.path, writes);
+      if (writes === SAME_FILE_WRITE_NUDGE_LIMIT || writes === SAME_FILE_WRITE_NUDGE_LIMIT + 4) {
+        events.push({
+          kind: "loop_break",
+          message: `Cheater: you have now written ${obs.path} ${writes} times. If it already works, STOP editing - run your verification once and call cheater_finish_gate. Repeatedly rewriting working code tends to BREAK it, not improve it.`,
+          terminal: false
+        });
+      }
+    }
     const step = {
       action: obs.toolName,
       argsSig: (record?.value ?? "").slice(0, 80),
