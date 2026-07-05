@@ -207,10 +207,42 @@ test("stable tool surface: after a code task, a follow-up question keeps the cod
   // default-on, the tool surface stays put so the local KV-cache prompt prefix is not invalidated; the
   // answer_only INSTRUCTION still routes the model to just answer.
   const q = await input({ type: "input", text: "what does that command print?", source: "interactive" }, fakeCtx(cwd));
-  assert.match(q.text, /question, not a code change/, "the instruction still routes the model to just answer");
+  assert.match(q.text, /genuinely a question, answer it directly/, "the instruction still routes the model to just answer a real question");
   assert.ok(activeTools.includes("cheater_commitlet_next"), "the code tool surface stays stable across the follow-up question");
   defaultAutopilotState.clear();
   defaultCommitletState.clear();
+});
+
+test("finding #7: a 'write/generate me a file' task routes ACTIONABLE, not answer_only", () => {
+  // These used to classify unknown->answer_only, and the model was told "this is a question, do not
+  // edit files" - so it answered in chat and produced nothing. "write"/"save"/"generate" now count.
+  for (const message of [
+    "I have a decompressor in /app/decomp.c. Write me data.comp that decompresses to data.txt.",
+    "Write a regex that matches dates. Save your regex in /app/regex.txt.",
+    "Generate a self-signed certificate and save it to /app/ssl/server.crt.",
+    "Compute the token count and write the integer to /app/answer.txt."
+  ]) {
+    const decision = routeAutopilot({ cwd: process.cwd(), message });
+    assert.notEqual(decision.executionMode, "answer_only", `"${message.slice(0, 45)}..." must not route answer_only`);
+  }
+});
+
+test("finding #7: a genuine question still routes answer_only (no false-execute from print/output/compute)", () => {
+  for (const message of [
+    "What does that command print?",
+    "How does the caching layer work?",
+    "Explain the authentication flow.",
+    "What is the output of this function?"
+  ]) {
+    const decision = routeAutopilot({ cwd: process.cwd(), message });
+    assert.equal(decision.executionMode, "answer_only", `"${message}" should stay answer_only`);
+  }
+});
+
+test("finding #7: the softened answer_only preamble no longer flatly forbids editing", () => {
+  const instr = buildAutopilotInstruction({ executionMode: "answer_only" } as never, "");
+  assert.doesNotMatch(instr, /Do not edit files/i);
+  assert.match(instr, /perform it NOW with your tools/i);
 });
 
 test("stable system-prompt prefix: the volatile git status trails the stable content (cache-friendly ordering)", async () => {

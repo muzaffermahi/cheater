@@ -7,6 +7,7 @@ import { assessCommandSafety } from "./reliability/commandSafety.js";
 import { registerRunConsole } from "./reliability/runConsole.js";
 import { registerSteeringCommands } from "./runstate/steering.js";
 import { registerEmptyTurnDetector } from "./reliability/emptyTurnDetector.js";
+import { shouldNudgeToAct, firstUserGoal, ANSWERED_WITHOUT_ACTING_NUDGE } from "./reliability/actGuard.js";
 
 /** Tool names that execute a shell command (subject to the safety boundary). */
 const SHELL_TOOL_NAMES = new Set(["bash", "run_command", "run", "shell", "exec"]);
@@ -39,6 +40,7 @@ import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
 import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
 import { activeTaskRun, endTaskRun, resumeTaskRun } from "./runstate/runState.js";
+import { ensureCheaterDirIgnored } from "./runstate/runDir.js";
 import { buildCompletionReceipt } from "./commitlet/kernel.js";
 import { preToolUse, postToolUse, bridgeLoopEvents } from "./runstate/hooks.js";
 import { listUnfinishedRuns } from "./runstate/worldState.js";
@@ -508,6 +510,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event: unknown, ctx: any) => {
+    // Hide cheater's own .cheater/ working-state dir from git so the model never mistakes the
+    // harness's untracked files for user content to recover/commit (finding #6).
+    try { ensureCheaterDirIgnored(ctx.cwd); } catch { /* best-effort */ }
     ctx.ui.setTitle?.(`Cheater - ${ctx.cwd}`);
     ctx.ui.setStatus?.("cheater", ctx.ui.theme?.fg ? ctx.ui.theme.fg("accent", "Cheater") : "Cheater");
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
@@ -985,6 +990,26 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event: { messages?: Array<{ stopReason?: string }> }, ctx: any) => {
+    // Finding #5: the model ANSWERED an actionable task in chat and called ZERO tools - the agent is
+    // about to end with nothing done (no file written, no command run). Nudge it ONCE to actually do
+    // the work. Distinct from the empty-turn detector (a frozen no-text model) and from the
+    // finish-gate nudge below (which requires files to have changed). A genuine question, an
+    // aborted/errored run, or an already-queued nudge is skipped.
+    if (liveSessionState.canNudge()) {
+      const lastMsg = (event.messages as Array<{ stopReason?: string }> | undefined)?.at(-1);
+      const goal = firstUserGoal(event.messages) || liveSessionState.getLastUserGoal();
+      if (lastMsg?.stopReason !== "aborted" && lastMsg?.stopReason !== "error"
+          && !ctx.hasPendingMessages?.()
+          && shouldNudgeToAct({ enabled: config.nudgeAnsweredWithoutActing !== false, messages: event.messages, goal })) {
+        liveSessionState.recordNudge();
+        pi.sendMessage({
+          customType: "cheater-act-not-answer",
+          content: ANSWERED_WITHOUT_ACTING_NUDGE,
+          display: true
+        }, { deliverAs: "followUp" });
+        return;
+      }
+    }
     const ledger = liveSessionState.getLedger();
     if (!ledger) return;
     const state = ledger.get();

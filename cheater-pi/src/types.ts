@@ -68,6 +68,9 @@ export interface CheaterConfig {
   // problems in-band on the edit's own result. Catches hallucinated imports immediately.
   postEditImportGateEnabled?: boolean;
   autoVerifyOnFinish?: boolean;
+  // When the model ANSWERS an actionable task in chat but calls zero tools (writes nothing, runs
+  // nothing), nudge it once at agent-end to actually do the work with its tools. Default on.
+  nudgeAnsweredWithoutActing?: boolean;
   loopGovernorEnabled?: boolean;
   maxLoopBreaksPerPacket?: number;
   maxToolCallsTinyPacket?: number;
@@ -166,6 +169,10 @@ export interface CheaterConfig {
   maxDiffLinesDefault?: number;
   maxModelCallsPerCommitlet?: number;
   repairAttemptsPerCommitlet?: number;
+  // #3 fix: run a SINGLE-commitlet task in-session (the main model does it directly) instead of
+  // spawning a cold fresh worker that lacks the exploration context and fails terminal/surgical
+  // tasks. Multi-commitlet plans still fan out to fresh workers. Default on.
+  singleCommitletInSession?: boolean;
   healthScoreThreshold?: number;
   hardRejectHealthThreshold?: number;
   allowDependencyEditsByDefault?: boolean;
@@ -254,14 +261,16 @@ export interface CheaterConfig {
   // Max sidecar jobs in flight at once (Track 2). Only >1 with a separate CPU endpoint that won't
   // contend with the GPU. Default 1 (a single local model can't usefully parallelize with itself).
   sidecarMaxConcurrency?: number;
-  // From-scratch boilerplate acceleration (Phase A): when the build's stack is RECOGNIZED (currently
-  // Vite+React+TS), the harness stamps that stack's INVARIANT files (build config, standard entry,
-  // Tailwind index.css, a localStorage hook) to disk so the local model never decodes ~260s of pure
-  // boilerplate. Purely additive: an unrecognized stack stamps nothing and the model-authored path
-  // (blueprint/scaffold.ts) is byte-identical. Off by default until the headless A/B confirms a net
-  // win with no new build-fix cycles; then flip on. See blueprint/stackTemplates.ts.
+  // From-scratch boilerplate acceleration (Phase A): the harness keeps a REGISTRY of stack profiles
+  // and matches the model's OWN proposed file list to one (.tsx -> React+Vite TS, .jsx -> React+Vite
+  // JS, ...), then stamps that stack's INVARIANT files (build config, standard entry, Tailwind
+  // index.css, a localStorage hook) to disk so the local model never decodes pure boilerplate. The
+  // model is never shown a menu; its file plan is its choice, and stamped files are an editable
+  // starting point, not a cage. Purely additive: an unrecognized stack stamps nothing and the
+  // model-authored path (blueprint/scaffold.ts) is byte-identical. Off by default until the headless
+  // A/B confirms a net win with no new build-fix cycles; then flip on. See blueprint/stackTemplates.ts.
   scaffoldTemplatesEnabled?: boolean;
-  // Which stack templates are eligible (default: all registered, currently ["vite-react-ts"]).
+  // Which stack profiles are eligible (default: all registered, currently vite-react-ts + vite-react-js).
   scaffoldTemplateStacks?: string[];
 }
 

@@ -154,7 +154,8 @@ function scaffoldFilePlanFn(cwd: string, ctx: ExtensionContextLike, config: Chea
 function stampScaffoldPrelude(cwd: string, scaffoldFiles: ScaffoldFile[], goal: string, config: CheaterConfig, run: TaskRunState): StampedFile[] {
   try {
     const plannedPaths = scaffoldFiles.map((file) => file.path);
-    const profile = detectStackProfile(goal, plannedPaths, config.scaffoldTemplateStacks);
+    // The model's OWN proposed file list picks the stack (.tsx -> TS, .jsx -> JS, ...); no goal regex.
+    const profile = detectStackProfile(plannedPaths, config.scaffoldTemplateStacks);
     if (!profile) return [];
     const usesTailwind = /\btailwind/i.test(goal) || plannedPaths.some((path) => /tailwind/i.test(path));
     const stamped = stampProfile(cwd, profile, { appName: deriveAppName(goal), usesTailwind, entryComponent: "./App" }, plannedPaths);
@@ -295,7 +296,20 @@ async function runClosedLoopInner(
       freshWorkerMode: "none",
       steps,
       details: { decision, noEdit: true }
-    }, userGoal, ["no edits needed: this routed as a question/answer-only request - answer the user directly."]);
+    }, userGoal, [
+      // This routed as "no orchestration needed". The guidance MUST be action-imperative, not
+      // "answer the user directly": in an agentic task context (a bench task, a "do X for me"
+      // request) small/mid models take "answer the user" LITERALLY and produce a chat reply -
+      // step-by-step instructions, or a claim that it is done - while performing ZERO actual work,
+      // so the task fails with nothing written. (deepseek ignores it and acts; qwen3-8b/coder-flash
+      // obeyed it and failed fix-git; qwen3.5-35b answered a "write the regex to a file" task in
+      // chat and never wrote the file.) Tell the model to DO the work now with its tools.
+      "no build/orchestration harness is needed for this one. If the task requires ANY actions " +
+        "(shell commands, file edits, creating a file, a git operation), perform them NOW yourself " +
+        "with your tools (bash/read/write/edit) and then verify the result. Do NOT merely describe " +
+        "the steps, hand back instructions, or claim it is done - actually make the changes. Only if " +
+        "this is genuinely a pure question with no work to perform should you answer it directly."
+    ]);
   }
   if (fromScratch && (decision.executionMode === "answer_only" || decision.executionDiscipline === "none")) {
     narrate(ctx, "empty repo + build goal: overriding an answer-only route to scaffold from scratch");
@@ -431,7 +445,16 @@ async function runClosedLoopInner(
   // From-scratch scaffolding runs IN-SESSION (spawnFreshWorker:false -> the main model builds all files
   // in one warm session): 15-25 cold fresh-worker prefills on a local model would take hours, and the
   // files must be coherent across the project. Editing an existing repo keeps the caller's choice.
-  const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: scaffolding ? false : params.spawnFreshWorker }, config, ctx);
+  //
+  // #3 fix (the dominant remaining hard-task friction): a SINGLE-commitlet task also runs in-session.
+  // A COLD fresh worker handed a terminal/surgical commitlet ("build X", "configure Y", "produce a
+  // file") lacks the main model's exploration context, hallucinates paths (e.g. wrote to /app/tls
+  // instead of /app/ssl), records no change, and grades "blocked by guard/health/test audit" - so the
+  // main model then thrashes. The main model, which JUST explored the repo, does a single focused task
+  // far better than a cold worker. Multi-commitlet plans still fan out to fresh workers.
+  const inSessionByDesign = scaffolding
+    || (config.singleCommitletInSession !== false && plan.commitlets.length <= 1);
+  const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: inSessionByDesign ? false : params.spawnFreshWorker }, config, ctx);
   const modelName = resolveModelName(config, ctx);
 
   const prepareNext = (current: CommitletPlan, next: Commitlet): Commitlet => {
@@ -470,6 +493,15 @@ async function runClosedLoopInner(
       ? [
           `From-scratch build: ${activePlan.commitlets.length} phase(s), built in-session in this warm session (the fast path - no per-file worker spawns).`,
           "Build the phase below, then call cheater_commitlet_next for the next phase. Keep going until cheater_finish_gate reports ALLOWED.",
+          "",
+          prompt.prompt
+        ]
+      : inSessionByDesign
+      ? [
+          // #3: a single focused task runs in-session ON PURPOSE - the main model has the exploration
+          // context a cold worker lacks. This is NOT a missing backend, so don't sound the alarm.
+          "This task runs IN-SESSION: you already explored this repo, so YOU do it directly (a cold fresh worker lacked that context and kept failing terminal tasks - wrong paths, no changes recorded).",
+          "Do the step below now with your tools (bash/read/write/edit), then call cheater_commitlet_next. Keep going until cheater_finish_gate reports ALLOWED.",
           "",
           prompt.prompt
         ]

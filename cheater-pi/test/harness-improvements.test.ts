@@ -62,6 +62,31 @@ test("a passing test stage clears stray exploratory failures so the gate is sati
   assert.equal(ledgerAllowsFinish(ledger).allowed, true, "a real passing test stage must clear stray exploratory failures");
 });
 
+test("a failed read-only inspection probe never latches a finish-blocking failure", () => {
+  // The model probes state BEFORE it creates the artifact: `openssl x509 -in server.crt` and
+  // `git show <hash>` fail because the file/commit is not there yet. Those are precondition probes,
+  // not task failures, so they must not wedge the finish gate on a phantom the model then wastes
+  // turns fighting (this is what failed the openssl-cert task and forced a waiver finish).
+  const ledger = new CompletionLedger("create a self-signed cert");
+  ledger.recordFileChange("app/ssl/server.crt");
+  ledger.recordCommandResult("openssl x509 -in /app/ssl/server.crt -noout -subject", false, "dependency");
+  ledger.recordCommandResult("git show 650dba4 --stat", false, "unknown");
+  assert.equal(ledger.get().unresolvedFailures.length, 0, "read-only probes must not latch a finish blocker");
+  // With the phantom probe-failures gone, a passing verification stage now satisfies the gate
+  // (before the fix, the latched probe failure blocked finish and forced a waiver).
+  ledger.recordVerificationStage({ stage: "full_tests", status: "ok", summary: "ok", failureClass: "unknown", artifacts: [], signals: {} });
+  assert.equal(ledgerAllowsFinish(ledger).allowed, true);
+});
+
+test("a failed WRITING command (openssl genrsa / git commit) still latches - not a probe", () => {
+  // The probe relaxation must not swallow a real mutation failure: generating a key or committing
+  // are writes, so a genuine failure must still block the gate.
+  const ledger = new CompletionLedger("create a self-signed cert");
+  ledger.recordFileChange("app/ssl/server.key");
+  ledger.recordCommandResult("openssl genrsa -out /app/ssl/server.key 2048", false, "command_invocation");
+  assert.equal(ledger.get().unresolvedFailures.length, 1, "a failed mutation must still latch");
+});
+
 test("symbol slice extracts the target function, not the import block", () => {
   const content = [
     "import { readFileSync } from 'node:fs';",

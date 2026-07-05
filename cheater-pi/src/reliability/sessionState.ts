@@ -131,6 +131,10 @@ class LiveSessionState {
     this.lastUserGoal = goal;
   }
 
+  getLastUserGoal(): string {
+    return this.lastUserGoal;
+  }
+
   ensure(config: CheaterConfig, userGoal = "current session"): { ledger: CompletionLedger; governor: LoopGovernor; detector: NonProgressDetector } {
     this.config = config;
     if (!this.ledger) this.ledger = new CompletionLedger(userGoal);

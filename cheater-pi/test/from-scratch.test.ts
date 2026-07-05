@@ -18,7 +18,7 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import { routeAutopilot } from "../src/autopilot/router.js";
 import { runClosedLoopCommitlets } from "../src/commitlet/closedLoop.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
-import { detectStackProfile, stampProfile, deriveAppName, VITE_REACT_TS } from "../src/blueprint/stackTemplates.js";
+import { detectStackProfile, stampProfile, deriveAppName, VITE_REACT_TS, VITE_REACT_JS } from "../src/blueprint/stackTemplates.js";
 import { beginTaskRun, endTaskRun } from "../src/runstate/runState.js";
 
 // --- B1: stack-agnostic from-scratch detection ---------------------------------------------------
@@ -293,18 +293,36 @@ test("cheater_replace does literal replace-all without rewriting the file, and r
 
 // --- Phase A: stack-template boilerplate acceleration ---------------------------------------------
 
-test("detectStackProfile recognizes Vite+React+TS from goal AND file list, else null", () => {
-  const files = ["package.json", "vite.config.ts", "src/App.tsx", "src/main.tsx"];
-  assert.equal(detectStackProfile("Create a Vite + React + TypeScript dashboard app", files)?.id, "vite-react-ts");
-  // goal signal missing (no stack words) -> null even though the files look right
-  assert.equal(detectStackProfile("build me a nice dashboard", files), null, "goal must name the stack");
-  // file signal missing (no vite.config / no .tsx) -> null even though the goal names the stack
-  assert.equal(detectStackProfile("Vite React TypeScript app", ["package.json", "src/index.js"]), null, "the model's file list must confirm the stack");
-  // an unrelated stack is not recognized -> the model-authored path runs unchanged
-  assert.equal(detectStackProfile("Create a Svelte + TypeScript app", ["package.json", "svelte.config.js", "src/App.svelte"]), null);
-  // allowedStacks (config) can gate eligibility
-  assert.equal(detectStackProfile("Vite React TypeScript app", files, ["some-other-stack"]), null, "allowedStacks gates eligibility");
-  assert.equal(detectStackProfile("Vite React TypeScript app", files, ["vite-react-ts"])?.id, "vite-react-ts");
+test("detectStackProfile picks the stack from the model's OWN file plan (TS vs JS), else null", () => {
+  const tsFiles = ["package.json", "vite.config.ts", "src/App.tsx", "src/main.tsx"];
+  const jsFiles = ["package.json", "vite.config.js", "src/App.jsx", "src/main.jsx"];
+  // .tsx in the plan -> TS profile; .jsx (no .tsx) -> JS profile. No goal regex involved.
+  assert.equal(detectStackProfile(tsFiles)?.id, "vite-react-ts");
+  assert.equal(detectStackProfile(jsFiles)?.id, "vite-react-js", "the common 'react + vite' JS plan now matches (the A/B gap)");
+  // TS wins when both extensions appear (a .tsx present means TypeScript)
+  assert.equal(detectStackProfile(["package.json", "vite.config.ts", "src/App.tsx", "src/legacy.jsx"])?.id, "vite-react-ts");
+  // no Vite manifest signature -> null (model-authored path unchanged)
+  assert.equal(detectStackProfile(["package.json", "src/index.js"]), null, "no vite.config -> no match");
+  // an unrelated stack is not recognized
+  assert.equal(detectStackProfile(["requirements.txt", "app.py"]), null, "a Python plan matches no React profile");
+  // allowedStacks (config) gates the menu
+  assert.equal(detectStackProfile(jsFiles, ["vite-react-ts"]), null, "JS plan excluded when only TS is allowed");
+  assert.equal(detectStackProfile(jsFiles, ["vite-react-js"])?.id, "vite-react-js");
+});
+
+test("stampProfile (JS) stamps vite.config.js + main.jsx, no tsconfig, vite-only build", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-stamp-js-"));
+  const planned = ["package.json", "vite.config.js", "src/App.jsx", "src/main.jsx", "index.html", "src/hooks/useLocalStorage.js"];
+  const stamped = stampProfile(cwd, VITE_REACT_JS, { appName: "todo", usesTailwind: false, entryComponent: "./App" }, planned);
+  const paths = stamped.map((s) => s.path);
+  assert.ok(paths.includes("vite.config.js") && paths.includes("src/main.jsx"), "JS config + jsx entry stamped");
+  assert.ok(!paths.some((p) => p.includes("tsconfig")), "no tsconfig in a JS project");
+  assert.ok(!paths.includes("src/App.jsx"), "App is the model's real logic - never stamped");
+  assert.match(readFileSync(join(cwd, "src", "main.jsx"), "utf8"), /from "\.\/App"/, "entry mounts ./App");
+  const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
+  assert.equal(pkg.scripts.build, "vite build", "JS build is vite-only (no tsc)");
+  assert.ok(!pkg.devDependencies.typescript, "no typescript dep in a JS project");
+  assert.ok(pkg.devDependencies.vitest, "test deps still pre-included");
 });
 
 test("stampProfile stamps invariant files to disk, honors the model's plan, and skips gated ones", () => {

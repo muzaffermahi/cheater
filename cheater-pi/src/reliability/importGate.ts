@@ -12,7 +12,7 @@
 // Python third-party packages are never flagged (environments are too messy to prove a
 // negative); only repo-internal python imports are checked.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 
 export interface ImportGateResult {
@@ -29,15 +29,22 @@ const NODE_BUILTINS = new Set([
 ]);
 
 const PY_STDLIB = new Set([
-  "abc", "argparse", "asyncio", "base64", "bisect", "collections", "contextlib", "copy",
-  "csv", "dataclasses", "datetime", "decimal", "difflib", "email", "enum", "errno",
-  "fnmatch", "fractions", "functools", "getpass", "glob", "hashlib", "heapq", "html",
-  "http", "importlib", "inspect", "io", "itertools", "json", "logging", "math",
-  "multiprocessing", "numbers", "operator", "os", "pathlib", "pickle", "platform",
-  "queue", "random", "re", "secrets", "shutil", "signal", "socket", "sqlite3", "stat",
-  "statistics", "string", "struct", "subprocess", "sys", "tempfile", "textwrap",
-  "threading", "time", "traceback", "types", "typing", "unicodedata", "unittest",
-  "urllib", "uuid", "warnings", "weakref", "xml", "zoneinfo"
+  "abc", "argparse", "array", "ast", "asyncio", "atexit", "base64", "binascii", "bisect",
+  "builtins", "bz2", "calendar", "codecs", "collections", "concurrent", "configparser",
+  "contextlib", "contextvars", "copy", "csv", "ctypes", "curses", "dataclasses", "datetime",
+  "decimal", "difflib", "dis", "email", "enum", "errno", "fcntl", "fnmatch", "fractions",
+  "ftplib", "functools", "gc", "getopt", "getpass", "gettext", "glob", "grp", "gzip",
+  "hashlib", "heapq", "hmac", "html", "http", "imaplib", "importlib", "inspect", "io",
+  "ipaddress", "itertools", "json", "keyword", "locale", "logging", "lzma", "math",
+  "mimetypes", "mmap", "multiprocessing", "numbers", "operator", "os", "pathlib", "pdb",
+  "pickle", "platform", "posixpath", "pprint", "profile", "pty", "pwd", "queue", "random",
+  "re", "readline", "resource", "sched", "secrets", "select", "selectors", "shlex", "shutil",
+  "signal", "smtplib", "socket", "socketserver", "sqlite3", "ssl", "stat", "statistics",
+  "string", "struct", "subprocess", "symtable", "sys", "sysconfig", "syslog", "tarfile",
+  "tempfile", "termios", "textwrap", "threading", "time", "token", "tokenize", "trace",
+  "traceback", "tracemalloc", "tty", "types", "typing", "unicodedata", "unittest", "urllib",
+  "uuid", "venv", "warnings", "wave", "weakref", "webbrowser", "xml", "xmlrpc", "zipfile",
+  "zlib", "zoneinfo", "__future__"
 ]);
 
 const JS_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
@@ -180,14 +187,37 @@ function pyModuleDefines(content: string, name: string): boolean {
  * (a real file or directory here) - third-party packages cannot be proven absent this way,
  * so they are silently skipped rather than false-flagged.
  */
+/**
+ * True when `dir` is a real Python package/namespace - it has __init__.py or actually contains
+ * Python (a .py file, or a subdirectory that is itself a package). A plain DATA directory that
+ * merely shares a name with a module (a certs `ssl/`, a `logs/`, `data/`, `config/` dir with no
+ * .py files) must NOT count as repo-internal: otherwise a stdlib or third-party import of the same
+ * name is false-flagged as an unresolved repo import, and the model rewrites working code to
+ * appease a phantom error. (This is exactly how `import ssl` broke on the openssl-cert task, whose
+ * solution creates an `/app/ssl/` cert directory.)
+ */
+function dirIsPyPackage(dir: string): boolean {
+  try {
+    if (!statSync(dir).isDirectory()) return false;
+    if (existsSync(join(dir, "__init__.py"))) return true;
+    for (const entry of readdirSync(dir)) {
+      if (entry.endsWith(".py")) return true;
+      if (existsSync(join(dir, entry, "__init__.py"))) return true;
+    }
+  } catch { /* unreadable/not a dir */ }
+  return false;
+}
+
 function checkAbsoluteModule(root: string, module: string, issues: string[]): void {
   const top = module.split(".")[0];
-  // A top-level segment counts as repo-internal if it is a real single-file module OR an
-  // existing directory - Python 3 namespace packages (a directory with no __init__.py) are
-  // valid, so requiring __init__.py here would miss the common "src/" layout entirely.
-  const isRepoInternalTop = (base: string) => existsSync(join(base, `${top}.py`)) || existsSync(join(base, top));
+  // Skip stdlib up front so a data directory that shares a stdlib name never trips the check.
+  if (PY_STDLIB.has(top)) return;
+  // A top-level segment counts as repo-internal if it is a real single-file module OR a directory
+  // that actually holds Python - Python 3 namespace packages (a code directory with no __init__.py)
+  // are valid, but a non-python data directory of the same name is NOT a package.
+  const isRepoInternalTop = (base: string) => existsSync(join(base, `${top}.py`)) || dirIsPyPackage(join(base, top));
   const repoInternal = isRepoInternalTop(root) || isRepoInternalTop(join(root, "src"));
-  if (!repoInternal || PY_STDLIB.has(top)) return;
+  if (!repoInternal) return;
   const bases = [root, join(root, "src")];
   if (!bases.some((base) => resolvePyModule(base, module))) {
     issues.push(`import path "${module}" does not resolve inside this repo. -> Fix the module path.`);

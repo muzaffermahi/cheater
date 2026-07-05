@@ -35,8 +35,28 @@ export function sanitizeTaskId(taskId: string): string {
   return safe || "run";
 }
 
+/**
+ * Keep cheater's own working-state dir OUT of the repo's git view. A `.cheater/` full of untracked
+ * controller/ledger/config files shows up in `git status` as untracked content, and small models
+ * mistake the HARNESS's own artifacts for user files to "recover"/commit (live-observed: qwen3-8b
+ * on a git-recovery task "recovered" `.cheater/commands.json` instead of the real lost commit).
+ * A self-ignoring `.cheater/.gitignore` (`*`, which also ignores itself) hides the entire dir from
+ * git without touching the user's own .gitignore. Idempotent + best-effort; never throws into a run.
+ */
+export function ensureCheaterDirIgnored(repoRoot: string): void {
+  try {
+    const dir = join(repoRoot, ".cheater");
+    mkdirSync(dir, { recursive: true });
+    const gitignore = join(dir, ".gitignore");
+    if (!existsSync(gitignore)) writeFileSync(gitignore, "*\n", "utf8");
+  } catch {
+    // hiding the state dir is a nicety, never a hard requirement
+  }
+}
+
 /** Create the run directory tree. Idempotent. Returns the run dir path. */
 export function ensureRunDir(repoRoot: string, taskId: string): string {
+  ensureCheaterDirIgnored(repoRoot);
   const dir = runDirFor(repoRoot, taskId);
   mkdirSync(dir, { recursive: true });
   for (const sub of RUN_SUBDIRS) mkdirSync(join(dir, sub), { recursive: true });

@@ -140,6 +140,46 @@ test("never flags third-party Python packages (cannot prove a negative about the
   assert.equal(result.ok, true);
 });
 
+test("does not flag `import ssl` when a non-python data directory named ssl/ exists (openssl-cert case)", () => {
+  // The openssl-selfsigned-cert task's solution creates an /app/ssl/ CERT directory, then a
+  // check_cert.py does `import ssl` (stdlib). The old gate saw the ssl/ directory, treated the
+  // module as repo-internal, failed to resolve it, and false-flagged it - so the model rewrote
+  // its working verifier script to appease a phantom error. ssl is stdlib and a cert dir is not
+  // a package, so this must be clean.
+  const root = tmpRepo();
+  mkdirSync(join(root, "ssl"), { recursive: true });
+  writeFileSync(join(root, "ssl", "server.crt"), "-----BEGIN CERTIFICATE-----\n", "utf8");
+  writeFileSync(join(root, "ssl", "server.key"), "-----BEGIN PRIVATE KEY-----\n", "utf8");
+  writeFileSync(join(root, "check_cert.py"), "import ssl\nimport subprocess\nimport os\n", "utf8");
+  const result = checkImports(root, "check_cert.py");
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.issues, []);
+});
+
+test("does not treat a non-python DATA directory as a repo package on a name collision", () => {
+  // `logs/` is a directory of log files, not a Python package. A `import logs...` must be treated
+  // as an unprovable third-party/absent import (never flagged), NOT as a broken repo-internal one.
+  const root = tmpRepo();
+  mkdirSync(join(root, "src", "logs"), { recursive: true });
+  writeFileSync(join(root, "src", "logs", "2025-08-10_db.log"), "ERROR x\n", "utf8");
+  writeFileSync(join(root, "src", "app.py"), "import logs.reader\n", "utf8");
+  const result = checkImports(root, "src/app.py");
+  assert.equal(result.ok, true);
+});
+
+test("still flags a broken submodule import inside a REAL python package dir (regression guard)", () => {
+  // The data-directory relaxation must not blind the gate to a genuinely-broken repo import: a
+  // directory that DOES contain python is still a package whose missing submodules are flagged.
+  const root = tmpRepo();
+  mkdirSync(join(root, "src", "logs"), { recursive: true });
+  writeFileSync(join(root, "src", "logs", "__init__.py"), "", "utf8");
+  writeFileSync(join(root, "src", "logs", "reader.py"), "def read():\n    pass\n", "utf8");
+  writeFileSync(join(root, "src", "app.py"), "import logs.missing_submodule\n", "utf8");
+  const result = checkImports(root, "src/app.py");
+  assert.equal(result.ok, false);
+  assert.match(result.issues.join(" "), /does not resolve inside this repo/);
+});
+
 test("is a no-op for unsupported file types and missing files", () => {
   const root = tmpRepo();
   writeFileSync(join(root, "README.md"), "# hi\n", "utf8");
