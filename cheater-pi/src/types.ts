@@ -3,6 +3,12 @@ export interface CheaterConfig {
   provider?: string;
   model?: string;
   themeEnabled?: boolean;
+  // The terminal mascot "Sly" - a cat whose expression follows the work (thinking/sampling/verifying/
+  // done/stuck). Default ON, but every mascot call is a no-op in --print/--mode json (pi no-ops the UI
+  // there), so it never touches machine-readable output. Set mascotEnabled:false or mascotStyle:"off"
+  // to disable; mascotStyle:"ascii" uses plainer glyphs for terminals that render kaomoji poorly.
+  mascotEnabled?: boolean;
+  mascotStyle?: "cat" | "ascii" | "off";
   defaultTestCommand?: string;
   packagePath?: string;
   debug?: boolean;

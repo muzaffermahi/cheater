@@ -1,7 +1,12 @@
 import type { CheaterConfig } from "./types.js";
+import { mascotBanner, type MascotStyle } from "./ui/mascot.js";
 
 function gymOn(config?: CheaterConfig): boolean {
   return config?.gymEnabled !== false;
+}
+
+function mascotOn(config?: CheaterConfig): boolean {
+  return config?.mascotEnabled !== false && config?.mascotStyle !== "off";
 }
 
 function blueprintOn(config?: CheaterConfig): boolean {
@@ -9,15 +14,26 @@ function blueprintOn(config?: CheaterConfig): boolean {
 }
 
 export function startupCard(cwd: string, model: string | undefined, config?: CheaterConfig): string[] {
-  const lines = [
-    "Cheater mode active",
+  const lines: string[] = [];
+  if (mascotOn(config)) {
+    // Sly the cheating cat greets the user. Rendered only in an interactive TUI (setWidget is a no-op
+    // in --print/--mode json), so this never touches machine-readable output.
+    lines.push(...mascotBanner({ style: (config?.mascotStyle as MascotStyle) ?? "cat" }).split("\n"));
+  } else {
+    lines.push("Cheater mode active");
+  }
+  lines.push(
     `repo: ${cwd}`,
     `model: ${model ?? "Pi default"}`,
     "Ask normally. Autopilot routes code requests through the one Reliability flow:",
     "  reliability_start -> edit allowed files -> commitlet_next -> verify -> finish_gate",
-    "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health",
-    "memory: compacted solved-bug corpus auto-consulted on failures via cheater_bug_memory_search"
-  ];
+    "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health"
+  );
+  // Only advertise the bug-memory corpus when it is actually enabled (it is OFF by default), so the
+  // startup card never claims a feature the run will not use.
+  if (config?.bugMemoryEnabled === true) {
+    lines.push("memory: compacted solved-bug corpus auto-consulted on failures via cheater_bug_memory_search");
+  }
   if (gymOn(config)) lines.push("gym (local benchmark): /gym /gym-list /gym-run /gym-report");
   return lines;
 }

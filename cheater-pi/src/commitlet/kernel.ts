@@ -8,6 +8,8 @@
 
 import { createCleanupCommitlet, createRepairCommitlet } from "./planner.js";
 import { commitletConfig } from "./config.js";
+import { setMascot } from "../ui/mascotUi.js";
+import { mascotStateForPhase } from "../ui/mascot.js";
 import { defaultCommitletState } from "./state.js";
 import { saveVerifiedFix } from "../reliability/experience.js";
 import { buildCheatSheet, renderCheatSheet } from "../reliability/cheatSheet.js";
@@ -114,7 +116,9 @@ export function workerProgress(ctx: ExtensionContext, plan: CommitletPlan, commi
   return (message: string) => {
     const line = `Cheater [commitlet ${position}] ${message}`;
     try {
-      ctx?.ui?.setWorkingMessage?.(line);
+      // The mascot's expression follows the work (sampling/verifying/working); it also sets the
+      // working message. No-op in JSON/headless. notify stays for the milestone chat line.
+      setMascot(ctx, mascotStateForPhase(message), line);
       ctx?.ui?.notify?.(line, "info");
     } catch { /* narration must never break the run */ }
   };
@@ -137,7 +141,7 @@ export function workerHeartbeat(ctx: ExtensionContext, plan: CommitletPlan, comm
       ? ` - slow PREFILL (this fresh worker re-processes its prompt cold). Faster: use a model that fits in VRAM, OR set "commitletFreshWorkerDefault": false to run in-session (reuses the warm cache instead of re-prefilling per file), OR raise LM Studio's GPU offload.`
       : "";
     try {
-      ctx?.ui?.setWorkingMessage?.(`Cheater [commitlet ${position}] worker still streaming on the local model (${secs}s)...${tip}`);
+      setMascot(ctx, "working", `Cheater [commitlet ${position}] worker still streaming on the local model (${secs}s)...${tip}`);
     } catch { /* heartbeat must never break the run */ }
   };
 }

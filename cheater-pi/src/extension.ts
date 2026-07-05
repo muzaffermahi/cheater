@@ -13,6 +13,7 @@ import { shouldNudgeToAct, firstUserGoal, ANSWERED_WITHOUT_ACTING_NUDGE } from "
 const SHELL_TOOL_NAMES = new Set(["bash", "run_command", "run", "shell", "exec"]);
 import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
+import { configureMascot } from "./ui/mascotUi.js";
 import { loadConfig } from "./config.js";
 import { registerAutopilotCommands } from "./autopilot/commands.js";
 import { routeAutopilot, buildAutopilotInstruction } from "./autopilot/router.js";
@@ -510,6 +511,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event: unknown, ctx: any) => {
+    // Arm the mascot with this session's config so worker-progress callbacks (which lack a config
+    // handle) still respect mascotEnabled/mascotStyle. No-op-safe in every mode.
+    configureMascot(config);
     // Hide cheater's own .cheater/ working-state dir from git so the model never mistakes the
     // harness's untracked files for user content to recover/commit (finding #6).
     try { ensureCheaterDirIgnored(ctx.cwd); } catch { /* best-effort */ }
