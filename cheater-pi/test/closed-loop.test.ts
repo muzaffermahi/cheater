@@ -470,3 +470,25 @@ test("repair worker prompts carry the observed failure as a typed capsule field"
   assert.equal(invariants.ok, true, invariants.failures.join("; "));
   endTaskRun();
 });
+
+test("in-session capsule says KEEP GOING and drops the contradicting nonGoal; isolated-worker capsule says STOP", () => {
+  // B1: the "stop / do not continue into another file" language is correct for an ISOLATED worker but
+  // makes a weak model end its turn after one file when the model IS the whole in-session build. The
+  // capsule must flip its closer and drop that nonGoal when freshWorkerMode === "simulated".
+  reset();
+  const repo = tmpRepo();
+  beginTaskRun(repo, "fix the widget", { taskId: "insession-capsule" });
+  const base = commitletFixture("c1", "first");
+  const commitlet = { ...base, spec: { ...base.spec!, nonGoals: ["Do not touch files outside allowedFiles.", "Do not continue into another commitlet or another file after this scope is complete."] } };
+  const plan = planFixture(repo, [commitlet]);
+
+  const inSession = buildCommitletExecutionPrompt(plan, commitlet, [], "simulated", 1, "qwen-2.5-32b-instruct");
+  assert.match(inSession.prompt, /Finish this file, then call cheater_commitlet_next/, "in-session closer is keep-going");
+  assert.doesNotMatch(inSession.prompt, /Stop when your narrow goal is done or blocked/, "in-session drops the stop closer");
+  assert.doesNotMatch(inSession.prompt, /Do not continue into another commitlet or another file/, "in-session drops the contradicting nonGoal");
+  assert.match(inSession.prompt, /Do not touch files outside allowedFiles/, "other nonGoals are preserved");
+
+  const isolated = buildCommitletExecutionPrompt(plan, commitlet, [], "real", 1, "qwen-2.5-32b-instruct");
+  assert.match(isolated.prompt, /Stop when your narrow goal is done or blocked/, "an isolated worker keeps the stop/hand-off framing");
+  endTaskRun();
+});

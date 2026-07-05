@@ -25,6 +25,10 @@ export interface PromptCapsule {
   workerRole: string;
   workerGoal: string;
   nonGoals: string[];
+  /** True when the commitlet runs IN-SESSION (the model is the whole build; there is no isolated
+   *  worker to hand off to). Flips the closing directive from "stop" to "keep going", so a
+   *  multi-commitlet in-session edit does not end the turn after one file. */
+  inSession?: boolean;
   /** Compact contract + acceptance lines - the literal terms of done. */
   acceptanceContract: string[];
   /**
@@ -112,6 +116,7 @@ export interface BuildCapsuleInput {
   workerRole: string;
   workerGoal: string;
   nonGoals?: string[];
+  inSession?: boolean;
   acceptanceContract?: string[];
   observedFailure?: string;
   attemptStance?: string;
@@ -145,6 +150,7 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
     workerRole: input.workerRole,
     workerGoal: clampText(input.workerGoal, 500),
     nonGoals: clampList(input.nonGoals, 5, 120),
+    inSession: input.inSession === true,
     acceptanceContract: clampList(input.acceptanceContract, 10, 160),
     // 2600 chars: enough for a compressed failure card plus a <=1.3KB cheat sheet. Learned
     // live: clipping this to 1400 chopped the evidence out of repair packets.
@@ -282,7 +288,14 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
   lines.push("When done, write a WorkerReport with:");
   for (const instruction of capsule.outputInstructions) lines.push(`- ${instruction}`);
   lines.push("");
-  lines.push("Stop when your narrow goal is done or blocked. Do not continue into a new concern - report it instead.");
+  if (capsule.inSession) {
+    // In-session: the model IS the whole build - there is no separate worker to hand off to, so a
+    // "stop / do not continue" closer would end the turn after one file (the "never finishes"
+    // failure). Tell it to keep going through the harness instead.
+    lines.push("Finish this file, then call cheater_commitlet_next to grade it and get the next step. Keep going until cheater_finish_gate reports ALLOWED - do not stop after one file or end your turn early.");
+  } else {
+    lines.push("Stop when your narrow goal is done or blocked. Do not continue into a new concern - report it instead.");
+  }
   return lines.join("\n");
 }
 

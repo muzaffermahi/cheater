@@ -394,11 +394,29 @@ function runSmoke(spec: WebappVerificationStageSpec, ctx: StageRunContext): Veri
   return { stage: spec.stage, status, summary: status === "ok" ? `smoke ok: ${healthUrl} -> ${httpCode}` : `smoke failed: ${healthUrl}`, failureClass, artifacts: [], signals: { httpCode, url: healthUrl } };
 }
 
+// A test command that RAN but found no tests to execute is "nothing to gate on", NOT a failure.
+// pytest exits 5 with "no tests ran"; a stub `npm test` is the classic "no test specified" / a
+// missing "test" script. Treating these as a hard failure on a REQUIRED stage blocks the finish gate
+// forever on a from-scratch CLI/library with no suite yet - the CLI twin of the fixed Vite-smoke
+// webapp dead-end. Real test FAILURES (exit 1 with assertion output) are unaffected.
+function ranButFoundNoTests(outcome: { returncode: number; stdout: string; stderr: string }): boolean {
+  if (outcome.returncode === 0) return false;
+  if (outcome.returncode === 5) return true; // pytest: no tests collected
+  const text = `${outcome.stdout ?? ""}\n${outcome.stderr ?? ""}`.toLowerCase();
+  return /no tests ran|collected 0 items|no tests? (were )?(found|collected|ran)|no test specified|missing script: "?test"?/.test(text);
+}
+
 function runTestStage(spec: WebappVerificationStageSpec, ctx: StageRunContext, cmd: string | null, label: string): VerificationStageResult {
   if (!cmd) {
     return { stage: spec.stage, status: "skipped", summary: `no ${label} command detected`, failureClass: "unknown", artifacts: [], signals: {} };
   }
   const outcome = ctx.runCommand(cmd, { cwd: ctx.cwd, timeoutSeconds: spec.timeoutSeconds });
+  if (!outcome.timedOut && ranButFoundNoTests(outcome)) {
+    // Record the command (honest receipt) but do NOT count "no tests to run" as a blocking failure.
+    recordOwnedCommand(ctx, cmd, "test", { ...outcome, returncode: 0 });
+    ctx.ledger.recordCommand(cmd);
+    return { stage: spec.stage, status: "skipped", summary: `${label} skipped: the command ran but found no tests to execute (nothing to gate on)`, failureClass: "unknown", artifacts: [], signals: { exitCode: outcome.returncode, noTests: true } };
+  }
   const status: VerificationStatus = outcome.timedOut ? "timed_out" : outcome.returncode === 0 ? "ok" : "failed";
   const failureClass = outcome.returncode === 0 ? "unknown" : classifyFailure({ exitCode: outcome.returncode, stdout: outcome.stdout, stderr: outcome.stderr, timedOut: outcome.timedOut });
   recordOwnedCommand(ctx, cmd, "test", outcome);

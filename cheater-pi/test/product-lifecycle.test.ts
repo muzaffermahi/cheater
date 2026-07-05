@@ -318,6 +318,45 @@ test("webapp verification: a real build failure STILL blocks (the gate stays hon
   assert.ok(result.ledger.get().unresolvedFailures.length > 0, "a real build failure IS a blocking unresolved failure");
 });
 
+test("CLI verification: a test command that finds NO tests is skipped, not a blocking failure (no dead-end)", async () => {
+  // B3: a from-scratch CLI/library with no suite yet. defaultCliPlan marks the test stages required,
+  // and detectProjectCommands synthesizes a test command anyway, so "no tests ran" (pytest exit 5 /
+  // npm placeholder) used to fail a REQUIRED stage and block the finish gate forever. It must skip.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-cli-notests-"));
+  writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "cli", scripts: { test: "jest", build: "tsc" } }), "utf8");
+  const cmds = detectProjectCommands(cwd);
+  const result = await runVerification({
+    cwd, userGoal: "Create a CLI tool", planKind: "cli", projectCommands: cmds,
+    hooks: {
+      runCommand: (cmd) => /test|jest|pytest/.test(cmd)
+        ? { returncode: 5, stdout: "no tests ran", stderr: "", timedOut: false }
+        : { returncode: 0, stdout: "", stderr: "", timedOut: false }
+    }
+  });
+  const full = result.stages.find((s) => s.stage === "full_tests");
+  assert.equal(full?.status, "skipped", "a test command that found no tests is skipped, not failed");
+  assert.equal(full?.signals?.noTests, true, "the skip is recorded as a no-tests skip");
+  assert.equal(result.passed, true, "a from-scratch CLI with no tests still finishes (no dead-end)");
+  assert.equal(result.ledger.get().unresolvedFailures.length, 0, "'no tests' is not a blocking unresolved failure");
+});
+
+test("CLI verification: a REAL test failure still blocks (the gate stays honest)", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-cli-failtests-"));
+  writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "cli", scripts: { test: "jest" } }), "utf8");
+  const cmds = detectProjectCommands(cwd);
+  const result = await runVerification({
+    cwd, userGoal: "Create a CLI tool", planKind: "cli", projectCommands: cmds,
+    hooks: {
+      runCommand: (cmd) => /test|jest|pytest/.test(cmd)
+        ? { returncode: 1, stdout: "1 failed, 2 passed", stderr: "AssertionError: boom", timedOut: false }
+        : { returncode: 0, stdout: "", stderr: "", timedOut: false }
+    }
+  });
+  const testStages = result.stages.filter((s) => s.stage === "focused_tests" || s.stage === "full_tests");
+  assert.ok(testStages.some((s) => s.status === "failed"), "a real assertion failure fails a test stage");
+  assert.equal(result.passed, false, "a real test failure blocks verification (honest gate)");
+});
+
 test("stale served workspace is detected through a mocked probe", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-stale-ws-"));
   writeFileSync(join(cwd, "package.json"), JSON.stringify({

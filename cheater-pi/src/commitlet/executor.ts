@@ -154,7 +154,8 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
       repoFacts,
       previousState,
       attempt,
-      modelName
+      modelName,
+      inSession: freshWorkerMode === "simulated"
     });
     const rendered = renderCapsulePrompt(capsule);
     const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or Pi's edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
@@ -315,6 +316,8 @@ function buildRunCapsule(
     previousState?: string[];
     attempt?: number;
     modelName?: string;
+    /** The model runs this commitlet in the current session (no isolated worker to hand off to). */
+    inSession?: boolean;
   }
 ): { capsule: PromptCapsule; fragments: ContextFragment[] } {
   const spec = commitlet.spec;
@@ -335,7 +338,13 @@ function buildRunCapsule(
     taskId: run.taskId,
     workerRole: commitlet.id,
     workerGoal: `${commitlet.title}: ${commitlet.purpose}`,
-    nonGoals: spec?.nonGoals,
+    // In-session the model IS the whole build, so the "do not continue into another commitlet/file"
+    // nonGoal directly contradicts the continuation instruction and makes weak models stop after one
+    // file. Drop just that nonGoal in-session; capsule.inSession also flips the closing directive.
+    nonGoals: extras.inSession
+      ? (spec?.nonGoals ?? []).filter((item) => !/continue into another commitlet|another file after this scope/i.test(item))
+      : spec?.nonGoals,
+    inSession: extras.inSession,
     acceptanceContract: [
       ...(spec?.acceptanceCriteria ?? []),
       ...run.contract.checklist.slice(0, 4)

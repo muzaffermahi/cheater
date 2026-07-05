@@ -13,15 +13,18 @@ wall-clock time: be concise, do not deliberate at length or restate the plan
 between actions - decide and act.`;
 
 const EDIT_DISCIPLINE = `For existing files, prefer surgical line/range edits. Use cheater_line_edit
-when available after reading the exact target lines. Do not rewrite complete
-existing templates, stylesheets, or source files just to modernize or refactor
-them; preserve working structure and update only the lines needed.`;
+when available after reading the exact target lines; to change a repeated literal
+across a file, prefer cheater_replace (find/replace) over rewriting it. Do not
+rewrite complete existing templates, stylesheets, or source files just to modernize
+or refactor them; preserve working structure and update only the lines needed.`;
 
 // When autopilot is on, the harness prepends a short plan to the user's message.
 const FLOW_WITH_AUTOPILOT = `## The one Cheater flow for code-changing tasks
 
-Cheater's harness prepends a short plan to code-changing messages. Follow it. For
-a question ("answer_only"), answer directly without editing. Otherwise the flow is:
+Cheater's harness prepends a short plan to code-changing messages. Follow it. For a
+genuine question, answer directly; but if the task asks you to produce or modify a
+file or run commands, actually DO it with your tools - describing the steps in chat
+does not complete a task. Otherwise the flow is:
 
   cheater_reliability_start -> edit only the allowed files -> cheater_commitlet_next
   (repeat) -> cheater_verification_run -> cheater_finish_gate
