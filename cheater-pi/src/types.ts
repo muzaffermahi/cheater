@@ -5,10 +5,7 @@ export interface CheaterConfig {
   themeEnabled?: boolean;
   defaultTestCommand?: string;
   packagePath?: string;
-  memoryEnabled?: boolean;
-  skillsEnabled?: boolean;
   debug?: boolean;
-  showStartupCard?: boolean;
   maxContextTokens?: number;
   // HTTP idle timeout (ms) for model requests. Pi's default (300000 = 5 min) kills a slow local
   // model's PREFILL of a big prompt (no response bytes flow during prefill), causing an infinite

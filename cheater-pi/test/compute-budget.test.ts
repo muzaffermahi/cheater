@@ -12,6 +12,17 @@ test("computeBudget OFF path returns the static budget (byte-identical to today)
   assert.equal(off3.samples, 3, "off path passes commitletCandidateSamples through unchanged");
 });
 
+test("enabling inSessionResampleEnabled alone yields samples>1 (no coupling papercut)", () => {
+  // Turning ON in-session best-of-N must not be a silent no-op: without adaptiveCompute and without an
+  // explicit sample count, it defaults to 3 so best-of-N actually runs.
+  const on = computeBudget({ taskKind: "feature", filesInScope: 1 }, { inSessionResampleEnabled: true });
+  assert.equal(on.samples, 3, "inSessionResampleEnabled defaults to 3 samples");
+  const explicit = computeBudget({ taskKind: "feature" }, { inSessionResampleEnabled: true, commitletCandidateSamples: 2 });
+  assert.equal(explicit.samples, 2, "an explicit commitletCandidateSamples still wins");
+  const offFlag = computeBudget({ taskKind: "feature" }, {});
+  assert.equal(offFlag.samples, 1, "flag off -> still single attempt");
+});
+
 test("firstSampleVerified short-circuits to k=1 / no extra compute even if signals say hard", () => {
   const b = computeBudget(
     { taskKind: "feature_addition", risk: "high", filesInScope: 5, isRepair: true, firstSampleVerified: true },

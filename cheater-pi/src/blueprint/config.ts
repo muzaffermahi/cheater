@@ -68,6 +68,10 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   blueprintMaxDebugRounds: 3,
   blueprintReplanAfterFailedDebug: true,
   blueprintMemoryEnabled: true,
+  // Intentional layering (NOT a contradiction): the blueprint subsystem's OWN default is on - it is
+  // used directly when createAutonomousBlueprint runs standalone (e.g. tests). The integrated cheater
+  // path (DEFAULT_CONFIG in config.ts) overrides this to OFF, so normal cheater runs keep docs search
+  // off unless an env var / explicit config turns it on.
   blueprintOfficialDocsSearchEnabled: true,
   blueprintDocsProvider: "official_allowlist",
   searxngBaseUrl: "",

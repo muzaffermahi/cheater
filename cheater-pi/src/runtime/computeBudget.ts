@@ -74,7 +74,11 @@ export function scoreHardness(signal: HardnessSignal): { hardness: number; facto
  * Compute the test-time-compute budget for a commitlet. OFF path (default) = today's static budget.
  */
 export function computeBudget(signal: HardnessSignal, config: CheaterConfig = {}): ComputeBudget {
-  const staticSamples = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? 1));
+  // Enabling in-session best-of-N must not be a silent no-op: with no explicit sample count (and
+  // adaptive compute off), turning ON inSessionResampleEnabled defaults to 3 samples so best-of-N
+  // actually runs. An explicit commitletCandidateSamples always wins. (The coupling where you had to
+  // set BOTH inSessionResampleEnabled and adaptiveComputeEnabled to get any resampling was a papercut.)
+  const staticSamples = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? (config.inSessionResampleEnabled === true ? 3 : 1)));
   if (config.adaptiveComputeEnabled !== true) {
     return { samples: staticSamples, maxDebugRounds: 1, localizationDepth: "shallow", useSkillMemory: false, hardness: 0, reason: "adaptive compute off (static budget)" };
   }
