@@ -13,6 +13,13 @@ import type { CheaterConfig } from "../types.js";
 
 const MAX_NUDGES_PER_TURN = 2;
 
+/** Normalize a goal string so a re-typed/rephrased-with-punctuation restart of the SAME task
+ *  compares equal (lowercase, collapse every non-alphanumeric run to one space, trim). Used to
+ *  tell "the model looped back into planning for the same goal" from "a genuinely new goal". */
+function normalizeGoal(goal: string): string {
+  return (goal || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_patch", "cheater_line_edit", "cheater_replace"]);
 // Driver tools ORCHESTRATE the commitlet chain; calling them repeatedly with no args is the intended
@@ -87,11 +94,31 @@ class LiveSessionState {
   private lastCallSignature = "";
   private identicalCallCount = 0;
 
+  /**
+   * Is the current ledger a RE-ENTRY for `userGoal` - i.e. it belongs to the same task, already
+   * holds real work (a file change, a command, or a verification stage), and is not finalized?
+   * A weak local model, blocked by the finish gate, often loops back and re-calls the planning
+   * tools (cheater_run / cheater_reliability_start) with the SAME goal. Those tools reset(), which
+   * used to mint a brand-new empty ledger and ERASE the record of the files it had already written
+   * and the tests it had already run - so the finish gate reported "no work was done" forever and
+   * the model spun until the turn cap. Preserving the ledger on re-entry is what breaks that loop.
+   */
+  isReentryGoal(userGoal: string): boolean {
+    if (!this.ledger) return false;
+    const s = this.ledger.get();
+    if (s.done) return false;
+    const hasWork = s.changedFiles.length > 0 || s.commandsRun.length > 0 || s.verification.length > 0;
+    if (!hasWork) return false;
+    return normalizeGoal(s.userGoal) === normalizeGoal(userGoal);
+  }
+
   reset(userGoal?: string): void {
     this.toolRecords = [];
     this.textSummaries = [];
     this.currentPacketId = "session";
-    if (userGoal) {
+    if (userGoal && !this.isReentryGoal(userGoal)) {
+      // Genuinely new (or first) goal -> fresh completion ledger. A same-goal re-entry keeps the
+      // existing ledger (see isReentryGoal) so the finish gate still sees the work already done.
       this.ledger = new CompletionLedger(userGoal);
     }
     this.governor = null;

@@ -101,6 +101,31 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         ].join("\n"), { decision, noEdit: true });
       }
 
+      // Idempotent re-entry: a weak model blocked at the finish gate frequently loops back and
+      // re-calls cheater_reliability_start with the SAME goal. Re-planning here would reset every
+      // commitlet to pending AND (via liveSessionState.reset) wipe the completion ledger, erasing
+      // the record of files it already wrote and tests it already ran - the exact cause of the
+      // finish gate's perpetual "no work was done" block. When a plan is already running for this
+      // goal and the ledger holds real work, CONTINUE it instead of restarting.
+      const priorPlan = defaultCommitletState.get().currentPlan;
+      if (priorPlan && liveSessionState.isReentryGoal(params.userGoal)) {
+        const planActive = priorPlan.status === "running"
+          || priorPlan.commitlets.some((commitlet) => commitlet.status === "pending" || commitlet.status === "running");
+        if (planActive) {
+          const ledgerState = liveSessionState.getLedger()?.get();
+          const pending = priorPlan.commitlets.find((commitlet) => commitlet.status === "pending");
+          return textResult([
+            "Cheater Reliability Start: a plan is ALREADY in progress for this goal - CONTINUING it, not restarting (your prior work is preserved).",
+            formatPlanChecklist(priorPlan),
+            `Recorded so far: ${ledgerState?.changedFiles.length ?? 0} file change(s), ${ledgerState?.commandsRun.length ?? 0} command(s) run, ${ledgerState?.verification.length ?? 0} verification stage(s).`,
+            "Do NOT call cheater_reliability_start again for this task.",
+            pending
+              ? `Next: call cheater_commitlet_next to continue with "${pending.title}".`
+              : "All commitlets are done. Call cheater_verification_run (if not yet green), then cheater_finish_gate to finish."
+          ].join("\n"), { continued: true, planId: priorPlan.id, decision });
+        }
+      }
+
       ctx?.ui?.setWorkingMessage?.("Cheater: planning commitlets (routing, candidates, packet decomposition)...");
       const activeBlueprint = params.useActiveBlueprint === false
         ? undefined

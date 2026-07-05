@@ -238,6 +238,35 @@ test("scaffold phase advances when its expected file exists under a DIFFERENT di
   defaultCommitletState.clear();
 });
 
+test("gradeCommitlet records a REAL WORKER's file edit into the main ledger (the finish-gate loop fix)", async () => {
+  // Regression for the local-bake-off finding: a fresh isolated worker edits files in its OWN pi
+  // session, so those writes never reach THIS session's observeToolResult. gradeCommitlet used to
+  // record the verification stage but NOT the touched files, so the finish gate saw changedFiles:0
+  // and blocked with "no work was done" - forever, as the model looped back through the planning
+  // tools. Here we simulate the worker by editing the file on disk WITHOUT any observeToolResult
+  // call; after grading, the MAIN completion ledger must reflect the change.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-worker-ledger-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    return 0  # buggy\n", "utf8");
+  const decision = routeAutopilot({ cwd, message: "fix the median function in src/stats.py" });
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "fix the median function in src/stats.py", autopilotDecision: decision });
+  const commitlet = { ...plan.commitlets[0], status: "running" as const, allowedFiles: ["src/stats.py"], expectedFilesTouched: ["src/stats.py"] };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet); // snapshots the buggy version
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("fix the median function in src/stats.py");
+  assert.equal(liveSessionState.getLedger()!.get().changedFiles.length, 0, "ledger starts with no work");
+
+  // The "worker" edits the file in its own session - no observeToolResult here, by design.
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    s = sorted(xs)\n    n = len(s)\n    return s[n // 2]\n", "utf8");
+  await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG);
+
+  const changed = liveSessionState.getLedger()!.get().changedFiles;
+  assert.ok(changed.some((f) => /stats\.py/.test(f)), `worker edit must be in the main ledger, got: ${JSON.stringify(changed)}`);
+  // And that recorded work now makes a same-goal re-entry PRESERVE the ledger (the two fixes combine).
+  assert.equal(liveSessionState.isReentryGoal("fix the median function in src/stats.py"), true, "recorded work makes a restart preserve, not wipe");
+  defaultCommitletState.clear();
+});
+
 test("scaffold phase STILL blocks when an expected file is genuinely absent by name (no false advance)", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-scaffold-missing-"));
   mkdirSync(join(cwd, "src"), { recursive: true });

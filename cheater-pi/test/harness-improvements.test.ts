@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { compressCommandResult, renderFailureCard } from "../src/reliability/failureCompressor.js";
 import { CompletionLedger, ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
+import { liveSessionState } from "../src/reliability/sessionState.js";
 import { buildAutopilotInstruction, routeAutopilot } from "../src/autopilot/router.js";
 import { relevantSymbolSlice } from "../src/reliability/symbolSlice.js";
 import { createRollbackPoint, revertRollbackPoint } from "../src/commitlet/rollback.js";
@@ -52,6 +53,45 @@ test("finish gate recovers when an equivalent command later succeeds", () => {
   // ...and an equivalent command (different flags) succeeding supersedes it.
   ledger.recordCommandResult("pytest -x tests/a.py", true);
   assert.equal(ledger.get().unresolvedFailures.length, 0, "equivalent command success must clear the latch");
+});
+
+// Re-entry ledger preservation: the fix for the finish-gate false "no work was done" loop. A weak
+// model blocked at the finish gate loops back and re-calls the planning tools with the SAME goal;
+// reset() used to mint a fresh empty ledger and erase the record of work already done, so the gate
+// reported "no work" forever. reset() must now PRESERVE the ledger on same-goal re-entry.
+test("reset preserves the completion ledger on a same-goal re-entry that already has work", () => {
+  liveSessionState.reset("Create stats.py with a median function");
+  const first = liveSessionState.getLedger();
+  assert.ok(first, "reset(goal) must create a ledger");
+  first!.recordFileChange("stats.py");
+  first!.recordCommand("python -m pytest -q");
+  assert.ok(first!.get().changedFiles.length > 0 && first!.get().commandsRun.length > 0);
+
+  // Model loops back and re-plans the SAME goal (rephrased/punctuated): work must survive.
+  liveSessionState.reset("create stats py with a median function!!");
+  const after = liveSessionState.getLedger();
+  assert.equal(after, first, "same-goal re-entry must keep the SAME ledger instance");
+  assert.deepEqual(after!.get().changedFiles, ["stats.py"], "the recorded file change must be preserved");
+  assert.equal(after!.get().commandsRun.length, 1, "the recorded command must be preserved");
+});
+
+test("reset mints a fresh ledger for a genuinely new goal", () => {
+  liveSessionState.reset("Create stats.py with a median function");
+  liveSessionState.getLedger()!.recordFileChange("stats.py");
+  liveSessionState.reset("Add a slugify function to slug.py");
+  const fresh = liveSessionState.getLedger();
+  assert.equal(fresh!.get().changedFiles.length, 0, "a new goal must not inherit the old goal's work");
+  assert.match(fresh!.get().userGoal, /slugify/);
+});
+
+test("isReentryGoal is false without work and false once the ledger is finalized", () => {
+  liveSessionState.reset("Fix the parser bug");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), false, "no work yet -> not a preserving re-entry");
+  liveSessionState.getLedger()!.recordFileChange("parser.ts");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), true, "same goal + work -> preserve");
+  assert.equal(liveSessionState.isReentryGoal("Write a totally different feature"), false, "different goal -> fresh");
+  liveSessionState.getLedger()!.finalize(true, "done");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), false, "a finalized task is not an open re-entry");
 });
 
 test("a passing test stage clears stray exploratory failures so the gate is satisfiable", () => {

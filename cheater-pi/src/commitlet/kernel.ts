@@ -263,7 +263,12 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     const verify = runFocusedVerification(cwd, commitlet);
     const scaffoldHealth = scorePatchHealth({ diffText, filesTouched: touchedFiles, threshold: config.healthScoreThreshold, hardRejectThreshold: config.hardRejectHealthThreshold });
     const ledger = liveSessionState.getLedger();
-    if (ledger) for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
+    // Same real-worker/finish-gate fix as the surgical path below: record the touched files into
+    // the MAIN ledger so a scaffold built by fresh workers is not seen as "no work was done".
+    if (ledger) {
+      for (const file of touchedFiles) ledger.recordFileChange(file);
+      for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
+    }
     activeTaskRun()?.integrateWorkerReport({
       workerRole: commitlet.id,
       summary: `scaffold phase created ${touchedFiles.length} file(s)`,
@@ -342,6 +347,16 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   let verify = runFocusedVerification(cwd, commitlet);
   const ledger = liveSessionState.getLedger();
   if (ledger) {
+    // Record the files this commitlet touched into the MAIN completion ledger. This is the load-
+    // bearing line for real-worker execution: a fresh isolated worker edits files in its OWN pi
+    // session, so those writes never reach this session's observeToolResult and the finish gate
+    // would see changedFiles:0 -> the false "no work was done" block that made weak models loop
+    // forever. touchedFiles is diffed from disk vs the rollback snapshot, so it captures the
+    // worker's edits (and the in-session model's) uniformly. Recorded even on a failing verify:
+    // the files WERE changed; the finish gate should then block on the real failure, not on "no
+    // work". Combined with the same-goal re-entry preservation in reset(), this survives the
+    // model looping back through the planning tools.
+    for (const file of touchedFiles) ledger.recordFileChange(file);
     for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
     ledger.recordVerificationStage({
       stage: "focused_tests",
