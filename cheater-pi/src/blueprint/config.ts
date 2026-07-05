@@ -100,7 +100,13 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   // fingerprints in loopGovernor.ts), not ordinary multi-edit sessions.
   maxTotalToolCallsPerPacket: 40,
   sameFileReadLimit: 4,
-  sameFailedCommandLimit: 2,
+  // Keyed on the COMMAND family, so a real build-fix loop (`npm run build` re-run after each fix, a
+  // DIFFERENT error each time = progress) counts as "the same failed command" even though it is
+  // advancing. A truly stuck loop (the SAME failure twice) is caught independently by the no-progress
+  // detector (observeNoProgress), so this limit can give legitimate iteration headroom: 3 lets a build
+  // fail-fix-fail-fix a few times before the cruder command-family break trips. (Full fix would key on
+  // the failure OUTPUT changing - needs the command output plumbed into the observation.)
+  sameFailedCommandLimit: 3,
   sameSearchQueryLimit: 3,
   samePatchLimit: 3,
   stopSentinelsEnabled: true,
