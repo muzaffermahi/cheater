@@ -26,9 +26,9 @@ import { defaultCommitletState } from "./state.js";
 import { buildCommitletExecutionPrompt, commitletRepoFacts, prepareCommitlet } from "./executor.js";
 import { runResampledWorker } from "./resampling.js";
 import {
+  concreteSingleFileCommitlet,
   mainModelSampler,
   runInSessionResample,
-  shouldResampleInSession,
   singleTargetFile,
   type InSessionResampleOutcome
 } from "./inSessionResample.js";
@@ -504,13 +504,15 @@ async function runClosedLoopInner(
       return report({ ok: false, status: "partial", freshWorkerMode: "simulated", steps, plan: finalized.details.plan, details: { decision, finalize: finalized.details } }, userGoal, [finalized.text]);
     }
     const prepared = prepareNext(plan, firstPending);
-    const activePlan = defaultCommitletState.get().currentPlan ?? plan;
+    let activePlan = defaultCommitletState.get().currentPlan ?? plan;
+    let activeCommitlet = prepared;
     // In-session best-of-N pre-build (local best-of-N, roadmap P1): fresh-worker resampling is
-    // unavailable on a single-GPU local box, so for a SINGLE-FILE commitlet with an adaptive sample
-    // budget > 1 the harness itself runs k independent direct-completion samples from the rollback
-    // snapshot and leaves the first VERIFIED pass (else the best candidate) on disk BEFORE the
-    // handoff. The existing cheater_commitlet_next then grades that pre-built file - zero change to
-    // grade/advance. Behind inSessionResampleEnabled (default off) so nothing changes unless enabled.
+    // unavailable on a single-GPU local box, so for a commitlet that resolves to a SINGLE target file
+    // with an adaptive sample budget > 1 the harness itself runs k independent direct-completion
+    // samples from the rollback snapshot and leaves the first VERIFIED pass (else the best candidate)
+    // on disk BEFORE the handoff. The existing cheater_commitlet_next then grades that pre-built file
+    // - zero change to grade/advance. Behind inSessionResampleEnabled (default off) so nothing changes
+    // unless enabled.
     let preBuiltNote: string | undefined;
     if (config.inSessionResampleEnabled === true) {
       const budget = computeBudget({
@@ -519,13 +521,22 @@ async function runClosedLoopInner(
         filesInScope: prepared.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")).length,
         isRepair: isRepairCommitlet(prepared)
       }, config);
-      if (shouldResampleInSession(prepared, budget.samples)) {
-        const target = singleTargetFile(prepared);
-        narrate(ctx, `in-session best-of-N: sampling ${budget.samples}x for ${prepared.id} (${target}) - local best-of-N, sequential on one GPU (~minutes each)`);
-        const outcome = await deps.runInSession(activePlan, prepared, config, ctx, budget.samples, (message) => narrate(ctx, message));
+      // Resolve a concrete single target (from allowedFiles, or the goal when the autopilot left a
+      // "(select one target file after inspection)" placeholder), pinning it into the commitlet so the
+      // downstream grade sees the same file the pre-build wrote.
+      const resolved = budget.samples > 1 ? concreteSingleFileCommitlet(activePlan, prepared, cwd) : null;
+      if (resolved) {
+        activeCommitlet = resolved;
+        if (resolved !== prepared) {
+          activePlan = { ...activePlan, commitlets: activePlan.commitlets.map((commitlet) => commitlet.id === resolved.id ? resolved : commitlet) };
+          defaultCommitletState.setPlan(activePlan);
+        }
+        const target = singleTargetFile(resolved);
+        narrate(ctx, `in-session best-of-N: sampling ${budget.samples}x for ${resolved.id} (${target}) - local best-of-N, sequential on one GPU (~minutes each)`);
+        const outcome = await deps.runInSession(activePlan, resolved, config, ctx, budget.samples, (message) => narrate(ctx, message));
         steps.push({
-          commitletId: prepared.id,
-          title: prepared.title,
+          commitletId: resolved.id,
+          title: resolved.title,
           outcome: outcome.passed ? "passed" : "blocked",
           note: `in-session best-of-N pre-build: ${outcome.note}`
         });
@@ -534,7 +545,7 @@ async function runClosedLoopInner(
           : `The harness ran in-session best-of-N for ${target} (${outcome.attemptsRun} samples; none fully verified) and left the strongest candidate on disk. Fix only what remains, then call cheater_commitlet_next.`;
       }
     }
-    const prompt = buildCommitletExecutionPrompt(activePlan, prepared, [], "simulated", 1, modelName);
+    const prompt = buildCommitletExecutionPrompt(activePlan, activeCommitlet, [], "simulated", 1, modelName);
     // A scaffold plan runs in-session BY DESIGN (the fast path - no per-file worker spawns), not
     // because a backend is missing. Say that plainly instead of the alarming "no backend available"
     // degradation notice, and frame the loop as phases so the model's ONE instruction set is coherent.
@@ -570,7 +581,7 @@ async function runClosedLoopInner(
       steps,
       plan: activePlan,
       handoffPrompt: prompt.prompt,
-      details: { decision, commitlet: prepared, prompt }
+      details: { decision, commitlet: activeCommitlet, prompt }
     }, userGoal, preBuiltNote ? [preBuiltNote, "", ...handoffLines] : handoffLines);
   }
 

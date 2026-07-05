@@ -6,7 +6,10 @@ import { join } from "node:path";
 import { createRollbackPoint } from "../src/commitlet/rollback.js";
 import {
   buildDirectCompletionPrompt,
+  concreteSingleFileCommitlet,
   extractFileContent,
+  extractGoalFilenames,
+  resolveTargetFile,
   runInSessionResample,
   shouldResampleInSession,
   singleTargetFile,
@@ -149,14 +152,54 @@ test("singleTargetFile returns the one editable file, else null", () => {
   assert.equal(singleTargetFile(makeCommitlet(cwd, ["(inspect)", "src/x/"])), null, "placeholders/dirs are not editable files");
 });
 
-test("shouldResampleInSession requires samples>1, a rollback snapshot, and a single file", () => {
+test("shouldResampleInSession requires samples>1 and a resolvable single target", () => {
   const cwd = makeRepo();
-  const single = makeCommitlet(cwd, ["target.txt"]);
-  assert.equal(shouldResampleInSession(single, 3), true);
-  assert.equal(shouldResampleInSession(single, 1), false, "k=1 -> classic single attempt");
-  const noRollback = { ...single, rollbackPoint: undefined } as Commitlet;
-  assert.equal(shouldResampleInSession(noRollback, 3), false, "no snapshot -> cannot revert between samples");
-  assert.equal(shouldResampleInSession(makeCommitlet(cwd, ["a.ts", "b.ts"]), 3), false, "multi-file -> not applicable");
+  const single = makeCommitlet(cwd, ["src/app.ts"]);
+  const plan = makePlan(cwd, single);
+  assert.equal(shouldResampleInSession(plan, single, 3), true);
+  assert.equal(shouldResampleInSession(plan, single, 1), false, "k=1 -> classic single attempt");
+  assert.equal(shouldResampleInSession(plan, makeCommitlet(cwd, ["a.ts", "b.ts"]), 3), false, "multi-file -> not applicable");
+});
+
+// The exact bug the live A/B surfaced: the autopilot leaves a from-scratch "create X" commitlet with
+// a "(select one target file after inspection)" placeholder, so a concrete-allowedFiles-only gate
+// never engages. resolveTargetFile recovers the target from the goal.
+
+test("resolveTargetFile recovers the goal-named file when allowedFiles is a placeholder", () => {
+  const cwd = makeRepo();
+  const placeholder = makeCommitlet(cwd, ["(select one target file after inspection)"]);
+  const plan = { ...makePlan(cwd, placeholder), userGoal: "Create glob_match.py with match(pattern, s). Make python -m pytest pass." } as CommitletPlan;
+  assert.equal(resolveTargetFile(plan, placeholder), "glob_match.py", "placeholder -> the one source file named in the goal");
+  assert.equal(resolveTargetFile(plan, makeCommitlet(cwd, ["src/x.ts"])), "src/x.ts", "a concrete allowedFile wins over the goal");
+  const ambiguous = { ...plan, userGoal: "Edit a.py and b.py" } as CommitletPlan;
+  assert.equal(resolveTargetFile(ambiguous, placeholder), null, "two named files -> ambiguous -> no engage");
+});
+
+test("extractGoalFilenames finds source files, ignores test files and version numbers", () => {
+  assert.deepEqual(extractGoalFilenames("Create glob_match.py so test_glob.py passes"), ["glob_match.py"], "the test file is excluded");
+  assert.deepEqual(extractGoalFilenames("upgrade to qwen 3.5 and edit src/parser.ts"), ["src/parser.ts"], "3.5 is not a source file");
+  assert.deepEqual(extractGoalFilenames("no files named here at all"), []);
+});
+
+test("concreteSingleFileCommitlet pins the goal target with a fresh rollback, then best-of-N builds it", async () => {
+  const cwd = makeRepo();
+  const CHECK_PY = `node -e "process.exit(require('fs').readFileSync('answer.py','utf8').includes('good')?0:1)"`;
+  const placeholder = { ...makeCommitlet(cwd, ["(select one target file after inspection)"]), focusedVerification: [{ command: CHECK_PY, purpose: "content check", required: true }] };
+  const plan = { ...makePlan(cwd, placeholder), userGoal: "Create answer.py that defines good output." } as CommitletPlan;
+  const resolved = concreteSingleFileCommitlet(plan, placeholder, cwd);
+  assert.ok(resolved, "a concrete commitlet is produced from the placeholder + goal");
+  assert.deepEqual(resolved!.allowedFiles, ["answer.py"], "the goal-named file is pinned into allowedFiles");
+  assert.ok(resolved!.rollbackPoint?.snapshotDir, "a fresh rollback snapshot was created for the pinned file");
+  const outcome = await runInSessionResample(plan, resolved!, {}, scriptedSampler([{ ok: true, text: fence("x = 'good'", "python") }]), 2);
+  assert.equal(outcome.passed, true, "best-of-N builds and verifies the pinned from-scratch file");
+  assert.match(readFileSync(join(cwd, "answer.py"), "utf8"), /good/);
+});
+
+test("concreteSingleFileCommitlet returns null when no single target resolves", () => {
+  const cwd = makeRepo();
+  const placeholder = makeCommitlet(cwd, ["(select one target file after inspection)"]);
+  const plan = { ...makePlan(cwd, placeholder), userGoal: "just refactor things generally" } as CommitletPlan;
+  assert.equal(concreteSingleFileCommitlet(plan, placeholder, cwd), null, "no goal-named file + placeholder -> not applicable");
 });
 
 // ---- extraction ----

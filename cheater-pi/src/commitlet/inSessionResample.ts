@@ -24,7 +24,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { applyCandidate, captureCandidate, scoreCandidate, scoreRankVector, type CandidateScore } from "./resampling.js";
-import { revertRollbackPoint } from "./rollback.js";
+import { createRollbackPoint, revertRollbackPoint } from "./rollback.js";
 import { attemptStance, attemptThinkingLevel } from "./executor.js";
 import { sdkSidecarClient } from "../sidecar/client.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
@@ -67,17 +67,64 @@ function editableFiles(commitlet: Commitlet): string[] {
   return commitlet.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/"));
 }
 
-/** The single target file for an in-session single-file resample (normalized), or null when the
- *  commitlet edits zero or several files (in-session best-of-N is single-file only). */
+/** The single CONCRETE target file in a commitlet's allowedFiles (normalized), or null when it edits
+ *  zero (e.g. an unresolved "(select ...)" placeholder) or several files. */
 export function singleTargetFile(commitlet: Commitlet): string | null {
   const files = editableFiles(commitlet);
   return files.length === 1 ? files[0].replace(/\\/g, "/") : null;
 }
 
-/** In-session best-of-N applies only to a single-file commitlet with a real rollback snapshot and a
- *  sample budget > 1. Everything else falls back to the classic in-session handoff. */
-export function shouldResampleInSession(commitlet: Commitlet, samples: number): boolean {
-  return samples > 1 && Boolean(commitlet.rollbackPoint?.snapshotDir) && singleTargetFile(commitlet) !== null;
+// Source-file extensions a from-scratch "create X" goal might name. Used to resolve the target when
+// the autopilot left allowedFiles as a placeholder ("(select one target file after inspection)").
+const SOURCE_EXT = /\.(py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|rb|c|h|cc|cpp|cs|css|scss|html|json|ya?ml|toml|sh|md|php|kt|swift|sql)$/i;
+
+/** Distinct source-file names explicitly written in the goal, excluding test files (the target of a
+ *  "create X" task is the non-test file). Lets in-session best-of-N resolve a concrete target even
+ *  when the commitlet's allowedFiles is a defer-to-inspection placeholder. */
+export function extractGoalFilenames(goal: string): string[] {
+  const tokens = goal.match(/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+/g) ?? [];
+  const files = tokens
+    .map((token) => token.replace(/\\/g, "/"))
+    .filter((token) => SOURCE_EXT.test(token) && !/(^|\/)(test_|.*_test\.|.*\.test\.|.*\.spec\.)/i.test(token));
+  return [...new Set(files)];
+}
+
+/**
+ * The concrete single target file for in-session best-of-N: the one concrete allowedFile if present,
+ * else (when allowedFiles is only a placeholder) the single source file named in the goal. Null when
+ * the commitlet is genuinely multi-file or no single target can be pinned - then best-of-N stays off
+ * and the classic in-session handoff runs.
+ */
+export function resolveTargetFile(plan: Pick<CommitletPlan, "userGoal">, commitlet: Commitlet): string | null {
+  const concrete = editableFiles(commitlet);
+  if (concrete.length === 1) return concrete[0].replace(/\\/g, "/");
+  if (concrete.length >= 2) return null; // genuinely multi-file
+  // allowedFiles carries no concrete file (a placeholder / inspection-deferred commitlet): fall back
+  // to a single source file the goal explicitly names.
+  const named = extractGoalFilenames(plan.userGoal ?? "");
+  return named.length === 1 ? named[0] : null;
+}
+
+/** In-session best-of-N applies when the sample budget is > 1 AND a single concrete target file can
+ *  be resolved (from allowedFiles or the goal). Everything else falls back to the classic handoff. */
+export function shouldResampleInSession(plan: Pick<CommitletPlan, "userGoal">, commitlet: Commitlet, samples: number): boolean {
+  return samples > 1 && resolveTargetFile(plan, commitlet) !== null;
+}
+
+/**
+ * A commitlet with a CONCRETE single target file and a rollback snapshot for it, ready for
+ * runInSessionResample - or null when no single target resolves. When allowedFiles was a placeholder
+ * (the from-scratch "create X" case), this pins the goal-named file into allowedFiles/
+ * expectedFilesTouched and creates a fresh rollback snapshot for it, so BOTH the internal candidate
+ * scorer AND the downstream cheater_commitlet_next grade resolve the same concrete file. When the
+ * commitlet already targets one concrete file with a snapshot, it is returned unchanged.
+ */
+export function concreteSingleFileCommitlet(plan: Pick<CommitletPlan, "userGoal">, commitlet: Commitlet, cwd: string): Commitlet | null {
+  const target = resolveTargetFile(plan, commitlet);
+  if (!target) return null;
+  if (singleTargetFile(commitlet) === target && commitlet.rollbackPoint?.snapshotDir) return commitlet;
+  const pinned: Commitlet = { ...commitlet, allowedFiles: [target], expectedFilesTouched: [target] };
+  return { ...pinned, rollbackPoint: createRollbackPoint(cwd, pinned) };
 }
 
 function fileExt(filename: string): string {
