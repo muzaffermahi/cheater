@@ -158,11 +158,13 @@ export function applyCandidate(cwd: string, snapshot: Map<string, Buffer | null>
 }
 
 /**
- * Rank for "best failing candidate": prefer an actual edit, then a guard-passing diff, then
- * fewer verification failures, then higher health, then the smaller diff.
+ * The lexicographic rank vector for a candidate score (higher is better) for "best failing
+ * candidate" selection: prefer an actual edit, then a guard-passing diff, then fewer verification
+ * failures, then higher health, then the smaller diff. Shared by fresh-worker resampling and
+ * in-session best-of-N (inSessionResample.ts) so both select the strongest failing candidate
+ * identically.
  */
-export function rankAttempt(attempt: CandidateAttempt): number[] {
-  const s = attempt.score;
+export function scoreRankVector(s: CandidateScore): number[] {
   return [
     s.touchedFiles.length > 0 ? 1 : 0,
     s.guardPassed ? 1 : 0,
@@ -170,6 +172,11 @@ export function rankAttempt(attempt: CandidateAttempt): number[] {
     s.healthScore,
     -s.diffLines
   ];
+}
+
+/** Rank vector for a fresh-worker candidate attempt (see scoreRankVector). */
+export function rankAttempt(attempt: CandidateAttempt): number[] {
+  return scoreRankVector(attempt.score);
 }
 
 function betterThan(a: CandidateAttempt, b: CandidateAttempt): boolean {

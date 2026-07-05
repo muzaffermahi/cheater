@@ -146,7 +146,9 @@ export function sdkSidecarClient(opts: { cwd: string; model?: unknown; timeoutMs
           sessionManager,
           settingsManager,
           noTools: "all",
-          ...(opts.model ? { model: opts.model } : {})
+          ...(opts.model ? { model: opts.model } : {}),
+          // Per-call reasoning-depth jitter (in-session best-of-N diversity); Pi clamps to model caps.
+          ...(params.thinkingLevel ? { thinkingLevel: params.thinkingLevel } : {})
         }));
       } catch (err) {
         // Transient: the endpoint may be momentarily down or still warming up. available() re-opens

@@ -326,6 +326,50 @@ test("#3: a single-commitlet task runs IN-SESSION (main model), never a cold fre
   assert.match(result.summary, /runs IN-SESSION/);
 });
 
+test("in-session best-of-N (flag on) pre-builds a single-file commitlet before the simulated handoff", async () => {
+  // The local best-of-N path: on a single-GPU box fresh-worker resampling is unavailable, so for a
+  // single-file commitlet with samples>1 the harness itself runs k direct completions and leaves the
+  // winner on disk BEFORE the handoff; the existing cheater_commitlet_next then grades it.
+  reset();
+  const repo = tmpRepo();
+  mkdirSync(join(repo, "src"), { recursive: true });
+  writeFileSync(join(repo, "src", "app.ts"), "export const app = 1;\n", "utf8");
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "build the thing")], { realWorkers: true });
+  // prepare must yield a rollback snapshot so shouldResampleInSession engages (single-file commitlet).
+  kernel.deps.prepare = ((_cwd: string, c: Commitlet) => ({ ...c, status: "running" as const, rollbackPoint: { id: "rb", createdAt: "t", snapshotDir: join(repo, ".snap"), description: "snap" } })) as any;
+  const calls: Array<{ id: string; samples: number }> = [];
+  kernel.deps.runInSession = (async (_plan: CommitletPlan, c: Commitlet, _cfg: CheaterConfig, _ctx: unknown, samples: number) => {
+    calls.push({ id: c.id, samples });
+    return { attemptsRun: samples, samplesRequested: samples, appliedAttempt: 2, passed: true, note: `in-session best-of-N: sample 2/${samples} passed guard+health+verification` };
+  }) as any;
+  const result = await runClosedLoopCommitlets(
+    { cwd: repo, userGoal: "build a glob matcher", config: { ...CONFIG, inSessionResampleEnabled: true, commitletCandidateSamples: 3 }, spawnFreshWorker: true },
+    kernel.deps
+  );
+  assert.equal(result.freshWorkerMode, "simulated", "a single commitlet runs in-session");
+  assert.deepEqual(calls, [{ id: "c1", samples: 3 }], "in-session best-of-N ran k=3 for the single-file commitlet");
+  assert.match(result.summary, /PRE-BUILT/, "the pre-built note is prepended to the handoff so the model grades, not rewrites");
+  assert.ok(result.steps.some((step) => /best-of-N/.test(step.note)), "the pre-build is recorded as a step");
+});
+
+test("in-session best-of-N (flag off) never runs - byte-identical to today's simulated handoff", async () => {
+  reset();
+  const repo = tmpRepo();
+  mkdirSync(join(repo, "src"), { recursive: true });
+  writeFileSync(join(repo, "src", "app.ts"), "export const app = 1;\n", "utf8");
+  const kernel = fakeKernel(repo, [commitletFixture("c1", "build the thing")], { realWorkers: true });
+  kernel.deps.prepare = ((_cwd: string, c: Commitlet) => ({ ...c, status: "running" as const, rollbackPoint: { id: "rb", createdAt: "t", snapshotDir: join(repo, ".snap"), description: "snap" } })) as any;
+  let called = false;
+  kernel.deps.runInSession = (async () => { called = true; return { attemptsRun: 0, samplesRequested: 0, appliedAttempt: 0, passed: false, note: "" }; }) as any;
+  const result = await runClosedLoopCommitlets(
+    // flag OFF but samples would be >1: must still not engage.
+    { cwd: repo, userGoal: "build a glob matcher", config: { ...CONFIG, commitletCandidateSamples: 3 }, spawnFreshWorker: true },
+    kernel.deps
+  );
+  assert.equal(called, false, "flag off -> no in-session best-of-N, classic single in-session handoff");
+  assert.doesNotMatch(result.summary, /PRE-BUILT/);
+});
+
 test("#3 off: with singleCommitletInSession disabled, a single commitlet still uses a fresh worker", async () => {
   reset();
   const repo = tmpRepo();

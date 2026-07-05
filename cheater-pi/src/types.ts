@@ -118,6 +118,25 @@ export interface CheaterConfig {
   // Only execution-verified fail->pass transitions are admitted; retrieval is event-driven and
   // similarity-gated; the bank is bounded + compacted. OFF by default until A/B-validated net-positive.
   skillMemoryEnabled?: boolean;
+  // In-session sequential best-of-N (local best-of-N; roadmap P1, the "make the validated lever run
+  // locally" fix). On a single-GPU local box the fresh-worker resampling path is unavailable - the
+  // backend probe latches "unavailable" to avoid sub-session GPU contention - so runResampledWorker
+  // never runs and P1a's adaptive-k has no effect. When true, a SINGLE-FILE commitlet in
+  // simulated/in-session mode with an adaptive sample budget > 1 is PRE-BUILT by the harness: k
+  // independent direct completions from the MAIN model (diversified by attempt stance + thinking-level
+  // jitter, since Pi exposes no temperature), each scored by guard->health->focused verification,
+  // keeping the first verified pass (else the best-ranked candidate) on disk BEFORE the handoff. The
+  // existing cheater_commitlet_next then grades that pre-built file - zero change to grade/advance. On
+  // one GPU the samples are sequential anyway, so this has the SAME wall-clock as N fresh workers
+  // without the sub-session problem. Needs adaptiveComputeEnabled (or commitletCandidateSamples>1) to
+  // yield samples>1. OFF by default. See commitlet/inSessionResample.ts.
+  inSessionResampleEnabled?: boolean;
+  // Soft token budget per in-session best-of-N sample (default 8000). ornith reasons heavily AND the
+  // whole file must still fit, so this is larger than a normal (clerk) sidecar call.
+  inSessionResampleMaxTokens?: number;
+  // Wall-clock bound per in-session best-of-N sample (default 600000 = 10 min), matching the worker
+  // idle timeout so a slow cold prefill is not aborted mid-file.
+  inSessionResampleTimeoutMs?: number;
   // Max fresh-worker attempts to run AT ONCE (WorkerPool). Default 1 (sequential) - correct on a
   // single GPU, which serializes concurrent model calls anyway. >1 only helps on a batching backend
   // (vLLM/TGI) AND needs workerBackendBatches:true; otherwise Cheater runs sequentially and says why.
