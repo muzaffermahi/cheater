@@ -11,7 +11,7 @@ import {
   renderCheatSheet,
   usableBugCorpus
 } from "../src/reliability/cheatSheet.js";
-import { saveVerifiedFix } from "../src/reliability/experience.js";
+import { saveVerifiedFix, pruneForRetention } from "../src/reliability/experience.js";
 import { CompletionLedger, ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
 import { createRepairCommitlet } from "../src/commitlet/planner.js";
 import { registerCommitletTools } from "../src/commitlet/tools.js";
@@ -33,6 +33,37 @@ const CHEAT_ON = { ...DEFAULT_CONFIG, bugMemoryEnabled: true };
 function tmpRepo(): string {
   return mkdtempSync(join(tmpdir(), "cheater-cheat-"));
 }
+
+// P3 disciplined SKILL memory: the verified experience store runs under skillMemoryEnabled, decoupled
+// from the disabled cross-repo bug-corpus (the analogy search that confused the small local model).
+test("P3: skillMemoryEnabled recalls a verified fix (experience card) and NEVER the bug-corpus", async () => {
+  const cwd = tmpRepo();
+  saveVerifiedFix(cwd, {
+    failureText: "TypeError: cannot read properties of missing reading getjson in widgetthing.py",
+    diffText: "+    if resp is None:\n+        return None\n-    return resp.getjson()",
+    files: ["widgetthing.py"], goal: "guard the missing response"
+  });
+  const sheet = await buildCheatSheet(cwd, "TypeError: cannot read properties of missing reading getjson in widgetthing.py", { skillMemoryEnabled: true });
+  assert.ok(sheet, "skillMemoryEnabled must produce a sheet from a matching verified fix");
+  assert.ok(sheet!.cards.some((c) => c.source === "experience"), "the recalled card is the verified experience");
+  assert.ok(!sheet!.cards.some((c) => c.source === "bug_corpus"), "skill memory never pulls the cross-repo bug-corpus");
+});
+
+test("P3: with neither skillMemoryEnabled nor bugMemoryEnabled the cheat sheet stays silent", async () => {
+  const cwd = tmpRepo();
+  saveVerifiedFix(cwd, { failureText: "TypeError: missing widgetthing attribute", diffText: "+guard here now", files: ["a.py"], goal: "g" });
+  assert.equal(await buildCheatSheet(cwd, "TypeError: missing widgetthing attribute", {}), null, "both master flags off -> no evidence injected");
+});
+
+test("P3: pruneForRetention keeps proven high-hit cards over fresh single-hit ones (not pure FIFO)", () => {
+  const mk = (fp: string, createdAt: string, hits: number) => ({ fingerprint: fp, errorType: "x", tokens: [], failureText: "", fixSummary: "f", files: [], goal: "", createdAt, hits });
+  const cards = [mk("old-proven-1", "2020-01-01T00:00:00Z", 50), mk("old-proven-2", "2020-01-02T00:00:00Z", 40)];
+  for (let i = 0; i < 300; i++) cards.push(mk(`fresh-${i}`, `2025-01-01T00:0${Math.floor(i / 60)}:${String(i % 60).padStart(2, "0")}Z`, 1));
+  const kept = pruneForRetention(cards);
+  assert.equal(kept.length, 300, "bounded to MAX_CARDS");
+  assert.ok(kept.some((c) => c.fingerprint === "old-proven-1") && kept.some((c) => c.fingerprint === "old-proven-2"),
+    "proven high-hit cards survive despite being the oldest (pure FIFO would have evicted them)");
+});
 
 function fakeCorpus(cwd: string, cards: Array<Record<string, unknown>>): string {
   const path = join(cwd, "corpus.jsonl");

@@ -425,7 +425,7 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     // original failed. The harness knows the observed failure AND the diff that fixed it -
     // ground truth, no model claim - so it writes the experience card itself. Future
     // matching failures get this fix recalled in-band inside their failure cards.
-    if (config.bugMemoryEnabled === true && config.experienceStoreEnabled !== false && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
+    if ((config.skillMemoryEnabled === true || (config.bugMemoryEnabled === true && config.experienceStoreEnabled !== false)) && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
       saveVerifiedFix(cwd, {
         failureText: commitlet.spec.observedFailure,
         diffText,

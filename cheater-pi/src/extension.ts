@@ -218,7 +218,7 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
     // enabled), and attaches at most three hypothesis cards - no model search tool involved.
     const sheet = await buildCheatSheet(cwd, summary, config ?? {});
     if (sheet) summary = `${summary}\n${renderCheatSheet(sheet, cmd)}`;
-  } else if (config?.bugMemoryEnabled === true && config?.experienceStoreEnabled !== false) {
+  } else if (config?.skillMemoryEnabled === true || (config?.bugMemoryEnabled === true && config?.experienceStoreEnabled !== false)) {
     // Verified fail->pass inside one session: the harness itself observed the earlier failed
     // stage and now the pass, and git shows what changed - write the experience card.
     const priorFailure = state.verification.filter((v) => v.status === "failed").at(-1);

@@ -230,9 +230,12 @@ export interface CheatSheetOptions {
  * evidence is worse for a small model than none.
  */
 export async function buildCheatSheet(cwd: string, failureText: string, config: CheaterConfig = {}, opts: CheatSheetOptions = {}): Promise<CheatSheet | null> {
-  // Master gate: the entire bug-memory / Cheat-Layer feature is OFF by default, so no recalled
-  // evidence is ever appended to a failure card the model reads. Enable with bugMemoryEnabled:true.
-  if (config.bugMemoryEnabled !== true) return null;
+  // Master gate: OFF by default. Enter when EITHER the disciplined skill memory (verified fail->pass
+  // recall - `skillMemoryEnabled`) OR the legacy bug-memory/corpus (`bugMemoryEnabled`) is on.
+  // skillMemoryEnabled ALONE runs only the verified local experience store + the factual installed-API
+  // oracle - never the cross-repo bug-corpus analogy search (that stays gated on bugMemoryEnabled,
+  // because its unverified out-of-repo hits are what confused a small local model).
+  if (config.skillMemoryEnabled !== true && config.bugMemoryEnabled !== true) return null;
   if (config.cheatSheetEnabled === false) return null;
   const text = (failureText ?? "").trim();
   if (!text) return null;
@@ -242,8 +245,9 @@ export async function buildCheatSheet(cwd: string, failureText: string, config: 
   const tokens = failureTokens(text);
   const cards: EvidenceCard[] = [];
 
-  // 1. Verified local experience - a fix proven by a fail->pass transition in this repo.
-  if (config.experienceStoreEnabled !== false) {
+  // 1. Verified local experience - a fix proven by a fail->pass transition in this repo. This IS the
+  // disciplined skill memory: runs whenever skillMemoryEnabled, or under the legacy bug-memory path.
+  if (config.skillMemoryEnabled === true || (config.bugMemoryEnabled === true && config.experienceStoreEnabled !== false)) {
     const hit = recallExperienceCard(cwd, text);
     if (hit) {
       cards.push({
@@ -274,8 +278,10 @@ export async function buildCheatSheet(cwd: string, failureText: string, config: 
     } catch { /* the oracle never blocks the cascade */ }
   }
 
-  // 3. Compacted bug corpus - analogies from other repos' verified bugs.
-  if (cards.length < MAX_CARDS && classification.trigger !== "unknown") {
+  // 3. Compacted bug corpus - analogies from OTHER repos' bugs. Unverified + out-of-repo, so it stays
+  // gated on bugMemoryEnabled ONLY (never runs under skillMemoryEnabled alone - this is the noise the
+  // disciplined skill memory deliberately excludes).
+  if (config.bugMemoryEnabled === true && cards.length < MAX_CARDS && classification.trigger !== "unknown") {
     const corpus = usableBugCorpus(cwd, opts.memoryPath);
     if (corpus) {
       try {

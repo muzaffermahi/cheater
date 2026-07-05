@@ -129,10 +129,23 @@ export function loadExperience(cwd: string): ExperienceCard[] {
   }
 }
 
+/**
+ * Retention when the store overflows: keep the most VALUABLE cards, not merely the newest. A fix that
+ * has re-verified several times (high hits) is proven useful and must outlive a fresh single-hit card;
+ * pure recency FIFO would evict a proven skill just because it is old. Rank by hits then recency, keep
+ * the top MAX_CARDS, and restore chronological order so recall and the on-disk log stay readable.
+ */
+export function pruneForRetention(cards: ExperienceCard[]): ExperienceCard[] {
+  if (cards.length <= MAX_CARDS) return cards;
+  const ranked = [...cards].sort((a, b) => (b.hits - a.hits) || b.createdAt.localeCompare(a.createdAt));
+  const keep = new Set(ranked.slice(0, MAX_CARDS));
+  return cards.filter((card) => keep.has(card));
+}
+
 function persist(cwd: string, cards: ExperienceCard[]): void {
   const file = storeFile(cwd);
   mkdirSync(join(cwd, ".cheater", "experience"), { recursive: true });
-  writeFileSync(file, cards.slice(-MAX_CARDS).map((card) => JSON.stringify(card)).join("\n") + "\n", "utf8");
+  writeFileSync(file, pruneForRetention(cards).map((card) => JSON.stringify(card)).join("\n") + "\n", "utf8");
 }
 
 /**
