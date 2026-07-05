@@ -53,7 +53,10 @@ export function attemptStance(attempt: number): string {
 // Per-attempt reasoning-depth jitter, the one sampling knob Pi's SDK exposes (there is no
 // temperature option). Attempt 1: the session default (byte-identical to single-sample
 // behavior). Attempt 2: deliberate. Attempt 3+: fast/instinctive. Pi clamps to model caps.
-const ATTEMPT_THINKING: Array<"off" | "low" | "medium" | "high" | undefined> = [undefined, "high", "off"];
+// One entry per ATTEMPT_STANCE (4). Attempt 4's stance is the MOST demanding ("re-derive and rewrite
+// the enclosing function cleanly"), so it gets "medium" thinking, not the "off" it used to inherit by
+// clamping to the 3rd entry - pairing the hardest re-derivation with reasoning disabled was a handicap.
+const ATTEMPT_THINKING: Array<"off" | "low" | "medium" | "high" | undefined> = [undefined, "high", "off", "medium"];
 
 export function attemptThinkingLevel(attempt: number): "off" | "low" | "medium" | "high" | undefined {
   return ATTEMPT_THINKING[Math.min(Math.max(attempt - 1, 0), ATTEMPT_THINKING.length - 1)];
