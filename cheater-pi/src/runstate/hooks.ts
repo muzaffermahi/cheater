@@ -89,7 +89,7 @@ export function preToolUse(event: PreToolInput, run: TaskRunState, config: Cheat
     const abs = resolve(event.cwd, event.path);
     const isContractArtifact = run.contract.outputPaths.some((p) => event.path!.replace(/\\/g, "/").endsWith(p))
       || run.contract.files.some((p) => event.path!.replace(/\\/g, "/").endsWith(p));
-    if (existsSync(abs) && !run.wasRead(event.path) && !isContractArtifact) {
+    if (existsSync(abs) && !run.wasRead(event.path) && !run.wasMutated(event.path) && !isContractArtifact) {
       run.bumpTelemetry("blockedToolCalls");
       decisions.push({
         action: "block",

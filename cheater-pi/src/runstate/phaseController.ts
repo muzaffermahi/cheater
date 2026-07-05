@@ -57,9 +57,17 @@ export class PhaseController {
     this.startedAtMs = this.now();
   }
 
-  /** Record one budget-consuming action (a tool call, a command). */
-  noteAction(count = 1): void {
-    this.actionsUsed += Math.max(0, count);
+  /** Record budget-consuming action(s). A READ is how the model earns the right to act (exploring the
+   *  repo), so it costs only a fraction of a state-changing action toward phase progress - otherwise a
+   *  long, legitimate read-heavy exploration drains the budget into RESERVE before the first edit and
+   *  then can't install or do a large edit. Edits/validations cost full. A numeric arg charges that
+   *  many full actions at once (used to fast-forward the phase). */
+  noteAction(kind: PhaseActionKind | number = "state_changing"): void {
+    if (typeof kind === "number") {
+      this.actionsUsed += Math.max(0, kind);
+      return;
+    }
+    this.actionsUsed += kind === "read" ? 0.25 : 1;
   }
 
   fractionUsed(): number {
@@ -103,11 +111,17 @@ export class PhaseController {
     const phase = this.currentPhase();
     const remaining = Math.max(0, 1 - this.fractionUsed());
     if (phase === "reserve" && kind === "state_changing") {
-      const risky = detail ? /\b(refactor|rewrite|install|upgrade|migrate|regenerate|rm -rf|reset --hard|clean -f)\b/i.test(detail) : false;
-      if (risky) {
-        return { verdict: "block", message: `RESERVE phase (${Math.round(remaining * 100)}% budget left): no new refactors, installs, or destructive commands. Preserve the current result; run final cheap checks only.` };
+      // Only truly DESTRUCTIVE commands (that could wipe the working result) are blocked in RESERVE.
+      // Installs/refactors/migrations are often a legitimate LATE need of a real build (add a dep,
+      // finish a file); blocking them was a top "never finishes" cause, and the command-classifier
+      // path (controlledExec) already only WARNS on install - this twin must match. Matching on a
+      // whitespace-anchored command shape also stops a filename that merely contains "install" or
+      // "migrate" from false-blocking an ordinary edit.
+      const destructive = detail ? /\b(rm\s+-rf|reset\s+--hard|clean\s+-f|drop\s+table|checkout\s+--)\b/i.test(detail) : false;
+      if (destructive) {
+        return { verdict: "block", message: `RESERVE phase (${Math.round(remaining * 100)}% budget left): destructive commands are blocked - preserve the current result and run final cheap checks only.` };
       }
-      return { verdict: "warn", message: `RESERVE phase: avoid new state-changing work; prefer preserving the current acceptable result.` };
+      return { verdict: "warn", message: `RESERVE phase: prefer preserving the current acceptable result over new state-changing work.` };
     }
     if (phase === "validate" && kind === "state_changing" && detail && /\b(refactor|rewrite|restructure)\b/i.test(detail)) {
       return { verdict: "warn", message: "VALIDATE phase: fix only validation blockers; broad refactors belong to a fresh run." };

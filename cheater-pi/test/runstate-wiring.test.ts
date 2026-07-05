@@ -237,16 +237,34 @@ test("context reincarnation: a fresh controller reconstructs contract, digest, l
   assert.ok(brief.length <= 4000, "the reincarnation brief itself must be capsule-sized");
 });
 
-test("run-state phase budget derives actions from tool calls and surfaces in capsules", () => {
+test("run-state phase budget: reads stay cheap (no premature RESERVE); state-changing work drives the phase (H1/H2)", () => {
   resetTaskRunForTests();
   const repo = tmpRepo();
   const run = beginTaskRun(repo, GOAL, { taskId: "run-phase", actionBudget: 10 });
+  // H1: a read-heavy exploration must NOT drain the budget into RESERVE - reads are how the model
+  // earns the right to act. 9 reads at 0.25 each = ~22% of budget, still EXPLORE.
   for (let i = 0; i < 9; i++) run.noteAction("read", "inspect");
+  assert.notEqual(run.currentPhase(), "reserve", "reads alone do not force RESERVE (H1)");
+  assert.equal(run.currentPhase(), "explore");
+  // State-changing actions drive the phase forward to RESERVE.
+  for (let i = 0; i < 10; i++) run.noteAction("state_changing", "edit");
   assert.equal(run.currentPhase(), "reserve");
-  const verdict = run.noteAction("state_changing", "npm install something && refactor");
-  assert.equal(verdict.verdict, "block", "reserve must block risky new state-changing work");
-  const lines = run.phase.capsuleLines().join("\n");
-  assert.match(lines, /RESERVE/);
-  assert.match(lines, /preserve the acceptable result/);
+  // H2: in RESERVE a destructive command blocks, but an install only warns (blocking installs was a
+  // top "never finishes" cause).
+  assert.equal(run.noteAction("state_changing", "rm -rf dist && git reset --hard").verdict, "block", "reserve blocks destructive work");
+  assert.equal(run.noteAction("state_changing", "npm install something").verdict, "warn", "reserve only warns on installs (H2)");
+  assert.match(run.phase.capsuleLines().join("\n"), /RESERVE/);
+  endTaskRun();
+});
+
+test("read-before-write treats a file the run itself created as seen (H3: no false block on a shell-made file)", () => {
+  resetTaskRunForTests();
+  const repo = tmpRepo();
+  const run = beginTaskRun(repo, GOAL, { taskId: "h3", actionBudget: 50 });
+  assert.equal(run.wasMutated("config.json"), false, "a never-touched file is not marked mutated");
+  // A file the run creates via ANY actor (incl. a shell command recorded in the mutation ledger) is
+  // "seen" - overwriting it later is not destroying unseen pre-existing code.
+  run.recordFileMutation("config.json", "file_created", "model", "shell edit");
+  assert.equal(run.wasMutated("config.json"), true, "a run-created file is seen for read-before-write");
   endTaskRun();
 });
