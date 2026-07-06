@@ -63,6 +63,23 @@ export function commitletsFromBlueprint(plan: BlueprintPlan, decision: Autopilot
   return packets.map((packet, index) => commitletFromPacket(packet, index, decision));
 }
 
+// Files a verification failure explicitly NAMES (compiler/test errors like `consumer.ts(12,5)` or
+// `src/api.ts:3:10`). Used to break the coupled-file deadlock (M2): when a scoped edit fails a
+// typecheck because a DIFFERENT file must change too, the repair may touch the named file. Filtered
+// to real relative source paths, never tests/node_modules, capped so a repair can't sprawl.
+export function filesNamedInFailure(text: string): string[] {
+  const files = new Set<string>();
+  const re = /([A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z0-9]+)(?=[:(]\d|["'\s:)]|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const file = match[1].replace(/\\/g, "/");
+    if (!/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|c|h|cc|cpp|cs|css|scss|vue|svelte|json)$/i.test(file)) continue;
+    if (/(^|\/)node_modules\//.test(file) || file.startsWith("/") || /(^|\/)(test_|.*\.test\.|.*\.spec\.|.*_test\.)/i.test(file)) continue;
+    files.add(file);
+  }
+  return [...files].slice(0, 4);
+}
+
 export function createRepairCommitlet(failed: Commitlet, failureSummary: string): Commitlet {
   // Evidence (the cheat sheet, and the sidecar-distilled "Repair focus" block) belongs ONLY in
   // observedFailure. The purpose/acceptance slices must be built from the bare failure, or
@@ -73,6 +90,16 @@ export function createRepairCommitlet(failed: Commitlet, failureSummary: string)
     .filter((index) => index > 0)
     .sort((a, b) => a - b)[0];
   const bareFailure = (evidenceStart !== undefined ? failureSummary.slice(0, evidenceStart) : failureSummary).trim();
+  // M2: a scoped edit can fail its typecheck/build because a COUPLED file must change too (edit
+  // types.ts -> consumer.ts no longer compiles). If the repair stayed locked to the original file it
+  // could never pass -> deadlock. So let the repair also touch the specific file(s) the failure NAMES
+  // (bounded, non-test). Scope still stays tight - only what the error points at, capped at +2.
+  const originalFiles = failed.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/"));
+  const coupled = filesNamedInFailure(bareFailure)
+    .filter((file) => !originalFiles.some((own) => own === file || own.endsWith(`/${file}`) || file.endsWith(`/${own}`)))
+    .slice(0, 2);
+  const allowedFiles = coupled.length ? [...failed.allowedFiles, ...coupled] : failed.allowedFiles;
+  const maxFilesTouched = Math.max(failed.maxFilesTouched, originalFiles.length + coupled.length);
   return {
     ...failed,
     id: `${failed.id}-repair`,
@@ -80,7 +107,9 @@ export function createRepairCommitlet(failed: Commitlet, failureSummary: string)
     purpose: `Repair failed commitlet without expanding scope: ${bareFailure.slice(0, 220)}`,
     status: "pending",
     maxModelCalls: 1,
-    expectedFilesTouched: failed.expectedFilesTouched,
+    allowedFiles,
+    maxFilesTouched,
+    expectedFilesTouched: allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")),
     spec: {
       behaviorMustHold: [`Original commitlet passes after repair: ${failed.title}`],
       behaviorMustNotChange: failed.spec?.behaviorMustNotChange ?? ["Unrelated behavior must not change."],
@@ -94,7 +123,9 @@ export function createRepairCommitlet(failed: Commitlet, failureSummary: string)
       observedFailure: failureSummary.slice(0, 2600),
       expectedBehavior: "Focused verification passes.",
       nonGoals: [
-        "Do not touch files outside the original allowedFiles.",
+        coupled.length
+          ? `Stay within allowedFiles - the coupled file(s) the failure named (${coupled.join(", ")}) are already included; do not widen further.`
+          : "Do not touch files outside the original allowedFiles.",
         "Do not add dependencies, lockfiles, generated artifacts, or broad rewrites."
       ]
     },
