@@ -38,6 +38,36 @@ function textResult(text: string, details: unknown = {}) {
 }
 
 export function registerCommitletTools(pi: ExtensionAPI, deps: { config: CheaterConfig }): void {
+  // Record a verification result into BOTH ledgers identically: the completion ledger (stages,
+  // artifacts, commands) that gates ledgerAllowsFinish AND the run-state validation ledger (mirrored
+  // per non-skipped stage, pinned to its artifacts) that gates run.finishCheck() freshness. The
+  // explicit cheater_verification_run tool AND the finish-gate inline auto-verify both call this, so an
+  // auto-verify unblocks the finish gate the SAME way an explicit run does - never half-recorded
+  // evidence that satisfies one gate but silently leaves the other stale.
+  const applyVerificationResult = (result: Awaited<ReturnType<typeof runVerification>>): void => {
+    const ledger = liveSessionState.getLedger();
+    if (ledger) {
+      for (const stage of result.stages) ledger.recordVerificationStage(stage);
+      for (const artifact of result.artifacts) ledger.recordArtifact(artifact);
+      for (const cmd of result.ledger.get().commandsRun) ledger.recordCommand(cmd);
+    }
+    const run = deps.config.runStateEnabled !== false ? activeTaskRun() : null;
+    if (run) {
+      for (const stage of result.stages) {
+        if (stage.status === "skipped") continue;
+        run.recordValidation({
+          name: stage.stage,
+          command: typeof (stage.signals as { command?: unknown } | undefined)?.command === "string" ? (stage.signals as { command: string }).command : undefined,
+          actor: "verification_run",
+          validates: stage.artifacts ?? [],
+          status: stage.status === "ok" ? "pass" : "fail",
+          outputSummary: stage.summary
+        });
+      }
+      run.phase.advanceTo("validate");
+      run.refreshDigest();
+    }
+  };
   pi.registerTool({
     name: "cheater_run",
     label: "Cheater Run (closed loop)",
@@ -99,6 +129,31 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
           `autopilot: ${decisionSummary}`,
           `reason: ${decision.reason}`
         ].join("\n"), { decision, noEdit: true });
+      }
+
+      // Idempotent re-entry: a weak model blocked at the finish gate frequently loops back and
+      // re-calls cheater_reliability_start with the SAME goal. Re-planning here would reset every
+      // commitlet to pending AND (via liveSessionState.reset) wipe the completion ledger, erasing
+      // the record of files it already wrote and tests it already ran - the exact cause of the
+      // finish gate's perpetual "no work was done" block. When a plan is already running for this
+      // goal and the ledger holds real work, CONTINUE it instead of restarting.
+      const priorPlan = defaultCommitletState.get().currentPlan;
+      if (priorPlan && liveSessionState.isReentryGoal(params.userGoal)) {
+        const planActive = priorPlan.status === "running"
+          || priorPlan.commitlets.some((commitlet) => commitlet.status === "pending" || commitlet.status === "running");
+        if (planActive) {
+          const ledgerState = liveSessionState.getLedger()?.get();
+          const pending = priorPlan.commitlets.find((commitlet) => commitlet.status === "pending");
+          return textResult([
+            "Cheater Reliability Start: a plan is ALREADY in progress for this goal - CONTINUING it, not restarting (your prior work is preserved).",
+            formatPlanChecklist(priorPlan),
+            `Recorded so far: ${ledgerState?.changedFiles.length ?? 0} file change(s), ${ledgerState?.commandsRun.length ?? 0} command(s) run, ${ledgerState?.verification.length ?? 0} verification stage(s).`,
+            "Do NOT call cheater_reliability_start again for this task.",
+            pending
+              ? `Next: call cheater_commitlet_next to continue with "${pending.title}".`
+              : "All commitlets are done. Call cheater_verification_run (if not yet green), then cheater_finish_gate to finish."
+          ].join("\n"), { continued: true, planId: priorPlan.id, decision });
+        }
       }
 
       ctx?.ui?.setWorkingMessage?.("Cheater: planning commitlets (routing, candidates, packet decomposition)...");
@@ -414,7 +469,34 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       // Shared kernel verdict: completion-ledger gate + run-state staleness gate + the
       // automatic exact-artifact reread. The closed-loop executor uses the SAME function -
       // one finish truth, never two.
-      const verdict = finishVerdict(deps.config, { summary: params.summary })!;
+      let verdict = finishVerdict(deps.config, { summary: params.summary })!;
+      // Easy-task speed: auto-verify INLINE. When the gate blocks only because no verification
+      // evidence exists yet (the model went straight to finish), run the detected verification HERE
+      // and re-check - instead of forcing a separate cheater_verification_run turn plus a
+      // blocked-then-retry finish (~2 wasted round-trips). A REAL failure re-surfaces and keeps the
+      // gate blocked, so honesty is preserved; this only rescues the "forgot to verify" path. Skipped
+      // when unresolved failures already exist (the model must fix those, not re-verify).
+      const state = ledger.get();
+      const noEvidence = state.verification.length === 0 && state.unresolvedFailures.length === 0;
+      if (!verdict.allowed && noEvidence && deps.config.autoVerifyOnFinish !== false && _ctx?.cwd) {
+        try {
+          const cmds = detectProjectCommands(_ctx.cwd);
+          const result = await runVerification({
+            cwd: _ctx.cwd,
+            userGoal: state.userGoal ?? "verification",
+            planKind: cmds.devCommand ? "webapp" : "cli",
+            projectCommands: cmds
+          });
+          // Record into BOTH ledgers (completion + run-state) so the re-check clears both finish gates,
+          // not just ledgerAllowsFinish - otherwise run.finishCheck() freshness would keep it blocked.
+          applyVerificationResult(result);
+          const reverdict = finishVerdict(deps.config, { summary: params.summary })!;
+          if (reverdict.allowed) {
+            return textResult(["Cheater Finish Gate: auto-verified inline (no separate verification_run needed).", ...reverdict.lines].join("\n"), { allowed: true, reason: reverdict.reason, freshness: reverdict.freshness, ledger: reverdict.ledgerState, autoVerified: true });
+          }
+          verdict = reverdict;
+        } catch { /* auto-verify is best-effort; fall through to the original verdict */ }
+      }
       return textResult(verdict.lines.join("\n"), { allowed: verdict.allowed, reason: verdict.reason, freshness: verdict.freshness, ledger: verdict.ledgerState });
     }
   });
@@ -437,37 +519,8 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
         projectCommands: cmds,
         port: params.port
       });
-      const ledger = liveSessionState.getLedger();
-      if (ledger) {
-        for (const stage of result.stages) {
-          ledger.recordVerificationStage(stage);
-        }
-        for (const artifact of result.artifacts) {
-          ledger.recordArtifact(artifact);
-        }
-        for (const cmd of result.ledger.get().commandsRun) {
-          ledger.recordCommand(cmd);
-        }
-      }
-      const run = deps.config.runStateEnabled !== false ? activeTaskRun() : null;
-      if (run) {
-        // Mirror the verification stages into the run's validation ledger, pinned to the
-        // artifacts each stage produced, so later mutations can stale them and an
-        // evaluator-mirroring pass protects the artifacts it proved.
-        for (const stage of result.stages) {
-          if (stage.status === "skipped") continue;
-          run.recordValidation({
-            name: stage.stage,
-            command: typeof (stage.signals as { command?: unknown } | undefined)?.command === "string" ? (stage.signals as { command: string }).command : undefined,
-            actor: "verification_run",
-            validates: stage.artifacts ?? [],
-            status: stage.status === "ok" ? "pass" : "fail",
-            outputSummary: stage.summary
-          });
-        }
-        run.phase.advanceTo("validate");
-        run.refreshDigest();
-      }
+      // One recording path for both the explicit run and the finish-gate inline auto-verify.
+      applyVerificationResult(result);
       const lines = [
         `Cheater Verification Run: ${result.passed ? "PASSED" : "FAILED"}`,
         `planKind: ${planKind}`,

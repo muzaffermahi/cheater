@@ -116,7 +116,6 @@ test("packet execution prompts are isolated fresh-agent handoffs", () => {
       evidence: [],
       architectureDecisions: [],
       implementationInvariants: ["Workers stay isolated."],
-      bugWorkflows: [],
       packetFacts: [{ packetId: "implement-src-commands-ts", file: "src/commands.ts", facts: ["src/commands.ts registers commands"] }],
       webEvidence: [],
       webSearchTriggers: [],

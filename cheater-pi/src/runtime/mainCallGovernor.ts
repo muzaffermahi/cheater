@@ -87,7 +87,7 @@ class MainCallGovernor {
 
   /** Point the governor at this run's config. Call on each new task (alongside reset). */
   configure(config: CheaterConfig): void {
-    this.enabled = config.mainCallGovernorEnabled === true;
+    this.enabled = true;
     if (config.mainAllowedRoles?.length) this.allowed = new Set(config.mainAllowedRoles as MainCallRole[]);
     if (config.sidecarPreferredRoles?.length) this.preferred = new Set(config.sidecarPreferredRoles as MainCallRole[]);
     // Escalation is opt-in per role; an empty/absent list keeps the deterministic floor.

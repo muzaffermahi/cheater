@@ -15,7 +15,7 @@ export function formatBlueprintPlanSummary(plan: BlueprintPlan): string {
     "Cheater Blueprint plan",
     `selected: ${plan.selectedCandidateId}    confidence: ${plan.confidence}`,
     `approval: ${plan.approval}`,
-    plan.intelligence ? `intelligence: evidence=${plan.intelligence.evidence.length} decisions=${plan.intelligence.architectureDecisions.length} workflows=${plan.intelligence.bugWorkflows.length} web=${plan.intelligence.webSearch.status}` : "intelligence: unavailable",
+    plan.intelligence ? `intelligence: evidence=${plan.intelligence.evidence.length} decisions=${plan.intelligence.architectureDecisions.length} web=${plan.intelligence.webSearch.status}` : "intelligence: unavailable",
     `packets: ${plan.workPackets.map((packet) => `${packet.id}:${packet.status}`).join(", ")}`,
     `verification: ${plan.verification.map((step) => step.command ?? step.description).join(" | ") || "(manual)"}`
   ].join("\n");

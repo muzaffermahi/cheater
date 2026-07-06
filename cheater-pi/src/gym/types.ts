@@ -144,7 +144,7 @@ export interface GymDeltaReport {
 }
 
 export interface GymLearningSuggestion {
-  kind: "bug_memory" | "anti_pattern" | "skill_improvement" | "playbook_note";
+  kind: "anti_pattern" | "skill_improvement" | "playbook_note";
   taskId: string;
   summary: string;
   details: string;

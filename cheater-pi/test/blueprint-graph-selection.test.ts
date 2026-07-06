@@ -87,39 +87,6 @@ test("autonomous blueprint selects command file as implementation target via gra
   assert.ok(plan.intelligence!.packetFacts.some((f) => f.file === "src/commands.ts"));
 });
 
-test("structured bug-memory worker brief renders try/do-not/verify practical constraints", () => {
-  const memoryHit: BlueprintMemoryHit = {
-    id: "bug-1", source: "bug",
-    summary: "bug type: null deref; symptom: crash; root cause: alpha; fix pattern: guard alpha; test signal: alpha crash signal",
-    confidence: "high",
-    keyFiles: ["src/alpha.ts"],
-    testSignal: "alpha crash signal",
-    matchReason: "matched because key files src/alpha.ts overlap",
-    workflowSteps: ["reproduce crash", "inspect alpha", "add guard"],
-    doNotDo: ["do not swallow the error", "do not wrap in try/catch silently"]
-  };
-  const packets = [
-    { id: "implement-src-alpha", title: "t", type: "implement", status: "pending", dependsOn: [], estimatedModelCalls: 1, maxModelCalls: 1,
-      filesToInspect: [{ path: "src/alpha.ts", reason: "r" }], filesToTouch: [{ path: "src/alpha.ts", reason: "r" }],
-      allowedTools: [], forbiddenActions: [], promptContract: "", acceptanceCriteria: ["alpha guard added"], verification: [{ id: "v", command: "npm test", description: "x", required: true }], simulationChecks: [], risk: "medium" } as any
-  ];
-  const pack = buildBlueprintIntelligencePack({
-    userGoal: "fix alpha crash", orientation, docsFacts: [], memoryHits: [memoryHit], packets, packetFacts: [],
-    taskType: "bug_fix", modelName: "qwen-9b", config: DEFAULT_BLUEPRINT_CONFIG
-  });
-  assert.equal(pack.bugWorkflows.length, 1);
-  const wf = pack.bugWorkflows[0];
-  assert.deepEqual(wf.workflowSteps, ["reproduce crash", "inspect alpha", "add guard"]);
-  assert.deepEqual(wf.doNotDo, ["do not swallow the error", "do not wrap in try/catch silently"]);
-  assert.equal(wf.risk, "medium");
-  assert.match(wf.applicabilityReason ?? "", /applies to implement-src-alpha/);
-  const brief = packetScopedWorkerBrief({ intelligence: pack }, packets[0])!;
-  assert.match(brief, /try repair pattern: guard alpha/);
-  assert.match(brief, /do not make this bad fix: do not swallow the error/);
-  assert.match(brief, /verify with: alpha crash signal/);
-  assert.match(brief, /why matched: matched because/);
-});
-
 test("docs cache avoids repeated network fetches and is non-fatal", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cheater-docs-cache-"));
   mkdirSync(join(dir, ".cheater"), { recursive: true });

@@ -357,6 +357,20 @@ test("focused verification passes, fails compactly, and creates bounded repair c
   assert.deepEqual(repair.allowedFiles, failing.allowedFiles);
 });
 
+test("M2: a repair may touch a coupled file the verification failure NAMES (breaks the deadlock)", () => {
+  const decision = routeAutopilot({ cwd: process.cwd(), message: "add a Foo type" });
+  const plan = createCommitletPlan({ repoRoot: process.cwd(), userGoal: "add a Foo type", autopilotDecision: decision });
+  const failing = { ...plan.commitlets[0], allowedFiles: ["src/types.ts"], maxFilesTouched: 1 };
+  // A typecheck failure that names a DIFFERENT, coupled file (consumer.ts must change too to compile).
+  const repair = createRepairCommitlet(failing, "src/consumer.ts(12,5): error TS2304: Cannot find name 'Foo'.");
+  assert.ok(repair.allowedFiles.includes("src/types.ts"), "keeps the original file");
+  assert.ok(repair.allowedFiles.includes("src/consumer.ts"), "adds the coupled file the failure named");
+  assert.ok(repair.maxFilesTouched >= 2, "raises the file cap to fit the coupled file");
+  // Never pull a test file or node_modules path in from the failure text.
+  const repair2 = createRepairCommitlet(failing, "test_types.py failed; node_modules/dep.ts error");
+  assert.deepEqual(repair2.allowedFiles, failing.allowedFiles, "tests and node_modules are never added");
+});
+
 test("constraint graph and impact propagation expose small facts", () => {
   const root = join(tmpdir(), `cheater-graph-${Date.now().toString(36)}`);
   mkdirSync(join(root, "src"), { recursive: true });

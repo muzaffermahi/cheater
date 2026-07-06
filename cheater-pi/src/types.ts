@@ -3,12 +3,15 @@ export interface CheaterConfig {
   provider?: string;
   model?: string;
   themeEnabled?: boolean;
+  // The terminal mascot "Sly" - a cat whose expression follows the work (thinking/sampling/verifying/
+  // done/stuck). Default ON, but every mascot call is a no-op in --print/--mode json (pi no-ops the UI
+  // there), so it never touches machine-readable output. Set mascotEnabled:false or mascotStyle:"off"
+  // to disable; mascotStyle:"ascii" uses plainer glyphs for terminals that render kaomoji poorly.
+  mascotEnabled?: boolean;
+  mascotStyle?: "cat" | "ascii" | "off";
   defaultTestCommand?: string;
   packagePath?: string;
-  memoryEnabled?: boolean;
-  skillsEnabled?: boolean;
   debug?: boolean;
-  showStartupCard?: boolean;
   maxContextTokens?: number;
   // HTTP idle timeout (ms) for model requests. Pi's default (300000 = 5 min) kills a slow local
   // model's PREFILL of a big prompt (no response bytes flow during prefill), causing an infinite
@@ -68,6 +71,9 @@ export interface CheaterConfig {
   // problems in-band on the edit's own result. Catches hallucinated imports immediately.
   postEditImportGateEnabled?: boolean;
   autoVerifyOnFinish?: boolean;
+  // When the model ANSWERS an actionable task in chat but calls zero tools (writes nothing, runs
+  // nothing), nudge it once at agent-end to actually do the work with its tools. Default on.
+  nudgeAnsweredWithoutActing?: boolean;
   loopGovernorEnabled?: boolean;
   maxLoopBreaksPerPacket?: number;
   maxToolCallsTinyPacket?: number;
@@ -99,6 +105,44 @@ export interface CheaterConfig {
   // otherwise. 1 (default) = today's single attempt; 2-3 recommended for small local models
   // where samples are cheap and pass@1 is weak.
   commitletCandidateSamples?: number;
+  // Adaptive test-time-compute (roadmap P5): when true, the per-commitlet best-of-N sample count,
+  // self-debug rounds, and localization depth scale with a cheap HARDNESS signal (task kind, risk,
+  // files in scope, repair, first-sample-verified) instead of the static commitletCandidateSamples.
+  // Easy commitlets get k=1 (near-vanilla speed); hard ones get up to adaptiveMaxSamples. OFF by
+  // default -> byte-identical static behavior. See runtime/computeBudget.ts.
+  adaptiveComputeEnabled?: boolean;
+  // Upper bound on adaptive best-of-N samples for the hardest commitlet (default 8), sized so a hard
+  // commitlet still fits the ~15-min wall-clock target at ~25 tok/s (sequential on one GPU).
+  adaptiveMaxSamples?: number;
+  // Upper bound on adaptive self-debug / bounded-repair rounds (default 2; research: two rounds
+  // capture 76-95% of the gain).
+  adaptiveMaxDebugRounds?: number;
+  // In-session sequential best-of-N (local best-of-N; roadmap P1, the "make the validated lever run
+  // locally" fix). On a single-GPU local box the fresh-worker resampling path is unavailable - the
+  // backend probe latches "unavailable" to avoid sub-session GPU contention - so runResampledWorker
+  // never runs and P1a's adaptive-k has no effect. When true, a SINGLE-FILE commitlet in
+  // simulated/in-session mode with an adaptive sample budget > 1 is PRE-BUILT by the harness: k
+  // independent direct completions from the MAIN model (diversified by attempt stance + thinking-level
+  // jitter, since Pi exposes no temperature), each scored by guard->health->focused verification,
+  // keeping the first verified pass (else the best-ranked candidate) on disk BEFORE the handoff. The
+  // existing cheater_commitlet_next then grades that pre-built file - zero change to grade/advance. On
+  // one GPU the samples are sequential anyway, so this has the SAME wall-clock as N fresh workers
+  // without the sub-session problem. Needs adaptiveComputeEnabled (or commitletCandidateSamples>1) to
+  // yield samples>1. OFF by default. See commitlet/inSessionResample.ts.
+  inSessionResampleEnabled?: boolean;
+  // Engagement backstop (roadmap B2): a NON-blocking nudge fired once per code task when the model
+  // edits files directly WITHOUT ever calling cheater_run/cheater_reliability_start - i.e. it bypassed
+  // the reliability flow entirely (observed live: a small model does a from-scratch task vanilla and
+  // no machinery engages). It NEVER blocks (that would be the handicap we forbid); it just injects a
+  // follow-up telling the model to route the change through cheater_run for a verified/best-of-N pass.
+  // OFF by default until A/B-validated that it improves engagement without nagging real one-liners.
+  engagementBackstopEnabled?: boolean;
+  // Soft token budget per in-session best-of-N sample (default 8000). ornith reasons heavily AND the
+  // whole file must still fit, so this is larger than a normal (clerk) sidecar call.
+  inSessionResampleMaxTokens?: number;
+  // Wall-clock bound per in-session best-of-N sample (default 600000 = 10 min), matching the worker
+  // idle timeout so a slow cold prefill is not aborted mid-file.
+  inSessionResampleTimeoutMs?: number;
   // Max fresh-worker attempts to run AT ONCE (WorkerPool). Default 1 (sequential) - correct on a
   // single GPU, which serializes concurrent model calls anyway. >1 only helps on a batching backend
   // (vLLM/TGI) AND needs workerBackendBatches:true; otherwise Cheater runs sequentially and says why.
@@ -109,28 +153,11 @@ export interface CheaterConfig {
   // Wall-clock limit per fresh-worker attempt (ms). A wedged worker on a slow local backend
   // is aborted at this deadline instead of hanging the main session forever. Default 10min.
   commitletWorkerTimeoutMs?: number;
-  // Bug memory MASTER switch (default OFF). Gates EVERYTHING the model could see or that feeds it
-  // about "bug memory": the cheater_bug_memory_search tool (not even registered when off), the
-  // Bug-memory system-prompt section, the Cheat-Layer recall appended to failure cards, and the
-  // experience-store WRITE. Off by default because the recalled analogies proved net-negative for a
-  // small local model (an out-of-repo "similar fix" is more distracting than helpful). Set true to
-  // bring the whole feature back for A/B testing; experienceStoreEnabled/cheatSheetEnabled then act
-  // as sub-toggles under it.
-  bugMemoryEnabled?: boolean;
   // Minimal main-session system prompt (default ON): identity + edit discipline + the one flow.
-  // The worked EXEMPLAR is dropped (set false to restore it) and the Bug-memory section only ever
-  // appears when bugMemoryEnabled is true. Fewer prompt tokens => faster prefill on a local model
-  // that recomputes the whole prompt each turn (LM Studio KV-cache reuse is unreliable for MoE/35B).
+  // The worked EXEMPLAR is dropped (set false to restore it). Fewer prompt tokens => faster prefill
+  // on a local model that recomputes the whole prompt each turn (LM Studio KV-cache reuse is
+  // unreliable for MoE/35B).
   minimalSystemPrompt?: boolean;
-  // Experience store: harness-written bug memory. Cards are saved only on verified
-  // fail->pass transitions and recalled in-band inside failure cards. Local-only JSONL.
-  // Only active when bugMemoryEnabled is true (the master switch above).
-  experienceStoreEnabled?: boolean;
-  // Cheat Layer: on failures, the harness classifies the failure, retrieves compact evidence
-  // (verified experience -> bug corpus -> local docs -> official docs when enabled), and
-  // injects at most 3 hypothesis cards into repair packets and failure notices. The model
-  // never calls a search tool; the verifier remains the source of truth.
-  cheatSheetEnabled?: boolean;
   // Sidecar model: a small 2B-4B "clerk" model for bounded fuzzy chores (currently failure
   // distillation for informed repairs). OFF by default; the deterministic fallback is the floor,
   // so Cheater behaves identically when this is unset. When enabled without an explicit
@@ -154,11 +181,6 @@ export interface CheaterConfig {
   // dispatch anytime - for a CPU-hosted sidecar or a real batching backend that won't contend.
   // "off": run sidecar jobs synchronously on demand (no background scheduling).
   sidecarParallelism?: "off" | "gap" | "concurrent";
-  // Bounded typecheck gate (R1): after a commitlet edit, run the project typechecker and
-  // hard-block ONLY new errors in the files this change touched (pre-existing repo errors warn;
-  // no typechecker / timeout never blocks). A block routes through the bounded repair path, so it
-  // is escapable, not a dead-end. Off by default until validated live. TypeScript-first.
-  typeCheckGateEnabled?: boolean;
   typeCheckGateBlocking?: boolean;
   typeCheckGateTimeoutMs?: number;
   rollbackRequired?: boolean;
@@ -166,6 +188,10 @@ export interface CheaterConfig {
   maxDiffLinesDefault?: number;
   maxModelCallsPerCommitlet?: number;
   repairAttemptsPerCommitlet?: number;
+  // #3 fix: run a SINGLE-commitlet task in-session (the main model does it directly) instead of
+  // spawning a cold fresh worker that lacks the exploration context and fails terminal/surgical
+  // tasks. Multi-commitlet plans still fan out to fresh workers. Default on.
+  singleCommitletInSession?: boolean;
   healthScoreThreshold?: number;
   hardRejectHealthThreshold?: number;
   allowDependencyEditsByDefault?: boolean;
@@ -185,9 +211,6 @@ export interface CheaterConfig {
   // Action budget for the time-aware phase controller (EXPLORE/IMPLEMENT/VALIDATE/RESERVE).
   // Unset = derived from the plan's per-commitlet tool budgets.
   runStateActionBudget?: number;
-  // Read-before-write hook: overwriting an existing file the run never read (and that the
-  // contract does not name as an artifact) is blocked. Default on.
-  readBeforeWriteEnabled?: boolean;
   // Threshold (chars) above which a full-file rewrite of an existing file draws a
   // verification-required warning. Default 6000.
   largeWriteWarnChars?: number;
@@ -201,12 +224,8 @@ export interface CheaterConfig {
   workerForkMode?: "none" | "last_n" | "all";
   workerForkModeOverrideReason?: string;
   workerForkTurns?: number;
-  // --- Main LLM Call Governor (control plane: call the big model less, only when it matters) ---
-  // The governor CLASSIFIES an intended call into a role, states the policy (main/sidecar/
-  // deterministic + whether it may escalate), and RECORDS main calls made vs avoided for the
-  // receipt. Off by default: the wiring still accounts, but the receipt section is gated on this,
-  // so behaviour is identical when off. See runtime/mainCallGovernor.ts.
-  mainCallGovernorEnabled?: boolean;
+  // --- Main LLM Call Governor: classify each intended call into a role, apply the policy
+  // (main/sidecar/deterministic), and record main calls made vs avoided for the receipt. ---
   // Roles the big model is allowed for (default: blueprint_planning, code_worker, repair_worker,
   // strategic_bug_reasoning). Clerical roles default to sidecar/deterministic.
   mainAllowedRoles?: string[];
@@ -231,11 +250,6 @@ export interface CheaterConfig {
   providerProbeEnabled?: boolean;
   // Also run the fixed-prefix reuse micro-benchmark (measured only; never claims KV-cache). Off by default.
   providerProbeBenchmark?: boolean;
-  // Lean worker prompt (Track 3 - prefill reduction): cap the growing/fixed capsule fields (rulePack,
-  // operatingRules, workspaceDigest, mutationSummary, priorWorkerReports, snippets) harder so each
-  // commitlet's prompt is smaller and the main model's per-file prefill is cheaper. Drops nothing
-  // load-bearing. Off by default (byte-identical worker prompts when off). See promptCapsule.setLeanCapsule.
-  leanWorkerPromptEnabled?: boolean;
   // MAIN-session prefill economy. The single biggest TTFT cost on a local model is the FIRST
   // prefill; the second is re-prefilling when the cached prompt PREFIX changes between turns (a
   // local engine like LM Studio/llama.cpp reuses the KV cache only for a byte-stable prefix).
@@ -254,14 +268,7 @@ export interface CheaterConfig {
   // Max sidecar jobs in flight at once (Track 2). Only >1 with a separate CPU endpoint that won't
   // contend with the GPU. Default 1 (a single local model can't usefully parallelize with itself).
   sidecarMaxConcurrency?: number;
-  // From-scratch boilerplate acceleration (Phase A): when the build's stack is RECOGNIZED (currently
-  // Vite+React+TS), the harness stamps that stack's INVARIANT files (build config, standard entry,
-  // Tailwind index.css, a localStorage hook) to disk so the local model never decodes ~260s of pure
-  // boilerplate. Purely additive: an unrecognized stack stamps nothing and the model-authored path
-  // (blueprint/scaffold.ts) is byte-identical. Off by default until the headless A/B confirms a net
-  // win with no new build-fix cycles; then flip on. See blueprint/stackTemplates.ts.
-  scaffoldTemplatesEnabled?: boolean;
-  // Which stack templates are eligible (default: all registered, currently ["vite-react-ts"]).
+  // Which stack profiles are eligible (default: all registered, currently vite-react-ts + vite-react-js).
   scaffoldTemplateStacks?: string[];
 }
 

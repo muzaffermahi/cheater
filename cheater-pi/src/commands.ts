@@ -1,6 +1,5 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
 import { commandHelp } from "./ui.js";
 import { renderSkills } from "./skills.js";
 import { saveMemory } from "./tools.js";
@@ -36,7 +35,7 @@ const PUBLIC_COMMAND_NAMES = [
   "gym-clean",
   "test",
   "map",
-  "bug-memory",
+  "pi",
   "remember",
   "skills",
   "traces",
@@ -96,16 +95,14 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
     }
   });
 
-  pi.registerCommand("bug-memory", {
-    description: "Search compacted solved-bug memories",
-    handler: async (args: string, ctx: CommandContext) => {
-      const query = await askOrUse(args, ctx, "Cheater /bug-memory", "Error text, failing test, API name, or bug description");
-      if (!query) {
-        ctx.ui.notify("No bug-memory query provided.", "warning");
-        return;
-      }
-      const result = await searchBugMemories({ cwd: ctx.cwd, query, topK: 5 });
-      notifyBlock(ctx, formatBugMemoryHits(result));
+  pi.registerCommand("pi", {
+    description: "Toggle pi's raw tool output (Cheater collapses it by default for a clean view)",
+    handler: async (_args: string, ctx: CommandContext) => {
+      try {
+        const expanded = !ctx.ui.getToolsExpanded?.();
+        ctx.ui.setToolsExpanded?.(expanded);
+        ctx.ui.notify?.(expanded ? "Cheater: raw pi tool output SHOWN" : "Cheater: clean view - pi tool output collapsed", "info");
+      } catch { /* best-effort; the toggle is cosmetic */ }
     }
   });
 
@@ -170,7 +167,6 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
           `mode: ${ctx.mode}`,
           `project trusted: ${ctx.isProjectTrusted?.() ? "yes" : "no"}`,
           `Cheater tools loaded: ${tools.filter((name: string) => name.startsWith("cheater_")).join(", ")}`,
-          `Compacted bug memories: ${tools.includes("cheater_bug_memory_search") ? "enabled" : "missing"}`,
           `Public commands loaded: ${commands.filter((name: string) => PUBLIC_COMMAND_NAMES.includes(name)).join(", ")}`,
           `Debug commands loaded: ${commands.filter((name: string) => DEBUG_COMMAND_NAMES.includes(name)).join(", ") || "(none)"}`,
           uncategorized.length ? `Uncategorized commands loaded (add to PUBLIC_COMMAND_NAMES/DEBUG_COMMAND_NAMES in commands.ts): ${uncategorized.join(", ")}` : ""

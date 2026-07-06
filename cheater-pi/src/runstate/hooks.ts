@@ -85,11 +85,11 @@ export function preToolUse(event: PreToolInput, run: TaskRunState, config: Cheat
 
   // Read-before-write: overwriting an existing file the run never read (and that is not a
   // contract-expected artifact) is how full-file rewrites destroy code the model never saw.
-  if (config.readBeforeWriteEnabled !== false && event.toolName === "write" && event.path) {
+  if (event.toolName === "write" && event.path) {
     const abs = resolve(event.cwd, event.path);
     const isContractArtifact = run.contract.outputPaths.some((p) => event.path!.replace(/\\/g, "/").endsWith(p))
       || run.contract.files.some((p) => event.path!.replace(/\\/g, "/").endsWith(p));
-    if (existsSync(abs) && !run.wasRead(event.path) && !isContractArtifact) {
+    if (existsSync(abs) && !run.wasRead(event.path) && !run.wasMutated(event.path) && !isContractArtifact) {
       run.bumpTelemetry("blockedToolCalls");
       decisions.push({
         action: "block",

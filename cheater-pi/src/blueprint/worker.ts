@@ -54,12 +54,16 @@ export function workerBackendState(): "unknown" | "available" | "unavailable" {
   return backendLatch;
 }
 
-/** HTTP idle timeout (ms) for Cheater-created sessions. Default 30 min so a slow local model's
- *  prefill is not killed by Pi's 5-min default; 0 = no timeout. Shared with the main-session
- *  launcher setting so worker/sidecar prefill gets the same generous window. */
+/** HTTP idle timeout (ms) for Cheater-created sessions - the max time with NO response activity
+ *  before Pi aborts the call. Default 10 min: comfortably above a slow local model's cold prefill
+ *  (measured ~230-360s for a 35B, so ~3x margin - no prefill-abort regression) while bounding a real
+ *  HANG (model/LM-Studio wedged mid-run, seen freezing ~6min) to ~10 min instead of the old 30. A
+ *  hung call then aborts and the commitlet/turn degrades instead of blocking silently. 0 = no timeout;
+ *  raise httpIdleTimeoutMs in config if your model's cold prefill genuinely exceeds this. Shared with
+ *  the main-session launcher setting. */
 export function piIdleTimeoutMs(config: CheaterConfig = {}): number {
   const value = config.httpIdleTimeoutMs;
-  return typeof value === "number" && value >= 0 ? Math.trunc(value) : 1_800_000;
+  return typeof value === "number" && value >= 0 ? Math.trunc(value) : 600_000;
 }
 
 /** The human-readable reason for the current backend state - surfaced loudly on degradation (R5). */

@@ -34,8 +34,9 @@ function installFakeTsc(cwd: string, stdout: string): void {
 
 // --- pure policy ----------------------------------------------------------------------------
 
-test("the typecheck gate is off by default", () => {
-  assert.equal(runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["src/a.ts"], config: DEFAULT_CONFIG }).ran, false);
+test("the typecheck gate runs by default", () => {
+  const on = runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["src/a.ts"], config: DEFAULT_CONFIG, run: fakeRun("", 0) });
+  assert.equal(on.ran, true, "runs by default");
 });
 
 test("attributeErrors splits changed-file errors from pre-existing debt", () => {
@@ -53,7 +54,7 @@ test("detectTypecheckCommand returns null without a tsconfig", () => {
 test("gate hard-blocks a changed-file type error", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-tc-block-"));
   installFakeTsc(cwd, TS_ERR);
-  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true }, run: fakeRun(TS_ERR) });
+  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG }, run: fakeRun(TS_ERR) });
   assert.equal(result.ran, true);
   assert.equal(result.ok, false);
   assert.equal(result.blocking, true);
@@ -63,7 +64,7 @@ test("gate hard-blocks a changed-file type error", () => {
 test("gate WARNS (never blocks) on pre-existing errors not caused by this change", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-tc-warn-"));
   installFakeTsc(cwd, OTHER_ERR);
-  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true }, run: fakeRun(OTHER_ERR) });
+  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG }, run: fakeRun(OTHER_ERR) });
   assert.equal(result.ran, true);
   assert.equal(result.ok, false);
   assert.equal(result.blocking, false, "pre-existing debt must not dead-end the change");
@@ -73,7 +74,7 @@ test("gate WARNS (never blocks) on pre-existing errors not caused by this change
 test("gate passes on a clean typecheck", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-tc-clean-"));
   installFakeTsc(cwd, "");
-  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true }, run: fakeRun("", 0) });
+  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG }, run: fakeRun("", 0) });
   assert.equal(result.ok, true);
   assert.equal(result.blocking, false);
 });
@@ -81,7 +82,7 @@ test("gate passes on a clean typecheck", () => {
 test("a timeout is recorded but never blocks (no dead-end on a slow typecheck)", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-tc-timeout-"));
   installFakeTsc(cwd, TS_ERR);
-  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true }, run: fakeRun("", 1, true) });
+  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG }, run: fakeRun("", 1, true) });
   assert.equal(result.ran, true);
   assert.equal(result.blocking, false);
   assert.match(result.summary, /timed out/);
@@ -90,13 +91,13 @@ test("a timeout is recorded but never blocks (no dead-end on a slow typecheck)",
 test("blocking policy can be disabled (observe-only mode)", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-tc-observe-"));
   installFakeTsc(cwd, TS_ERR);
-  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true, typeCheckGateBlocking: false }, run: fakeRun(TS_ERR) });
+  const result = runTypeCheckGate({ cwd, changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateBlocking: false }, run: fakeRun(TS_ERR) });
   assert.equal(result.ran, true);
   assert.equal(result.blocking, false);
 });
 
 test("non-TypeScript changes skip the gate honestly", () => {
-  const result = runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["README.md", "data.json"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: true } });
+  const result = runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["README.md", "data.json"], config: { ...DEFAULT_CONFIG } });
   assert.equal(result.ran, false);
 });
 
@@ -123,7 +124,7 @@ test("gradeCommitlet fails a commitlet whose tests pass but whose changed file h
   defaultCommitletState.clear();
   liveSessionState.reset("change the value in a.ts");
 
-  const grade = await gradeCommitlet(root, { ...base, rollbackPoint, status: "running" as const }, { ...DEFAULT_CONFIG, typeCheckGateEnabled: true });
+  const grade = await gradeCommitlet(root, { ...base, rollbackPoint, status: "running" as const }, { ...DEFAULT_CONFIG });
 
   // Tests passed, but the type error in the changed file blocked the pass and queued a repair.
   assert.equal(grade.advance, true, "a blocked commitlet advances by queuing a bounded repair (escapable, not a dead-end)");

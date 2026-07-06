@@ -53,6 +53,30 @@ test("loop governor emits one forced recovery action and stops after max breaks"
   assert.match(terminalEvent?.recovery.instruction ?? "", /Stop this packet/);
 });
 
+test("#8 hardTaskLoopBudget extends the terminal cap for genuine iteration, not for spinning", () => {
+  const cfg = { ...DEFAULT_BLUEPRINT_CONFIG, maxLoopBreaksPerPacket: 1, sameFileReadLimit: 1, hardTaskLoopBudget: 2 };
+  // Genuine iteration: a repeated read triggers the break, but the packet ALSO shows 2 distinct edited
+  // files + 2 distinct failing commands -> real progress -> the cap is extended (break 1 not terminal).
+  const iterating = [
+    { kind: "read_file" as const, value: "a.ts" },
+    { kind: "read_file" as const, value: "a.ts" },
+    { kind: "patch" as const, value: "p1", changedFiles: ["f1.py"] },
+    { kind: "patch" as const, value: "p2", changedFiles: ["f2.py"] },
+    { kind: "failed_command" as const, value: "gcc build.c" },
+    { kind: "failed_command" as const, value: "python run.py" }
+  ];
+  assert.equal(new LoopGovernor(cfg, "p8a").observeTools(iterating)?.terminal, false, "progress earns budget");
+  assert.equal(new LoopGovernor({ ...cfg, hardTaskLoopBudget: 0 }, "p8b").observeTools(iterating)?.terminal, true, "budget off -> terminal at base cap");
+  // Spinning: one file, one command -> no distinct progress -> no budget -> terminal at the base cap.
+  const spinning = [
+    { kind: "read_file" as const, value: "a.ts" },
+    { kind: "read_file" as const, value: "a.ts" },
+    { kind: "patch" as const, value: "p1", changedFiles: ["f1.py"] },
+    { kind: "failed_command" as const, value: "gcc build.c" }
+  ];
+  assert.equal(new LoopGovernor(cfg, "p8c").observeTools(spinning)?.terminal, true, "spinning is not granted budget");
+});
+
 test("stop sentinels strip and report missing sentinel safely", () => {
   assert.deepEqual(stripSentinel("{\"ok\":true}@@END_JSON@@", "@@END_JSON@@"), { ok: true, body: "{\"ok\":true}", repaired: false });
   assert.equal(stripSentinel("partial", "@@END_JSON@@").ok, false);

@@ -106,24 +106,3 @@ test("/gym-run-suite with mocked runAgent writes a report", async () => {
   rmSync(cwd, { recursive: true, force: true });
 });
 
-test("/gym-run-suite promotes gym successes to bug memory when auto-learn is enabled", async () => {
-  const cwd = mkdtempSync(join(tmpdir(), "gym-cmd-autolearn-"));
-  const { pi, commands } = makePi();
-  registerGymCommands(pi, {
-    config: { ...defaultGymConfig(), gymDefaultLimit: 1, gymAutoLearn: true, gymKeepWorkspaces: false } as any,
-    getCwd: (ctx) => ctx.cwd,
-    runAgent: async () => ({
-      focusedTestsPassed: true, fullTestsPassed: true, reproduced: true, noOpDetected: false,
-      memoryUsed: true, evidenceUsed: true, missionStepsCompleted: 4, commandsRun: ["pytest -q"]
-    })
-  });
-  const ctx = makeCtx(cwd);
-  await commands.get("gym-run-suite")!.handler("--limit 1", ctx);
-  const memoryPath = join(cwd, ".cheater", "bug_memories.jsonl");
-  assert.ok(existsSync(memoryPath));
-  const text = readFileSync(memoryPath, "utf8");
-  assert.match(text, /"source_gym_task_id":/);
-  assert.match(text, /"workflow_steps":/);
-  assert.match(ctx._notifications[0].text, /learned bug-memory cards: 1/);
-  rmSync(cwd, { recursive: true, force: true });
-});

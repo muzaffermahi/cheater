@@ -20,7 +20,13 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   blueprintOfficialDocsSearchEnabled: false,
   // Durable run state (contract, digest, ledgers, capsules, phase control, post-success
   // guard) under .cheater/runs/<taskId>/. Deterministic and local-only; on by default.
-  runStateEnabled: true
+  runStateEnabled: true,
+  // Adaptive best-of-N: k scales with per-commitlet hardness and the in-session resampler early-exits
+  // on the first verified sample, so an easy edit runs exactly k=1 (no overhead) while a hard one gets
+  // up to adaptiveMaxSamples independent tries. Single-file commitlets, in-session lane.
+  adaptiveComputeEnabled: true,
+  inSessionResampleEnabled: true,
+  adaptiveMaxSamples: 3
 };
 
 export function packageRoot(): string {

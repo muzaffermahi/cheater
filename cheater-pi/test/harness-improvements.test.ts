@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { compressCommandResult, renderFailureCard } from "../src/reliability/failureCompressor.js";
 import { CompletionLedger, ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
+import { liveSessionState } from "../src/reliability/sessionState.js";
 import { buildAutopilotInstruction, routeAutopilot } from "../src/autopilot/router.js";
 import { relevantSymbolSlice } from "../src/reliability/symbolSlice.js";
 import { createRollbackPoint, revertRollbackPoint } from "../src/commitlet/rollback.js";
@@ -54,12 +55,101 @@ test("finish gate recovers when an equivalent command later succeeds", () => {
   assert.equal(ledger.get().unresolvedFailures.length, 0, "equivalent command success must clear the latch");
 });
 
+// Re-entry ledger preservation: the fix for the finish-gate false "no work was done" loop. A weak
+// model blocked at the finish gate loops back and re-calls the planning tools with the SAME goal;
+// reset() used to mint a fresh empty ledger and erase the record of work already done, so the gate
+// reported "no work" forever. reset() must now PRESERVE the ledger on same-goal re-entry.
+test("reset preserves the completion ledger on a same-goal re-entry that already has work", () => {
+  liveSessionState.reset("Create stats.py with a median function");
+  const first = liveSessionState.getLedger();
+  assert.ok(first, "reset(goal) must create a ledger");
+  first!.recordFileChange("stats.py");
+  first!.recordCommand("python -m pytest -q");
+  assert.ok(first!.get().changedFiles.length > 0 && first!.get().commandsRun.length > 0);
+
+  // Model loops back and re-plans the SAME goal (rephrased/punctuated): work must survive.
+  liveSessionState.reset("create stats py with a median function!!");
+  const after = liveSessionState.getLedger();
+  assert.equal(after, first, "same-goal re-entry must keep the SAME ledger instance");
+  assert.deepEqual(after!.get().changedFiles, ["stats.py"], "the recorded file change must be preserved");
+  assert.equal(after!.get().commandsRun.length, 1, "the recorded command must be preserved");
+});
+
+test("reset mints a fresh ledger for a genuinely new goal", () => {
+  liveSessionState.reset("Create stats.py with a median function");
+  liveSessionState.getLedger()!.recordFileChange("stats.py");
+  liveSessionState.reset("Add a slugify function to slug.py");
+  const fresh = liveSessionState.getLedger();
+  assert.equal(fresh!.get().changedFiles.length, 0, "a new goal must not inherit the old goal's work");
+  assert.match(fresh!.get().userGoal, /slugify/);
+});
+
+test("isReentryGoal is false without work and false once the ledger is finalized", () => {
+  liveSessionState.reset("Fix the parser bug");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), false, "no work yet -> not a preserving re-entry");
+  liveSessionState.getLedger()!.recordFileChange("parser.ts");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), true, "same goal + work -> preserve");
+  assert.equal(liveSessionState.isReentryGoal("Write a totally different feature"), false, "different goal -> fresh");
+  liveSessionState.getLedger()!.finalize(true, "done");
+  assert.equal(liveSessionState.isReentryGoal("Fix the parser bug"), false, "a finalized task is not an open re-entry");
+});
+
+// Over-write thrash nudge: rewriting one file many times (the csvparse failure mode - 15 rewrites of
+// an already-correct parser, never finishing) gets an advisory nudge to verify-and-finish. Fires even
+// when the model works "raw" without cheater tools, because observeToolResult sees every write.
+test("over-write nudge fires (advisory) after too many writes to the SAME file", () => {
+  liveSessionState.reset("build a csv parser");
+  let nudge = null;
+  for (let i = 1; i <= 8; i++) {
+    const events = liveSessionState.observeToolResult({ toolCallId: `w${i}`, toolName: "write", ok: true, path: "csvparse.py" }, {});
+    const hit = events.find((e) => /written csvparse\.py 8 times/.test(e.message ?? ""));
+    if (hit) nudge = hit;
+  }
+  assert.ok(nudge, "a nudge must fire at the write threshold");
+  assert.equal(nudge!.terminal, false, "the over-write nudge is ADVISORY, never a hard block");
+});
+
+test("over-write nudge does NOT fire for a few writes spread across different files", () => {
+  liveSessionState.reset("build a small app");
+  let fired = false;
+  for (let i = 1; i <= 5; i++) {
+    const events = liveSessionState.observeToolResult({ toolCallId: `f${i}`, toolName: "write", ok: true, path: `file${i}.py` }, {});
+    if (events.some((e) => /If it already works, STOP editing/.test(e.message ?? ""))) fired = true;
+  }
+  assert.equal(fired, false, "distinct files, each written once, must never trigger the over-write nudge");
+});
+
 test("a passing test stage clears stray exploratory failures so the gate is satisfiable", () => {
   const ledger = new CompletionLedger("fix the thing");
   ledger.recordFileChange("src/a.ts");
   ledger.recordCommandResult("ls nonexistent", false, "unknown"); // stage-less exploratory failure
   ledger.recordVerificationStage({ stage: "focused_tests", status: "ok", summary: "ok", failureClass: "unknown", artifacts: [], signals: {} });
   assert.equal(ledgerAllowsFinish(ledger).allowed, true, "a real passing test stage must clear stray exploratory failures");
+});
+
+test("a failed read-only inspection probe never latches a finish-blocking failure", () => {
+  // The model probes state BEFORE it creates the artifact: `openssl x509 -in server.crt` and
+  // `git show <hash>` fail because the file/commit is not there yet. Those are precondition probes,
+  // not task failures, so they must not wedge the finish gate on a phantom the model then wastes
+  // turns fighting (this is what failed the openssl-cert task and forced a waiver finish).
+  const ledger = new CompletionLedger("create a self-signed cert");
+  ledger.recordFileChange("app/ssl/server.crt");
+  ledger.recordCommandResult("openssl x509 -in /app/ssl/server.crt -noout -subject", false, "dependency");
+  ledger.recordCommandResult("git show 650dba4 --stat", false, "unknown");
+  assert.equal(ledger.get().unresolvedFailures.length, 0, "read-only probes must not latch a finish blocker");
+  // With the phantom probe-failures gone, a passing verification stage now satisfies the gate
+  // (before the fix, the latched probe failure blocked finish and forced a waiver).
+  ledger.recordVerificationStage({ stage: "full_tests", status: "ok", summary: "ok", failureClass: "unknown", artifacts: [], signals: {} });
+  assert.equal(ledgerAllowsFinish(ledger).allowed, true);
+});
+
+test("a failed WRITING command (openssl genrsa / git commit) still latches - not a probe", () => {
+  // The probe relaxation must not swallow a real mutation failure: generating a key or committing
+  // are writes, so a genuine failure must still block the gate.
+  const ledger = new CompletionLedger("create a self-signed cert");
+  ledger.recordFileChange("app/ssl/server.key");
+  ledger.recordCommandResult("openssl genrsa -out /app/ssl/server.key 2048", false, "command_invocation");
+  assert.equal(ledger.get().unresolvedFailures.length, 1, "a failed mutation must still latch");
 });
 
 test("symbol slice extracts the target function, not the import block", () => {

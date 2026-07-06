@@ -1,7 +1,6 @@
 import { officialDomainsFor } from "./docsScout.js";
 import type {
   BlueprintArchitectureDecision,
-  BlueprintBugWorkflow,
   BlueprintEvidenceItem,
   BlueprintIntelligencePack,
   BlueprintMemoryHit,
@@ -30,7 +29,6 @@ export function buildBlueprintIntelligencePack(params: {
   const evidence = buildEvidence(params);
   const architectureDecisions = buildArchitectureDecisions(params);
   const implementationInvariants = buildImplementationInvariants(params);
-  const bugWorkflows = buildBugWorkflows(params.memoryHits, params.packets, params.taskType);
   const webSearch = buildWebSearchPlan(params);
   const packetFacts = params.packetFacts ?? [];
   const webEvidence = params.webEvidence ?? [];
@@ -60,7 +58,6 @@ export function buildBlueprintIntelligencePack(params: {
     evidence,
     architectureDecisions,
     implementationInvariants,
-    bugWorkflows,
     packetFacts,
     webEvidence,
     webSearchTriggers,
@@ -70,7 +67,6 @@ export function buildBlueprintIntelligencePack(params: {
       evidence,
       architectureDecisions,
       implementationInvariants,
-      bugWorkflows,
       packetFacts,
       webEvidence,
       webSearch
@@ -182,81 +178,10 @@ function buildImplementationInvariants(params: {
   if (params.docsFacts.some((fact) => fact.sourceDomain !== "local")) {
     invariants.push("Remote docs facts must come only from official allowlisted domains or configured SearXNG official-domain filters.");
   }
-  if (params.memoryHits.some((hit) => hit.source === "bug")) {
-    invariants.push("Bug-memory cards should be translated into diagnostic workflows before changing code.");
-  }
   if (params.packets.some((packet) => packet.risk === "high")) {
     invariants.push("Approval-sensitive packets cannot dispatch until approval is recorded.");
   }
   return invariants;
-}
-
-function buildBugWorkflows(memoryHits: BlueprintMemoryHit[], packets: WorkPacket[], taskType?: string): BlueprintBugWorkflow[] {
-  const bugHits = memoryHits.filter((hit) => hit.source === "bug");
-  if (!packets.length) return [];
-  return bugHits
-    .slice(0, 5)
-    .map((hit, index) => {
-      const summary = hit.summary.replace(/\s+/g, " ").trim();
-      const appliesToPackets = packetsForBugHit(hit, packets, taskType);
-      const appliesTo = appliesToPackets.map((packet) => packet.id);
-      const baseReason = hit.matchReason?.trim() || "matched by bug-memory retrieval";
-      const applicabilityReason = appliesTo.length
-        ? `applies to ${appliesTo.slice(0, 4).join(", ")}`
-        : "no packet-level overlap; keep as diagnostic only";
-      const verificationSignal = extractAfter(summary, /test signal:?\s*/i) ?? (hit.testSignal?.slice(0, 120)) ?? "Run the focused command tied to the failure before broad checks.";
-      const diagnosticSteps = hit.workflowSteps && hit.workflowSteps.length
-        ? hit.workflowSteps.slice(0, 5)
-        : [
-            "Match the current failure signal to local stack traces, tests, or command output.",
-            "Inspect the smallest local file region that can explain the signal.",
-            "Reject the analogy if local source contradicts it."
-          ];
-      const doNotDo = hit.doNotDo && hit.doNotDo.length
-        ? hit.doNotDo.slice(0, 4)
-        : extractList(summary, /do not do:?\s*([^;.\n]+(?:;[^;.\n]+)*)/i)
-          .concat(extractList(summary, /failed approaches:?\s*([^;.\n]+(?:;[^;.\n]+)*)/i)).slice(0, 4);
-      const workflowSteps = hit.workflowSteps && hit.workflowSteps.length
-        ? hit.workflowSteps.slice(0, 5)
-        : extractList(summary, /workflow steps:?\s*(.+)/i).flatMap((s) => s.split(/\s*->\s*/)).filter(Boolean).slice(0, 5);
-      const risk = appliesTo.length ? (hit.confidence === "high" ? "medium" : "low") : "low";
-      return {
-        id: `workflow-${index + 1}`,
-        trigger: summary.slice(0, 180),
-        diagnosticSteps,
-        fixPattern: extractAfter(summary, /fix pattern:?\s*/i) ?? extractAfter(summary, /fix:?\s*/i) ?? "Apply the smallest local fix that satisfies the reproduced failure.",
-        verificationSignal,
-        appliesTo,
-        matchReason: `${baseReason}; ${applicabilityReason}`,
-        workflowSteps: workflowSteps.length ? workflowSteps : undefined,
-        doNotDo: doNotDo.length ? doNotDo : undefined,
-        applicabilityReason,
-        risk
-      };
-    });
-}
-
-function extractList(text: string, pattern: RegExp): string[] {
-  const match = pattern.exec(text);
-  if (!match) return [];
-  return match[1].split(/[;,]/).map((item) => item.trim()).filter((item) => item.length > 0).slice(0, 5);
-}
-
-function packetsForBugHit(hit: BlueprintMemoryHit, packets: WorkPacket[], taskType?: string): WorkPacket[] {
-  const keyFiles = (hit.keyFiles ?? []).map((file) => normalizeFileId(file).toLowerCase());
-  const signalTerms = (hit.testSignal ?? "").toLowerCase().split(/\W+/).filter((t) => t.length > 3);
-  const taskDriven = Boolean(taskType && /bug_fix|test_failure|import_error|type_error/i.test(taskType));
-  const hasLocalizing = keyFiles.length > 0 || signalTerms.length > 0;
-  return packets.filter((packet) => {
-    if (packet.type !== "implement" && packet.type !== "repair" && packet.type !== "test") return false;
-    const packetFiles = [...packet.filesToTouch, ...packet.filesToInspect]
-      .map((file) => normalizeFileId(file.path).toLowerCase())
-      .filter((file) => file && !file.startsWith("(") && !file.endsWith("/"));
-    const fileOverlap = keyFiles.some((key) => packetFiles.some((file) => file.includes(key) || key.includes(file) || sameStem(file, key)));
-    const signalOverlap = signalTerms.length > 0 && packet.acceptanceCriteria.some((crit) => signalTerms.some((t) => crit.toLowerCase().includes(t)));
-    if (hasLocalizing) return fileOverlap || signalOverlap;
-    return taskDriven && packet.type === "implement";
-  });
 }
 
 function normalizeFileId(file: string): string {
@@ -314,14 +239,12 @@ function renderWorkerBrief(params: {
   evidence: BlueprintEvidenceItem[];
   architectureDecisions: BlueprintArchitectureDecision[];
   implementationInvariants: string[];
-  bugWorkflows: BlueprintBugWorkflow[];
   packetFacts: BlueprintPacketFact[];
   webEvidence: WebEvidenceCard[];
   webSearch: BlueprintIntelligencePack["webSearch"];
 }): string {
   const evidence = params.evidence.slice(0, 8).map((item) => `- [${item.kind}/${item.confidence}] ${item.claim} (${item.source})`);
   const decisions = params.architectureDecisions.map((item) => `- ${item.decision}`);
-  const workflows = params.bugWorkflows.slice(0, 3).map((item) => `- ${item.trigger} -> ${item.fixPattern} (${item.matchReason})`);
   const packetFacts = params.packetFacts.slice(0, 8).map((item) => `- ${item.packetId}:${item.file}: ${item.facts.slice(0, 3).join("; ")}`);
   const web = params.webEvidence.slice(0, 6).map((card) => `- [${card.sourceTier}/${card.confidence}] ${card.fact.slice(0, 180)} (${card.sourceDomain})`);
   return [
@@ -332,8 +255,6 @@ function renderWorkerBrief(params: {
     decisions.join("\n"),
     "Implementation invariants:",
     params.implementationInvariants.map((item) => `- ${item}`).join("\n"),
-    "Bug-memory workflows:",
-    workflows.join("\n") || "- none",
     "Packet-local repo facts:",
     packetFacts.join("\n") || "- none",
     "Web evidence (pack-wide):",
@@ -348,7 +269,6 @@ export function packetScopedWorkerBrief(plan: { intelligence?: BlueprintIntellig
   const packetFacts = pack.packetFacts.filter((item) => item.packetId === packet.id);
   const evidence = pack.evidence.filter((item) => item.useInPackets.includes(packet.id)).slice(0, pack.contextBudget.maxFactsPerPacket);
   const decisions = pack.architectureDecisions.filter((item) => item.appliesTo.includes(packet.id));
-  const relevantWorkflows = pack.bugWorkflows.filter((item) => item.appliesTo.includes(packet.id)).slice(0, Math.max(1, Math.min(2, pack.contextBudget.maxFactsPerPacket)));
   const packetFiles = new Set([...packet.filesToTouch, ...packet.filesToInspect].map((f) => f.path));
   const packetSymbols = new Set<string>();
   for (const fact of packetFacts) for (const f of fact.facts) for (const m of f.matchAll(/["']([A-Za-z_]\w{2,})["']/g)) packetSymbols.add(m[1]);
@@ -382,21 +302,6 @@ export function packetScopedWorkerBrief(plan: { intelligence?: BlueprintIntellig
     `- model=${pack.contextBudget.modelName} class=${pack.contextBudget.modelClass} workerTokens=${pack.contextBudget.workerTokens} maxOutput=${pack.contextBudget.maxOutputTokens} maxFacts=${pack.contextBudget.maxFactsPerPacket}`,
     ...pack.contextBudget.compressionRules.slice(-2).map((item) => `- ${item}`)
   );
-  lines.push(
-    relevantWorkflows.length
-      ? `Bug-memory workflows (${relevantWorkflows.length}):`
-      : "Bug-memory workflows: none"
-  );
-  if (relevantWorkflows.length) {
-    for (const item of relevantWorkflows) {
-      lines.push(`- ${item.trigger}`);
-      if (item.fixPattern) lines.push(`  try repair pattern: ${item.fixPattern}`);
-      if (item.doNotDo?.length) lines.push(`  do not make this bad fix: ${item.doNotDo.slice(0, 3).join("; ")}`);
-      if (item.verificationSignal) lines.push(`  verify with: ${item.verificationSignal}`);
-      if (item.matchReason) lines.push(`  why matched: ${item.matchReason}`);
-      if (item.applicabilityReason) lines.push(`  applicability: ${item.applicabilityReason}`);
-    }
-  }
   lines.push(relevantWebEvidence.length ? `Web evidence (${relevantWebEvidence.length}):` : "Web evidence: none");
   for (const card of relevantWebEvidence) {
     lines.push(`- [${card.sourceTier}/${card.confidence}] ${card.fact.slice(0, 200)} (${card.sourceDomain})`);

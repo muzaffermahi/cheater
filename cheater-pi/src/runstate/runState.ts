@@ -125,7 +125,7 @@ export class TaskRunState {
 
   /** One budget-consuming action happened (tool call / command). */
   noteAction(kind: PhaseActionKind, detail?: string): PhaseAssessment {
-    this.phase.noteAction();
+    this.phase.noteAction(kind);
     return this.phase.assessAction(kind, detail);
   }
 
@@ -157,6 +157,13 @@ export class TaskRunState {
       if (seen.endsWith(`/${norm}`) || norm.endsWith(`/${seen}`)) return true;
     }
     return false;
+  }
+
+  /** True if the run itself created/modified this path (via any tool OR a shell command recorded in
+   *  the mutation ledger). Read-before-write only guards PRE-EXISTING unseen code; a file the run
+   *  just made is fair game to overwrite. */
+  wasMutated(path: string): boolean {
+    return this.mutations.hasTouched(path);
   }
 
   /** Files whose content a capsule carried count as read for its worker. */

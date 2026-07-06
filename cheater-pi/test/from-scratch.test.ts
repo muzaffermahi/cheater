@@ -18,7 +18,7 @@ import { DEFAULT_CONFIG } from "../src/config.js";
 import { routeAutopilot } from "../src/autopilot/router.js";
 import { runClosedLoopCommitlets } from "../src/commitlet/closedLoop.js";
 import { defaultBlueprintState } from "../src/blueprint/state.js";
-import { detectStackProfile, stampProfile, deriveAppName, VITE_REACT_TS } from "../src/blueprint/stackTemplates.js";
+import { detectStackProfile, stampProfile, deriveAppName, VITE_REACT_TS, VITE_REACT_JS } from "../src/blueprint/stackTemplates.js";
 import { beginTaskRun, endTaskRun } from "../src/runstate/runState.js";
 
 // --- B1: stack-agnostic from-scratch detection ---------------------------------------------------
@@ -238,6 +238,35 @@ test("scaffold phase advances when its expected file exists under a DIFFERENT di
   defaultCommitletState.clear();
 });
 
+test("gradeCommitlet records a REAL WORKER's file edit into the main ledger (the finish-gate loop fix)", async () => {
+  // Regression for the local-bake-off finding: a fresh isolated worker edits files in its OWN pi
+  // session, so those writes never reach THIS session's observeToolResult. gradeCommitlet used to
+  // record the verification stage but NOT the touched files, so the finish gate saw changedFiles:0
+  // and blocked with "no work was done" - forever, as the model looped back through the planning
+  // tools. Here we simulate the worker by editing the file on disk WITHOUT any observeToolResult
+  // call; after grading, the MAIN completion ledger must reflect the change.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-worker-ledger-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    return 0  # buggy\n", "utf8");
+  const decision = routeAutopilot({ cwd, message: "fix the median function in src/stats.py" });
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "fix the median function in src/stats.py", autopilotDecision: decision });
+  const commitlet = { ...plan.commitlets[0], status: "running" as const, allowedFiles: ["src/stats.py"], expectedFilesTouched: ["src/stats.py"] };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet); // snapshots the buggy version
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("fix the median function in src/stats.py");
+  assert.equal(liveSessionState.getLedger()!.get().changedFiles.length, 0, "ledger starts with no work");
+
+  // The "worker" edits the file in its own session - no observeToolResult here, by design.
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    s = sorted(xs)\n    n = len(s)\n    return s[n // 2]\n", "utf8");
+  await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG);
+
+  const changed = liveSessionState.getLedger()!.get().changedFiles;
+  assert.ok(changed.some((f) => /stats\.py/.test(f)), `worker edit must be in the main ledger, got: ${JSON.stringify(changed)}`);
+  // And that recorded work now makes a same-goal re-entry PRESERVE the ledger (the two fixes combine).
+  assert.equal(liveSessionState.isReentryGoal("fix the median function in src/stats.py"), true, "recorded work makes a restart preserve, not wipe");
+  defaultCommitletState.clear();
+});
+
 test("scaffold phase STILL blocks when an expected file is genuinely absent by name (no false advance)", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-scaffold-missing-"));
   mkdirSync(join(cwd, "src"), { recursive: true });
@@ -293,18 +322,36 @@ test("cheater_replace does literal replace-all without rewriting the file, and r
 
 // --- Phase A: stack-template boilerplate acceleration ---------------------------------------------
 
-test("detectStackProfile recognizes Vite+React+TS from goal AND file list, else null", () => {
-  const files = ["package.json", "vite.config.ts", "src/App.tsx", "src/main.tsx"];
-  assert.equal(detectStackProfile("Create a Vite + React + TypeScript dashboard app", files)?.id, "vite-react-ts");
-  // goal signal missing (no stack words) -> null even though the files look right
-  assert.equal(detectStackProfile("build me a nice dashboard", files), null, "goal must name the stack");
-  // file signal missing (no vite.config / no .tsx) -> null even though the goal names the stack
-  assert.equal(detectStackProfile("Vite React TypeScript app", ["package.json", "src/index.js"]), null, "the model's file list must confirm the stack");
-  // an unrelated stack is not recognized -> the model-authored path runs unchanged
-  assert.equal(detectStackProfile("Create a Svelte + TypeScript app", ["package.json", "svelte.config.js", "src/App.svelte"]), null);
-  // allowedStacks (config) can gate eligibility
-  assert.equal(detectStackProfile("Vite React TypeScript app", files, ["some-other-stack"]), null, "allowedStacks gates eligibility");
-  assert.equal(detectStackProfile("Vite React TypeScript app", files, ["vite-react-ts"])?.id, "vite-react-ts");
+test("detectStackProfile picks the stack from the model's OWN file plan (TS vs JS), else null", () => {
+  const tsFiles = ["package.json", "vite.config.ts", "src/App.tsx", "src/main.tsx"];
+  const jsFiles = ["package.json", "vite.config.js", "src/App.jsx", "src/main.jsx"];
+  // .tsx in the plan -> TS profile; .jsx (no .tsx) -> JS profile. No goal regex involved.
+  assert.equal(detectStackProfile(tsFiles)?.id, "vite-react-ts");
+  assert.equal(detectStackProfile(jsFiles)?.id, "vite-react-js", "the common 'react + vite' JS plan now matches (the A/B gap)");
+  // TS wins when both extensions appear (a .tsx present means TypeScript)
+  assert.equal(detectStackProfile(["package.json", "vite.config.ts", "src/App.tsx", "src/legacy.jsx"])?.id, "vite-react-ts");
+  // no Vite manifest signature -> null (model-authored path unchanged)
+  assert.equal(detectStackProfile(["package.json", "src/index.js"]), null, "no vite.config -> no match");
+  // an unrelated stack is not recognized
+  assert.equal(detectStackProfile(["requirements.txt", "app.py"]), null, "a Python plan matches no React profile");
+  // allowedStacks (config) gates the menu
+  assert.equal(detectStackProfile(jsFiles, ["vite-react-ts"]), null, "JS plan excluded when only TS is allowed");
+  assert.equal(detectStackProfile(jsFiles, ["vite-react-js"])?.id, "vite-react-js");
+});
+
+test("stampProfile (JS) stamps vite.config.js + main.jsx, no tsconfig, vite-only build", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-stamp-js-"));
+  const planned = ["package.json", "vite.config.js", "src/App.jsx", "src/main.jsx", "index.html", "src/hooks/useLocalStorage.js"];
+  const stamped = stampProfile(cwd, VITE_REACT_JS, { appName: "todo", usesTailwind: false, entryComponent: "./App" }, planned);
+  const paths = stamped.map((s) => s.path);
+  assert.ok(paths.includes("vite.config.js") && paths.includes("src/main.jsx"), "JS config + jsx entry stamped");
+  assert.ok(!paths.some((p) => p.includes("tsconfig")), "no tsconfig in a JS project");
+  assert.ok(!paths.includes("src/App.jsx"), "App is the model's real logic - never stamped");
+  assert.match(readFileSync(join(cwd, "src", "main.jsx"), "utf8"), /from "\.\/App"/, "entry mounts ./App");
+  const pkg = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8"));
+  assert.equal(pkg.scripts.build, "vite build", "JS build is vite-only (no tsc)");
+  assert.ok(!pkg.devDependencies.typescript, "no typescript dep in a JS project");
+  assert.ok(pkg.devDependencies.vitest, "test deps still pre-included");
 });
 
 test("stampProfile stamps invariant files to disk, honors the model's plan, and skips gated ones", () => {

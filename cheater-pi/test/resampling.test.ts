@@ -67,6 +67,32 @@ test("first verified pass accepts immediately with no wasted samples", async () 
   assert.match(readFileSync(join(cwd, "target.txt"), "utf8"), /good v1/);
 });
 
+test("adaptive compute (P1a) raises the sample count for a HARD commitlet", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const plan = { ...makePlan(cwd, commitlet), risk: "high", autopilotDecision: { taskKind: "bug_fix" } } as unknown as CommitletPlan;
+  const runner = scriptedRunner(cwd, [() => writeFileSync(join(cwd, "target.txt"), "bad\n", "utf8")]); // never passes -> runs every sample
+  const outcome = await runResampledWorker(plan, commitlet, { adaptiveComputeEnabled: true, adaptiveMaxSamples: 8 }, runner);
+  assert.ok(outcome.samplesRequested >= 4, `hard commitlet should request several samples, got ${outcome.samplesRequested}`);
+  assert.equal(outcome.attemptsRun, outcome.samplesRequested, "all samples run when none pass");
+});
+
+test("adaptive compute (P1a) keeps k=1 for a trivial commitlet; OFF path ignores hardness", async () => {
+  const cwd = makeRepo();
+  const commitlet = makeCommitlet(cwd);
+  const trivialPlan = { ...makePlan(cwd, commitlet), risk: "low", autopilotDecision: { taskKind: "trivial" } } as unknown as CommitletPlan;
+  const runner = scriptedRunner(cwd, [() => writeFileSync(join(cwd, "target.txt"), "bad\n", "utf8")]);
+  const adaptive = await runResampledWorker(trivialPlan, commitlet, { adaptiveComputeEnabled: true }, runner);
+  assert.equal(adaptive.samplesRequested, 1, "trivial commitlet -> k=1 even with adaptive on");
+
+  const cwd2 = makeRepo();
+  const c2 = makeCommitlet(cwd2);
+  const hardOffPlan = { ...makePlan(cwd2, c2), risk: "high", autopilotDecision: { taskKind: "bug_fix" } } as unknown as CommitletPlan;
+  const runner2 = scriptedRunner(cwd2, [() => writeFileSync(join(cwd2, "target.txt"), "bad\n", "utf8")]);
+  const off = await runResampledWorker(hardOffPlan, c2, { commitletCandidateSamples: 2 }, runner2);
+  assert.equal(off.samplesRequested, 2, "adaptive OFF -> static commitletCandidateSamples, hardness ignored");
+});
+
 test("failed attempt is reverted and a later fresh sample wins", async () => {
   const cwd = makeRepo();
   const commitlet = makeCommitlet(cwd);
@@ -169,6 +195,21 @@ test("guard allows editing a source file named in the verification command, bloc
   const testGuard = runDiffGuard(testCommitlet, { touchedFiles: ["tests/test_target.py"], diffText: "-a\n+b" });
   assert.equal(testGuard.passed, false, "the test the commitlet is graded by must stay locked");
   assert.match(testGuard.blockingIssues.join(" "), /verification target/i);
+});
+
+test("manifest edit is blocked by default, but allowed when the task is explicitly about a dependency (M1)", () => {
+  const cwd = makeRepo();
+  const base = makeCommitlet(cwd);
+  const diff = "+  \"axios\": \"^1.6.0\"";
+  // An ordinary commitlet that happens to touch package.json is still blocked (supply-chain safety).
+  const blocked = runDiffGuard({ ...base, allowedFiles: ["package.json"], title: "edit target", purpose: "make target good" }, { touchedFiles: ["package.json"], diffText: diff });
+  assert.equal(blocked.passed, false);
+  assert.match(blocked.blockingIssues.join(" "), /Dependency\/manifest edit is not allowed/);
+  // A task explicitly about adding a dependency may edit the manifest (warned, not a dead-end).
+  const depTask = { ...base, allowedFiles: ["package.json"], title: "add axios", purpose: "add the axios package and use it in api.ts" };
+  const allowed = runDiffGuard(depTask, { touchedFiles: ["package.json"], diffText: diff });
+  assert.equal(allowed.passed, true, "an 'add axios' task may edit the manifest instead of hard-failing");
+  assert.match(allowed.warnings.join(" "), /adding a dependency/);
 });
 
 test("ranking prefers edits, then guard-passing, then fewer failures, then health", () => {

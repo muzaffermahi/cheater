@@ -7,11 +7,14 @@ import { assessCommandSafety } from "./reliability/commandSafety.js";
 import { registerRunConsole } from "./reliability/runConsole.js";
 import { registerSteeringCommands } from "./runstate/steering.js";
 import { registerEmptyTurnDetector } from "./reliability/emptyTurnDetector.js";
+import { shouldNudgeToAct, firstUserGoal, ANSWERED_WITHOUT_ACTING_NUDGE } from "./reliability/actGuard.js";
 
 /** Tool names that execute a shell command (subject to the safety boundary). */
 const SHELL_TOOL_NAMES = new Set(["bash", "run_command", "run", "shell", "exec"]);
 import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
+import { configureMascot, getMascotState, mascotOff } from "./ui/mascotUi.js";
+import { CheaterMascotComponent } from "./ui/mascotComponent.js";
 import { loadConfig } from "./config.js";
 import { registerAutopilotCommands } from "./autopilot/commands.js";
 import { routeAutopilot, buildAutopilotInstruction } from "./autopilot/router.js";
@@ -35,10 +38,9 @@ import { checkFileSyntax } from "./reliability/diagnostics.js";
 import { editRescueNotice } from "./reliability/editMatch.js";
 import { checkImports } from "./reliability/importGate.js";
 import { compressFailureOutput } from "./reliability/failureCompressor.js";
-import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
-import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
 import { activeTaskRun, endTaskRun, resumeTaskRun } from "./runstate/runState.js";
+import { ensureCheaterDirIgnored } from "./runstate/runDir.js";
 import { buildCompletionReceipt } from "./commitlet/kernel.js";
 import { preToolUse, postToolUse, bridgeLoopEvents } from "./runstate/hooks.js";
 import { listUnfinishedRuns } from "./runstate/worldState.js";
@@ -72,19 +74,15 @@ export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", s
   // heuristic and sometimes wrong, and a misroute must NEVER hard-lock the model out of
   // starting the flow. (Observed live: "proceed" after an approval question routed
   // answer_only, masked the planner tool away, and the model - narrating "launching the
-  // planner now" - could only emit bug_memory_search five times in a row. The mask is
-  // guidance, not a cage.)
-  answer_only: ["cheater_run", "cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
-  planner: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
-  execute: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_replace", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
+  // planner now" - could only emit a couple of tools in a row. The mask is guidance, not a cage.)
+  answer_only: ["cheater_run", "cheater_reliability_start", "cheater_memory_search", "cheater_project_brief"],
+  planner: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_ledger_status"],
+  execute: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_replace", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
 
 /** The cheater tools visible in a mode. Every registered cheater tool appears in a mode. */
-export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", config: CheaterConfig): string[] {
-  const tools = CHEATER_TOOL_MODES[mode];
-  // The bug-memory tool is filtered from every mask unless the (default-off) feature is enabled -
-  // matching its gated registration, so applyToolMask never activates an unregistered tool name.
-  return config.bugMemoryEnabled === true ? [...tools] : tools.filter((name) => name !== "cheater_bug_memory_search");
+export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute"): string[] {
+  return CHEATER_TOOL_MODES[mode];
 }
 
 // getActiveTools/setActiveTools live on the ExtensionAPI (`pi`) object, NOT on the per-event
@@ -96,7 +94,7 @@ function applyToolMask(pi: ExtensionAPI, config: CheaterConfig, mode: "answer_on
   // Pi-native tools persist (never removed); recompute the cheater subset from the known
   // mode map so masking is reversible across turns.
   const piNative = active.filter((name) => !name.startsWith("cheater_"));
-  pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode, config)]);
+  pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode)]);
 }
 
 // KV-cache stability: once a session has entered a code mask (planner/execute), keep the cheater
@@ -209,26 +207,7 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
   ctx?.ui?.notify?.(`Cheater verifying: ${cmd}`, "info");
   const r = await runCommandAsync(cmd, cwd, 90000);
   const ok = r.code === 0;
-  let summary = ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code);
-  if (!ok) {
-    // Cheat Layer: the harness classifies the failure, retrieves evidence across every
-    // source it owns (verified experience -> bug corpus -> local docs -> official docs when
-    // enabled), and attaches at most three hypothesis cards - no model search tool involved.
-    const sheet = await buildCheatSheet(cwd, summary, config ?? {});
-    if (sheet) summary = `${summary}\n${renderCheatSheet(sheet, cmd)}`;
-  } else if (config?.bugMemoryEnabled === true && config?.experienceStoreEnabled !== false) {
-    // Verified fail->pass inside one session: the harness itself observed the earlier failed
-    // stage and now the pass, and git shows what changed - write the experience card.
-    const priorFailure = state.verification.filter((v) => v.status === "failed").at(-1);
-    if (priorFailure?.summary) {
-      saveVerifiedFix(cwd, {
-        failureText: priorFailure.summary,
-        diffText: gitDiffFor(cwd, state.changedFiles),
-        files: state.changedFiles.slice(0, 6),
-        goal: state.userGoal
-      });
-    }
-  }
+  const summary = ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code);
   ledger.recordCommand(cmd);
   ledger.recordVerificationStage({
     stage,
@@ -460,6 +439,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
   let gitBaseline: Map<string, string> | null = null;
+  // Engagement backstop (B2) per-task state: did a code goal route, did the model call the flow
+  // (cheater_run/reliability_start), did it edit a file, and have we nudged once already?
+  let engagementTask = { codeGoal: false, engaged: false, edited: false, nudged: false };
   // Run-state hints raised at tool_call time, delivered in-band on the matching tool_result.
   const pendingRunHints = new Map<string, string[]>();
   // De-dup for risk-middleware hints: the same standing condition (e.g. "stale validation
@@ -508,8 +490,31 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event: unknown, ctx: any) => {
+    // Arm the mascot with this session's config so worker-progress callbacks (which lack a config
+    // handle) still respect mascotEnabled/mascotStyle. No-op-safe in every mode.
+    configureMascot(config);
+    // Hide cheater's own .cheater/ working-state dir from git so the model never mistakes the
+    // harness's untracked files for user content to recover/commit (finding #6).
+    try { ensureCheaterDirIgnored(ctx.cwd); } catch { /* best-effort */ }
     ctx.ui.setTitle?.(`Cheater - ${ctx.cwd}`);
     ctx.ui.setStatus?.("cheater", ctx.ui.theme?.fg ? ctx.ui.theme.fg("accent", "Cheater") : "Cheater");
+    // Sly, the big animated mascot: a real pi Component with its own render loop that constantly
+    // moves (tail swish, blink, breathing) and whose face follows the work. Interactive TUI ONLY -
+    // gated on ctx.mode === "tui" so it never constructs an interval timer in rpc/print/json mode.
+    if (ctx.mode === "tui" && !mascotOff(config)) {
+      try {
+        ctx.ui.setWidget?.(
+          "cheater-mascot",
+          (tui: any, theme: any) => new CheaterMascotComponent(tui, theme, getMascotState),
+          { placement: "aboveEditor" }
+        );
+      } catch { /* the mascot is best-effort and must never break startup */ }
+    }
+    // Clean cheater view: collapse pi's raw tool output by default so the user isn't buried in every
+    // terminal command scrolling by. /pi toggles the raw output back on. Interactive TUI only.
+    if (ctx.mode === "tui") {
+      try { ctx.ui.setToolsExpanded?.(false); } catch { /* best-effort */ }
+    }
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
     ctx.ui.notify?.("Cheater mode active", "info");
   });
@@ -644,6 +649,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const atFiles = resolveAtFiles(ctx.cwd, message);
     const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined, requireApproval: config.requireApprovalForHighRisk === true });
     defaultAutopilotState.setDecision(message, decision);
+    // Engagement backstop: this is a fresh code goal iff it routes to a code mode. Reset the per-task
+    // engagement tracking so the message_end nudge can catch a full bypass (edits with no flow call).
+    engagementTask = { codeGoal: decision.executionMode !== "answer_only" && decision.executionDiscipline !== "none", engaged: false, edited: false, nudged: false };
     applyToolMaskStable(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
     ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(decision).split("\n"), { placement: "aboveEditor" });
     ctx.ui.notify?.(decision.userVisibleSummary, "info");
@@ -657,6 +665,26 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // was implemented but never wired; message_end is the real Pi event that carries the model's
   // finished text.
   pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }, ctx: any) => {
+    // Engagement backstop (B2): a code goal whose model EDITED files but never entered the flow gets
+    // a ONE-TIME, non-blocking follow-up nudge to route through cheater_run. Skipped whenever a plan
+    // or durable run is active (that IS engaged), so it only catches a true bypass.
+    if (config.engagementBackstopEnabled === true && engagementTask.codeGoal && engagementTask.edited && !engagementTask.nudged) {
+      const engaged = engagementTask.engaged || Boolean(defaultCommitletState.get().currentPlan) || Boolean(activeTaskRun());
+      if (!engaged) {
+        engagementTask.nudged = true;
+        try {
+          pi.sendMessage({
+            customType: "cheater-engagement",
+            content: [
+              "Cheater: you're editing files directly, without the reliability flow.",
+              "Route this through cheater_run now (pass your goal as ONE short line). It runs the change as a bounded, verified commitlet - and on a hard task it can try best-of-N and keep the passing attempt - catching bugs a single unverified pass ships.",
+              "If this genuinely is a trivial one-liner, at least call cheater_finish_gate before you say it's done, so the harness verifies it."
+            ].join("\n"),
+            display: true
+          }, { deliverAs: "followUp" });
+        } catch { /* the backstop is best-effort and must never break a turn */ }
+      }
+    }
     if (config.loopGovernorEnabled === false) return;
     const text = extractMessageText(event.message);
     if (!text) return;
@@ -733,6 +761,10 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown> }, ctx: any) => {
+    // Engagement backstop tracking (cheap, never blocks): did the model enter the reliability flow, or
+    // is it editing files directly? The message_end nudge reads these.
+    if (event.toolName === "cheater_run" || event.toolName === "cheater_reliability_start") engagementTask.engaged = true;
+    else if (EDIT_TOOLS.has(event.toolName)) engagementTask.edited = true;
     // Security boundary FIRST: hard-block the handful of shell actions a local model must never
     // take (fetch-and-run pipes, disk/root destruction, secret exfiltration) regardless of the
     // autonomy setting. Destructive-but-legitimate commands only hard-block under requireApproval.
@@ -985,6 +1017,26 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event: { messages?: Array<{ stopReason?: string }> }, ctx: any) => {
+    // Finding #5: the model ANSWERED an actionable task in chat and called ZERO tools - the agent is
+    // about to end with nothing done (no file written, no command run). Nudge it ONCE to actually do
+    // the work. Distinct from the empty-turn detector (a frozen no-text model) and from the
+    // finish-gate nudge below (which requires files to have changed). A genuine question, an
+    // aborted/errored run, or an already-queued nudge is skipped.
+    if (liveSessionState.canNudge()) {
+      const lastMsg = (event.messages as Array<{ stopReason?: string }> | undefined)?.at(-1);
+      const goal = firstUserGoal(event.messages) || liveSessionState.getLastUserGoal();
+      if (lastMsg?.stopReason !== "aborted" && lastMsg?.stopReason !== "error"
+          && !ctx.hasPendingMessages?.()
+          && shouldNudgeToAct({ enabled: config.nudgeAnsweredWithoutActing !== false, messages: event.messages, goal })) {
+        liveSessionState.recordNudge();
+        pi.sendMessage({
+          customType: "cheater-act-not-answer",
+          content: ANSWERED_WITHOUT_ACTING_NUDGE,
+          display: true
+        }, { deliverAs: "followUp" });
+        return;
+      }
+    }
     const ledger = liveSessionState.getLedger();
     if (!ledger) return;
     const state = ledger.get();

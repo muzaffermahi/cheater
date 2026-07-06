@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { Type } from "typebox";
-import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
 import type { CheaterConfig } from "./types.js";
 
 type ExtensionAPI = any;
@@ -138,46 +137,6 @@ export function createCheaterLineEditTool() {
   };
 }
 
-export function createCheaterBugMemorySearchTool() {
-  return {
-    name: "cheater_bug_memory_search",
-    label: "Cheater Bug Memory Search",
-    description: "Search the compacted solved-bug memory corpus for highly relevant analogies without loading the full corpus into RAM.",
-    promptSnippet: "cheater_bug_memory_search - find compacted solved-bug analogies relevant to the current failure.",
-    // Aligned with the authoritative BUG_MEMORY system section (prompts.ts): the harness
-    // auto-attaches evidence to failures, so this is a rare last resort - NOT "use it whenever a
-    // failure looks distinctive" (that contradiction made a weak model over-search).
-    promptGuidelines: [
-      "The harness auto-attaches solved-bug evidence to failures, so you rarely need this.",
-      "Only call it when stuck on a specific error AND the failure carried no evidence; never pre-emptively.",
-      "Treat any memory as an analogy to verify against local code, not a fact about this repo."
-    ],
-    parameters: Type.Object({
-      query: Type.String({ description: "Bug description, error text, failing test, or likely API/function names" }),
-      topK: Type.Optional(Type.Number({ description: "Number of memories to return, 1-10", minimum: 1, maximum: 10 })),
-      memoryPath: Type.Optional(Type.String({ description: "Optional compacted JSONL path; defaults to CHEATER_BUG_MEMORY_PATH or data/cards/compacted.jsonl" })),
-      rebuild: Type.Optional(Type.Boolean({ description: "Rebuild the on-disk index before searching" }))
-    }),
-    async execute(_toolCallId: string, params: { query: string; topK?: number; memoryPath?: string; rebuild?: boolean }, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) {
-      const result = await searchBugMemories({
-        cwd: ctx.cwd,
-        query: params.query,
-        topK: params.topK,
-        memoryPath: params.memoryPath,
-        rebuild: params.rebuild
-      });
-      return textResult(formatBugMemoryHits(result), {
-        query: result.query,
-        memoryPath: result.memoryPath,
-        indexDir: result.indexDir,
-        built: result.built,
-        docCount: result.docCount,
-        hits: result.hits
-      });
-    }
-  };
-}
-
 /**
  * Literal find-and-replace across a file WITHOUT reading or rewriting the whole thing. This is the
  * cheap-token fix for the reported pattern where the model re-generates a 600-1000 line file just to
@@ -287,10 +246,6 @@ export function registerCheaterTools(pi: ExtensionAPI, config: CheaterConfig = {
     }
   });
 
-  // Bug-memory search is registered ONLY when the (default-off) feature is explicitly enabled. When
-  // off it does not exist at all, so a masking slip can never expose it and the model sees nothing
-  // about a bug-memory tool. Re-enable with bugMemoryEnabled:true to A/B test it later.
-  if (config.bugMemoryEnabled === true) pi.registerTool(createCheaterBugMemorySearchTool());
   // cheater_skill_search was removed: it ignored its own query param and just dumped the
   // static skill list, which Pi already surfaces natively via --skill progressive disclosure.
 }

@@ -48,7 +48,11 @@ function summarizeDecision(mode: AutopilotDecision["executionMode"], reason: str
 // block is short.
 export function buildAutopilotInstruction(decision: AutopilotDecision, _goal: string, lean = false): string {
   if (decision.executionMode === "answer_only") {
-    return "Cheater: this is a question, not a code change. Answer directly. Do not edit files or start a commitlet plan.";
+    // Do NOT flatly forbid editing: "this is a question, do not edit files" was told to actionable
+    // tasks the classifier under-recognized ("Write me data.comp", "Save your regex to a file") and
+    // the model then answered in chat and produced nothing. Answer a real question directly, but if
+    // the task actually asks to produce/modify a file or run commands, DO it with tools.
+    return "Cheater: if this is genuinely a question, answer it directly. But if the task asks you to produce or modify a file, run commands, or otherwise DO something, perform it NOW with your tools (write/edit/bash) - a chat answer does not complete a task. For anything that changes a file, prefer cheater_run so the change is verified - even one file is one bounded step, not a heavy plan.";
   }
   if (decision.executionDiscipline === "blocked_needs_user") {
     return "Cheater: this looks high-risk (dependency/lockfile/destructive change). Stop before editing and ask the user for explicit approval.";

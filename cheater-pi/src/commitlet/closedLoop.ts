@@ -25,6 +25,15 @@ import { detectStackProfile, stampProfile, deriveAppName, type StampedFile } fro
 import { defaultCommitletState } from "./state.js";
 import { buildCommitletExecutionPrompt, commitletRepoFacts, prepareCommitlet } from "./executor.js";
 import { runResampledWorker } from "./resampling.js";
+import {
+  concreteSingleFileCommitlet,
+  mainModelSampler,
+  runInSessionResample,
+  singleTargetFile,
+  type InSessionResampleOutcome
+} from "./inSessionResample.js";
+import { computeBudget } from "../runtime/computeBudget.js";
+import { isRepairCommitlet } from "./types.js";
 import { liveSessionState } from "../reliability/sessionState.js";
 import { resolveSidecarClient, sidecarConfig, sdkSidecarClient } from "../sidecar/client.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
@@ -35,7 +44,6 @@ import { mainCallGovernor, workerRoleForCommitletId } from "../runtime/mainCallG
 import { sidecarUsage, sidecarKeepAlive } from "../runtime/sidecarUsage.js";
 import { getWorkerPromptShape, resetWorkerPromptShape } from "../runtime/promptShape.js";
 import { runProviderProbe } from "../providers/lmStudioStateful.js";
-import { setLeanCapsule } from "../runstate/promptCapsule.js";
 import { workerBackendReason } from "../blueprint/worker.js";
 import { steeringControl } from "../runstate/steering.js";
 import { activeTaskRun, beginTaskRun, type TaskRunState } from "../runstate/runState.js";
@@ -99,6 +107,16 @@ export interface ClosedLoopDeps {
   finalize: typeof finalizePlan;
   finish: typeof finishVerdict;
   resolveWorkerMode: typeof resolveRealWorkerMode;
+  /** In-session best-of-N pre-build (local best-of-N). Injectable so the wiring is testable without
+   *  a model; the default runs k direct main-model completions via mainModelSampler. */
+  runInSession: (
+    plan: CommitletPlan,
+    commitlet: Commitlet,
+    config: CheaterConfig,
+    ctx: ExtensionContextLike,
+    samples: number,
+    onProgress?: (message: string) => void
+  ) => Promise<InSessionResampleOutcome>;
 }
 
 const DEFAULT_DEPS: ClosedLoopDeps = {
@@ -110,7 +128,9 @@ const DEFAULT_DEPS: ClosedLoopDeps = {
   grade: gradeCommitlet,
   finalize: finalizePlan,
   finish: finishVerdict,
-  resolveWorkerMode: resolveRealWorkerMode
+  resolveWorkerMode: resolveRealWorkerMode,
+  runInSession: (plan, commitlet, config, ctx, samples, onProgress) =>
+    runInSessionResample(plan, commitlet, config, mainModelSampler(plan, commitlet, config, ctx), samples, onProgress)
 };
 
 function narrate(ctx: ExtensionContextLike, message: string): void {
@@ -154,7 +174,8 @@ function scaffoldFilePlanFn(cwd: string, ctx: ExtensionContextLike, config: Chea
 function stampScaffoldPrelude(cwd: string, scaffoldFiles: ScaffoldFile[], goal: string, config: CheaterConfig, run: TaskRunState): StampedFile[] {
   try {
     const plannedPaths = scaffoldFiles.map((file) => file.path);
-    const profile = detectStackProfile(goal, plannedPaths, config.scaffoldTemplateStacks);
+    // The model's OWN proposed file list picks the stack (.tsx -> TS, .jsx -> JS, ...); no goal regex.
+    const profile = detectStackProfile(plannedPaths, config.scaffoldTemplateStacks);
     if (!profile) return [];
     const usesTailwind = /\btailwind/i.test(goal) || plannedPaths.some((path) => /tailwind/i.test(path));
     const stamped = stampProfile(cwd, profile, { appName: deriveAppName(goal), usesTailwind, entryComponent: "./App" }, plannedPaths);
@@ -295,7 +316,20 @@ async function runClosedLoopInner(
       freshWorkerMode: "none",
       steps,
       details: { decision, noEdit: true }
-    }, userGoal, ["no edits needed: this routed as a question/answer-only request - answer the user directly."]);
+    }, userGoal, [
+      // This routed as "no orchestration needed". The guidance MUST be action-imperative, not
+      // "answer the user directly": in an agentic task context (a bench task, a "do X for me"
+      // request) small/mid models take "answer the user" LITERALLY and produce a chat reply -
+      // step-by-step instructions, or a claim that it is done - while performing ZERO actual work,
+      // so the task fails with nothing written. (deepseek ignores it and acts; qwen3-8b/coder-flash
+      // obeyed it and failed fix-git; qwen3.5-35b answered a "write the regex to a file" task in
+      // chat and never wrote the file.) Tell the model to DO the work now with its tools.
+      "no build/orchestration harness is needed for this one. If the task requires ANY actions " +
+        "(shell commands, file edits, creating a file, a git operation), perform them NOW yourself " +
+        "with your tools (bash/read/write/edit) and then verify the result. Do NOT merely describe " +
+        "the steps, hand back instructions, or claim it is done - actually make the changes. Only if " +
+        "this is genuinely a pure question with no work to perform should you answer it directly."
+    ]);
   }
   if (fromScratch && (decision.executionMode === "answer_only" || decision.executionDiscipline === "none")) {
     narrate(ctx, "empty repo + build goal: overriding an answer-only route to scaffold from scratch");
@@ -333,7 +367,6 @@ async function runClosedLoopInner(
   mainCallGovernor.reset();
   sidecarUsage.reset();
   resetWorkerPromptShape();
-  setLeanCapsule(config.leanWorkerPromptEnabled === true); // Track 3: smaller worker prompts = cheaper prefill
   sidecarUsage.noteResolved(scfg.enabled, sidecar.available());
   // Optional: keep a CPU sidecar warm with ONE tiny JSON health check (non-blocking, never a gate).
   if (scfg.enabled && (config.sidecarForceWarmOnRunStart || config.sidecarKeepAliveEnabled)) {
@@ -414,7 +447,7 @@ async function runClosedLoopInner(
   // Phase A: stamp a recognized stack's invariant boilerplate to disk up front (once), so the model
   // decodes only real app logic. Needs the durable run for read-before-write bookkeeping; a no-op
   // when the flag is off, there is no run, or the stack is not recognized.
-  if (scaffolding && config.scaffoldTemplatesEnabled === true) {
+  if (scaffolding) {
     const stampRun = activeTaskRun();
     if (stampRun) {
       const stamped = stampScaffoldPrelude(cwd, scaffoldFiles, userGoal, config, stampRun);
@@ -431,7 +464,16 @@ async function runClosedLoopInner(
   // From-scratch scaffolding runs IN-SESSION (spawnFreshWorker:false -> the main model builds all files
   // in one warm session): 15-25 cold fresh-worker prefills on a local model would take hours, and the
   // files must be coherent across the project. Editing an existing repo keeps the caller's choice.
-  const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: scaffolding ? false : params.spawnFreshWorker }, config, ctx);
+  //
+  // #3 fix (the dominant remaining hard-task friction): a SINGLE-commitlet task also runs in-session.
+  // A COLD fresh worker handed a terminal/surgical commitlet ("build X", "configure Y", "produce a
+  // file") lacks the main model's exploration context, hallucinates paths (e.g. wrote to /app/tls
+  // instead of /app/ssl), records no change, and grades "blocked by guard/health/test audit" - so the
+  // main model then thrashes. The main model, which JUST explored the repo, does a single focused task
+  // far better than a cold worker. Multi-commitlet plans still fan out to fresh workers.
+  const inSessionByDesign = scaffolding
+    || (config.singleCommitletInSession !== false && plan.commitlets.length <= 1);
+  const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: inSessionByDesign ? false : params.spawnFreshWorker }, config, ctx);
   const modelName = resolveModelName(config, ctx);
 
   const prepareNext = (current: CommitletPlan, next: Commitlet): Commitlet => {
@@ -460,8 +502,48 @@ async function runClosedLoopInner(
       return report({ ok: false, status: "partial", freshWorkerMode: "simulated", steps, plan: finalized.details.plan, details: { decision, finalize: finalized.details } }, userGoal, [finalized.text]);
     }
     const prepared = prepareNext(plan, firstPending);
-    const activePlan = defaultCommitletState.get().currentPlan ?? plan;
-    const prompt = buildCommitletExecutionPrompt(activePlan, prepared, [], "simulated", 1, modelName);
+    let activePlan = defaultCommitletState.get().currentPlan ?? plan;
+    let activeCommitlet = prepared;
+    // In-session best-of-N pre-build (local best-of-N, roadmap P1): fresh-worker resampling is
+    // unavailable on a single-GPU local box, so for a commitlet that resolves to a SINGLE target file
+    // with an adaptive sample budget > 1 the harness itself runs k independent direct-completion
+    // samples from the rollback snapshot and leaves the first VERIFIED pass (else the best candidate)
+    // on disk BEFORE the handoff. The existing cheater_commitlet_next then grades that pre-built file
+    // - zero change to grade/advance. Behind inSessionResampleEnabled (default off) so nothing changes
+    // unless enabled.
+    let preBuiltNote: string | undefined;
+    if (config.inSessionResampleEnabled === true) {
+      const budget = computeBudget({
+        taskKind: activePlan.autopilotDecision?.taskKind,
+        risk: String(activePlan.risk ?? ""),
+        filesInScope: prepared.allowedFiles.filter((file) => !file.startsWith("(") && !file.endsWith("/")).length,
+        isRepair: isRepairCommitlet(prepared)
+      }, config);
+      // Resolve a concrete single target (from allowedFiles, or the goal when the autopilot left a
+      // "(select one target file after inspection)" placeholder), pinning it into the commitlet so the
+      // downstream grade sees the same file the pre-build wrote.
+      const resolved = budget.samples > 1 ? concreteSingleFileCommitlet(activePlan, prepared, cwd) : null;
+      if (resolved) {
+        activeCommitlet = resolved;
+        if (resolved !== prepared) {
+          activePlan = { ...activePlan, commitlets: activePlan.commitlets.map((commitlet) => commitlet.id === resolved.id ? resolved : commitlet) };
+          defaultCommitletState.setPlan(activePlan);
+        }
+        const target = singleTargetFile(resolved);
+        narrate(ctx, `in-session best-of-N: sampling ${budget.samples}x for ${resolved.id} (${target}) - local best-of-N, sequential on one GPU (~minutes each)`);
+        const outcome = await deps.runInSession(activePlan, resolved, config, ctx, budget.samples, (message) => narrate(ctx, message));
+        steps.push({
+          commitletId: resolved.id,
+          title: resolved.title,
+          outcome: outcome.passed ? "passed" : "blocked",
+          note: `in-session best-of-N pre-build: ${outcome.note}`
+        });
+        preBuiltNote = outcome.passed
+          ? `The harness PRE-BUILT ${target} for you via in-session best-of-N: sample ${outcome.appliedAttempt}/${outcome.samplesRequested} passed guard+health+verification and is already on disk. Do NOT rewrite it - call cheater_commitlet_next now to grade it and continue.`
+          : `The harness ran in-session best-of-N for ${target} (${outcome.attemptsRun} samples; none fully verified) and left the strongest candidate on disk. Fix only what remains, then call cheater_commitlet_next.`;
+      }
+    }
+    const prompt = buildCommitletExecutionPrompt(activePlan, activeCommitlet, [], "simulated", 1, modelName);
     // A scaffold plan runs in-session BY DESIGN (the fast path - no per-file worker spawns), not
     // because a backend is missing. Say that plainly instead of the alarming "no backend available"
     // degradation notice, and frame the loop as phases so the model's ONE instruction set is coherent.
@@ -470,6 +552,15 @@ async function runClosedLoopInner(
       ? [
           `From-scratch build: ${activePlan.commitlets.length} phase(s), built in-session in this warm session (the fast path - no per-file worker spawns).`,
           "Build the phase below, then call cheater_commitlet_next for the next phase. Keep going until cheater_finish_gate reports ALLOWED.",
+          "",
+          prompt.prompt
+        ]
+      : inSessionByDesign
+      ? [
+          // #3: a single focused task runs in-session ON PURPOSE - the main model has the exploration
+          // context a cold worker lacks. This is NOT a missing backend, so don't sound the alarm.
+          "This task runs IN-SESSION: you already explored this repo, so YOU do it directly (a cold fresh worker lacked that context and kept failing terminal tasks - wrong paths, no changes recorded).",
+          "Do the step below now with your tools (bash/read/write/edit), then call cheater_commitlet_next. Keep going until cheater_finish_gate reports ALLOWED.",
           "",
           prompt.prompt
         ]
@@ -488,8 +579,8 @@ async function runClosedLoopInner(
       steps,
       plan: activePlan,
       handoffPrompt: prompt.prompt,
-      details: { decision, commitlet: prepared, prompt }
-    }, userGoal, handoffLines);
+      details: { decision, commitlet: activeCommitlet, prompt }
+    }, userGoal, preBuiltNote ? [preBuiltNote, "", ...handoffLines] : handoffLines);
   }
 
   // The closed loop proper: harness prepares, spawns, grades, repairs, advances.

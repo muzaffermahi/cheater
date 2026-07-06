@@ -83,17 +83,6 @@ export function renderBlueprintArtifact(plan: Omit<BlueprintPlan, "artifactMarkd
       ? intelligence.packetFacts.map((item) => `- ${item.packetId}:${item.file}: ${item.facts.slice(0, 5).join("; ")}`)
       : ["- none"]),
     "",
-    "## Bug-Memory Workflows",
-    ...(intelligence?.bugWorkflows.length
-      ? intelligence.bugWorkflows.map((item) => {
-          const parts = [`- ${item.id}: trigger=${item.trigger}`, `  fix pattern: ${item.fixPattern}`, `  verify: ${item.verificationSignal}`, `  applies_to=${item.appliesTo.join(",") || "(diagnostic only)"}`, `  ${item.matchReason}`];
-          if (item.workflowSteps?.length) parts.push(`  workflow steps: ${item.workflowSteps.join(" -> ")}`);
-          if (item.doNotDo?.length) parts.push(`  do not do: ${item.doNotDo.join("; ")}`);
-          if (item.risk) parts.push(`  risk: ${item.risk}`);
-          return parts.join("\n");
-        })
-      : ["- none"]),
-    "",
     "## Done Criteria",
     ...plan.workPackets.map((packet) => `- ${packet.id}: ${packet.acceptanceCriteria.join("; ") || "(no explicit criteria)"} ${packet.verification.length ? "| verify: " + packet.verification.map((step) => step.command ?? step.description).join("; ") : ""}`.trim()),
     "",

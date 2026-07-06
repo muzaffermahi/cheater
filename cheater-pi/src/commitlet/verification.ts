@@ -34,9 +34,6 @@ export function runFocusedVerification(cwd: string, commitlet: Commitlet, timeou
     if (exitCode !== 0) {
       // Structured failure card (expected/got, top stack file, next-action) instead of a
       // blunt tail truncation, so the repair prompt is a localization answer not noise.
-      // Evidence injection deliberately does NOT happen here: this function also scores
-      // every resampling candidate, and the Cheat Layer (buildCheatSheet in gradeCommitlet)
-      // owns retrieval exactly once per graded failure instead of once per attempt.
       failures.push(compressFailureOutput(step.command, result.stdout ?? "", result.stderr ?? "", exitCode));
       if (step.required) break;
     }

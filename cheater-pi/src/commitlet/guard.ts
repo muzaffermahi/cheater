@@ -22,6 +22,15 @@ export function hasResolvedScope(allowedFiles: string[]): boolean {
   return allowedFiles.some(isConcreteScope);
 }
 
+/** True when the commitlet's OWN goal is explicitly about adding/using a dependency, so a manifest
+ *  edit is expected work - not an incidental supply-chain change. The manifest block stays for
+ *  everything else. */
+export function taskInvolvesDependency(commitlet: Pick<Commitlet, "title" | "purpose" | "spec">): boolean {
+  const text = `${commitlet.title} ${commitlet.purpose} ${(commitlet.spec?.behaviorMustHold ?? []).join(" ")} ${(commitlet.spec?.acceptanceCriteria ?? []).join(" ")}`.toLowerCase();
+  return /\b(npm (i|install|add)|yarn add|pnpm add|pip install|cargo add|go get|gem install)\b/.test(text)
+    || /\b(add|install|integrate|pull in|bring in)\b[^.]{0,40}\b(dependenc|package|librar|module|crate|gem)\b/.test(text);
+}
+
 /** Whether a (forward-slash) file path falls under an allowed scope (exact file or `dir/`). */
 export function fileMatchesScope(normalizedFile: string, scope: string): boolean {
   if (!isConcreteScope(scope)) return false;
@@ -59,7 +68,16 @@ export function runDiffGuard(commitlet: Commitlet, input: DiffInput, overrides: 
   // so a from-scratch component/module should not be blocked by the edit-tuned maxDiffLines cap.
   const effectiveMaxDiff = isCreationDiff(input.diffText) ? Math.max(commitlet.maxDiffLines, 2000) : commitlet.maxDiffLines;
   if (diffLines > effectiveMaxDiff) blockingIssues.push(`Diff has ${diffLines} changed lines, max is ${effectiveMaxDiff}. -> Make a smaller, more focused change or split it across commitlets.`);
-  if (touchedFiles.some(isDependencyFile) && !commitlet.healthBudget.allowDependencyEdits) blockingIssues.push("Dependency/manifest edit is not allowed for this commitlet. -> Revert the manifest change; if a dependency is truly required, tell the user and get explicit approval first.");
+  if (touchedFiles.some(isDependencyFile) && !commitlet.healthBudget.allowDependencyEdits) {
+    // A task that is explicitly about adding a dependency ("add axios and use it") legitimately edits
+    // the manifest; hard-blocking it was a dead-end (the commitlet could never pass). Demote to a
+    // warning there; keep the block for incidental/unexplained manifest changes.
+    if (taskInvolvesDependency(commitlet)) {
+      warnings.push("Manifest edit allowed: this task is explicitly about adding a dependency. Keep it to the one package needed and let the package manager regenerate the lockfile.");
+    } else {
+      blockingIssues.push("Dependency/manifest edit is not allowed for this commitlet. -> Revert the manifest change; if a dependency is truly required, tell the user and get explicit approval first.");
+    }
+  }
   if (touchedFiles.some(isLockfile) && !commitlet.healthBudget.allowLockfileEdits) blockingIssues.push("Lockfile edit is not allowed for this commitlet. -> Revert the lockfile; let the package manager regenerate it only after an approved dependency change.");
   if (touchedFiles.some(isTestFile) && !commitlet.healthBudget.allowTestEdits) blockingIssues.push("Test edit is not allowed for this commitlet. -> Revert the test change and fix the source instead; only edit tests when the task is explicitly about them.");
   if (touchedFiles.some(isGeneratedFile)) blockingIssues.push("Generated/compiled artifact was touched. -> Revert it and change the source that produces it instead.");

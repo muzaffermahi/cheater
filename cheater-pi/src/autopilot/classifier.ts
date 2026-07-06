@@ -117,7 +117,7 @@ const RULES: Rule[] = [
   },
   {
     kind: "feature_addition",
-    patterns: [/\b(add|implement|create|build|introduce|support|enable|new|tag|label|categorize|classify)\b/i],
+    patterns: [/\b(add|implement|create|build|introduce|support|enable|new|tag|label|categorize|classify|write|generate|produce|scaffold|compress|encode|decode|compile|extract)\b/i],
     confidence: 0.74,
     needsRepro: false,
     risk: "medium",
@@ -138,7 +138,15 @@ const RULES: Rule[] = [
 // change later ("Explain why the login test is failing and fix it"). Any of these action
 // verbs ANYWHERE in the message means the request is not purely informational, so
 // explanation_only must not fire regardless of how the message opens.
-const ACTION_OVERRIDE = /\b(fix|repair|implement|refactor|resolve|build|create|add|enable|support|change|update|modify|remove|delete|wire|register)\b/i;
+// File/output/compute verbs are ACTIONS, not questions. Their omission was a top failure mode: a
+// task literally titled "Write me data.comp ..." or "Write a regex ... save it to /app/regex.txt"
+// or "Compute the number of tokens ... write it to answer.txt" matched no action verb, classified
+// as `unknown`->`answer_only`, and the model was told "this is a question, do not edit files" - so
+// it answered in chat and produced nothing. (Live-observed across the hard TB2 sweep.)
+// Only clearly-action file/artifact-producing verbs are added - NOT question-ambiguous ones like
+// print/output/compute/count ("what does it print?", "what's the output?", "how many?"), which would
+// misfire on genuine questions. "write"/"save"/"generate" already catch the file-output tasks.
+const ACTION_OVERRIDE = /\b(fix|repair|implement|refactor|resolve|build|create|add|enable|support|change|update|modify|remove|delete|wire|register|write|generate|produce|save|store|scaffold|compress|decompress|encode|decode|encrypt|decrypt|compile|install|configure|download|extract)\b/i;
 
 // Destructive intent, not destructive vocabulary: the verb must target a repo/file/data
 // object (or name an inherently dangerous artifact like a lockfile). Exported so the policy
@@ -206,7 +214,7 @@ export function classifyAutopilotTask(input: AutopilotInput): AutopilotClassific
     // Widen the no-rule-match code-intent net to match ACTION_OVERRIDE's coverage: a bare
     // "swap/port/replace/convert the X" is a code task, not a question, and must not default to
     // answer_only.
-    const codeIntent = /\b(change|update|modify|make|remove|delete|wire|register|swap|port|replace|convert)\b/i.test(text);
+    const codeIntent = /\b(change|update|modify|make|remove|delete|wire|register|swap|port|replace|convert|write|generate|produce|save|store|scaffold|compress|decompress|encode|decode|encrypt|decrypt|compile|install|configure|download|extract)\b/i.test(text);
     return {
       taskKind: codeIntent ? "feature_addition" : "unknown",
       confidence: codeIntent ? 0.48 : 0.25,

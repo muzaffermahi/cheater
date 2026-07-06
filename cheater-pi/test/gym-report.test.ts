@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildReport, writeReport, writeMarkdownReport, listReports, readLatestReport, buildDeltaReport, buildLearningSuggestions, writeLearningSuggestions, listLearningSuggestions, buildGymBugMemoryCards, writeGymBugMemoryCards } from "../src/gym/report.js";
+import { buildReport, writeReport, writeMarkdownReport, listReports, readLatestReport, buildDeltaReport, buildLearningSuggestions, writeLearningSuggestions, listLearningSuggestions } from "../src/gym/report.js";
 import type { GymRunResult, GymScored, GymTask } from "../src/gym/types.js";
 
 function fixtureTask(): GymTask {
@@ -84,12 +84,6 @@ test("delta report structure", () => {
   assert.equal(report.improvement.vanillaAvailable, true);
 });
 
-test("learning suggestion from successful run", () => {
-  const passed = { ...fixtureResult(), task: fixtureTask(), score: { ...fixtureScore(), score: 90, pass: true } };
-  const suggestions = buildLearningSuggestions([passed]);
-  assert.ok(suggestions.some((s) => s.kind === "bug_memory"));
-});
-
 test("anti-pattern suggestion from failed run", () => {
   const failed = { ...fixtureResult(), task: { ...fixtureTask(), category: "off_by_one" as const }, score: { ...fixtureScore(), score: 30, pass: false } };
   const suggestions = buildLearningSuggestions([failed]);
@@ -103,31 +97,6 @@ test("learning suggestions persist and are listed", () => {
   writeLearningSuggestions(cwd, suggestions);
   const listed = listLearningSuggestions(cwd);
   assert.equal(listed.length, suggestions.length);
-  rmSync(cwd, { recursive: true, force: true });
-});
-
-test("high scoring gym runs become structured bug-memory workflow cards", () => {
-  const passed = { ...fixtureResult(), task: fixtureTask(), score: { ...fixtureScore(), score: 90, pass: true } };
-  const cards = buildGymBugMemoryCards([passed]);
-  assert.equal(cards.length, 1);
-  assert.equal(cards[0].id, "gym-py_x");
-  assert.equal(cards[0].repo, "cheater-gym");
-  assert.deepEqual(cards[0].key_files, ["src/app.py"]);
-  assert.ok(cards[0].workflow_steps.some((step) => /Reproduce with: echo/.test(step)));
-  assert.ok(cards[0].do_not_do.some((step) => /do not edit tests/.test(step)));
-  assert.match(cards[0].embedding_text, /Verify with: echo/);
-});
-
-test("gym bug-memory cards persist to the searchable project corpus", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "gym-card-"));
-  const passed = { ...fixtureResult(), task: fixtureTask(), score: { ...fixtureScore(), score: 90, pass: true } };
-  const cards = buildGymBugMemoryCards([passed]);
-  const path = writeGymBugMemoryCards(cwd, cards);
-  assert.ok(path);
-  const text = readFileSync(path!, "utf8");
-  assert.match(text, /"id":"gym-py_x"/);
-  assert.match(text, /"workflow_steps":/);
-  assert.match(text, /"do_not_do":/);
   rmSync(cwd, { recursive: true, force: true });
 });
 

@@ -72,6 +72,14 @@ export class MutationLedger {
     return [...this.entries];
   }
 
+  /** True if any recorded mutation touched this path (created/modified by any actor this run,
+   *  including a shell command). Overwriting a file the run itself made is not destroying unseen code. */
+  hasTouched(path: string): boolean {
+    const norm = normalizePath(path);
+    if (!norm) return false;
+    return this.entries.some((entry) => entry.paths.includes(norm));
+  }
+
   /** Mark every mutation touching these paths as covered by a validation. */
   markValidated(paths: string[]): void {
     const targets = new Set(paths.map(normalizePath));

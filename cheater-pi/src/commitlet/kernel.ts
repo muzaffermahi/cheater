@@ -8,9 +8,9 @@
 
 import { createCleanupCommitlet, createRepairCommitlet } from "./planner.js";
 import { commitletConfig } from "./config.js";
+import { setMascot } from "../ui/mascotUi.js";
+import { mascotStateForPhase } from "../ui/mascot.js";
 import { defaultCommitletState } from "./state.js";
-import { saveVerifiedFix } from "../reliability/experience.js";
-import { buildCheatSheet, renderCheatSheet } from "../reliability/cheatSheet.js";
 import { distillFailureSidecar, renderDistillation, reviewDiffSidecar, type DiffReview } from "../sidecar/jobs.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
 import { sidecarConfig } from "../sidecar/client.js";
@@ -114,7 +114,9 @@ export function workerProgress(ctx: ExtensionContext, plan: CommitletPlan, commi
   return (message: string) => {
     const line = `Cheater [commitlet ${position}] ${message}`;
     try {
-      ctx?.ui?.setWorkingMessage?.(line);
+      // The mascot's expression follows the work (sampling/verifying/working); it also sets the
+      // working message. No-op in JSON/headless. notify stays for the milestone chat line.
+      setMascot(ctx, mascotStateForPhase(message), line);
       ctx?.ui?.notify?.(line, "info");
     } catch { /* narration must never break the run */ }
   };
@@ -137,7 +139,7 @@ export function workerHeartbeat(ctx: ExtensionContext, plan: CommitletPlan, comm
       ? ` - slow PREFILL (this fresh worker re-processes its prompt cold). Faster: use a model that fits in VRAM, OR set "commitletFreshWorkerDefault": false to run in-session (reuses the warm cache instead of re-prefilling per file), OR raise LM Studio's GPU offload.`
       : "";
     try {
-      ctx?.ui?.setWorkingMessage?.(`Cheater [commitlet ${position}] worker still streaming on the local model (${secs}s)...${tip}`);
+      setMascot(ctx, "working", `Cheater [commitlet ${position}] worker still streaming on the local model (${secs}s)...${tip}`);
     } catch { /* heartbeat must never break the run */ }
   };
 }
@@ -263,7 +265,12 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     const verify = runFocusedVerification(cwd, commitlet);
     const scaffoldHealth = scorePatchHealth({ diffText, filesTouched: touchedFiles, threshold: config.healthScoreThreshold, hardRejectThreshold: config.hardRejectHealthThreshold });
     const ledger = liveSessionState.getLedger();
-    if (ledger) for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
+    // Same real-worker/finish-gate fix as the surgical path below: record the touched files into
+    // the MAIN ledger so a scaffold built by fresh workers is not seen as "no work was done".
+    if (ledger) {
+      for (const file of touchedFiles) ledger.recordFileChange(file);
+      for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
+    }
     activeTaskRun()?.integrateWorkerReport({
       workerRole: commitlet.id,
       summary: `scaffold phase created ${touchedFiles.length} file(s)`,
@@ -342,6 +349,16 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   let verify = runFocusedVerification(cwd, commitlet);
   const ledger = liveSessionState.getLedger();
   if (ledger) {
+    // Record the files this commitlet touched into the MAIN completion ledger. This is the load-
+    // bearing line for real-worker execution: a fresh isolated worker edits files in its OWN pi
+    // session, so those writes never reach this session's observeToolResult and the finish gate
+    // would see changedFiles:0 -> the false "no work was done" block that made weak models loop
+    // forever. touchedFiles is diffed from disk vs the rollback snapshot, so it captures the
+    // worker's edits (and the in-session model's) uniformly. Recorded even on a failing verify:
+    // the files WERE changed; the finish gate should then block on the real failure, not on "no
+    // work". Combined with the same-goal re-entry preservation in reset(), this survives the
+    // model looping back through the planning tools.
+    for (const file of touchedFiles) ledger.recordFileChange(file);
     for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
     ledger.recordVerificationStage({
       stage: "focused_tests",
@@ -406,18 +423,6 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   }
 
   if (verify.passed) {
-    // Verified fail->pass transition: a repair commitlet just passed the verification its
-    // original failed. The harness knows the observed failure AND the diff that fixed it -
-    // ground truth, no model claim - so it writes the experience card itself. Future
-    // matching failures get this fix recalled in-band inside their failure cards.
-    if (config.bugMemoryEnabled === true && config.experienceStoreEnabled !== false && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
-      saveVerifiedFix(cwd, {
-        failureText: commitlet.spec.observedFailure,
-        diffText,
-        files: touchedFiles,
-        goal: defaultCommitletState.get().currentPlan?.userGoal
-      });
-    }
     defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
       filesChanged: touchedFiles,
       diffLines: countDiffLines(diffText),
@@ -441,20 +446,8 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     };
   }
 
-  // The Cheat Layer: the harness (not the model) classifies this failure, retrieves compact
-  // evidence from every source it owns, and injects the sheet exactly where the failure is
-  // being handed to a model - into the repair commitlet's observedFailure (which flows into
-  // every repair worker/resample packet) and into the grade message the orchestrating
-  // session reads. No search tool call is required or possible here.
   const rawFailure = [verify.summary, ...verify.failures].join("\n");
-  const sheet = await buildCheatSheet(cwd, rawFailure, config);
-  const renderedSheet = sheet ? renderCheatSheet(sheet, commitlet.focusedVerification.find((step) => step.command)?.command) : "";
-  let failureWithEvidence = renderedSheet ? `${verify.summary}\n${renderedSheet}` : verify.summary;
-  if (sheet && ledger) {
-    // Receipt truthfulness: record WHICH evidence sources were injected, so the completion
-    // receipt can say "cheat evidence used (experience, api_oracle)" from ground truth.
-    ledger.addEntry("cheat_evidence", `trigger ${sheet.trigger}`, { sources: sheet.cards.map((card) => card.source), commitletId: commitlet.id });
-  }
+  let failureWithEvidence = verify.summary;
 
   // Tool-error normalization (governor-gated, additive): reshape the raw failure into a bounded,
   // structured kind for the ledger/receipt so we can SEE that clerical error-shaping stayed OFF the
@@ -521,17 +514,17 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     return {
       advance: true,
       message: [failureWithEvidence, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
-      details: { guard, health, audit, verify, repair, cheatSheet: sheet ?? undefined }
+      details: { guard, health, audit, verify, repair }
     };
   }
 
   if (commitlet.rollbackPoint) {
     const reverted = revertRollbackPoint(cwd, commitlet);
     defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${verify.summary}; ${reverted.reason}`);
-    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted, cheatSheet: sheet ?? undefined } };
+    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted } };
   }
   defaultCommitletState.updateCommitlet(commitlet.id, "failed", verify.summary);
-  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify, cheatSheet: sheet ?? undefined } };
+  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify } };
 }
 
 export function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {

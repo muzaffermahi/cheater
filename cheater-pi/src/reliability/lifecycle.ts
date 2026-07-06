@@ -463,13 +463,26 @@ const TEST_STAGES = new Set<VerificationStageName>(["build", "smoke", "focused_t
 // deliberately NOT listed, so a genuine check failure still blocks. Matches the leading command word
 // after an optional `cd <path> &&` prefix.
 const EXPLORATORY_WORDS = /^\s*(?:cd|pushd|popd|ls|dir|pwd|echo|printf|cat|type|head|tail|less|more|find|grep|rg|ag|sed|awk|which|where|whereis|mkdir|rmdir|rm|del|mv|move|cp|copy|touch|stat|file|wc|sort|uniq|tree|clear|export|set|env|nl|basename|dirname|realpath|readlink|move-item|get-childitem|gci|copy-item|remove-item|new-item|set-location|get-content|get-location|select-string|test-path|write-host|write-output)\b/i;
+// Read-only INSPECTION commands: the model probing state (does the cert exist? what's in the log?).
+// When these FAIL - typically because the file they inspect does not exist YET (the model checks
+// before it creates) - that is a precondition probe, NOT a task failure, so it must never latch a
+// finish-blocking "unresolved failure". (A failed early `openssl x509 -in /app/ssl/server.crt`
+// before the cert was generated wedged the openssl-cert task's finish gate on a phantom failure
+// the model then wasted turns fighting and could only clear with a waiver.) Anything that WRITES
+// (openssl genrsa/... -out, git commit/merge/cherry-pick) is deliberately excluded and still latches.
+const READ_ONLY_GIT = /^git\s+(?:-C\s+\S+\s+)?(?:show|log|diff|status|reflog|fsck|branch|rev-parse|cat-file|blame|describe|ls-files|ls-tree|remote|shortlog|whatchanged|for-each-ref|show-ref|tag\s+-l|config\s+--get)\b/i;
+const READ_ONLY_OPENSSL = /^openssl\s+(?:x509|rsa|pkey|ec|dsa|dhparam|verify|asn1parse|crl|s_client|version)\b(?![^\n]*\s-out\b)/i;
+export function isReadOnlyProbe(cmd: string): boolean {
+  const stripped = cmd.replace(/^\s*(?:cd|pushd|popd)\s+[^&;]+(?:&&|;)\s*/i, "").trim();
+  return READ_ONLY_GIT.test(stripped) || READ_ONLY_OPENSSL.test(stripped);
+}
 export function isExploratoryCommand(cmd: string): boolean {
   // Classify the ACTUAL operation, not a leading `cd <path> &&` wrapper (which may prefix a REAL check
   // like `cd x && npm run build`): strip the wrapper first, then test the remainder. A command that is
   // ONLY a `cd`/navigation is itself exploratory; a check runner (npm/tsc/pytest/...) is not listed.
   const stripped = cmd.replace(/^\s*(?:cd|pushd|popd)\s+[^&;]+(?:&&|;)\s*/i, "").trim();
   if (!stripped) return true;
-  return EXPLORATORY_WORDS.test(stripped);
+  return EXPLORATORY_WORDS.test(stripped) || isReadOnlyProbe(cmd);
 }
 
 export function commandFingerprint(cmd: string): string {

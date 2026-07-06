@@ -53,7 +53,10 @@ export function attemptStance(attempt: number): string {
 // Per-attempt reasoning-depth jitter, the one sampling knob Pi's SDK exposes (there is no
 // temperature option). Attempt 1: the session default (byte-identical to single-sample
 // behavior). Attempt 2: deliberate. Attempt 3+: fast/instinctive. Pi clamps to model caps.
-const ATTEMPT_THINKING: Array<"off" | "low" | "medium" | "high" | undefined> = [undefined, "high", "off"];
+// One entry per ATTEMPT_STANCE (4). Attempt 4's stance is the MOST demanding ("re-derive and rewrite
+// the enclosing function cleanly"), so it gets "medium" thinking, not the "off" it used to inherit by
+// clamping to the 3rd entry - pairing the hardest re-derivation with reasoning disabled was a handicap.
+const ATTEMPT_THINKING: Array<"off" | "low" | "medium" | "high" | undefined> = [undefined, "high", "off", "medium"];
 
 export function attemptThinkingLevel(attempt: number): "off" | "low" | "medium" | "high" | undefined {
   return ATTEMPT_THINKING[Math.min(Math.max(attempt - 1, 0), ATTEMPT_THINKING.length - 1)];
@@ -154,13 +157,14 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
       repoFacts,
       previousState,
       attempt,
-      modelName
+      modelName,
+      inSession: freshWorkerMode === "simulated"
     });
     const rendered = renderCapsulePrompt(capsule);
     const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or Pi's edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
     const verifyLine = verificationCommand
       ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
-      : "No verification command is configured; state explicitly what you checked manually.";
+      : "No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). If a test file is within THIS commitlet's allowed files, add a small one in the project's language and run it; otherwise verify by running the code and report its real output. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.";
     // Prompt shape (measurement only - does not change the prompt below). The fixed operating rules
     // sit AFTER the big dynamic capsule, so they are not a reusable leading prefix; recorded so the
     // receipt can show worker-prompt size and cache-friendliness. See runtime/promptShape.ts.
@@ -315,6 +319,8 @@ function buildRunCapsule(
     previousState?: string[];
     attempt?: number;
     modelName?: string;
+    /** The model runs this commitlet in the current session (no isolated worker to hand off to). */
+    inSession?: boolean;
   }
 ): { capsule: PromptCapsule; fragments: ContextFragment[] } {
   const spec = commitlet.spec;
@@ -335,7 +341,13 @@ function buildRunCapsule(
     taskId: run.taskId,
     workerRole: commitlet.id,
     workerGoal: `${commitlet.title}: ${commitlet.purpose}`,
-    nonGoals: spec?.nonGoals,
+    // In-session the model IS the whole build, so the "do not continue into another commitlet/file"
+    // nonGoal directly contradicts the continuation instruction and makes weak models stop after one
+    // file. Drop just that nonGoal in-session; capsule.inSession also flips the closing directive.
+    nonGoals: extras.inSession
+      ? (spec?.nonGoals ?? []).filter((item) => !/continue into another commitlet|another file after this scope/i.test(item))
+      : spec?.nonGoals,
+    inSession: extras.inSession,
     acceptanceContract: [
       ...(spec?.acceptanceCriteria ?? []),
       ...run.contract.checklist.slice(0, 4)

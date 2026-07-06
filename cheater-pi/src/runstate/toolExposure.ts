@@ -44,11 +44,11 @@ export const CONTROLLER_ONLY_TOOLS = [
 ];
 
 /** Broad retrieval tools workers must not see by default: retrieval is controller-side. */
-export const RETRIEVAL_TOOLS = ["cheater_bug_memory_search", "cheater_memory_search"];
+export const RETRIEVAL_TOOLS = ["cheater_memory_search"];
 
 const MAIN_SESSION_CHEATER_TOOLS: Record<string, string[]> = {
-  answer_only: ["cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
-  controller_planner: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
+  answer_only: ["cheater_reliability_start", "cheater_memory_search", "cheater_project_brief"],
+  controller_planner: ["cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_ledger_status"],
   validator: ["cheater_verification_run", "cheater_finish_gate", "cheater_ledger_status"],
   reserve: ["cheater_verification_run", "cheater_finish_gate", "cheater_ledger_status"]
 };

@@ -126,6 +126,16 @@ test("mirrorsEvaluator is true only for checks that touch exact contract targets
   assert.equal(mirrorsEvaluator("ls -la", contract), false);
 });
 
+test("M4: an equivalent same-ACTION command satisfies the contract target; a different action does not", () => {
+  const buildContract = { outputPaths: [], endpoints: [], commands: ["npm run build"], files: [] };
+  assert.equal(mirrorsEvaluator("npx vite build", buildContract), true, "a proxy build validates a build contract target");
+  assert.equal(mirrorsEvaluator("npm run build", buildContract), true, "the exact command still matches (substring)");
+  assert.equal(mirrorsEvaluator("npm test", buildContract), false, "a TEST command does not satisfy a BUILD target");
+  // A specific grader/command with no recognized action verb only matches on substring - never loosened.
+  const gradeContract = { outputPaths: [], endpoints: [], commands: ["python grade.py"], files: [] };
+  assert.equal(mirrorsEvaluator("npm run build", gradeContract), false, "a build never satisfies a required grade command");
+});
+
 // ---------------------------------------------------------------------------
 // Phase controller (Phase 7): monotonic phases, reserve protects the result.
 // ---------------------------------------------------------------------------
@@ -153,17 +163,20 @@ test("phases never move backward without an explicit recorded override", () => {
   assert.equal(phase.snapshot().overrides.length, 1, "the override must be recorded, not silent");
 });
 
-test("reserve phase blocks risky state-changing actions and warns on ordinary ones", () => {
+test("reserve phase blocks DESTRUCTIVE actions but only WARNS on installs/refactors (H2)", () => {
   const phase = new PhaseController({ actionBudget: 10 });
   phase.noteAction(10);
   assert.equal(phase.currentPhase(), "reserve");
-  const risky = phase.assessAction("state_changing", "npm install && refactor the whole module");
-  assert.equal(risky.verdict, "block");
-  assert.match(risky.message ?? "", /RESERVE/);
-  const ordinary = phase.assessAction("state_changing", "edit src/app.ts");
-  assert.equal(ordinary.verdict, "warn");
-  const read = phase.assessAction("read", "cat src/app.ts");
-  assert.equal(read.verdict, "ok", "reading is always safe in reserve");
+  // Truly destructive commands that could wipe the working result stay blocked.
+  const destructive = phase.assessAction("state_changing", "rm -rf dist && git reset --hard");
+  assert.equal(destructive.verdict, "block");
+  assert.match(destructive.message ?? "", /RESERVE/);
+  // Installs / refactors are often a legitimate LATE need of a real build (add a dep, finish a file);
+  // blocking them was a top "never finishes" cause, so RESERVE only WARNS on them now.
+  assert.equal(phase.assessAction("state_changing", "npm install axios").verdict, "warn", "an install warns, not blocks");
+  assert.equal(phase.assessAction("state_changing", "refactor the whole module").verdict, "warn", "a refactor warns, not blocks");
+  assert.equal(phase.assessAction("state_changing", "edit src/app.ts").verdict, "warn");
+  assert.equal(phase.assessAction("read", "cat src/app.ts").verdict, "ok", "reading is always safe in reserve");
 });
 
 // ---------------------------------------------------------------------------

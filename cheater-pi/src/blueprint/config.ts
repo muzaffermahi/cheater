@@ -36,6 +36,11 @@ export interface BlueprintConfig extends CommitletConfig {
   packetHardContextCeilingTokensMoE: number;
   loopGovernorEnabled: boolean;
   maxLoopBreaksPerPacket: number;
+  /** Extra loop-break budget granted to a packet that is GENUINELY iterating on a hard task (>=2
+   *  distinct files edited AND >=2 distinct failing commands - real progress, not spinning). 0 = off
+   *  (the terminal cap is exactly maxLoopBreaksPerPacket). Raises the ceiling only for real iteration;
+   *  pure spinning is still caught by the same-patch/same-command detectors and hits terminal on time. */
+  hardTaskLoopBudget: number;
   maxToolCallsTinyPacket: number;
   maxToolCallsNormalPacket: number;
   maxToolCallsHardPacket: number;
@@ -68,6 +73,10 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   blueprintMaxDebugRounds: 3,
   blueprintReplanAfterFailedDebug: true,
   blueprintMemoryEnabled: true,
+  // Intentional layering (NOT a contradiction): the blueprint subsystem's OWN default is on - it is
+  // used directly when createAutonomousBlueprint runs standalone (e.g. tests). The integrated cheater
+  // path (DEFAULT_CONFIG in config.ts) overrides this to OFF, so normal cheater runs keep docs search
+  // off unless an env var / explicit config turns it on.
   blueprintOfficialDocsSearchEnabled: true,
   blueprintDocsProvider: "official_allowlist",
   searxngBaseUrl: "",
@@ -88,6 +97,7 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   packetHardContextCeilingTokensMoE: 24000,
   loopGovernorEnabled: true,
   maxLoopBreaksPerPacket: 3,
+  hardTaskLoopBudget: 0,
   maxToolCallsTinyPacket: 6,
   maxToolCallsNormalPacket: 14,
   maxToolCallsHardPacket: 24,
@@ -96,7 +106,13 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   // fingerprints in loopGovernor.ts), not ordinary multi-edit sessions.
   maxTotalToolCallsPerPacket: 40,
   sameFileReadLimit: 4,
-  sameFailedCommandLimit: 2,
+  // Keyed on the COMMAND family, so a real build-fix loop (`npm run build` re-run after each fix, a
+  // DIFFERENT error each time = progress) counts as "the same failed command" even though it is
+  // advancing. A truly stuck loop (the SAME failure twice) is caught independently by the no-progress
+  // detector (observeNoProgress), so this limit can give legitimate iteration headroom: 3 lets a build
+  // fail-fix-fail-fix a few times before the cruder command-family break trips. (Full fix would key on
+  // the failure OUTPUT changing - needs the command output plumbed into the observation.)
+  sameFailedCommandLimit: 3,
   sameSearchQueryLimit: 3,
   samePatchLimit: 3,
   stopSentinelsEnabled: true,

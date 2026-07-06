@@ -13,6 +13,13 @@ import type { CheaterConfig } from "../types.js";
 
 const MAX_NUDGES_PER_TURN = 2;
 
+/** Normalize a goal string so a re-typed/rephrased-with-punctuation restart of the SAME task
+ *  compares equal (lowercase, collapse every non-alphanumeric run to one space, trim). Used to
+ *  tell "the model looped back into planning for the same goal" from "a genuinely new goal". */
+function normalizeGoal(goal: string): string {
+  return (goal || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 const COMMAND_TOOLS = new Set(["bash", "run_command", "run", "shell"]);
 const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_patch", "cheater_line_edit", "cheater_replace"]);
 // Driver tools ORCHESTRATE the commitlet chain; calling them repeatedly with no args is the intended
@@ -22,6 +29,11 @@ const EDIT_TOOLS = new Set(["edit", "write", "edit_file", "create_file", "apply_
 // them; if the model truly does nothing, the loop governor's total-call cap and the closed loop's
 // iteration cap still bound it.
 const DRIVER_TOOLS = new Set(["cheater_commitlet_next", "cheater_run", "cheater_reliability_start"]);
+
+// A model that rewrites the SAME file this many times (with different content each time, so the
+// identical-call guard never fires) is almost always second-guessing code that already works. It
+// gets one advisory nudge to verify-and-finish at the limit, and a firmer one a few writes later.
+const SAME_FILE_WRITE_NUDGE_LIMIT = 8;
 
 export interface LiveToolCallObservation {
   toolCallId: string;
@@ -86,12 +98,34 @@ class LiveSessionState {
   // last tool call, and how many times in a row the exact same call was made.
   private lastCallSignature = "";
   private identicalCallCount = 0;
+  // Per-path count of successful edit-tool writes this session, for the over-write thrash nudge.
+  private readonly fileWriteCounts = new Map<string, number>();
+
+  /**
+   * Is the current ledger a RE-ENTRY for `userGoal` - i.e. it belongs to the same task, already
+   * holds real work (a file change, a command, or a verification stage), and is not finalized?
+   * A weak local model, blocked by the finish gate, often loops back and re-calls the planning
+   * tools (cheater_run / cheater_reliability_start) with the SAME goal. Those tools reset(), which
+   * used to mint a brand-new empty ledger and ERASE the record of the files it had already written
+   * and the tests it had already run - so the finish gate reported "no work was done" forever and
+   * the model spun until the turn cap. Preserving the ledger on re-entry is what breaks that loop.
+   */
+  isReentryGoal(userGoal: string): boolean {
+    if (!this.ledger) return false;
+    const s = this.ledger.get();
+    if (s.done) return false;
+    const hasWork = s.changedFiles.length > 0 || s.commandsRun.length > 0 || s.verification.length > 0;
+    if (!hasWork) return false;
+    return normalizeGoal(s.userGoal) === normalizeGoal(userGoal);
+  }
 
   reset(userGoal?: string): void {
     this.toolRecords = [];
     this.textSummaries = [];
     this.currentPacketId = "session";
-    if (userGoal) {
+    if (userGoal && !this.isReentryGoal(userGoal)) {
+      // Genuinely new (or first) goal -> fresh completion ledger. A same-goal re-entry keeps the
+      // existing ledger (see isReentryGoal) so the finish gate still sees the work already done.
       this.ledger = new CompletionLedger(userGoal);
     }
     this.governor = null;
@@ -102,6 +136,7 @@ class LiveSessionState {
     this.pendingLoopWarnings.clear();
     this.lastCallSignature = "";
     this.identicalCallCount = 0;
+    this.fileWriteCounts.clear();
   }
 
   /**
@@ -121,6 +156,7 @@ class LiveSessionState {
     this.pendingLoopWarnings.clear();
     this.lastCallSignature = "";
     this.identicalCallCount = 0;
+    this.fileWriteCounts.clear();
     if (this.ledger) {
       const state = this.ledger.get();
       if (state.done || isTerminalVerified(state.verification)) this.ledger = null;
@@ -129,6 +165,10 @@ class LiveSessionState {
 
   setLastUserGoal(goal: string): void {
     this.lastUserGoal = goal;
+  }
+
+  getLastUserGoal(): string {
+    return this.lastUserGoal;
   }
 
   ensure(config: CheaterConfig, userGoal = "current session"): { ledger: CompletionLedger; governor: LoopGovernor; detector: NonProgressDetector } {
@@ -280,6 +320,22 @@ class LiveSessionState {
     }
 
     const events: LiveLifecycleEvent[] = [];
+    // Over-write thrash guard: rewriting one file many times (each write a bit different, so the
+    // identical-call guard never fires) is the csvparse failure mode - the model kept rewriting a
+    // parser that ALREADY passed, never finishing, and ballooned the run. Nudge it (advisory, never
+    // a hard block) to verify once and finish. Fires even when the model works "raw" without
+    // cheater's tools, because observeToolResult sees every write.
+    if (obs.ok && obs.path && EDIT_TOOLS.has(obs.toolName)) {
+      const writes = (this.fileWriteCounts.get(obs.path) ?? 0) + 1;
+      this.fileWriteCounts.set(obs.path, writes);
+      if (writes === SAME_FILE_WRITE_NUDGE_LIMIT || writes === SAME_FILE_WRITE_NUDGE_LIMIT + 4) {
+        events.push({
+          kind: "loop_break",
+          message: `Cheater: you have now written ${obs.path} ${writes} times. If it already works, STOP editing - run your verification once and call cheater_finish_gate. Repeatedly rewriting working code tends to BREAK it, not improve it.`,
+          terminal: false
+        });
+      }
+    }
     const step = {
       action: obs.toolName,
       argsSig: (record?.value ?? "").slice(0, 80),

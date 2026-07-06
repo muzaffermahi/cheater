@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { collectTasks } from "./cli.js";
 import { createWorkspace } from "./workspace.js";
 import { buildPrompt } from "./runner.js";
-import { readLatestReport, listLearningSuggestions, buildReport, writeReport, writeMarkdownReport, buildLearningSuggestions, writeLearningSuggestions, listReports, buildGymBugMemoryCards, writeGymBugMemoryCards } from "./report.js";
+import { readLatestReport, listLearningSuggestions, buildReport, writeReport, writeMarkdownReport, buildLearningSuggestions, writeLearningSuggestions, listReports } from "./report.js";
 import { formatTaskCard, formatTaskList, formatReportSummary, formatDeltaReport, formatLearningSuggestions } from "./ui.js";
 import { loadConfig } from "../config.js";
 import type { CheaterConfig } from "../types.js";
@@ -162,13 +162,7 @@ export function registerGymCommands(pi: ExtensionAPI, deps: GymCommandDeps): voi
       const enrichedResults = results.map((r) => ({ ...r.result, task: r.task, score: r.score }));
       const suggestions = buildLearningSuggestions(enrichedResults);
       if (suggestions.length > 0) writeLearningSuggestions(cwd, suggestions);
-      let memoryNote = "";
-      if (deps.config.gymAutoLearn) {
-        const cards = buildGymBugMemoryCards(enrichedResults);
-        const path = writeGymBugMemoryCards(cwd, cards);
-        memoryNote = path ? `\nlearned bug-memory cards: ${cards.length} -> ${path}` : "\nlearned bug-memory cards: 0";
-      }
-      notifyDefault(deps, ctx, `${formatReportSummary(report)}${memoryNote}`);
+      notifyDefault(deps, ctx, formatReportSummary(report));
     }
   });
 

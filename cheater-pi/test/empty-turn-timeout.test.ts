@@ -27,10 +27,10 @@ test("a turn with assistant text is never counted as empty", () => {
   emptyTurnDetector.reset();
 });
 
-test("piIdleTimeoutMs defaults to 30 minutes and honors config (incl. 0 = no timeout)", () => {
-  assert.equal(piIdleTimeoutMs(), 1_800_000);
-  assert.equal(piIdleTimeoutMs({}), 1_800_000);
-  assert.equal(piIdleTimeoutMs({ httpIdleTimeoutMs: 600_000 }), 600_000);
+test("piIdleTimeoutMs defaults to 10 minutes (prefill-safe, bounds a hang) and honors config (incl. 0 = no timeout)", () => {
+  assert.equal(piIdleTimeoutMs(), 600_000);
+  assert.equal(piIdleTimeoutMs({}), 600_000);
+  assert.equal(piIdleTimeoutMs({ httpIdleTimeoutMs: 1_200_000 }), 1_200_000, "config raises it for very slow prefill");
   assert.equal(piIdleTimeoutMs({ httpIdleTimeoutMs: 0 }), 0, "0 means no timeout");
-  assert.equal(piIdleTimeoutMs({ httpIdleTimeoutMs: -5 }), 1_800_000, "invalid negative falls back");
+  assert.equal(piIdleTimeoutMs({ httpIdleTimeoutMs: -5 }), 600_000, "invalid negative falls back to default");
 });

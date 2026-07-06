@@ -26,7 +26,8 @@ test("renderRunConsole shows mode, a progress bar, current commitlet, verify, an
 });
 
 test("renderRunConsole stays minimal when there is little to show", () => {
-  const lines = renderRunConsole({ status: "working", changedFiles: 0, unresolvedFailures: 0 });
+  // mascot:false isolates the content (the cat-face prefix is covered in mascot.test.ts).
+  const lines = renderRunConsole({ status: "working", changedFiles: 0, unresolvedFailures: 0 }, { mascot: false });
   assert.deepEqual(lines, ["Cheater - working"]);
 });
 

@@ -9,14 +9,15 @@ function blueprintOn(config?: CheaterConfig): boolean {
 }
 
 export function startupCard(cwd: string, model: string | undefined, config?: CheaterConfig): string[] {
-  const lines = [
+  // The mascot itself is a separate animated widget (mascotComponent, TUI only) that sits above this
+  // card; this card is the plain info block beneath it.
+  const lines: string[] = [
     "Cheater mode active",
     `repo: ${cwd}`,
     `model: ${model ?? "Pi default"}`,
     "Ask normally. Autopilot routes code requests through the one Reliability flow:",
     "  reliability_start -> edit allowed files -> commitlet_next -> verify -> finish_gate",
-    "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health",
-    "memory: compacted solved-bug corpus auto-consulted on failures via cheater_bug_memory_search"
+    "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health"
   ];
   if (gymOn(config)) lines.push("gym (local benchmark): /gym /gym-list /gym-run /gym-report");
   return lines;
@@ -65,9 +66,7 @@ export function commandHelp(config?: CheaterConfig): string {
   lines.push(
     "/test     Infer or run a focused test command",
     "/map      Ask Pi for a compact repo overview",
-    "/bug-memory Search compacted solved-bug memories",
     "/remember Save a project note",
-    "bug memory tool: cheater_bug_memory_search (auto-invoked on failures)",
     "/skills   List Cheater skills loaded by this package",
     "/traces   Show recent session/history guidance",
     "/settings Show Cheater settings",

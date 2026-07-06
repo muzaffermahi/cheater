@@ -18,6 +18,10 @@ export interface SidecarCompletionParams {
   timeoutMs?: number;
   /** Telemetry/receipt label, e.g. "distill_failure" / "route_goal". */
   label?: string;
+  /** Per-call reasoning-depth jitter - the one sampling knob Pi's SDK exposes (there is no
+   *  temperature). Used by in-session best-of-N to diversify otherwise-identical samples; Pi
+   *  clamps it to the model's capabilities. Omitted = the session/model default. */
+  thinkingLevel?: "off" | "low" | "medium" | "high";
 }
 
 export type SidecarCompletion =
