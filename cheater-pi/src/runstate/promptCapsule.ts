@@ -81,14 +81,6 @@ export interface CapsuleSizeReport {
 export const CAPSULE_TARGET_TOKENS = 4000;
 export const CAPSULE_WARN_TOKENS = 8000;
 
-// Lean mode (Track 3 - prefill reduction): cap the growing/fixed fields harder so each worker prompt
-// is smaller, cutting the main model's per-commitlet prefill (the "main works too hard" bottleneck).
-// Set per-run from config (leanWorkerPromptEnabled); OFF = the exact caps below, byte-identical. No
-// field is DROPPED - only capped tighter - so nothing load-bearing (contract, failure, scope) is lost.
-let leanMode = false;
-export function setLeanCapsule(enabled: boolean): void { leanMode = enabled; }
-export function leanCapsuleEnabled(): boolean { return leanMode; }
-
 const DEFAULT_OUTPUT_INSTRUCTIONS = [
   "files changed (exact paths)",
   "commands run and their outcomes",
@@ -156,12 +148,12 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
     // live: clipping this to 1400 chopped the evidence out of repair packets.
     observedFailure: input.observedFailure?.trim() ? clampText(input.observedFailure, 2600) : undefined,
     attemptStance: input.attemptStance?.trim() ? clampText(input.attemptStance, 300) : undefined,
-    operatingRules: input.operatingRules?.length ? clampList(input.operatingRules, leanMode ? 4 : 6, 160) : undefined,
-    worldDiff: input.worldDiff?.length ? clampList(input.worldDiff, leanMode ? 5 : 8, 160) : undefined,
-    relevantFiles: (input.relevantFiles ?? []).slice(0, leanMode ? 4 : 6).map((file) => ({
+    operatingRules: input.operatingRules?.length ? clampList(input.operatingRules, 6, 160) : undefined,
+    worldDiff: input.worldDiff?.length ? clampList(input.worldDiff, 8, 160) : undefined,
+    relevantFiles: (input.relevantFiles ?? []).slice(0, 6).map((file) => ({
       path: file.path,
       reason: clampText(file.reason, 100),
-      snippet: file.snippet ? clampText(file.snippet, leanMode ? 1100 : 1600) : undefined
+      snippet: file.snippet ? clampText(file.snippet, 1600) : undefined
     })),
     allowedFiles: clampList(input.allowedFiles, 8, 200),
     forbiddenFiles: clampList(input.forbiddenFiles, 8, 200),
@@ -169,12 +161,12 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
     constraints: clampList(input.constraints, 8, 160),
     riskWarnings: clampList(input.riskWarnings, 4, 200),
     validationPlan: clampList(input.validationPlan, 5, 160),
-    workspaceDigest: clampText(input.workspaceDigest, leanMode ? 900 : 1500),
-    mutationSummary: clampList(input.mutationSummary, leanMode ? 4 : 6, 160),
-    priorWorkerReports: clampList(input.priorWorkerReports, leanMode ? 2 : 3, 240),
+    workspaceDigest: clampText(input.workspaceDigest, 1500),
+    mutationSummary: clampList(input.mutationSummary, 6, 160),
+    priorWorkerReports: clampList(input.priorWorkerReports, 3, 240),
     outputInstructions: clampList(input.outputInstructions ?? DEFAULT_OUTPUT_INSTRUCTIONS, 8, 120),
     phaseLines: clampList(input.phaseLines, 4, 160),
-    rulePack: clampList(input.rulePack, leanMode ? 7 : 12, 140),
+    rulePack: clampList(input.rulePack, 12, 140),
     tokenBudgetHint: input.tokenBudgetHint ?? CAPSULE_TARGET_TOKENS,
     fragments: input.fragments?.slice(0, 20)
   };
@@ -187,14 +179,10 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
   lines.push("Your only job:");
   lines.push(capsule.workerGoal);
   lines.push("");
-  if (leanMode) {
-    lines.push("Stay strictly in scope: only the listed files, no unrelated fixes, no broad rewrites or refactors.");
-  } else {
-    lines.push("Do not solve unrelated problems.");
-    lines.push("Do not inspect the whole repo unless a listed file requires it.");
-    lines.push("Do not refactor outside allowed files.");
-    lines.push("Do not perform broad rewrites.");
-  }
+  lines.push("Do not solve unrelated problems.");
+  lines.push("Do not inspect the whole repo unless a listed file requires it.");
+  lines.push("Do not refactor outside allowed files.");
+  lines.push("Do not perform broad rewrites.");
   if (capsule.nonGoals.length) {
     lines.push("Non-goals:");
     for (const nonGoal of capsule.nonGoals) lines.push(`- ${nonGoal}`);
@@ -325,8 +313,4 @@ export function capsuleSizeReport(capsule: PromptCapsule): CapsuleSizeReport {
           ? `capsule is ~${estimatedTokens} tokens - above the ${CAPSULE_TARGET_TOKENS} target`
           : undefined
   };
-}
-
-export function saveCapsule(runDir: string, capsule: PromptCapsule): string {
-  return writeRunFile(runDir, `capsules/${capsule.workerRole}-capsule.json`, JSON.stringify(capsule, null, 2) + "\n");
 }

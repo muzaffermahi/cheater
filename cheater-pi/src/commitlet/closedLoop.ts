@@ -44,7 +44,6 @@ import { mainCallGovernor, workerRoleForCommitletId } from "../runtime/mainCallG
 import { sidecarUsage, sidecarKeepAlive } from "../runtime/sidecarUsage.js";
 import { getWorkerPromptShape, resetWorkerPromptShape } from "../runtime/promptShape.js";
 import { runProviderProbe } from "../providers/lmStudioStateful.js";
-import { setLeanCapsule } from "../runstate/promptCapsule.js";
 import { workerBackendReason } from "../blueprint/worker.js";
 import { steeringControl } from "../runstate/steering.js";
 import { activeTaskRun, beginTaskRun, type TaskRunState } from "../runstate/runState.js";
@@ -368,7 +367,6 @@ async function runClosedLoopInner(
   mainCallGovernor.reset();
   sidecarUsage.reset();
   resetWorkerPromptShape();
-  setLeanCapsule(config.leanWorkerPromptEnabled === true); // Track 3: smaller worker prompts = cheaper prefill
   sidecarUsage.noteResolved(scfg.enabled, sidecar.available());
   // Optional: keep a CPU sidecar warm with ONE tiny JSON health check (non-blocking, never a gate).
   if (scfg.enabled && (config.sidecarForceWarmOnRunStart || config.sidecarKeepAliveEnabled)) {

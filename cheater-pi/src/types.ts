@@ -265,11 +265,6 @@ export interface CheaterConfig {
   providerProbeEnabled?: boolean;
   // Also run the fixed-prefix reuse micro-benchmark (measured only; never claims KV-cache). Off by default.
   providerProbeBenchmark?: boolean;
-  // Lean worker prompt (Track 3 - prefill reduction): cap the growing/fixed capsule fields (rulePack,
-  // operatingRules, workspaceDigest, mutationSummary, priorWorkerReports, snippets) harder so each
-  // commitlet's prompt is smaller and the main model's per-file prefill is cheaper. Drops nothing
-  // load-bearing. Off by default (byte-identical worker prompts when off). See promptCapsule.setLeanCapsule.
-  leanWorkerPromptEnabled?: boolean;
   // MAIN-session prefill economy. The single biggest TTFT cost on a local model is the FIRST
   // prefill; the second is re-prefilling when the cached prompt PREFIX changes between turns (a
   // local engine like LM Studio/llama.cpp reuses the KV cache only for a byte-stable prefix).

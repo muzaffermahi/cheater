@@ -4,7 +4,7 @@ import { mainCallGovernor } from "../src/runtime/mainCallGovernor.js";
 import { sidecarUsage, sidecarKeepAlive } from "../src/runtime/sidecarUsage.js";
 import { analyzePromptShape, recordWorkerPromptShape, getWorkerPromptShape, resetWorkerPromptShape, promptShapeLine } from "../src/runtime/promptShape.js";
 import { normalizeToolError } from "../src/runtime/toolErrorNormalize.js";
-import { buildPromptCapsule, estimateCapsuleTokens, setLeanCapsule } from "../src/runstate/promptCapsule.js";
+import { buildPromptCapsule, estimateCapsuleTokens } from "../src/runstate/promptCapsule.js";
 import { buildCompletionReceipt } from "../src/commitlet/kernel.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
 import type { SidecarClient, SidecarCompletion } from "../src/sidecar/types.js";
@@ -166,23 +166,4 @@ test("buildCompletionReceipt shows the main-call budget + sidecar liveness when 
   sidecarUsage.reset();
   // With the governor off, the same ledger yields no budget lines (behaviour unchanged).
   assert.doesNotMatch(buildCompletionReceipt(ledger), /main model calls:/);
-});
-
-// --- Track 3: lean worker prompt shrinks the capsule --------------------------------------------
-
-test("lean worker prompt caps the growing/fixed fields and shrinks the prompt (Track 3)", () => {
-  const heavy = {
-    taskId: "t", workerRole: "w", workerGoal: "do the thing",
-    rulePack: Array.from({ length: 12 }, (_, i) => `rule ${i} that is long enough to matter for the token estimate`),
-    operatingRules: Array.from({ length: 6 }, (_, i) => `operating rule ${i} also reasonably long here`),
-    priorWorkerReports: Array.from({ length: 3 }, (_, i) => `prior worker report number ${i} `.repeat(15)),
-    mutationSummary: Array.from({ length: 6 }, (_, i) => `mutation ${i} touched some file in the tree`),
-    workspaceDigest: "digest line ".repeat(300)
-  };
-  setLeanCapsule(false);
-  const normal = estimateCapsuleTokens(buildPromptCapsule(heavy));
-  setLeanCapsule(true);
-  const lean = estimateCapsuleTokens(buildPromptCapsule(heavy));
-  setLeanCapsule(false); // reset the module flag so other tests/files are unaffected
-  assert.ok(lean < normal, `lean (${lean} tok) should be smaller than normal (${normal} tok)`);
 });
