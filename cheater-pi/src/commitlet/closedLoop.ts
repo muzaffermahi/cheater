@@ -447,7 +447,7 @@ async function runClosedLoopInner(
   // Phase A: stamp a recognized stack's invariant boilerplate to disk up front (once), so the model
   // decodes only real app logic. Needs the durable run for read-before-write bookkeeping; a no-op
   // when the flag is off, there is no run, or the stack is not recognized.
-  if (scaffolding && config.scaffoldTemplatesEnabled === true) {
+  if (scaffolding) {
     const stampRun = activeTaskRun();
     if (stampRun) {
       const stamped = stampScaffoldPrelude(cwd, scaffoldFiles, userGoal, config, stampRun);

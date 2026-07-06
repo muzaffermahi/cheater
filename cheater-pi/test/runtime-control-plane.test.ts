@@ -16,7 +16,7 @@ function fakeClient(available: boolean, complete: () => Promise<SidecarCompletio
 // --- Part A: the Main LLM Call Governor -----------------------------------------------------------
 
 test("governor: a clerical role prefers sidecar/deterministic and is never a main call", () => {
-  mainCallGovernor.configure({ mainCallGovernorEnabled: true });
+  mainCallGovernor.configure({});
   mainCallGovernor.reset();
   const d = mainCallGovernor.decide("route");
   assert.equal(d.target, "sidecar", "route is clerical -> sidecar/deterministic, not main");
@@ -30,16 +30,16 @@ test("governor: a clerical role prefers sidecar/deterministic and is never a mai
 });
 
 test("governor: clerical roles do not escalate to main unless configured", () => {
-  mainCallGovernor.configure({ mainCallGovernorEnabled: true });
+  mainCallGovernor.configure({});
   assert.equal(mainCallGovernor.decide("failure_distill").canEscalate, false, "no escalation by default");
-  mainCallGovernor.configure({ mainCallGovernorEnabled: true, mainFallbackAllowedRoles: ["failure_distill"] });
+  mainCallGovernor.configure({mainFallbackAllowedRoles: ["failure_distill"] });
   assert.equal(mainCallGovernor.decide("failure_distill").canEscalate, true, "escalation only for the configured role");
   assert.equal(mainCallGovernor.decide("route").canEscalate, false, "a non-configured clerical role still cannot escalate");
   mainCallGovernor.configure({});
 });
 
 test("governor: creation/repair roles go to main and are counted with est tokens", () => {
-  mainCallGovernor.configure({ mainCallGovernorEnabled: true });
+  mainCallGovernor.configure({});
   mainCallGovernor.reset();
   assert.equal(mainCallGovernor.decide("code_worker").target, "main");
   assert.equal(mainCallGovernor.decide("repair_worker").target, "main");
@@ -51,14 +51,6 @@ test("governor: creation/repair roles go to main and are counted with est tokens
   assert.equal(s.estMainTokens, 2 * 1500 + 900);
   assert.match(mainCallGovernor.receiptLines().join("\n"), /main model calls: 3 total/);
   mainCallGovernor.configure({});
-});
-
-test("governor receipt section is gated on the enabled flag", () => {
-  mainCallGovernor.configure({}); // off
-  mainCallGovernor.reset();
-  mainCallGovernor.recordMain("code_worker", { calls: 1 });
-  assert.deepEqual(mainCallGovernor.receiptLines(), [], "off -> no receipt lines, behaviour unchanged");
-  mainCallGovernor.reset();
 });
 
 // --- Part C: prompt shape -------------------------------------------------------------------------
@@ -144,7 +136,7 @@ test("toolErrorNormalize classifies common tool/command errors into bounded kind
 // --- Part F: the receipt actually shows the budget when the governor is on ------------------------
 
 test("buildCompletionReceipt shows the main-call budget + sidecar liveness when the governor is on", () => {
-  mainCallGovernor.configure({ mainCallGovernorEnabled: true });
+  mainCallGovernor.configure({});
   mainCallGovernor.reset();
   mainCallGovernor.recordMain("code_worker", { calls: 2, estTokens: 1200 });
   mainCallGovernor.recordAvoided("route", "deterministic", "confident deterministic route");

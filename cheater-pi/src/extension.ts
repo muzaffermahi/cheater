@@ -512,7 +512,7 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     }
     // Clean cheater view: collapse pi's raw tool output by default so the user isn't buried in every
     // terminal command scrolling by. /pi toggles the raw output back on. Interactive TUI only.
-    if (ctx.mode === "tui" && config.cleanTuiEnabled !== false) {
+    if (ctx.mode === "tui") {
       try { ctx.ui.setToolsExpanded?.(false); } catch { /* best-effort */ }
     }
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });

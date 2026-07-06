@@ -92,7 +92,6 @@ const defaultRun: RunFn = (command, opts) => {
  */
 export function runTypeCheckGate(params: { cwd: string; changedFiles: string[]; config: CheaterConfig; run?: RunFn }): TypeCheckGateResult {
   const { cwd, changedFiles, config } = params;
-  if (config.typeCheckGateEnabled !== true) return DISABLED;
   const relevant = changedFiles.filter((file) => /\.(m|c)?tsx?$/.test(file));
   if (!relevant.length) return { ...DISABLED, summary: "no TypeScript files changed" };
   const detected = detectTypecheckCommand(cwd);

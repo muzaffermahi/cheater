@@ -9,9 +9,6 @@ export interface CheaterConfig {
   // to disable; mascotStyle:"ascii" uses plainer glyphs for terminals that render kaomoji poorly.
   mascotEnabled?: boolean;
   mascotStyle?: "cat" | "ascii" | "off";
-  /** Interactive TUI only: collapse pi's raw tool output by default for a clean cheater view - the
-   *  user isn't buried in every terminal command. /pi toggles the raw output back on. Default on. */
-  cleanTuiEnabled?: boolean;
   defaultTestCommand?: string;
   packagePath?: string;
   debug?: boolean;
@@ -184,11 +181,6 @@ export interface CheaterConfig {
   // dispatch anytime - for a CPU-hosted sidecar or a real batching backend that won't contend.
   // "off": run sidecar jobs synchronously on demand (no background scheduling).
   sidecarParallelism?: "off" | "gap" | "concurrent";
-  // Bounded typecheck gate (R1): after a commitlet edit, run the project typechecker and
-  // hard-block ONLY new errors in the files this change touched (pre-existing repo errors warn;
-  // no typechecker / timeout never blocks). A block routes through the bounded repair path, so it
-  // is escapable, not a dead-end. Off by default until validated live. TypeScript-first.
-  typeCheckGateEnabled?: boolean;
   typeCheckGateBlocking?: boolean;
   typeCheckGateTimeoutMs?: number;
   rollbackRequired?: boolean;
@@ -219,9 +211,6 @@ export interface CheaterConfig {
   // Action budget for the time-aware phase controller (EXPLORE/IMPLEMENT/VALIDATE/RESERVE).
   // Unset = derived from the plan's per-commitlet tool budgets.
   runStateActionBudget?: number;
-  // Read-before-write hook: overwriting an existing file the run never read (and that the
-  // contract does not name as an artifact) is blocked. Default on.
-  readBeforeWriteEnabled?: boolean;
   // Threshold (chars) above which a full-file rewrite of an existing file draws a
   // verification-required warning. Default 6000.
   largeWriteWarnChars?: number;
@@ -235,12 +224,8 @@ export interface CheaterConfig {
   workerForkMode?: "none" | "last_n" | "all";
   workerForkModeOverrideReason?: string;
   workerForkTurns?: number;
-  // --- Main LLM Call Governor (control plane: call the big model less, only when it matters) ---
-  // The governor CLASSIFIES an intended call into a role, states the policy (main/sidecar/
-  // deterministic + whether it may escalate), and RECORDS main calls made vs avoided for the
-  // receipt. Off by default: the wiring still accounts, but the receipt section is gated on this,
-  // so behaviour is identical when off. See runtime/mainCallGovernor.ts.
-  mainCallGovernorEnabled?: boolean;
+  // --- Main LLM Call Governor: classify each intended call into a role, apply the policy
+  // (main/sidecar/deterministic), and record main calls made vs avoided for the receipt. ---
   // Roles the big model is allowed for (default: blueprint_planning, code_worker, repair_worker,
   // strategic_bug_reasoning). Clerical roles default to sidecar/deterministic.
   mainAllowedRoles?: string[];
@@ -283,15 +268,6 @@ export interface CheaterConfig {
   // Max sidecar jobs in flight at once (Track 2). Only >1 with a separate CPU endpoint that won't
   // contend with the GPU. Default 1 (a single local model can't usefully parallelize with itself).
   sidecarMaxConcurrency?: number;
-  // From-scratch boilerplate acceleration (Phase A): the harness keeps a REGISTRY of stack profiles
-  // and matches the model's OWN proposed file list to one (.tsx -> React+Vite TS, .jsx -> React+Vite
-  // JS, ...), then stamps that stack's INVARIANT files (build config, standard entry, Tailwind
-  // index.css, a localStorage hook) to disk so the local model never decodes pure boilerplate. The
-  // model is never shown a menu; its file plan is its choice, and stamped files are an editable
-  // starting point, not a cage. Purely additive: an unrecognized stack stamps nothing and the
-  // model-authored path (blueprint/scaffold.ts) is byte-identical. Off by default until the headless
-  // A/B confirms a net win with no new build-fix cycles; then flip on. See blueprint/stackTemplates.ts.
-  scaffoldTemplatesEnabled?: boolean;
   // Which stack profiles are eligible (default: all registered, currently vite-react-ts + vite-react-js).
   scaffoldTemplateStacks?: string[];
 }

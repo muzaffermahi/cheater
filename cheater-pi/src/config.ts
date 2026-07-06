@@ -21,35 +21,12 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   // Durable run state (contract, digest, ledgers, capsules, phase control, post-success
   // guard) under .cheater/runs/<taskId>/. Deterministic and local-only; on by default.
   runStateEnabled: true,
-  // Promoted from the underexplored-but-built set (28th session flag review):
-  // - mainCallGovernor: PURE telemetry (call-economy receipt of big-model calls made vs avoided) -
-  //   byte-identical behavior, zero risk, and it surfaces exactly the "call the big model less" metric
-  //   this project optimizes. Safe to leave on.
-  // - typeCheckGate: safe-by-design correctness gate - only ever blocks a NEW type error the model's
-  //   OWN change introduced in a changed .ts file, is escapable (routes to the bounded repair path),
-  //   and no-ops when there is no typechecker / it times out / no TS files changed. High value for a
-  //   TS-first workflow. Reversible via config. (typeCheckGateBlocking:false makes it warn-only.)
-  mainCallGovernorEnabled: true,
-  typeCheckGateEnabled: true,
-  // Promoted after a LIVE 3-way A/B (vite-ab/, 2 rounds): on a from-scratch Vite/React/TS build,
-  // stamping the recognized-stack boilerplate (config/entry/index.css) made the model ~22% FASTER
-  // (297s vs 382s avg) with fewer turns and ZERO build regressions - it decodes only app logic.
-  // Safe-by-design: additive, only fires for a recognized stack, no-op otherwise.
-  scaffoldTemplatesEnabled: true,
-  // ADAPTIVE best-of-N (promote-A rule): the pass@k A/B decided A>B - independent samples + an
-  // execution-verified selector took ornith 0.33 -> 1.00 on a hard single-file task. Promoted
-  // ADAPTIVELY so it stays speed-safe on easy tasks: adaptiveCompute scales k by hardness and the
-  // in-session resampler EARLY-EXITS on the first verified sample, so an easy single-file commitlet
-  // runs exactly k=1 (no overhead), while a hard one gets up to adaptiveMaxSamples independent tries.
-  // Fires only on single-file commitlets in the in-session (simulated) lane. maxSamples 3 keeps the
-  // hardest commitlet inside the ~15-min local budget.
+  // Adaptive best-of-N: k scales with per-commitlet hardness and the in-session resampler early-exits
+  // on the first verified sample, so an easy edit runs exactly k=1 (no overhead) while a hard one gets
+  // up to adaptiveMaxSamples independent tries. Single-file commitlets, in-session lane.
   adaptiveComputeEnabled: true,
   inSessionResampleEnabled: true,
-  adaptiveMaxSamples: 3,
-  // Clean TUI: collapse pi's raw tool output by default so a cheater session looks like cheater, not a
-  // wall of pi terminal commands. /pi toggles the raw output back on. Interactive TUI only; no effect
-  // in --print/--mode json. Set false to keep pi's default expanded tool view.
-  cleanTuiEnabled: true
+  adaptiveMaxSamples: 3
 };
 
 export function packageRoot(): string {
