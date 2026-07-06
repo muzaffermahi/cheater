@@ -20,7 +20,17 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   blueprintOfficialDocsSearchEnabled: false,
   // Durable run state (contract, digest, ledgers, capsules, phase control, post-success
   // guard) under .cheater/runs/<taskId>/. Deterministic and local-only; on by default.
-  runStateEnabled: true
+  runStateEnabled: true,
+  // Promoted from the underexplored-but-built set (28th session flag review):
+  // - mainCallGovernor: PURE telemetry (call-economy receipt of big-model calls made vs avoided) -
+  //   byte-identical behavior, zero risk, and it surfaces exactly the "call the big model less" metric
+  //   this project optimizes. Safe to leave on.
+  // - typeCheckGate: safe-by-design correctness gate - only ever blocks a NEW type error the model's
+  //   OWN change introduced in a changed .ts file, is escapable (routes to the bounded repair path),
+  //   and no-ops when there is no typechecker / it times out / no TS files changed. High value for a
+  //   TS-first workflow. Reversible via config. (typeCheckGateBlocking:false makes it warn-only.)
+  mainCallGovernorEnabled: true,
+  typeCheckGateEnabled: true
 };
 
 export function packageRoot(): string {

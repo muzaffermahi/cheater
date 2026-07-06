@@ -34,8 +34,10 @@ function installFakeTsc(cwd: string, stdout: string): void {
 
 // --- pure policy ----------------------------------------------------------------------------
 
-test("the typecheck gate is off by default", () => {
-  assert.equal(runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["src/a.ts"], config: DEFAULT_CONFIG }).ran, false);
+test("the typecheck gate is ON by default (promoted); an explicit false disables it (honest skip)", () => {
+  assert.equal(runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["src/a.ts"], config: { ...DEFAULT_CONFIG, typeCheckGateEnabled: false } }).ran, false, "explicit false -> never runs");
+  const on = runTypeCheckGate({ cwd: process.cwd(), changedFiles: ["src/a.ts"], config: DEFAULT_CONFIG, run: fakeRun("", 0) });
+  assert.equal(on.ran, true, "enabled by default");
 });
 
 test("attributeErrors splits changed-file errors from pre-existing debt", () => {
