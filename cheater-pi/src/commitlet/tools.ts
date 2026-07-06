@@ -439,7 +439,33 @@ export function registerCommitletTools(pi: ExtensionAPI, deps: { config: Cheater
       // Shared kernel verdict: completion-ledger gate + run-state staleness gate + the
       // automatic exact-artifact reread. The closed-loop executor uses the SAME function -
       // one finish truth, never two.
-      const verdict = finishVerdict(deps.config, { summary: params.summary })!;
+      let verdict = finishVerdict(deps.config, { summary: params.summary })!;
+      // Easy-task speed: auto-verify INLINE. When the gate blocks only because no verification
+      // evidence exists yet (the model went straight to finish), run the detected verification HERE
+      // and re-check - instead of forcing a separate cheater_verification_run turn plus a
+      // blocked-then-retry finish (~2 wasted round-trips). A REAL failure re-surfaces and keeps the
+      // gate blocked, so honesty is preserved; this only rescues the "forgot to verify" path. Skipped
+      // when unresolved failures already exist (the model must fix those, not re-verify).
+      const state = ledger.get();
+      const noEvidence = state.verification.length === 0 && state.unresolvedFailures.length === 0;
+      if (!verdict.allowed && noEvidence && deps.config.autoVerifyOnFinish !== false && _ctx?.cwd) {
+        try {
+          const cmds = detectProjectCommands(_ctx.cwd);
+          const result = await runVerification({
+            cwd: _ctx.cwd,
+            userGoal: state.userGoal ?? "verification",
+            planKind: cmds.devCommand ? "webapp" : "cli",
+            projectCommands: cmds
+          });
+          for (const stage of result.stages) ledger.recordVerificationStage(stage);
+          for (const artifact of result.artifacts) ledger.recordArtifact(artifact);
+          const reverdict = finishVerdict(deps.config, { summary: params.summary })!;
+          if (reverdict.allowed) {
+            return textResult(["Cheater Finish Gate: auto-verified inline (no separate verification_run needed).", ...reverdict.lines].join("\n"), { allowed: true, reason: reverdict.reason, freshness: reverdict.freshness, ledger: reverdict.ledgerState, autoVerified: true });
+          }
+          verdict = reverdict;
+        } catch { /* auto-verify is best-effort; fall through to the original verdict */ }
+      }
       return textResult(verdict.lines.join("\n"), { allowed: verdict.allowed, reason: verdict.reason, freshness: verdict.freshness, ledger: verdict.ledgerState });
     }
   });

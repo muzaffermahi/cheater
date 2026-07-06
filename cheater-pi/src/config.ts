@@ -35,7 +35,17 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   // stamping the recognized-stack boilerplate (config/entry/index.css) made the model ~22% FASTER
   // (297s vs 382s avg) with fewer turns and ZERO build regressions - it decodes only app logic.
   // Safe-by-design: additive, only fires for a recognized stack, no-op otherwise.
-  scaffoldTemplatesEnabled: true
+  scaffoldTemplatesEnabled: true,
+  // ADAPTIVE best-of-N (promote-A rule): the pass@k A/B decided A>B - independent samples + an
+  // execution-verified selector took ornith 0.33 -> 1.00 on a hard single-file task. Promoted
+  // ADAPTIVELY so it stays speed-safe on easy tasks: adaptiveCompute scales k by hardness and the
+  // in-session resampler EARLY-EXITS on the first verified sample, so an easy single-file commitlet
+  // runs exactly k=1 (no overhead), while a hard one gets up to adaptiveMaxSamples independent tries.
+  // Fires only on single-file commitlets in the in-session (simulated) lane. maxSamples 3 keeps the
+  // hardest commitlet inside the ~15-min local budget.
+  adaptiveComputeEnabled: true,
+  inSessionResampleEnabled: true,
+  adaptiveMaxSamples: 3
 };
 
 export function packageRoot(): string {
