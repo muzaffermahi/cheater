@@ -30,7 +30,12 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   //   and no-ops when there is no typechecker / it times out / no TS files changed. High value for a
   //   TS-first workflow. Reversible via config. (typeCheckGateBlocking:false makes it warn-only.)
   mainCallGovernorEnabled: true,
-  typeCheckGateEnabled: true
+  typeCheckGateEnabled: true,
+  // Promoted after a LIVE 3-way A/B (vite-ab/, 2 rounds): on a from-scratch Vite/React/TS build,
+  // stamping the recognized-stack boilerplate (config/entry/index.css) made the model ~22% FASTER
+  // (297s vs 382s avg) with fewer turns and ZERO build regressions - it decodes only app logic.
+  // Safe-by-design: additive, only fires for a recognized stack, no-op otherwise.
+  scaffoldTemplatesEnabled: true
 };
 
 export function packageRoot(): string {
