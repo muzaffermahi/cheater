@@ -89,17 +89,15 @@ test("setMascot is JSON/headless-safe: it never throws when ui methods are absen
 
 // ---- the big animated component (catFrame) ----
 
-test("catFrame renders a multi-line cat whose face tracks the state, and animates over ticks", () => {
-  const ready = catFrame(1, "ready");
-  assert.ok(ready.length >= 6, "the mascot is a big multi-line cat, not a one-char spinner");
-  assert.match(ready.join("\n"), /\/\\_\/\\/, "it has cat ears");
-  assert.match(catFrame(1, "success").join("\n"), /\^\s+\^/, "success shows happy eyes");
-  assert.match(catFrame(1, "blocked").join("\n"), /x\s+x/, "blocked shows x eyes");
-  assert.match(catFrame(1, "success").join("\n"), /✓/, "success shows a check aura");
-  // Constant motion: the tail row differs across ticks (it slides).
-  const tailA = catFrame(0, "working").at(-1);
-  const tailB = catFrame(2, "working").at(-1);
-  assert.notEqual(tailA, tailB, "the tail swishes between frames");
+test("catFrame renders a big centered cat whose face tracks the state, and animates over ticks", () => {
+  const cat = catFrame(1, "working");
+  assert.ok(cat.length >= 10, "the mascot is a big multi-line cat, not a one-char spinner");
+  assert.ok(cat.join("\n").includes("/@@\\"), "it has cat ears");
+  assert.match(catFrame(1, "success").join("\n"), /\(\^\)/, "success shows a happy eye");
+  assert.match(catFrame(1, "blocked").join("\n"), /\(x\)/, "blocked shows an x eye");
+  assert.match(catFrame(1, "success").join("\n"), /vvvv/, "success shows a grin");
+  // Constant motion: a blink frame (tick 0) differs from the open-eyed frame (tick 1).
+  assert.notEqual(catFrame(0, "working").join("\n"), catFrame(1, "working").join("\n"), "the face animates between ticks");
 });
 
 test("the animated component calls theme.fg BOUND (never detached) and never throws on a bad theme", () => {

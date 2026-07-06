@@ -1,11 +1,11 @@
-// The BIG animated mascot: "Sly", a chunky terminal cat that moves CONSTANTLY (tail swish, blink,
-// ear twitch, breathing) - the Cline-robot vibe, a real pi TUI Component instead of the one-char
-// spinner glyph. Modeled on pi's ArminComponent (interval -> requestRender -> render(width)), but the
-// loop never stops: it idle-animates forever, and its face tracks the work (thinking/coding/verifying/
-// done/stuck). Interactive TUI only - the factory is mounted just for ctx.mode === "tui", so it never
-// runs in --print/--mode json.
+// "Sly", the big animated cheater mascot: a chunky solid-@ cat HEAD (Cline-robot vibe - a detailed,
+// centered, constantly-alive face rather than a one-char spinner). Modeled on pi's ArminComponent
+// (interval -> requestRender -> render(width)): it idle-animates forever (blink, wink, ear-twitch) and
+// its face tracks the work (thinking/working/sampling/verifying/success/blocked/sleeping). Interactive
+// TUI only - the factory is mounted just for ctx.mode === "tui", so it never runs in --print/--mode json.
 //
 // Pure frame production (catFrame) is separated from the ticking component so the art is unit-testable.
+// All rows are pure ASCII @ (matches the user's reference + is safe on any code page, incl. cp1254).
 
 import type { MascotState } from "./mascot.js";
 
@@ -14,68 +14,66 @@ type TuiLike = { requestRender: () => void };
 type ThemeLike = { fg?: (color: string, text: string) => string };
 
 interface FaceParts {
-  eyes: [string, string]; // left, right eye glyphs (blink overrides these)
-  mouth: string;
+  eye: string; // single-char eye glyph (blink/wink override it)
+  mouth: string; // mouth key -> mouthStr()
   color: string; // theme color name for the whole cat
-  aura: string; // a small tag rendered beside the cat (e.g. "zzZ", "✓", "!", "×3")
 }
 
 function facePartsFor(state: MascotState): FaceParts {
   switch (state) {
-    case "thinking": return { eyes: ["o", "-"], mouth: "~", color: "accent", aura: "?" };
-    case "working": return { eyes: [">", "<"], mouth: "w", color: "text", aura: "" };
-    case "sampling": return { eyes: ["o", "o"], mouth: "o", color: "accent", aura: "×" };
-    case "verifying": return { eyes: ["-", "-"], mouth: "~", color: "warning", aura: "?" };
-    case "success": return { eyes: ["^", "^"], mouth: "‿", color: "success", aura: "✓" };
-    case "blocked": return { eyes: ["x", "x"], mouth: "n", color: "error", aura: "!" };
-    case "sleeping": return { eyes: ["-", "-"], mouth: "‿", color: "muted", aura: "zzZ" };
+    case "thinking": return { eye: "o", mouth: "neutral", color: "accent" };
+    case "working": return { eye: "O", mouth: "neutral", color: "text" };
+    case "sampling": return { eye: "O", mouth: "open", color: "accent" };
+    case "verifying": return { eye: "-", mouth: "neutral", color: "warning" };
+    case "success": return { eye: "^", mouth: "happy", color: "success" };
+    case "blocked": return { eye: "x", mouth: "frown", color: "error" };
+    case "sleeping": return { eye: "-", mouth: "sleep", color: "muted" };
     case "ready":
-    default: return { eyes: ["o", "o"], mouth: "ᵕ", color: "muted", aura: "" };
+    default: return { eye: "O", mouth: "neutral", color: "muted" };
   }
 }
 
-// A swishing tail: a curl that slides left<->right below the cat over a 10-tick ping-pong, so it
-// reads clearly as a tail sweeping the floor rather than scattered glyphs on the body.
-const TAIL_FRAMES = [
-  "  ╰──╮     ",
-  "   ╰──╮    ",
-  "    ╰──╮   ",
-  "     ╰──╮  ",
-  "    ╰──╮   ",
-  "   ╰──╮    ",
-  "  ╰──╮     ",
-  " ╰──╮      "
-];
+// Every mouth is EXACTLY 12 chars so the mouth row never shifts width across states.
+function mouthStr(key: string): string {
+  switch (key) {
+    case "happy": return "\\___vvvv___/";
+    case "frown": return "/^^^^^^^^^^\\";
+    case "sleep": return "\\___ZZZZ___/";
+    case "open": return "\\___OOOO___/";
+    default: return "\\__________/";
+  }
+}
 
 /**
  * Produce the cat's lines for an animation tick + mood. Pure + deterministic (given tick), so it is
- * unit-testable. `tick` increments every frame; blink, ear-twitch, breathing and tail-swish derive
- * from it. Rows are a consistent width and centered so the cat never looks ragged.
+ * unit-testable. `tick` increments every frame; blink, wink and ear-twitch derive from it. The face
+ * itself (eyes + mouth) tracks the mood; expressive moods (success/blocked/sleeping) hold their look
+ * instead of blinking. Rows are left-aligned as a block; the component centers the whole block.
  */
 export function catFrame(tick: number, state: MascotState): string[] {
   const parts = facePartsFor(state);
-  // Blink: eyes shut for one frame roughly every ~2.3s at 6fps, unless the mood already squints.
-  const blinking = tick % 14 === 0 && state !== "sleeping" && state !== "verifying";
-  const [le, re] = blinking ? ["-", "-"] : parts.eyes;
-  // Ear twitch: the ears flick every ~11 frames.
-  const ears = tick % 11 === 5 ? " /\\   /\\ " : " /\\_/\\  ";
-  // Breathing: a subtle one-space bob every other half-cycle.
-  const bob = Math.floor(tick / 5) % 2 === 0 ? "" : " ";
-  const tail = TAIL_FRAMES[tick % TAIL_FRAMES.length];
-  const aura = parts.aura ? ` ${parts.aura}` : "";
-  // Front paws do a slow "make biscuits" shuffle so the chonky body feels alive.
-  const paws = tick % 8 < 4 ? "( |   | )" : "(|   | )";
+  // Expressive moods hold their face; neutral moods blink (both eyes) then wink (one eye) each cycle.
+  const expressive = state === "success" || state === "blocked" || state === "sleeping";
+  const blink = !expressive && tick % 16 === 0;
+  const wink = !expressive && tick % 16 === 8;
+  const le = blink || wink ? "-" : parts.eye;
+  const re = blink ? "-" : parts.eye;
+  // Ears flick outward every ~2s.
+  const ear = tick % 12 === 6 ? "/@ \\" : "/@@\\";
+  const m = mouthStr(parts.mouth);
   return [
-    `${bob}   ${ears}`,
-    `${bob}  /  V  \\`,
-    `${bob} ( ${le}   ${re} )${aura}`,
-    `${bob} (  =^=  )`,
-    `${bob}  ) ${parts.mouth} (`,
-    `${bob}  /~   ~\\`,
-    `${bob} /|     |\\`,
-    `${bob} ${paws}`,
-    `${bob} \\|_ _|/`,
-    `${bob}${tail}`
+    `     ${ear}              ${ear}`,
+    `     @@@@@@          @@@@@@`,
+    `    @@@@@@@@@@@@@@@@@@@@@@@@`,
+    `   @@@@@@@@@@@@@@@@@@@@@@@@@@`,
+    `   @@@@@@  @@@@@@@@@@  @@@@@@`,
+    ` ==@@@@@ (${le}) @@@@ (${re}) @@@@@==`,
+    `   @@@@@@@@@@@@@@@@@@@@@@@@@@`,
+    `   @@@@@@@@@@@ vv @@@@@@@@@@@`,
+    ` ==@@@@@ ${m} @@@@@==`,
+    `    @@@@@@@@@@@@@@@@@@@@@@@@`,
+    `     @@@@@@@@@@@@@@@@@@@@@@`,
+    `       @@@@@@@@@@@@@@@@@@`
   ];
 }
 
@@ -110,16 +108,20 @@ export class CheaterMascotComponent {
     if (width === this.cachedWidth && this.cachedTick === this.tick) return this.cachedLines;
     const state = safeState(this.getState);
     const color = facePartsFor(state).color;
-    this.cachedLines = catFrame(this.tick, state).map((line) => {
-      const clipped = line.slice(0, Math.max(0, width - 1));
+    const frame = catFrame(this.tick, state);
+    // Center the whole cat block: pad every row by the same lead so internal alignment is preserved.
+    const artWidth = Math.max(...frame.map((l) => l.length));
+    const lead = " ".repeat(Math.max(0, Math.floor((width - artWidth) / 2)));
+    this.cachedLines = frame.map((line) => {
+      const centered = (lead + line).slice(0, Math.max(0, width));
       // pi's theme.fg is a METHOD that reads this.fgColors and THROWS on an unknown color, so it must
-      // be called on the theme (never captured as a bare fn, which loses `this`) and wrapped: a
+      // be called ON the theme (never captured as a bare fn, which loses `this`) and wrapped: a
       // decorative mascot must NEVER throw in render or it kills pi's whole TUI loop.
-      let painted = clipped;
+      let painted = centered;
       try {
-        if (this.theme?.fg) painted = this.theme.fg(color, clipped);
+        if (this.theme?.fg) painted = this.theme.fg(color, centered);
       } catch { /* themeless render, unknown color, or detached call - show the cat uncolored */ }
-      return ` ${painted}`;
+      return painted;
     });
     this.cachedWidth = width;
     this.cachedTick = this.tick;
