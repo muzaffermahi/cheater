@@ -126,6 +126,16 @@ test("mirrorsEvaluator is true only for checks that touch exact contract targets
   assert.equal(mirrorsEvaluator("ls -la", contract), false);
 });
 
+test("M4: an equivalent same-ACTION command satisfies the contract target; a different action does not", () => {
+  const buildContract = { outputPaths: [], endpoints: [], commands: ["npm run build"], files: [] };
+  assert.equal(mirrorsEvaluator("npx vite build", buildContract), true, "a proxy build validates a build contract target");
+  assert.equal(mirrorsEvaluator("npm run build", buildContract), true, "the exact command still matches (substring)");
+  assert.equal(mirrorsEvaluator("npm test", buildContract), false, "a TEST command does not satisfy a BUILD target");
+  // A specific grader/command with no recognized action verb only matches on substring - never loosened.
+  const gradeContract = { outputPaths: [], endpoints: [], commands: ["python grade.py"], files: [] };
+  assert.equal(mirrorsEvaluator("npm run build", gradeContract), false, "a build never satisfies a required grade command");
+});
+
 // ---------------------------------------------------------------------------
 // Phase controller (Phase 7): monotonic phases, reserve protects the result.
 // ---------------------------------------------------------------------------

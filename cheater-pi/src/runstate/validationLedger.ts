@@ -205,6 +205,19 @@ export function classifyValidationResultType(
   return "proxy";
 }
 
+// The build/test/lint/typecheck ACTION a command performs, or null. Lets an equivalent command
+// satisfy a contract target of the same action (M4): `npx vite build` validates a `npm run build`
+// target - both build the app - even though their tokens differ so a substring match misses it.
+// Ordered most-specific-first so `build:watch` reads as build, `typecheck` not as `check`.
+const COMMAND_ACTIONS = ["typecheck", "type-check", "e2e", "lint", "test", "build", "compile", "bundle", "serve", "start", "dev"];
+export function commandAction(cmd: string): string | null {
+  const c = (cmd ?? "").toLowerCase();
+  for (const action of COMMAND_ACTIONS) {
+    if (new RegExp(`(^|[\\s:/])${action}([\\s:/-]|$)`).test(c)) return action === "type-check" ? "typecheck" : action;
+  }
+  return null;
+}
+
 export function mirrorsEvaluator(
   commandOrName: string,
   contract: { outputPaths: string[]; endpoints: string[]; commands: string[]; files: string[] } | null
@@ -218,8 +231,14 @@ export function mirrorsEvaluator(
   for (const endpoint of contract.endpoints) {
     if (endpoint && endpoint !== "/" && probe.includes(endpoint.toLowerCase())) return true;
   }
+  const probeAction = commandAction(probe);
   for (const command of contract.commands) {
-    if (command && probe.includes(command.toLowerCase())) return true;
+    if (!command) continue;
+    if (probe.includes(command.toLowerCase())) return true;
+    // M4: same-action equivalence (only when the command carries a recognized action verb), so a
+    // proxy build/test/lint that passed counts as validating a same-action contract target. Never
+    // matches across DIFFERENT actions (a build never satisfies a required grade/test command).
+    if (probeAction && commandAction(command) === probeAction) return true;
   }
   return false;
 }
