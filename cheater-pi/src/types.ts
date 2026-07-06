@@ -9,6 +9,9 @@ export interface CheaterConfig {
   // to disable; mascotStyle:"ascii" uses plainer glyphs for terminals that render kaomoji poorly.
   mascotEnabled?: boolean;
   mascotStyle?: "cat" | "ascii" | "off";
+  /** Interactive TUI only: collapse pi's raw tool output by default for a clean cheater view - the
+   *  user isn't buried in every terminal command. /pi toggles the raw output back on. Default on. */
+  cleanTuiEnabled?: boolean;
   defaultTestCommand?: string;
   packagePath?: string;
   debug?: boolean;

@@ -36,6 +36,7 @@ const PUBLIC_COMMAND_NAMES = [
   "gym-clean",
   "test",
   "map",
+  "pi",
   "bug-memory",
   "remember",
   "skills",
@@ -93,6 +94,17 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
     description: "Ask Pi for a compact repo overview",
     handler: async (_args: string, _ctx: CommandContext) => {
       pi.sendUserMessage("Cheater /map: build a compact repo overview using Pi's native search/list/read tools. Keep it short and emphasize entry points, tests, and likely edit areas.");
+    }
+  });
+
+  pi.registerCommand("pi", {
+    description: "Toggle pi's raw tool output (Cheater collapses it by default for a clean view)",
+    handler: async (_args: string, ctx: CommandContext) => {
+      try {
+        const expanded = !ctx.ui.getToolsExpanded?.();
+        ctx.ui.setToolsExpanded?.(expanded);
+        ctx.ui.notify?.(expanded ? "Cheater: raw pi tool output SHOWN" : "Cheater: clean view - pi tool output collapsed", "info");
+      } catch { /* best-effort; the toggle is cosmetic */ }
     }
   });
 

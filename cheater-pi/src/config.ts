@@ -45,7 +45,11 @@ export const DEFAULT_CONFIG: CheaterConfig = {
   // hardest commitlet inside the ~15-min local budget.
   adaptiveComputeEnabled: true,
   inSessionResampleEnabled: true,
-  adaptiveMaxSamples: 3
+  adaptiveMaxSamples: 3,
+  // Clean TUI: collapse pi's raw tool output by default so a cheater session looks like cheater, not a
+  // wall of pi terminal commands. /pi toggles the raw output back on. Interactive TUI only; no effect
+  // in --print/--mode json. Set false to keep pi's default expanded tool view.
+  cleanTuiEnabled: true
 };
 
 export function packageRoot(): string {
