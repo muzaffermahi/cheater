@@ -9,7 +9,7 @@ import {
   mascotStateForPhase
 } from "../src/ui/mascot.js";
 import { setMascot, configureMascot, getMascotState } from "../src/ui/mascotUi.js";
-import { catFrame } from "../src/ui/mascotComponent.js";
+import { catFrame, CheaterMascotComponent } from "../src/ui/mascotComponent.js";
 import { renderRunConsole } from "../src/reliability/runConsole.js";
 
 // ---- pure mascot strings ----
@@ -100,6 +100,37 @@ test("catFrame renders a multi-line cat whose face tracks the state, and animate
   const tailA = catFrame(0, "working").at(-1);
   const tailB = catFrame(2, "working").at(-1);
   assert.notEqual(tailA, tailB, "the tail swishes between frames");
+});
+
+test("the animated component calls theme.fg BOUND (never detached) and never throws on a bad theme", () => {
+  const tui = { requestRender: () => {} };
+  // A theme whose fg is a METHOD that relies on `this` - exactly like pi's real Theme (this.fgColors).
+  // The old code captured `const fg = this.theme.fg` and called it detached, losing `this` -> the live
+  // "Cannot read properties of undefined (reading 'fgColors')" crash that killed the whole TUI.
+  const realish = {
+    palette: new Map([["muted", "<m>"], ["success", "<s>"]]),
+    fg(color: string, text: string): string {
+      const p = this.palette.get(color);
+      if (!p) throw new Error(`Unknown theme color: ${color}`);
+      return `${p}${text}`;
+    }
+  };
+  const comp = new CheaterMascotComponent(tui, realish, () => "ready");
+  try {
+    const lines = comp.render(40);
+    assert.ok(lines.length >= 6, "renders the multi-line cat");
+    assert.ok(lines.join("").includes("<m>"), "themed via a BOUND this (muted color applied), not crashed");
+  } finally {
+    comp.dispose();
+  }
+  // A theme that THROWS (unknown color / any quirk) must NOT crash render - the cat shows uncolored.
+  const throwing = { fg(): string { throw new Error("Unknown theme color: boom"); } };
+  const comp2 = new CheaterMascotComponent(tui, throwing, () => "success");
+  try {
+    assert.doesNotThrow(() => comp2.render(40), "a throwing theme is swallowed; the mascot never breaks the TUI");
+  } finally {
+    comp2.dispose();
+  }
 });
 
 // ---- run console face ----

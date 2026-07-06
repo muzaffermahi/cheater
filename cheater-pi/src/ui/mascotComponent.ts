@@ -110,10 +110,16 @@ export class CheaterMascotComponent {
     if (width === this.cachedWidth && this.cachedTick === this.tick) return this.cachedLines;
     const state = safeState(this.getState);
     const color = facePartsFor(state).color;
-    const fg = this.theme?.fg;
     this.cachedLines = catFrame(this.tick, state).map((line) => {
       const clipped = line.slice(0, Math.max(0, width - 1));
-      return ` ${fg ? fg(color, clipped) : clipped}`;
+      // pi's theme.fg is a METHOD that reads this.fgColors and THROWS on an unknown color, so it must
+      // be called on the theme (never captured as a bare fn, which loses `this`) and wrapped: a
+      // decorative mascot must NEVER throw in render or it kills pi's whole TUI loop.
+      let painted = clipped;
+      try {
+        if (this.theme?.fg) painted = this.theme.fg(color, clipped);
+      } catch { /* themeless render, unknown color, or detached call - show the cat uncolored */ }
+      return ` ${painted}`;
     });
     this.cachedWidth = width;
     this.cachedTick = this.tick;
