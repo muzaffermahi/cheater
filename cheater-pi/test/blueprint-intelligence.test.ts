@@ -102,49 +102,6 @@ test("packetScopedWorkerBrief is bounded, packet-local, and carries failure mode
   assert.ok(fullBrief.length > 0);
 });
 
-test("bug-memory workflows apply only to packets overlapping key files or test signals", () => {
-  const memoryHits: BlueprintMemoryHit[] = [
-    {
-      id: "bug-alpha-rootcause",
-      source: "bug",
-      summary: "bug type: null deref; symptom: crash; root cause: alpha; fix pattern: guard alpha; test signal: alpha crash signal",
-      confidence: "high",
-      keyFiles: ["src/alpha.ts"],
-      testSignal: "alpha crash signal",
-      matchReason: "matched because key files src/alpha.ts overlap the plan target"
-    }
-  ];
-  const packets = [
-    makePacket({ id: "implement-src-alpha", filesToInspect: [{ path: "src/alpha.ts", reason: "r" }], filesToTouch: [{ path: "src/alpha.ts", reason: "r" }] }),
-    makePacket({ id: "implement-src-beta", filesToInspect: [{ path: "src/beta.ts", reason: "r" }], filesToTouch: [{ path: "src/beta.ts", reason: "r" }] })
-  ];
-  const pack = buildBlueprintIntelligencePack({
-    userGoal: "fix the alpha crash",
-    orientation,
-    docsFacts: [],
-    memoryHits,
-    packets,
-    packetFacts: [],
-    taskType: "bug_fix",
-    modelName: "qwen-9b",
-    config: DEFAULT_BLUEPRINT_CONFIG
-  });
-
-  assert.equal(pack.bugWorkflows.length, 1);
-  const workflow = pack.bugWorkflows[0];
-  assert.ok(workflow.appliesTo.includes("implement-src-alpha"), `${JSON.stringify(workflow.appliesTo)}`);
-  assert.ok(!workflow.appliesTo.includes("implement-src-beta"));
-  assert.match(workflow.matchReason, /key files/i);
-  assert.match(workflow.matchReason, /applies to implement-src-alpha/);
-
-  const alphaBrief = packetScopedWorkerBrief({ intelligence: pack }, packets[0])!;
-  const betaBrief = packetScopedWorkerBrief({ intelligence: pack }, packets[1])!;
-  assert.match(alphaBrief, /Bug-memory workflows \(1\):/);
-  assert.match(alphaBrief, /guard alpha/);
-  assert.match(alphaBrief, /matched because/);
-  assert.match(betaBrief, /Bug-memory workflows: none/);
-});
-
 test("irrelevant bug memory does not pollute a normal feature task", async () => {
   const dir = mkdtempSync(join(tmpdir(), "cheater-bug-irrelevance-"));
   mkdirSync(join(dir, "src"), { recursive: true });
@@ -177,7 +134,6 @@ test("irrelevant bug memory does not pollute a normal feature task", async () =>
     modelName: "qwen-9b"
   });
 
-  assert.equal(plan.intelligence!.bugWorkflows.length, 0);
   assert.ok(!plan.intelligence!.evidence.some((item) => item.kind === "memory"));
   assert.ok(!plan.memoryHits.some((hit) => hit.source === "bug"));
 });
@@ -244,7 +200,7 @@ test("quality gate flags missing test signal, vague criteria, and risky API gues
         { id: "d2", decision: "dec2", rationale: "r", appliesTo: ["implement-src-feature"], riskIfIgnored: "x" },
         { id: "d3", decision: "dec3", rationale: "r", appliesTo: ["implement-src-feature"], riskIfIgnored: "x" }
       ], implementationInvariants: ["a", "b", "c", "d"],
-      bugWorkflows: [], packetFacts: [
+      packetFacts: [
         { packetId: "implement-src-feature", file: "src/feature.ts", facts: ["src/feature.ts registers commands"] }
       ],
       contextBudget: {
@@ -315,7 +271,6 @@ test("quality gate blocks evidence-required web tasks without remote evidence", 
         { id: "d3", decision: "verify focused", rationale: "r", appliesTo: ["implement-src-api"], riskIfIgnored: "regression" }
       ] as BlueprintArchitectureDecision[],
       implementationInvariants: ["planner never edits", "one touched file", "verify before broad checks", "stop with handoff"],
-      bugWorkflows: [],
       packetFacts: [{ packetId: "implement-src-api", file: "src/api.ts", facts: ["likely tests: test/api.test.ts"] }] as BlueprintPacketFact[],
       webEvidence: [],
       webSearchTriggers: ["user_requested_search=3", "version_sensitive=3"],
@@ -405,9 +360,6 @@ test("artifact renders done criteria per packet and bug-workflow match reasons",
   const md = renderBlueprintArtifact(plan);
   assert.match(md, /## Done Criteria/);
   assert.match(md, /implement-src-alpha: implement-src-alpha behavior implemented \| verify: npm test/);
-  assert.match(md, /## Bug-Memory Workflows/);
-  assert.match(md, /matched because key files src\/alpha\.ts overlap/);
-  assert.match(md, /applies_to=implement-src-alpha/);
   assert.match(md, /- Remediate: none/);
 });
 

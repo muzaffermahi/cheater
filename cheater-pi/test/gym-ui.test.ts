@@ -54,8 +54,8 @@ test("formatLearningSuggestions handles empty", () => {
 
 test("formatLearningSuggestions renders one suggestion", () => {
   const suggestions: GymLearningSuggestion[] = [
-    { kind: "bug_memory", taskId: "x", summary: "fix x", details: "details", reason: "r" }
+    { kind: "anti_pattern", taskId: "x", summary: "fix x", details: "details", reason: "r" }
   ];
   const text = formatLearningSuggestions(suggestions);
-  assert.match(text, /\[bug_memory\]/);
+  assert.match(text, /\[anti_pattern\]/);
 });

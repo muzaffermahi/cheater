@@ -35,35 +35,6 @@ test("graph touch targets drive implementation packet files; tests never become 
   assert.ok(true);
 });
 
-// Fix 2: derive doNotDo/workflowSteps from summary text
-test("buildBugWorkflows derives doNotDo from failed_approaches text when card lacks structured fields", async () => {
-  const { buildBlueprintIntelligencePack, packetScopedWorkerBrief } = await import("../src/blueprint/intelligence.js");
-  const { DEFAULT_BLUEPRINT_CONFIG } = await import("../src/blueprint/config.js");
-  const memoryHit = {
-    id: "bug-x", source: "bug" as const,
-    summary: "bug type: KeyError; root cause: missing key; fix pattern: provide default; failed approaches: wrap in try/catch; swallow error; test signal: KeyError templates",
-    confidence: "medium" as const,
-    keyFiles: ["src/app.py"],
-    testSignal: "KeyError templates",
-    matchReason: "matched because key files overlap"
-  };
-  const packets = [{
-    id: "implement-src-app-py", title: "t", type: "implement", status: "pending", dependsOn: [], estimatedModelCalls: 1, maxModelCalls: 1,
-    filesToInspect: [{ path: "src/app.py", reason: "r" }], filesToTouch: [{ path: "src/app.py", reason: "r" }],
-    allowedTools: [], forbiddenActions: [], promptContract: "", acceptanceCriteria: ["app default provided"], verification: [{ id: "v", command: "pytest -q", description: "x", required: true }], simulationChecks: [], risk: "medium"
-  } as any];
-  const pack = buildBlueprintIntelligencePack({
-    userGoal: "fix KeyError templates", orientation: { repoRoot: "x", languages: [], frameworks: [], testCommands: [], typecheckCommands: [], entrypoints: [], importantPaths: [] } as any,
-    docsFacts: [], memoryHits: [memoryHit], packets, packetFacts: [], taskType: "bug_fix", modelName: "qwen-9b", config: DEFAULT_BLUEPRINT_CONFIG
-  });
-  const wf = pack.bugWorkflows[0];
-  assert.ok(wf.doNotDo && wf.doNotDo.length >= 2, `doNotDo: ${JSON.stringify(wf.doNotDo)}`);
-  assert.ok(wf.doNotDo!.some((d) => /wrap in try\/catch/.test(d)));
-  const brief = packetScopedWorkerBrief({ intelligence: pack }, packets[0])!;
-  assert.match(brief, /do not make this bad fix/);
-  assert.match(brief, /wrap in try\/catch/);
-});
-
 // Fix 3: docs cache LRU eviction
 test("docs cache evicts oldest entries when exceeding max entries cap", async () => {
   const { writeDocsCache, evictDocsCache, docsCacheDir, docsCacheKey, docsCacheStats } = await import("../src/blueprint/docsCache.js");

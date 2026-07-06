@@ -99,20 +99,6 @@ export interface BlueprintArchitectureDecision {
   riskIfIgnored: string;
 }
 
-export interface BlueprintBugWorkflow {
-  id: string;
-  trigger: string;
-  diagnosticSteps: string[];
-  fixPattern: string;
-  verificationSignal: string;
-  appliesTo: string[];
-  matchReason: string;
-  workflowSteps?: string[];
-  doNotDo?: string[];
-  applicabilityReason?: string;
-  risk?: "low" | "medium" | "high";
-}
-
 export interface BlueprintContextBudget {
   modelName: string;
   modelClass: string;
@@ -167,7 +153,6 @@ export interface BlueprintIntelligencePack {
   evidence: BlueprintEvidenceItem[];
   architectureDecisions: BlueprintArchitectureDecision[];
   implementationInvariants: string[];
-  bugWorkflows: BlueprintBugWorkflow[];
   packetFacts: BlueprintPacketFact[];
   webEvidence: WebEvidenceCard[];
   webSearchTriggers?: string[];

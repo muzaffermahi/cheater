@@ -167,7 +167,6 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
           `mode: ${ctx.mode}`,
           `project trusted: ${ctx.isProjectTrusted?.() ? "yes" : "no"}`,
           `Cheater tools loaded: ${tools.filter((name: string) => name.startsWith("cheater_")).join(", ")}`,
-          `Compacted bug memories: ${tools.includes("cheater_bug_memory_search") ? "enabled" : "missing"}`,
           `Public commands loaded: ${commands.filter((name: string) => PUBLIC_COMMAND_NAMES.includes(name)).join(", ")}`,
           `Debug commands loaded: ${commands.filter((name: string) => DEBUG_COMMAND_NAMES.includes(name)).join(", ") || "(none)"}`,
           uncategorized.length ? `Uncategorized commands loaded (add to PUBLIC_COMMAND_NAMES/DEBUG_COMMAND_NAMES in commands.ts): ${uncategorized.join(", ")}` : ""
