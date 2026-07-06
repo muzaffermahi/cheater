@@ -22,8 +22,6 @@ export interface ComputeBudget {
   maxDebugRounds: number;
   /** how aggressively to localize + slice context. */
   localizationDepth: "shallow" | "deep";
-  /** whether to consult skill memory for this commitlet (also gated by skillMemoryEnabled). */
-  useSkillMemory: boolean;
   /** hardness score and a human-readable reason, for receipts/telemetry. */
   hardness: number;
   reason: string;
@@ -80,7 +78,7 @@ export function computeBudget(signal: HardnessSignal, config: CheaterConfig = {}
   // set BOTH inSessionResampleEnabled and adaptiveComputeEnabled to get any resampling was a papercut.)
   const staticSamples = Math.max(1, Math.trunc(config.commitletCandidateSamples ?? (config.inSessionResampleEnabled === true ? 3 : 1)));
   if (config.adaptiveComputeEnabled !== true) {
-    return { samples: staticSamples, maxDebugRounds: 1, localizationDepth: "shallow", useSkillMemory: false, hardness: 0, reason: "adaptive compute off (static budget)" };
+    return { samples: staticSamples, maxDebugRounds: 1, localizationDepth: "shallow", hardness: 0, reason: "adaptive compute off (static budget)" };
   }
   const maxSamples = Math.max(1, Math.trunc(config.adaptiveMaxSamples ?? 8));
   const maxDebug = Math.max(0, Math.trunc(config.adaptiveMaxDebugRounds ?? 2));
@@ -88,7 +86,7 @@ export function computeBudget(signal: HardnessSignal, config: CheaterConfig = {}
   // A first cheap attempt that already verified means this commitlet is definitively easy - never
   // spend more compute on it, whatever the static hardness signals say.
   if (signal.firstSampleVerified) {
-    return { samples: 1, maxDebugRounds: 0, localizationDepth: "shallow", useSkillMemory: false, hardness: 0, reason: "first sample verified - no extra compute" };
+    return { samples: 1, maxDebugRounds: 0, localizationDepth: "shallow", hardness: 0, reason: "first sample verified - no extra compute" };
   }
 
   const { hardness, factors } = scoreHardness(signal);
@@ -97,14 +95,11 @@ export function computeBudget(signal: HardnessSignal, config: CheaterConfig = {}
   const samples = Math.max(1, Math.min(maxSamples, 1 + Math.round(hardness * 1.5)));
   const localizationDepth: "shallow" | "deep" = hardness >= 3 ? "deep" : "shallow";
   const maxDebugRounds = hardness >= 2 ? maxDebug : Math.min(1, maxDebug);
-  const useSkillMemory = hardness >= 1 && config.skillMemoryEnabled === true;
-
   return {
     samples,
     maxDebugRounds,
     localizationDepth,
-    useSkillMemory,
     hardness,
-    reason: `hardness ${hardness}${factors.length ? ` (${factors.join(", ")})` : ""} -> k=${samples}, debug=${maxDebugRounds}, ${localizationDepth}${useSkillMemory ? ", skill-memory" : ""}`
+    reason: `hardness ${hardness}${factors.length ? ` (${factors.join(", ")})` : ""} -> k=${samples}, debug=${maxDebugRounds}, ${localizationDepth}`
   };
 }

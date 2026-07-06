@@ -266,20 +266,7 @@ test("minimal system prompt is the default: the one flow, but no worked example 
   const def = buildSystemPrompt({});
   assert.match(def, /The one Cheater flow/, "the flow is always present");
   assert.doesNotMatch(def, /Worked example/, "the exemplar is dropped by default (minimal)");
-  assert.doesNotMatch(def, /Bug-memory/, "no bug-memory guidance is shown by default");
-  // Both are restorable via config for later A/B testing.
+  assert.doesNotMatch(def, /Bug-memory/, "no bug-memory guidance anywhere");
+  // The exemplar is restorable via config.
   assert.match(buildSystemPrompt({ minimalSystemPrompt: false }), /Worked example/, "the exemplar returns when minimal is off");
-  assert.match(buildSystemPrompt({ bugMemoryEnabled: true }), /Bug-memory/, "the bug-memory section returns when enabled");
-});
-
-test("bug-memory tool is hidden by default: not registered and filtered from every mask", () => {
-  const off = new Map<string, any>();
-  registerCheaterTools({ registerTool: (def: any) => off.set(def.name, def) } as any, {});
-  assert.equal(off.has("cheater_bug_memory_search"), false, "not registered by default");
-  const on = new Map<string, any>();
-  registerCheaterTools({ registerTool: (def: any) => on.set(def.name, def) } as any, { bugMemoryEnabled: true });
-  assert.equal(on.has("cheater_bug_memory_search"), true, "registered when the feature is enabled");
-  // The mask filter matches the registration gate, so applyToolMask never activates a missing tool.
-  assert.equal(cheaterToolsForMode("execute", {}).includes("cheater_bug_memory_search"), false, "filtered from the mask by default");
-  assert.equal(cheaterToolsForMode("execute", { bugMemoryEnabled: true }).includes("cheater_bug_memory_search"), true, "in the mask when enabled");
 });

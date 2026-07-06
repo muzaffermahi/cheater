@@ -45,10 +45,11 @@ test("end-to-end: build learning suggestions and write them", async () => {
   const task = ZOO_TASKS[0];
   const run = await runTask({
     rootDir: cwd, task, mode: "cheater",
-    outcomeOverride: { ...PASS, noOpDetected: false },
+    outcomeOverride: { ...PASS, focusedTestsPassed: false, fullTestsPassed: false, noOpDetected: false },
     hooks: { runAgent: async () => PASS, snapshotBaseline: async () => {} }
   });
   const score = scoreRun({ task, result: run.result });
+  // A failing run yields an anti-pattern learning suggestion (the write path we exercise here).
   const suggestions = buildLearningSuggestions([{ ...run.result, task, score }]);
   assert.ok(suggestions.length > 0);
   const file = writeLearningSuggestions(cwd, suggestions);

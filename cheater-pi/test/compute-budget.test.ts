@@ -7,7 +7,6 @@ test("computeBudget OFF path returns the static budget (byte-identical to today)
   assert.equal(off.samples, 1, "no adaptive -> static commitletCandidateSamples (default 1)");
   assert.equal(off.maxDebugRounds, 1);
   assert.equal(off.localizationDepth, "shallow");
-  assert.equal(off.useSkillMemory, false);
   const off3 = computeBudget({ taskKind: "bug_fix" }, { commitletCandidateSamples: 3 });
   assert.equal(off3.samples, 3, "off path passes commitletCandidateSamples through unchanged");
 });
@@ -56,16 +55,6 @@ test("a very hard commitlet saturates at adaptiveMaxSamples and respects a lower
     { adaptiveComputeEnabled: true, adaptiveMaxSamples: 4 }
   );
   assert.equal(capped.samples, 4, "respects a lower adaptiveMaxSamples cap");
-});
-
-test("useSkillMemory only when hardness>=1 AND skillMemoryEnabled", () => {
-  assert.equal(computeBudget({ taskKind: "bug_fix" }, { adaptiveComputeEnabled: true }).useSkillMemory, false, "off unless the flag is set");
-  assert.equal(computeBudget({ taskKind: "bug_fix" }, { adaptiveComputeEnabled: true, skillMemoryEnabled: true }).useSkillMemory, true);
-  assert.equal(
-    computeBudget({ taskKind: "trivial", risk: "low" }, { adaptiveComputeEnabled: true, skillMemoryEnabled: true }).useSkillMemory,
-    false,
-    "a trivial commitlet (hardness<1) skips skill memory even with the flag on"
-  );
 });
 
 test("scoreHardness rises with each of risk / scope / repair", () => {

@@ -182,46 +182,6 @@ test("irrelevant bug memory does not pollute a normal feature task", async () =>
   assert.ok(!plan.memoryHits.some((hit) => hit.source === "bug"));
 });
 
-test("bug-memory retrieval for a bug-fix task produces a workflow with a match reason and targeted appliesTo", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "cheater-bug-relevance-"));
-  mkdirSync(join(dir, "src"), { recursive: true });
-  mkdirSync(join(dir, "test"), { recursive: true });
-  mkdirSync(join(dir, ".cheater"), { recursive: true });
-  writeFileSync(join(dir, "package.json"), JSON.stringify({ scripts: { build: "tsc -p tsconfig.json", test: "node --test" } }));
-  writeFileSync(join(dir, "src", "commands.ts"), "export function registerCheaterCommands(pi: any) { pi.registerCommand('cheater', {}); }\n");
-  writeFileSync(join(dir, "test", "commands.test.ts"), "import test from 'node:test';\ntest('commands', () => {});\n");
-  writeFileSync(join(dir, ".cheater", "bug_memories.jsonl"), JSON.stringify({
-    id: "command-registration-crash",
-    repo: "other/cli",
-    language: "TypeScript",
-    bug_type: "command registration TypeError",
-    symptom: "TypeError when registerCommand called twice",
-    root_cause: "command id reused without guard",
-    fix_pattern: "guard duplicate command registration",
-    failed_approaches: [],
-    key_files: ["src/commands.ts"],
-    search_keywords: ["registercommand", "typeerror", "commands", "registration"],
-    test_signal: "TypeError registerCommand commands",
-    embedding_text: "registerCommand TypeError",
-    quality_score: 0.95,
-    quality_tier: "high"
-  }) + "\n");
-
-  const plan = await createAutonomousBlueprint({
-    cwd: dir,
-    userGoal: "fix the TypeError when registerCommand is called twice for the commands file",
-    taskType: "bug_fix",
-    modelName: "qwen-9b"
-  });
-
-  const commandPacket = plan.workPackets.find((p) => p.type === "implement" && p.filesToTouch.some((f) => /commands\.ts/.test(f.path)));
-  assert.ok(commandPacket, "expected an implement packet touching commands.ts");
-  assert.equal(plan.intelligence!.bugWorkflows.length, 1);
-  const workflow = plan.intelligence!.bugWorkflows[0];
-  assert.match(workflow.matchReason, /matched because/);
-  assert.ok(workflow.appliesTo.includes(commandPacket!.id));
-});
-
 test("constraint graph discovers co-located test files for touched source files", () => {
   const dir = mkdtempSync(join(tmpdir(), "cheater-constraint-tests-"));
   mkdirSync(join(dir, "src"), { recursive: true });

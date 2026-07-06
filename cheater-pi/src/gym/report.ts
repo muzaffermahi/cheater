@@ -1,7 +1,6 @@
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { GymConfig, GymDeltaReport, GymLearningSuggestion, GymReport, GymRunResult, GymScored, GymTask } from "./types.js";
-import type { BugMemoryCard } from "../bug-memory.js";
 
 export interface BuildReportInput {
   id: string;
@@ -143,20 +142,7 @@ export function buildLearningSuggestions(results: Array<GymRunResult & { score: 
   }
 
   for (const r of results) {
-    if (r.score.pass && r.score.score >= 80) {
-      suggestions.push({
-        kind: "bug_memory",
-        taskId: r.taskId,
-        summary: `${r.task.category}: ${r.task.title}`,
-        details: [
-          `symptom: ${r.task.goal}`,
-          `root_cause: minimal source change in ${r.task.expectedTouchedFiles.join(", ") || "target source"}`,
-          `fix_pattern: ${r.task.expectedTouchedFiles.length > 0 ? `edit ${r.task.expectedTouchedFiles[0]}` : "edit the target source"}`,
-          `validation: ${r.task.focusedTestCommand}`
-        ].join("\n"),
-        reason: "task passed with high score; pattern is reusable"
-      });
-    } else if (!r.score.pass) {
+    if (!r.score.pass) {
       suggestions.push({
         kind: "anti_pattern",
         taskId: r.taskId,
@@ -188,83 +174,6 @@ export function buildLearningSuggestions(results: Array<GymRunResult & { score: 
   }
 
   return suggestions;
-}
-
-export interface GymBugMemoryCard extends BugMemoryCard {
-  source_gym_task_id: string;
-  created_at: string;
-  workflow_steps: string[];
-  do_not_do: string[];
-}
-
-export function buildGymBugMemoryCards(results: Array<GymRunResult & { score: GymScored; task: GymTask }>): GymBugMemoryCard[] {
-  return results
-    .filter((r) => r.score.pass && r.score.score >= 80 && !r.editedTests && !r.editedDependencies)
-    .map((r) => {
-      const touched = r.task.expectedTouchedFiles.length ? r.task.expectedTouchedFiles : r.filesTouched;
-      const primaryFile = touched[0] ?? "target source";
-      const workflowSteps = [
-        `Reproduce with: ${r.task.focusedTestCommand}`,
-        `Inspect: ${touched.join(", ") || primaryFile}`,
-        "Do not edit tests, manifests, dependencies, or lockfiles to make the score pass.",
-        `Apply fix pattern: edit ${primaryFile} only unless local evidence proves another source file is required.`,
-        `Verify with: ${r.task.focusedTestCommand}`,
-        r.task.fullTestCommand ? `Then run broad check: ${r.task.fullTestCommand}` : ""
-      ].filter(Boolean);
-      const doNotDo = [
-        "do not edit tests to satisfy the gym task",
-        "do not change dependencies or lockfiles for a source bug",
-        "do not broaden the diff beyond the expected source file without evidence"
-      ];
-      const symptom = r.task.goal;
-      const rootCause = `Minimal source defect in ${primaryFile} for ${r.task.category}.`;
-      const fixPattern = `Edit ${primaryFile}; keep the diff small; rerun ${r.task.focusedTestCommand}.`;
-      const testSignal = [r.task.focusedTestCommand, r.task.fullTestCommand].filter(Boolean).join(" | ");
-      return {
-        id: `gym-${r.task.id}`,
-        source_gym_task_id: r.task.id,
-        created_at: new Date().toISOString(),
-        repo: "cheater-gym",
-        language: r.task.language,
-        bug_type: r.task.category,
-        symptom,
-        root_cause: rootCause,
-        fix_pattern: fixPattern,
-        failed_approaches: doNotDo,
-        key_files: touched.slice(0, 8),
-        search_keywords: unique([
-          r.task.category,
-          r.task.language,
-          ...tokenish(r.task.title),
-          ...tokenish(r.task.goal),
-          ...touched.flatMap(tokenish)
-        ]).slice(0, 18),
-        test_signal: testSignal,
-        embedding_text: [
-          r.task.category,
-          r.task.title,
-          symptom,
-          rootCause,
-          fixPattern,
-          testSignal,
-          workflowSteps.join(" ")
-        ].filter(Boolean).join("\n"),
-        quality_score: Number((r.score.score / 100).toFixed(2)),
-        quality_tier: r.score.score >= 90 ? "high" : "medium",
-        workflow_steps: workflowSteps,
-        do_not_do: doNotDo
-      };
-    });
-}
-
-export function writeGymBugMemoryCards(cwd: string, cards: GymBugMemoryCard[]): string | null {
-  if (cards.length === 0) return null;
-  const file = join(cwd, ".cheater", "bug_memories.jsonl");
-  mkdirSync(join(cwd, ".cheater"), { recursive: true });
-  for (const card of cards) {
-    writeFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...card })}\n`, { flag: "a", encoding: "utf8" });
-  }
-  return file;
 }
 
 export function writeLearningSuggestions(cwd: string, suggestions: GymLearningSuggestion[]): string {

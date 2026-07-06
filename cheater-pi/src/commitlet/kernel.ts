@@ -11,8 +11,6 @@ import { commitletConfig } from "./config.js";
 import { setMascot } from "../ui/mascotUi.js";
 import { mascotStateForPhase } from "../ui/mascot.js";
 import { defaultCommitletState } from "./state.js";
-import { saveVerifiedFix } from "../reliability/experience.js";
-import { buildCheatSheet, renderCheatSheet } from "../reliability/cheatSheet.js";
 import { distillFailureSidecar, renderDistillation, reviewDiffSidecar, type DiffReview } from "../sidecar/jobs.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
 import { sidecarConfig } from "../sidecar/client.js";
@@ -425,18 +423,6 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   }
 
   if (verify.passed) {
-    // Verified fail->pass transition: a repair commitlet just passed the verification its
-    // original failed. The harness knows the observed failure AND the diff that fixed it -
-    // ground truth, no model claim - so it writes the experience card itself. Future
-    // matching failures get this fix recalled in-band inside their failure cards.
-    if ((config.skillMemoryEnabled === true || (config.bugMemoryEnabled === true && config.experienceStoreEnabled !== false)) && /-repair$/.test(commitlet.id) && commitlet.spec?.observedFailure) {
-      saveVerifiedFix(cwd, {
-        failureText: commitlet.spec.observedFailure,
-        diffText,
-        files: touchedFiles,
-        goal: defaultCommitletState.get().currentPlan?.userGoal
-      });
-    }
     defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
       filesChanged: touchedFiles,
       diffLines: countDiffLines(diffText),
@@ -460,20 +446,8 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     };
   }
 
-  // The Cheat Layer: the harness (not the model) classifies this failure, retrieves compact
-  // evidence from every source it owns, and injects the sheet exactly where the failure is
-  // being handed to a model - into the repair commitlet's observedFailure (which flows into
-  // every repair worker/resample packet) and into the grade message the orchestrating
-  // session reads. No search tool call is required or possible here.
   const rawFailure = [verify.summary, ...verify.failures].join("\n");
-  const sheet = await buildCheatSheet(cwd, rawFailure, config);
-  const renderedSheet = sheet ? renderCheatSheet(sheet, commitlet.focusedVerification.find((step) => step.command)?.command) : "";
-  let failureWithEvidence = renderedSheet ? `${verify.summary}\n${renderedSheet}` : verify.summary;
-  if (sheet && ledger) {
-    // Receipt truthfulness: record WHICH evidence sources were injected, so the completion
-    // receipt can say "cheat evidence used (experience, api_oracle)" from ground truth.
-    ledger.addEntry("cheat_evidence", `trigger ${sheet.trigger}`, { sources: sheet.cards.map((card) => card.source), commitletId: commitlet.id });
-  }
+  let failureWithEvidence = verify.summary;
 
   // Tool-error normalization (governor-gated, additive): reshape the raw failure into a bounded,
   // structured kind for the ledger/receipt so we can SEE that clerical error-shaping stayed OFF the
@@ -540,17 +514,17 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     return {
       advance: true,
       message: [failureWithEvidence, `Created bounded repair commitlet: ${repair.id}`].join("\n"),
-      details: { guard, health, audit, verify, repair, cheatSheet: sheet ?? undefined }
+      details: { guard, health, audit, verify, repair }
     };
   }
 
   if (commitlet.rollbackPoint) {
     const reverted = revertRollbackPoint(cwd, commitlet);
     defaultCommitletState.updateCommitlet(commitlet.id, reverted.ok ? "reverted" : "failed", `${verify.summary}; ${reverted.reason}`);
-    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted, cheatSheet: sheet ?? undefined } };
+    return { advance: false, message: [failureWithEvidence, `Repair failed; ${reverted.reason}`].join("\n"), details: { guard, health, audit, verify, reverted } };
   }
   defaultCommitletState.updateCommitlet(commitlet.id, "failed", verify.summary);
-  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify, cheatSheet: sheet ?? undefined } };
+  return { advance: false, message: [failureWithEvidence, "Repair failed and no rollback was available."].join("\n"), details: { guard, health, audit, verify } };
 }
 
 export function shouldCreateCleanupCommitlet(plan: { commitlets: Array<{ id: string }> }, review: { accepted: boolean; blockingIssues: string[]; warnings: string[] }): boolean {

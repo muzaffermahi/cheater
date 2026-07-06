@@ -1,6 +1,5 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { formatBugMemoryHits, searchBugMemories } from "./bug-memory.js";
 import { commandHelp } from "./ui.js";
 import { renderSkills } from "./skills.js";
 import { saveMemory } from "./tools.js";
@@ -37,7 +36,6 @@ const PUBLIC_COMMAND_NAMES = [
   "test",
   "map",
   "pi",
-  "bug-memory",
   "remember",
   "skills",
   "traces",
@@ -105,19 +103,6 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
         ctx.ui.setToolsExpanded?.(expanded);
         ctx.ui.notify?.(expanded ? "Cheater: raw pi tool output SHOWN" : "Cheater: clean view - pi tool output collapsed", "info");
       } catch { /* best-effort; the toggle is cosmetic */ }
-    }
-  });
-
-  pi.registerCommand("bug-memory", {
-    description: "Search compacted solved-bug memories",
-    handler: async (args: string, ctx: CommandContext) => {
-      const query = await askOrUse(args, ctx, "Cheater /bug-memory", "Error text, failing test, API name, or bug description");
-      if (!query) {
-        ctx.ui.notify("No bug-memory query provided.", "warning");
-        return;
-      }
-      const result = await searchBugMemories({ cwd: ctx.cwd, query, topK: 5 });
-      notifyBlock(ctx, formatBugMemoryHits(result));
     }
   });
 

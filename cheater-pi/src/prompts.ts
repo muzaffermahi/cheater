@@ -63,17 +63,6 @@ you: cheater_commitlet_next()   // grades the edit in code, runs focused verific
 you: cheater_verification_run() then cheater_finish_gate()  -> ALLOWED
 you (to user): Added the --json flag to src/export.ts; export tests pass.`;
 
-const BUG_MEMORY = `## Bug-memory lookup
-
-The harness attaches relevant solved-bug evidence to failures automatically (the
-cheat sheet on failed verifications), so you normally never need to search
-yourself. Never search before you have a concrete failure in hand. Call
-cheater_bug_memory_search at most once, only when you are actively stuck on a
-specific error AND the failure card carried no evidence. Treat any memory as an
-analogy/hypothesis, not a fact about this repo: verify against local code, make
-the smallest diff, and rerun the focused test. Never repeat a search that
-returned nothing useful.`;
-
 /**
  * Single authoritative system prompt, assembled config-aware so the model never sees rules
  * for a disabled subsystem or a false "an autopilot decision is attached" promise. This is
@@ -90,9 +79,6 @@ export function buildSystemPrompt(config: CheaterConfig = {}): string {
     // recomputes the whole prompt each turn); minimal drops it. Restore with minimalSystemPrompt:false.
     if (!minimal) sections.push(EXEMPLAR);
   }
-  // Bug-memory guidance is shown ONLY when the feature is explicitly enabled (default off). Otherwise
-  // the model must see nothing about a bug-memory tool or concept.
-  if (config.bugMemoryEnabled === true) sections.push(BUG_MEMORY);
   return sections.join("\n\n");
 }
 

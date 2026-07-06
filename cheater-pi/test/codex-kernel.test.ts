@@ -141,7 +141,7 @@ test("planner mode blocks file/shell tools; workers can never see controller/spa
   for (const tool of ["read", "edit", "write", "bash"]) assert.ok(planner.blockedNativeTools.includes(tool));
   assert.equal(violatesWorkerToolPolicy(WORKER_READ_TOOLS), null);
   assert.match(violatesWorkerToolPolicy([...WORKER_READ_TOOLS, "cheater_reliability_start"]) ?? "", /controller tool/);
-  assert.match(violatesWorkerToolPolicy(["read", "cheater_bug_memory_search"]) ?? "", /retrieval/);
+  assert.match(violatesWorkerToolPolicy(["read", "cheater_memory_search"]) ?? "", /retrieval/);
   assert.match(violatesWorkerToolPolicy([...WORKER_EDIT_TOOLS, "extra_tool"]) ?? "", /may only shrink/);
 });
 

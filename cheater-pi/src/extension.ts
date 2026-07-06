@@ -38,8 +38,6 @@ import { checkFileSyntax } from "./reliability/diagnostics.js";
 import { editRescueNotice } from "./reliability/editMatch.js";
 import { checkImports } from "./reliability/importGate.js";
 import { compressFailureOutput } from "./reliability/failureCompressor.js";
-import { buildCheatSheet, renderCheatSheet } from "./reliability/cheatSheet.js";
-import { saveVerifiedFix } from "./reliability/experience.js";
 import { classifyFailure, type CompletionLedger } from "./reliability/lifecycle.js";
 import { activeTaskRun, endTaskRun, resumeTaskRun } from "./runstate/runState.js";
 import { ensureCheaterDirIgnored } from "./runstate/runDir.js";
@@ -76,19 +74,15 @@ export const CHEATER_TOOL_MODES: Record<"answer_only" | "planner" | "execute", s
   // heuristic and sometimes wrong, and a misroute must NEVER hard-lock the model out of
   // starting the flow. (Observed live: "proceed" after an approval question routed
   // answer_only, masked the planner tool away, and the model - narrating "launching the
-  // planner now" - could only emit bug_memory_search five times in a row. The mask is
-  // guidance, not a cage.)
-  answer_only: ["cheater_run", "cheater_reliability_start", "cheater_bug_memory_search", "cheater_memory_search", "cheater_project_brief"],
-  planner: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_bug_memory_search", "cheater_ledger_status"],
-  execute: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_replace", "cheater_bug_memory_search", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
+  // planner now" - could only emit a couple of tools in a row. The mask is guidance, not a cage.)
+  answer_only: ["cheater_run", "cheater_reliability_start", "cheater_memory_search", "cheater_project_brief"],
+  planner: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_ledger_status"],
+  execute: ["cheater_run", "cheater_reliability_start", "cheater_commitlet_next", "cheater_verification_run", "cheater_finish_gate", "cheater_line_edit", "cheater_replace", "cheater_memory_search", "cheater_ledger_status", "cheater_rollback_status", "cheater_commitlet_revert"]
 };
 
 /** The cheater tools visible in a mode. Every registered cheater tool appears in a mode. */
-export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute", config: CheaterConfig): string[] {
-  const tools = CHEATER_TOOL_MODES[mode];
-  // The bug-memory tool is filtered from every mask unless the (default-off) feature is enabled -
-  // matching its gated registration, so applyToolMask never activates an unregistered tool name.
-  return config.bugMemoryEnabled === true ? [...tools] : tools.filter((name) => name !== "cheater_bug_memory_search");
+export function cheaterToolsForMode(mode: "answer_only" | "planner" | "execute"): string[] {
+  return CHEATER_TOOL_MODES[mode];
 }
 
 // getActiveTools/setActiveTools live on the ExtensionAPI (`pi`) object, NOT on the per-event
@@ -100,7 +94,7 @@ function applyToolMask(pi: ExtensionAPI, config: CheaterConfig, mode: "answer_on
   // Pi-native tools persist (never removed); recompute the cheater subset from the known
   // mode map so masking is reversible across turns.
   const piNative = active.filter((name) => !name.startsWith("cheater_"));
-  pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode, config)]);
+  pi.setActiveTools([...piNative, ...cheaterToolsForMode(mode)]);
 }
 
 // KV-cache stability: once a session has entered a code mask (planner/execute), keep the cheater
@@ -213,26 +207,7 @@ async function harnessAutoVerify(cwd: string, ledger: CompletionLedger, ctx: any
   ctx?.ui?.notify?.(`Cheater verifying: ${cmd}`, "info");
   const r = await runCommandAsync(cmd, cwd, 90000);
   const ok = r.code === 0;
-  let summary = ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code);
-  if (!ok) {
-    // Cheat Layer: the harness classifies the failure, retrieves evidence across every
-    // source it owns (verified experience -> bug corpus -> local docs -> official docs when
-    // enabled), and attaches at most three hypothesis cards - no model search tool involved.
-    const sheet = await buildCheatSheet(cwd, summary, config ?? {});
-    if (sheet) summary = `${summary}\n${renderCheatSheet(sheet, cmd)}`;
-  } else if (config?.skillMemoryEnabled === true || (config?.bugMemoryEnabled === true && config?.experienceStoreEnabled !== false)) {
-    // Verified fail->pass inside one session: the harness itself observed the earlier failed
-    // stage and now the pass, and git shows what changed - write the experience card.
-    const priorFailure = state.verification.filter((v) => v.status === "failed").at(-1);
-    if (priorFailure?.summary) {
-      saveVerifiedFix(cwd, {
-        failureText: priorFailure.summary,
-        diffText: gitDiffFor(cwd, state.changedFiles),
-        files: state.changedFiles.slice(0, 6),
-        goal: state.userGoal
-      });
-    }
-  }
+  const summary = ok ? `harness auto-verify ok: ${cmd}` : compressFailureOutput(cmd, r.stdout, r.stderr, r.code);
   ledger.recordCommand(cmd);
   ledger.recordVerificationStage({
     stage,

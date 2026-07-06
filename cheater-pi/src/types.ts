@@ -120,10 +120,6 @@ export interface CheaterConfig {
   // Upper bound on adaptive self-debug / bounded-repair rounds (default 2; research: two rounds
   // capture 76-95% of the gain).
   adaptiveMaxDebugRounds?: number;
-  // Disciplined SKILL memory (roadmap P3), SEPARATE from the disabled bugMemoryEnabled bug-corpus.
-  // Only execution-verified fail->pass transitions are admitted; retrieval is event-driven and
-  // similarity-gated; the bank is bounded + compacted. OFF by default until A/B-validated net-positive.
-  skillMemoryEnabled?: boolean;
   // In-session sequential best-of-N (local best-of-N; roadmap P1, the "make the validated lever run
   // locally" fix). On a single-GPU local box the fresh-worker resampling path is unavailable - the
   // backend probe latches "unavailable" to avoid sub-session GPU contention - so runResampledWorker
@@ -160,28 +156,11 @@ export interface CheaterConfig {
   // Wall-clock limit per fresh-worker attempt (ms). A wedged worker on a slow local backend
   // is aborted at this deadline instead of hanging the main session forever. Default 10min.
   commitletWorkerTimeoutMs?: number;
-  // Bug memory MASTER switch (default OFF). Gates EVERYTHING the model could see or that feeds it
-  // about "bug memory": the cheater_bug_memory_search tool (not even registered when off), the
-  // Bug-memory system-prompt section, the Cheat-Layer recall appended to failure cards, and the
-  // experience-store WRITE. Off by default because the recalled analogies proved net-negative for a
-  // small local model (an out-of-repo "similar fix" is more distracting than helpful). Set true to
-  // bring the whole feature back for A/B testing; experienceStoreEnabled/cheatSheetEnabled then act
-  // as sub-toggles under it.
-  bugMemoryEnabled?: boolean;
   // Minimal main-session system prompt (default ON): identity + edit discipline + the one flow.
-  // The worked EXEMPLAR is dropped (set false to restore it) and the Bug-memory section only ever
-  // appears when bugMemoryEnabled is true. Fewer prompt tokens => faster prefill on a local model
-  // that recomputes the whole prompt each turn (LM Studio KV-cache reuse is unreliable for MoE/35B).
+  // The worked EXEMPLAR is dropped (set false to restore it). Fewer prompt tokens => faster prefill
+  // on a local model that recomputes the whole prompt each turn (LM Studio KV-cache reuse is
+  // unreliable for MoE/35B).
   minimalSystemPrompt?: boolean;
-  // Experience store: harness-written bug memory. Cards are saved only on verified
-  // fail->pass transitions and recalled in-band inside failure cards. Local-only JSONL.
-  // Only active when bugMemoryEnabled is true (the master switch above).
-  experienceStoreEnabled?: boolean;
-  // Cheat Layer: on failures, the harness classifies the failure, retrieves compact evidence
-  // (verified experience -> bug corpus -> local docs -> official docs when enabled), and
-  // injects at most 3 hypothesis cards into repair packets and failure notices. The model
-  // never calls a search tool; the verifier remains the source of truth.
-  cheatSheetEnabled?: boolean;
   // Sidecar model: a small 2B-4B "clerk" model for bounded fuzzy chores (currently failure
   // distillation for informed repairs). OFF by default; the deterministic fallback is the floor,
   // so Cheater behaves identically when this is unset. When enabled without an explicit
