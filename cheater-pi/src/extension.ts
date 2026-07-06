@@ -464,6 +464,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // Per-turn git baseline so shell-based edits (sed/echo/git apply) that bypass the
   // structured edit tools still land in the completion ledger and count as real work.
   let gitBaseline: Map<string, string> | null = null;
+  // Engagement backstop (B2) per-task state: did a code goal route, did the model call the flow
+  // (cheater_run/reliability_start), did it edit a file, and have we nudged once already?
+  let engagementTask = { codeGoal: false, engaged: false, edited: false, nudged: false };
   // Run-state hints raised at tool_call time, delivered in-band on the matching tool_result.
   const pendingRunHints = new Map<string, string[]>();
   // De-dup for risk-middleware hints: the same standing condition (e.g. "stale validation
@@ -666,6 +669,9 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     const atFiles = resolveAtFiles(ctx.cwd, message);
     const decision = routeAutopilot({ cwd: ctx.cwd, message, repoHints: atFiles.files.length ? { likelyFiles: atFiles.files } : undefined, requireApproval: config.requireApprovalForHighRisk === true });
     defaultAutopilotState.setDecision(message, decision);
+    // Engagement backstop: this is a fresh code goal iff it routes to a code mode. Reset the per-task
+    // engagement tracking so the message_end nudge can catch a full bypass (edits with no flow call).
+    engagementTask = { codeGoal: decision.executionMode !== "answer_only" && decision.executionDiscipline !== "none", engaged: false, edited: false, nudged: false };
     applyToolMaskStable(pi, config, decision.executionMode === "answer_only" ? "answer_only" : decision.executionMode === "blueprint_orchestrator" ? "planner" : "execute");
     ctx.ui.setWidget?.("cheater-autopilot", formatAutopilotDecision(decision).split("\n"), { placement: "aboveEditor" });
     ctx.ui.notify?.(decision.userVisibleSummary, "info");
@@ -679,6 +685,26 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   // was implemented but never wired; message_end is the real Pi event that carries the model's
   // finished text.
   pi.on("message_end", async (event: { message?: { role?: string; content?: unknown } }, ctx: any) => {
+    // Engagement backstop (B2): a code goal whose model EDITED files but never entered the flow gets
+    // a ONE-TIME, non-blocking follow-up nudge to route through cheater_run. Skipped whenever a plan
+    // or durable run is active (that IS engaged), so it only catches a true bypass.
+    if (config.engagementBackstopEnabled === true && engagementTask.codeGoal && engagementTask.edited && !engagementTask.nudged) {
+      const engaged = engagementTask.engaged || Boolean(defaultCommitletState.get().currentPlan) || Boolean(activeTaskRun());
+      if (!engaged) {
+        engagementTask.nudged = true;
+        try {
+          pi.sendMessage({
+            customType: "cheater-engagement",
+            content: [
+              "Cheater: you're editing files directly, without the reliability flow.",
+              "Route this through cheater_run now (pass your goal as ONE short line). It runs the change as a bounded, verified commitlet - and on a hard task it can try best-of-N and keep the passing attempt - catching bugs a single unverified pass ships.",
+              "If this genuinely is a trivial one-liner, at least call cheater_finish_gate before you say it's done, so the harness verifies it."
+            ].join("\n"),
+            display: true
+          }, { deliverAs: "followUp" });
+        } catch { /* the backstop is best-effort and must never break a turn */ }
+      }
+    }
     if (config.loopGovernorEnabled === false) return;
     const text = extractMessageText(event.message);
     if (!text) return;
@@ -755,6 +781,10 @@ export default function cheaterExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event: { toolName: string; toolCallId: string; input?: Record<string, unknown> }, ctx: any) => {
+    // Engagement backstop tracking (cheap, never blocks): did the model enter the reliability flow, or
+    // is it editing files directly? The message_end nudge reads these.
+    if (event.toolName === "cheater_run" || event.toolName === "cheater_reliability_start") engagementTask.engaged = true;
+    else if (EDIT_TOOLS.has(event.toolName)) engagementTask.edited = true;
     // Security boundary FIRST: hard-block the handful of shell actions a local model must never
     // take (fetch-and-run pipes, disk/root destruction, secret exfiltration) regardless of the
     // autonomy setting. Destructive-but-legitimate commands only hard-block under requireApproval.

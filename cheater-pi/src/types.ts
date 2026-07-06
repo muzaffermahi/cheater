@@ -134,6 +134,13 @@ export interface CheaterConfig {
   // without the sub-session problem. Needs adaptiveComputeEnabled (or commitletCandidateSamples>1) to
   // yield samples>1. OFF by default. See commitlet/inSessionResample.ts.
   inSessionResampleEnabled?: boolean;
+  // Engagement backstop (roadmap B2): a NON-blocking nudge fired once per code task when the model
+  // edits files directly WITHOUT ever calling cheater_run/cheater_reliability_start - i.e. it bypassed
+  // the reliability flow entirely (observed live: a small model does a from-scratch task vanilla and
+  // no machinery engages). It NEVER blocks (that would be the handicap we forbid); it just injects a
+  // follow-up telling the model to route the change through cheater_run for a verified/best-of-N pass.
+  // OFF by default until A/B-validated that it improves engagement without nagging real one-liners.
+  engagementBackstopEnabled?: boolean;
   // Soft token budget per in-session best-of-N sample (default 8000). ornith reasons heavily AND the
   // whole file must still fit, so this is larger than a normal (clerk) sidecar call.
   inSessionResampleMaxTokens?: number;
