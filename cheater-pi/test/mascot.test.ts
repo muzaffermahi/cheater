@@ -8,7 +8,8 @@ import {
   mascotSpinnerFrames,
   mascotStateForPhase
 } from "../src/ui/mascot.js";
-import { setMascot, clearMascot, configureMascot } from "../src/ui/mascotUi.js";
+import { setMascot, configureMascot, getMascotState } from "../src/ui/mascotUi.js";
+import { catFrame } from "../src/ui/mascotComponent.js";
 import { renderRunConsole } from "../src/reliability/runConsole.js";
 
 // ---- pure mascot strings ----
@@ -58,10 +59,9 @@ test("mascotVisible hides the mascot for JSON/headless/non-TTY, shows it interac
 // ---- ctx wiring (mascotUi) ----
 
 function fakeCtx() {
-  const calls: { indicator: unknown[]; message: (string | undefined)[] } = { indicator: [], message: [] };
+  const calls: { message: (string | undefined)[] } = { message: [] };
   const ctx = {
     ui: {
-      setWorkingIndicator: (o?: unknown) => calls.indicator.push(o),
       setWorkingMessage: (m?: string) => calls.message.push(m),
       theme: { fg: (_c: string, t: string) => t }
     }
@@ -69,29 +69,37 @@ function fakeCtx() {
   return { ctx, calls };
 }
 
-test("setMascot drives the spinner frames and the message via ctx.ui", () => {
+test("setMascot records the mood (for the big component) and sets the working message", () => {
   configureMascot({});
   const { ctx, calls } = fakeCtx();
   setMascot(ctx, "sampling", "best-of-N 1/3");
-  assert.equal(calls.indicator.length, 1, "an animated indicator was set");
-  assert.ok((calls.indicator[0] as { frames?: string[] }).frames!.length >= 1);
+  assert.equal(getMascotState(), "sampling", "the big animated component reads this state");
   assert.deepEqual(calls.message, ["best-of-N 1/3"]);
-});
-
-test("setMascot respects mascotStyle:off (no cat frames) but still shows the message", () => {
-  const { ctx, calls } = fakeCtx();
-  setMascot(ctx, "working", "still coding", { mascotStyle: "off" });
-  assert.equal(calls.indicator.length, 0, "no mascot indicator when off");
-  assert.deepEqual(calls.message, ["still coding"], "the message still shows");
+  setMascot(ctx, "success");
+  assert.equal(getMascotState(), "success");
 });
 
 test("setMascot is JSON/headless-safe: it never throws when ui methods are absent or throw", () => {
   configureMascot({});
   assert.doesNotThrow(() => setMascot(undefined, "working", "x"), "no ctx at all");
   assert.doesNotThrow(() => setMascot({ ui: {} }, "working", "x"), "ui with no methods (noOpUIContext shape)");
-  const throwingCtx = { ui: { setWorkingIndicator: () => { throw new Error("boom"); }, setWorkingMessage: () => { throw new Error("boom"); } } };
+  const throwingCtx = { ui: { setWorkingMessage: () => { throw new Error("boom"); } } };
   assert.doesNotThrow(() => setMascot(throwingCtx, "working", "x"), "a throwing ui must not break the run");
-  assert.doesNotThrow(() => clearMascot(throwingCtx));
+});
+
+// ---- the big animated component (catFrame) ----
+
+test("catFrame renders a multi-line cat whose face tracks the state, and animates over ticks", () => {
+  const ready = catFrame(1, "ready");
+  assert.ok(ready.length >= 6, "the mascot is a big multi-line cat, not a one-char spinner");
+  assert.match(ready.join("\n"), /\/\\_\/\\/, "it has cat ears");
+  assert.match(catFrame(1, "success").join("\n"), /\^ \^/, "success shows happy eyes");
+  assert.match(catFrame(1, "blocked").join("\n"), /x x/, "blocked shows x eyes");
+  assert.match(catFrame(1, "success").join("\n"), /✓/, "success shows a check aura");
+  // Constant motion: the tail row differs across ticks (it slides).
+  const tailA = catFrame(0, "working").at(-1);
+  const tailB = catFrame(2, "working").at(-1);
+  assert.notEqual(tailA, tailB, "the tail swishes between frames");
 });
 
 // ---- run console face ----

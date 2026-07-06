@@ -13,7 +13,8 @@ import { shouldNudgeToAct, firstUserGoal, ANSWERED_WITHOUT_ACTING_NUDGE } from "
 const SHELL_TOOL_NAMES = new Set(["bash", "run_command", "run", "shell", "exec"]);
 import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
-import { configureMascot } from "./ui/mascotUi.js";
+import { configureMascot, getMascotState, mascotOff } from "./ui/mascotUi.js";
+import { CheaterMascotComponent } from "./ui/mascotComponent.js";
 import { loadConfig } from "./config.js";
 import { registerAutopilotCommands } from "./autopilot/commands.js";
 import { routeAutopilot, buildAutopilotInstruction } from "./autopilot/router.js";
@@ -519,6 +520,18 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     try { ensureCheaterDirIgnored(ctx.cwd); } catch { /* best-effort */ }
     ctx.ui.setTitle?.(`Cheater - ${ctx.cwd}`);
     ctx.ui.setStatus?.("cheater", ctx.ui.theme?.fg ? ctx.ui.theme.fg("accent", "Cheater") : "Cheater");
+    // Sly, the big animated mascot: a real pi Component with its own render loop that constantly
+    // moves (tail swish, blink, breathing) and whose face follows the work. Interactive TUI ONLY -
+    // gated on ctx.mode === "tui" so it never constructs an interval timer in rpc/print/json mode.
+    if (ctx.mode === "tui" && !mascotOff(config)) {
+      try {
+        ctx.ui.setWidget?.(
+          "cheater-mascot",
+          (tui: any, theme: any) => new CheaterMascotComponent(tui, theme, getMascotState),
+          { placement: "aboveEditor" }
+        );
+      } catch { /* the mascot is best-effort and must never break startup */ }
+    }
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
     ctx.ui.notify?.("Cheater mode active", "info");
   });
