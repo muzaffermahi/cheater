@@ -93,8 +93,8 @@ test("catFrame renders a multi-line cat whose face tracks the state, and animate
   const ready = catFrame(1, "ready");
   assert.ok(ready.length >= 6, "the mascot is a big multi-line cat, not a one-char spinner");
   assert.match(ready.join("\n"), /\/\\_\/\\/, "it has cat ears");
-  assert.match(catFrame(1, "success").join("\n"), /\^ \^/, "success shows happy eyes");
-  assert.match(catFrame(1, "blocked").join("\n"), /x x/, "blocked shows x eyes");
+  assert.match(catFrame(1, "success").join("\n"), /\^\s+\^/, "success shows happy eyes");
+  assert.match(catFrame(1, "blocked").join("\n"), /x\s+x/, "blocked shows x eyes");
   assert.match(catFrame(1, "success").join("\n"), /✓/, "success shows a check aura");
   // Constant motion: the tail row differs across ticks (it slides).
   const tailA = catFrame(0, "working").at(-1);

@@ -63,13 +63,18 @@ export function catFrame(tick: number, state: MascotState): string[] {
   const bob = Math.floor(tick / 5) % 2 === 0 ? "" : " ";
   const tail = TAIL_FRAMES[tick % TAIL_FRAMES.length];
   const aura = parts.aura ? ` ${parts.aura}` : "";
+  // Front paws do a slow "make biscuits" shuffle so the chonky body feels alive.
+  const paws = tick % 8 < 4 ? "( |   | )" : "(|   | )";
   return [
-    `${bob}  ${ears}`,
-    `${bob} ( ${le} ${re} )${aura}`,
-    `${bob} ( =^= )`,
+    `${bob}   ${ears}`,
+    `${bob}  /  V  \\`,
+    `${bob} ( ${le}   ${re} )${aura}`,
+    `${bob} (  =^=  )`,
     `${bob}  ) ${parts.mouth} (`,
-    `${bob} /|   |\\`,
-    `${bob}(_|   |_)`,
+    `${bob}  /~   ~\\`,
+    `${bob} /|     |\\`,
+    `${bob} ${paws}`,
+    `${bob} \\|_ _|/`,
     `${bob}${tail}`
   ];
 }
