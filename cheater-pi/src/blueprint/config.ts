@@ -36,6 +36,11 @@ export interface BlueprintConfig extends CommitletConfig {
   packetHardContextCeilingTokensMoE: number;
   loopGovernorEnabled: boolean;
   maxLoopBreaksPerPacket: number;
+  /** Extra loop-break budget granted to a packet that is GENUINELY iterating on a hard task (>=2
+   *  distinct files edited AND >=2 distinct failing commands - real progress, not spinning). 0 = off
+   *  (the terminal cap is exactly maxLoopBreaksPerPacket). Raises the ceiling only for real iteration;
+   *  pure spinning is still caught by the same-patch/same-command detectors and hits terminal on time. */
+  hardTaskLoopBudget: number;
   maxToolCallsTinyPacket: number;
   maxToolCallsNormalPacket: number;
   maxToolCallsHardPacket: number;
@@ -92,6 +97,7 @@ export const DEFAULT_BLUEPRINT_CONFIG: BlueprintConfig = {
   packetHardContextCeilingTokensMoE: 24000,
   loopGovernorEnabled: true,
   maxLoopBreaksPerPacket: 3,
+  hardTaskLoopBudget: 0,
   maxToolCallsTinyPacket: 6,
   maxToolCallsNormalPacket: 14,
   maxToolCallsHardPacket: 24,

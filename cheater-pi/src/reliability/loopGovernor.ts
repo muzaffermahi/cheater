@@ -49,9 +49,28 @@ export class LoopGovernor {
     return undefined;
   }
 
+  /**
+   * #8: a packet GENUINELY iterating on a hard task (>=2 distinct files edited AND >=2 distinct failing
+   * commands - trying different things, tests advancing) earns extra loop-break budget so the governor
+   * does not cut off slow real progress (the regex-chess/polyglot pattern: 95 turns of real attempts
+   * terminated). Off by default (hardTaskLoopBudget 0). Pure spinning stays bounded: the
+   * same-patch/same-command detectors keep the distinct sets small, so no extra budget is granted.
+   */
+  private progressBudget(records: ToolCallRecord[]): number {
+    const budget = this.config.hardTaskLoopBudget ?? 0;
+    if (budget <= 0 || records.length === 0) return 0;
+    const files = new Set<string>();
+    const failed = new Set<string>();
+    for (const record of records) {
+      for (const file of record.changedFiles ?? []) files.add(file);
+      if (record.kind === "failed_command") failed.add(commandSignature(String(record.value ?? "")));
+    }
+    return files.size >= 2 && failed.size >= 2 ? budget : 0;
+  }
+
   private break(reason: string, state: string[], records: ToolCallRecord[]): LoopBreakEvent {
     const nextCount = this.events.length + 1;
-    const terminal = nextCount >= this.config.maxLoopBreaksPerPacket;
+    const terminal = nextCount >= this.config.maxLoopBreaksPerPacket + this.progressBudget(records);
     const recovery = chooseRecovery(reason, state.filter(Boolean).slice(-5), records, terminal);
     const event: LoopBreakEvent = {
       packetId: this.packetId,
