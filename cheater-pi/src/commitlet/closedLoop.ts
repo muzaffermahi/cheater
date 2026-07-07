@@ -46,6 +46,7 @@ import { getWorkerPromptShape, resetWorkerPromptShape } from "../runtime/promptS
 import { runProviderProbe } from "../providers/lmStudioStateful.js";
 import { workerBackendReason } from "../blueprint/worker.js";
 import { steeringControl } from "../runstate/steering.js";
+import { resetNounGate } from "../reliability/nounGate.js";
 import { activeTaskRun, beginTaskRun, type TaskRunState } from "../runstate/runState.js";
 import {
   buildCompletionReceipt,
@@ -360,6 +361,7 @@ async function runClosedLoopInner(
   const sidecarConcurrency = scfg.baseUrl ? Math.max(1, config.sidecarMaxConcurrency ?? 1) : 1;
   sidecarScheduler.configure(sidecar, scfg.parallelism, scfg.parallelism === "concurrent" ? undefined : jobGate(cwd, scfg.modelId ?? "main"), sidecarConcurrency);
   steeringControl.reset();
+  resetNounGate();
   if (scfg.enabled) announceSidecarHealth(sidecar, ctx);
 
   // Control plane (Main LLM Call Governor + sidecar usage accounting + prompt shape). All per-run
