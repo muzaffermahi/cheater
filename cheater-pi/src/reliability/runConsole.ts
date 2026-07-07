@@ -110,15 +110,26 @@ type ExtensionAPI = { on: (event: string, handler: (...args: unknown[]) => unkno
  * results) so it tracks the run in real time. Pure-notification taps only, so it never interferes.
  */
 export function registerRunConsole(pi: ExtensionAPI): void {
+  // Last content actually pushed to the widget. Re-setting the widget on every tool/turn event -
+  // even with identical or taller content - forces Pi to re-lay-out the whole screen, which yanks
+  // the viewport back to the top mid-run (the reported "force scroll to top"). We only push when
+  // the rendered lines change, so a run that isn't visibly progressing leaves the scroll alone.
+  let lastKey = "";
   const refresh = (_event: unknown, ctx: any) => {
     try {
       const snapshot = runConsoleSnapshot();
       if (snapshot) {
-        ctx?.ui?.setWidget?.("cheater-run-console", renderRunConsole(snapshot), { placement: "aboveEditor" });
+        const lines = renderRunConsole(snapshot);
+        const key = lines.join("\n");
+        if (key !== lastKey) {
+          lastKey = key;
+          ctx?.ui?.setWidget?.("cheater-run-console", lines, { placement: "aboveEditor" });
+        }
         // Drive the animated spinner mascot from here too: on a single-GPU local box everything runs
         // in-session (no fresh workers), so the worker-progress spinner never fires - this makes the
         // reactive cat show during ordinary local work as well. pi controls when the spinner is
-        // visible; we only set the frames. No-op in JSON/headless.
+        // visible; we only set the frames (the mascot component ignores same-state updates). No-op in
+        // JSON/headless.
         setMascot(ctx, consoleMascotState(snapshot));
       }
     } catch {

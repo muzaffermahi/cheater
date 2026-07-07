@@ -58,5 +58,5 @@ test("doctor reports Cheater resources", () => {
   const checks = doctorChecks({ piCommand: "pi" }, parseLaunchOptions(["--doctor"]));
   const names = new Set(checks.map((check) => check.name));
   assert.ok(names.has("Cheater extension exists"));
-  assert.ok(names.has("Old Python TUI is not entrypoint"));
+  assert.ok(names.has("Runtime entrypoint is Cheater"));
 });

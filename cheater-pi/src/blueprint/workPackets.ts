@@ -2,7 +2,7 @@ import type { BlueprintCandidate, BlueprintPreview, FilePlan, RepoOrientation, V
 import { inferFilePlans, graphTouchTargets } from "./contextSketch.js";
 import type { GraphFileTarget, SymbolCluster } from "../commitlet/constraintGraph.js";
 
-const BASE_ALLOWED_TOOLS = ["Pi search/list/read", "Pi edit", "cheater_line_edit", "Pi shell", "Cheater verification tools"];
+const BASE_ALLOWED_TOOLS = ["search/list/read", "edit", "cheater_line_edit", "shell", "Cheater verification tools"];
 const BASE_FORBIDDEN = [
   "standalone TUI",
   "standalone agent loop",
@@ -159,7 +159,7 @@ function packet(params: Omit<WorkPacket, "status" | "estimatedModelCalls" | "all
     forbiddenActions: BASE_FORBIDDEN,
     promptContract: [
       `Do only packet ${params.id}: ${params.title}.`,
-      "Use Pi native read/edit/shell tools and prefer cheater_line_edit for existing files.",
+      "Use the built-in read/edit/shell tools and prefer cheater_line_edit for existing files.",
       "Keep context narrow; do not execute unrelated packets or move to another file.",
       "Read the exact line range before editing. Make the smallest line/range edit that satisfies the packet.",
       "Do not rewrite a whole existing file, template, or stylesheet just to modernize it.",

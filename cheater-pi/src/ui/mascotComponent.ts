@@ -1,130 +1,67 @@
-// "Sly", the big animated cheater mascot: a chunky solid-@ cat HEAD (Cline-robot vibe - a detailed,
-// centered, constantly-alive face rather than a one-char spinner). Modeled on pi's ArminComponent
-// (interval -> requestRender -> render(width)): it idle-animates forever (blink, wink, ear-twitch) and
-// its face tracks the work (thinking/working/sampling/verifying/success/blocked/sleeping). Interactive
-// TUI only - the factory is mounted just for ctx.mode === "tui", so it never runs in --print/--mode json.
+// The live mascot widget: mounts "Sly" (the front-facing pixel-art cat) into the interactive TUI and
+// keeps it in sync with the work. The art + colors live in catPixels.ts (pure, unit-testable); this
+// file is only the thin widget shell that centers and re-renders it.
 //
-// Pure frame production (catFrame) is separated from the ticking component so the art is unit-testable.
-// All rows are pure ASCII @ (matches the user's reference + is safe on any code page, incl. cp1254).
+// The cat is STATIC per work-state - calm, no idle animation. A light poll watches the shared mascot
+// mood and asks the host TUI to re-render only when it changes (awake vs sleeping), so an idle session
+// is still and costs nothing. Interactive TUI only: the factory is mounted just for ctx.mode === "tui",
+// so it never constructs a timer in --print/--mode json.
+//
+// Centering is done in PIXEL space (before color escapes are added) so the SGR color codes never skew
+// the layout math, and a row is never emitted wider than the terminal.
 
 import type { MascotState } from "./mascot.js";
+import { composeCat, renderCatRow } from "./catPixels.js";
 
-// Minimal shapes of the pi TUI/Theme the factory receives - typed loosely to avoid deep type imports.
 type TuiLike = { requestRender: () => void };
-type ThemeLike = { fg?: (color: string, text: string) => string };
-
-interface FaceParts {
-  eye: string; // single-char eye glyph (blink/wink override it)
-  mouth: string; // mouth key -> mouthStr()
-  color: string; // theme color name for the whole cat
-}
-
-function facePartsFor(state: MascotState): FaceParts {
-  switch (state) {
-    case "thinking": return { eye: "o", mouth: "neutral", color: "accent" };
-    case "working": return { eye: "O", mouth: "neutral", color: "text" };
-    case "sampling": return { eye: "O", mouth: "open", color: "accent" };
-    case "verifying": return { eye: "-", mouth: "neutral", color: "warning" };
-    case "success": return { eye: "^", mouth: "happy", color: "success" };
-    case "blocked": return { eye: "x", mouth: "frown", color: "error" };
-    case "sleeping": return { eye: "-", mouth: "sleep", color: "muted" };
-    case "ready":
-    default: return { eye: "O", mouth: "neutral", color: "muted" };
-  }
-}
-
-// Every mouth is EXACTLY 12 chars so the mouth row never shifts width across states.
-function mouthStr(key: string): string {
-  switch (key) {
-    case "happy": return "\\___vvvv___/";
-    case "frown": return "/^^^^^^^^^^\\";
-    case "sleep": return "\\___ZZZZ___/";
-    case "open": return "\\___OOOO___/";
-    default: return "\\__________/";
-  }
-}
 
 /**
- * Produce the cat's lines for an animation tick + mood. Pure + deterministic (given tick), so it is
- * unit-testable. `tick` increments every frame; blink, wink and ear-twitch derive from it. The face
- * itself (eyes + mouth) tracks the mood; expressive moods (success/blocked/sleeping) hold their look
- * instead of blinking. Rows are left-aligned as a block; the component centers the whole block.
- */
-export function catFrame(tick: number, state: MascotState): string[] {
-  const parts = facePartsFor(state);
-  // Expressive moods hold their face; neutral moods blink (both eyes) then wink (one eye) each cycle.
-  const expressive = state === "success" || state === "blocked" || state === "sleeping";
-  const blink = !expressive && tick % 16 === 0;
-  const wink = !expressive && tick % 16 === 8;
-  const le = blink || wink ? "-" : parts.eye;
-  const re = blink ? "-" : parts.eye;
-  // Ears flick outward every ~2s.
-  const ear = tick % 12 === 6 ? "/@ \\" : "/@@\\";
-  const m = mouthStr(parts.mouth);
-  return [
-    `     ${ear}              ${ear}`,
-    `     @@@@@@          @@@@@@`,
-    `    @@@@@@@@@@@@@@@@@@@@@@@@`,
-    `   @@@@@@@@@@@@@@@@@@@@@@@@@@`,
-    `   @@@@@@  @@@@@@@@@@  @@@@@@`,
-    ` ==@@@@@ (${le}) @@@@ (${re}) @@@@@==`,
-    `   @@@@@@@@@@@@@@@@@@@@@@@@@@`,
-    `   @@@@@@@@@@@ vv @@@@@@@@@@@`,
-    ` ==@@@@@ ${m} @@@@@==`,
-    `    @@@@@@@@@@@@@@@@@@@@@@@@`,
-    `     @@@@@@@@@@@@@@@@@@@@@@`,
-    `       @@@@@@@@@@@@@@@@@@`
-  ];
-}
-
-/**
- * The live animated component. Mount via:
+ * The live mascot component. Mount via the host TUI's widget API:
  *   ctx.ui.setWidget("cheater-mascot", (tui, theme) => new CheaterMascotComponent(tui, theme, getState),
  *                    { placement: "aboveEditor" })
- * only when ctx.mode === "tui". `getState` lets the cat's face follow the work.
+ * only when ctx.mode === "tui". `getState` lets the cat doze when the session goes idle.
  */
 export class CheaterMascotComponent {
   private interval: ReturnType<typeof setInterval> | null = null;
-  private tick = 0;
+  private lastState: MascotState;
   private cachedWidth = -1;
-  private cachedTick = -1;
+  private cachedState: MascotState | null = null;
   private cachedLines: string[] = [];
 
   constructor(
     private readonly tui: TuiLike,
-    private readonly theme: ThemeLike,
+    _theme: unknown,   // accepted for API compatibility; the cat owns its own colors
     private readonly getState: () => MascotState = () => "ready",
-    fps = 6
+    pollMs = 300
   ) {
+    this.lastState = safeState(this.getState);
+    // Watch the mascot's mood; re-render only when it changes (no per-frame animation loop).
     this.interval = setInterval(() => {
-      this.tick += 1;
+      const state = safeState(this.getState);
+      if (state === this.lastState) return;
+      this.lastState = state;
       try { this.tui.requestRender(); } catch { /* never break the TUI */ }
-    }, Math.max(60, Math.round(1000 / fps)));
+    }, Math.max(120, pollMs));
     // Node timers keep the process alive; a mascot must not. unref if available.
     (this.interval as { unref?: () => void }).unref?.();
   }
 
   render(width: number): string[] {
-    if (width === this.cachedWidth && this.cachedTick === this.tick) return this.cachedLines;
     const state = safeState(this.getState);
-    const color = facePartsFor(state).color;
-    const frame = catFrame(this.tick, state);
-    // Center the whole cat block: pad every row by the same lead so internal alignment is preserved.
-    const artWidth = Math.max(...frame.map((l) => l.length));
-    const lead = " ".repeat(Math.max(0, Math.floor((width - artWidth) / 2)));
-    this.cachedLines = frame.map((line) => {
-      const centered = (lead + line).slice(0, Math.max(0, width));
-      // pi's theme.fg is a METHOD that reads this.fgColors and THROWS on an unknown color, so it must
-      // be called ON the theme (never captured as a bare fn, which loses `this`) and wrapped: a
-      // decorative mascot must NEVER throw in render or it kills pi's whole TUI loop.
-      let painted = centered;
-      try {
-        if (this.theme?.fg) painted = this.theme.fg(color, centered);
-      } catch { /* themeless render, unknown color, or detached call - show the cat uncolored */ }
-      return painted;
+    if (width === this.cachedWidth && state === this.cachedState) return this.cachedLines;
+    const rows = composeCat(state);
+    const pxW = rows[0]?.length ?? 0;   // logical pixels per row
+    const visW = pxW * 2;               // terminal columns the cat occupies
+    const lead = " ".repeat(Math.max(0, Math.floor((width - visW) / 2)));
+    // If the terminal is narrower than the cat, clip whole pixels so we never emit an over-wide line.
+    const keep = width >= visW ? pxW : Math.max(0, Math.floor(width / 2));
+    this.cachedLines = rows.map((row) => {
+      // A decorative mascot must NEVER throw in render or it kills the whole TUI loop.
+      try { return lead + renderCatRow(row.slice(0, keep)); }
+      catch { return ""; }
     });
     this.cachedWidth = width;
-    this.cachedTick = this.tick;
+    this.cachedState = state;
     return this.cachedLines;
   }
 

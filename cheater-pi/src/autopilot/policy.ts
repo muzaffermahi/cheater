@@ -73,8 +73,8 @@ function decideExecutionDiscipline(mode: ExecutionMode, input: RoutePolicyInput,
 }
 
 function explainMode(mode: ExecutionMode, input: RoutePolicyInput): string {
-  if (mode === "answer_only") return "No code change is implied, so Pi should answer directly.";
-  if (mode === "vanilla_pi") return "Task is small enough for Pi's normal path with focused verification.";
+  if (mode === "answer_only") return "No code change is implied, so Cheater should answer directly.";
+  if (mode === "vanilla_pi") return "Task is small enough for the model's normal path with focused verification.";
   if (mode === "careful_repro") return input.needsRepro
     ? "Bug/test signal should reproduce first, then run the verified flow."
     : "Task is bounded enough for the fast path.";

@@ -1,9 +1,13 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import type { CheaterConfig, LaunchOptions, PiCommandResolution } from "./types.js";
+
+/** The brand Cheater stamps onto its bundled Pi runtime (Pi's own white-label field). */
+export const BRAND_NAME = "Cheater";
 
 export const legacyCommands = new Set([
   "agent", "arena", "audit-cards", "bench", "benchmark", "build-cards", "build-index",
@@ -54,15 +58,74 @@ export function parseLaunchOptions(argv: string[]): LaunchOptions {
   return options;
 }
 
+/**
+ * Path to the Pi runtime bundled with Cheater (a normal dependency), resolved wherever npm
+ * placed it (local node_modules or hoisted) via Node's own resolver. This copy is what Cheater
+ * brands as "Cheater"; the user's global `pi`, if any, is left untouched.
+ */
+export function bundledPiCli(root = packageDir()): string | undefined {
+  const rel = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
+  const candidates: string[] = [];
+  // 1) Node's resolver (handles npm hoisting). Resolve the package ENTRY, not its package.json -
+  //    a package with an `exports` map blocks deep `/package.json` resolution - then walk up to
+  //    the package root and take dist/cli.js.
+  try {
+    const require = createRequire(import.meta.url);
+    let dir = dirname(require.resolve("@earendil-works/pi-coding-agent"));
+    while (dir !== dirname(dir) && !existsSync(join(dir, "package.json"))) dir = dirname(dir);
+    candidates.push(join(dir, "dist", "cli.js"));
+  } catch { /* fall through to path guesses */ }
+  // 2) Directly under the Cheater package (local dev / un-hoisted install).
+  candidates.push(join(root, "node_modules", rel));
+  // 3) Hoisted a level up (a global install puts deps beside @cheater/cheater-pi).
+  candidates.push(join(root, "..", "..", rel));
+  return candidates.find((cli) => existsSync(cli));
+}
+
 export function resolvePiCommand(config: CheaterConfig = {}): PiCommandResolution {
   const configured = process.env.CHEATER_PI_COMMAND ?? process.env.CHEATER_PI_PATH ?? config.piCommand;
   if (configured) return { command: Array.isArray(configured) ? configured : [configured], source: process.env.CHEATER_PI_COMMAND || process.env.CHEATER_PI_PATH ? "env" : "config" };
+
+  // Prefer the bundled Pi so Cheater controls the runtime version AND its branding. Run it with
+  // the SAME node that launched us (process.execPath) rather than relying on "node" being on PATH.
+  const bundled = bundledPiCli();
+  if (bundled) return { command: [process.execPath, bundled], source: "bundled" };
 
   const found = findOnPath("pi");
   if (found) return { command: [found], source: "path" };
   const npmPi = process.env.APPDATA ? join(process.env.APPDATA, "npm", process.platform === "win32" ? "pi.cmd" : "pi") : "";
   if (npmPi && existsSync(npmPi) && !isStaleCheaterPiShim(npmPi)) return { command: [npmPi], source: "path" };
   return { command: ["pi"], source: "fallback" };
+}
+
+/**
+ * White-label the bundled Pi: Pi reads its app identity from `piConfig.name` in its OWN
+ * package.json (APP_NAME/APP_TITLE, the terminal `process.title`, the header logo, the window
+ * title). Setting it to "Cheater" is the only way to hide the "pi" name a running extension
+ * cannot touch. We KEEP `configDir` (default ".pi") so the user's existing Pi login/sessions/
+ * config keep working. Idempotent and best-effort: branding must never block a launch, and it is
+ * re-applied every run so it self-heals if `npm i` regenerates node_modules.
+ */
+export function ensurePiBranded(cliJs: string): void {
+  try {
+    const pkgPath = join(resolve(dirname(cliJs), ".."), "package.json");
+    if (!existsSync(pkgPath)) return;
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { piConfig?: { name?: string; configDir?: string } };
+    const current = pkg.piConfig ?? {};
+    if (current.name === BRAND_NAME) return; // already branded; nothing to write
+    pkg.piConfig = { ...current, name: BRAND_NAME, configDir: current.configDir ?? ".pi" };
+    writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`);
+  } catch {
+    // A read-only/locked node_modules or malformed package.json must not stop Cheater launching;
+    // the worst case is the runtime still shows "pi", not a crash.
+  }
+}
+
+/** Brand the resolved Pi iff it is the bundled copy we own. Never mutates a user-provided pi. */
+export function brandResolvedPi(config: CheaterConfig = {}): void {
+  const resolved = resolvePiCommand(config);
+  if (resolved.source !== "bundled") return;
+  ensurePiBranded(resolved.command[resolved.command.length - 1]);
 }
 
 export function buildPiCommand(config: CheaterConfig, options: LaunchOptions, root = packageDir()): string[] {

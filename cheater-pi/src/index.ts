@@ -1,30 +1,30 @@
 #!/usr/bin/env node
 import { loadConfig, VERSION } from "./config.js";
-import { buildPiCommand, firstLegacyCommand, formatCommand, spawnPi } from "./launcher.js";
+import { brandResolvedPi, buildPiCommand, firstLegacyCommand, formatCommand, spawnPi } from "./launcher.js";
 import { printDoctor } from "./doctor.js";
 import { parseLaunchOptions } from "./launcher.js";
 import { runGymCli } from "./gym/cli.js";
 import { runReliabilityCli } from "./reliability/cli.js";
 
 function printHelp(): void {
-  console.log(`Cheater ${VERSION} - Pi-based coding agent distribution
+  console.log(`Cheater ${VERSION} - a reliable local-first coding agent
 
 Usage:
-  cheater [Pi options] [message]
+  cheater [options] [message]
   cheater --doctor
   cheater --print-pi-command
   cheater gym <command> [args...]
   cheater bench reliability <command> [args...]
 
-Cheater starts Pi's TUI with Cheater's extension, prompt, skills, slash
-commands, and theme preloaded. It never starts the old Python TUI.
+Cheater opens its terminal UI with the reliability harness, prompt, skills,
+slash commands, and theme preloaded.
 
 Options:
-  --doctor             Check Pi discovery and Cheater resource wiring
+  --doctor             Check the runtime and Cheater resource wiring
   --version, -v        Print Cheater version
-  --debug              Print resolved Pi command before launching
+  --debug              Print the resolved launch command before starting
   --no-theme           Keep Cheater behavior but skip the Cheater theme
-  --print-pi-command   Print the resolved Pi command and exit
+  --print-pi-command   Print the resolved launch command and exit
   --help, -h           Show help
 
 Gym subcommands:
@@ -58,7 +58,7 @@ export function main(argv = process.argv.slice(2)): number {
 
   const legacy = firstLegacyCommand(options.passthrough);
   if (legacy) {
-    console.error(`cheater: ${legacy} was part of the old Python CLI. Run cheater to open the Cheater-flavored Pi TUI.`);
+    console.error(`cheater: ${legacy} was part of an old CLI. Run cheater to open the Cheater TUI.`);
     return 2;
   }
 
@@ -68,9 +68,12 @@ export function main(argv = process.argv.slice(2)): number {
     console.log(formatCommand(command));
     return 0;
   }
+  // White-label the bundled runtime just before launch (idempotent, best-effort) so the terminal
+  // title, banner, and window title read "Cheater" instead of "pi".
+  brandResolvedPi(config);
   const code = spawnPi(command);
   if (code === 127) {
-    console.error("cheater: Pi was not found. Install Pi or set CHEATER_PI_COMMAND, then run cheater --doctor.");
+    console.error("cheater: could not start the Cheater runtime. Reinstall Cheater, or set CHEATER_PI_COMMAND, then run cheater --doctor.");
   }
   return code;
 }

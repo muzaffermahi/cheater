@@ -14,7 +14,7 @@ export function startupCard(cwd: string, model: string | undefined, config?: Che
   const lines: string[] = [
     "Cheater mode active",
     `repo: ${cwd}`,
-    `model: ${model ?? "Pi default"}`,
+    `model: ${model ?? "default"}`,
     "Ask normally. Autopilot routes code requests through the one Reliability flow:",
     "  reliability_start -> edit allowed files -> commitlet_next -> verify -> finish_gate",
     "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health"
@@ -65,7 +65,7 @@ export function commandHelp(config?: CheaterConfig): string {
 
   lines.push(
     "/test     Infer or run a focused test command",
-    "/map      Ask Pi for a compact repo overview",
+    "/map      Build a compact repo overview",
     "/remember Save a project note",
     "/skills   List Cheater skills loaded by this package",
     "/traces   Show recent session/history guidance",

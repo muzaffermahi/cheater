@@ -30,7 +30,7 @@ function compactGitStatus(cwd: string): string {
   try {
     const gitDir = resolve(cwd, ".git");
     if (!existsSync(gitDir)) return "not a git repository";
-    return "git repository detected; use Pi's bash tool for detailed status";
+    return "git repository detected; use the bash tool for detailed status";
   } catch {
     return "git status unavailable";
   }
@@ -200,7 +200,7 @@ export function registerCheaterTools(pi: ExtensionAPI, config: CheaterConfig = {
   pi.registerTool({
     name: "cheater_project_brief",
     label: "Cheater Project Brief",
-    description: "Return a compact Cheater project brief without duplicating Pi file tools.",
+    description: "Return a compact Cheater project brief without duplicating the built-in file tools.",
     promptSnippet: "cheater_project_brief - compact project status and top-level shape.",
     parameters: Type.Object({}),
     async execute(_toolCallId: string, _params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) {

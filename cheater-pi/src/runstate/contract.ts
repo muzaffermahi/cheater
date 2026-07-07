@@ -219,8 +219,28 @@ function buildEvaluatorHints(contract: Omit<AcceptanceContract, "evaluatorHints"
   return hints.slice(0, 3);
 }
 
+const CODE_DELIVERABLE_RE = /\.(py|ts|tsx|js|jsx|mjs|cjs|go|rs|java|rb|c|cc|cpp|h|hpp|php|swift|kt|scala)$/i;
+
 function buildChecklist(contract: Omit<AcceptanceContract, "checklist">): string[] {
   const checklist: string[] = [];
+  // When the deliverable is code and NO evaluator command was provided, the worker is
+  // the only checker there is. A small model most often drifts here in two ways: it
+  // renames/re-shapes the entry point (a class or helper instead of the exact function,
+  // or the wrong return type), and it ships a plausible-but-wrong implementation it never
+  // actually ran. Put an exact-interface + self-derived-test gate FIRST so it's seen while
+  // there's still time to fix, not as an afterthought.
+  const codeDeliverable = contract.outputPaths.some((p) => CODE_DELIVERABLE_RE.test(p));
+  if (codeDeliverable && contract.commands.length === 0) {
+    checklist.push(
+      "No test command was given, so YOU are the only checker before finishing: " +
+      "(a) confirm the file defines the EXACT top-level entry point the task names - same " +
+      "function name and signature, returning the exact type asked for (not a class, a " +
+      "renamed helper, or a printed value); " +
+      "(b) take every rule, boundary, and worked example in the task, turn each into a " +
+      "concrete assertion whose expected value you compute BY HAND from the task text, run " +
+      "them, and fix each mismatch. Do not finish while any derived case still fails."
+    );
+  }
   for (const path of contract.outputPaths.slice(0, 3)) checklist.push(`Re-open ${path} and confirm its content and format.`);
   for (const endpoint of contract.endpoints.slice(0, 3)) checklist.push(`Request ${endpoint} (that exact path) and check the response.`);
   for (const command of contract.commands.slice(0, 2)) checklist.push(`Run \`${command}\` and confirm exit code 0.`);

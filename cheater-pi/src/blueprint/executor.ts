@@ -34,7 +34,7 @@ export function buildPacketExecutionPrompts(plan: BlueprintPlan, rawConfig: Chea
       `Prompt contract: ${packet.promptContract}`,
       `Forbidden actions: ${packet.forbiddenActions.join("; ")}`,
       `Verification: ${packet.verification.map((step) => step.command ?? step.description).join("; ") || "manual review"}`,
-      "Use Pi native tools only. Do not execute unrelated packets.",
+      "Use the built-in tools only. Do not execute unrelated packets.",
       "For existing files, use a line/range edit such as cheater_line_edit after reading the target lines. Avoid complete-file writes.",
       "If this packet touches one file, do not edit sibling files in the same packet. Complete the packet and request the next one.",
       "If you notice yourself starting 'Now let me update...' for another file, stop and complete the current packet first.",
@@ -59,6 +59,6 @@ export function markPacketResult(packet: WorkPacket, ok: boolean, summary: strin
 
 export function executePacketsAsPiPrompts(plan: BlueprintPlan): BlueprintPlan {
   const ordered = topologicalPackets(plan.workPackets);
-  const completed = ordered.map((packet) => markPacketResult(packet, true, "Prepared for sequential Pi execution."));
+  const completed = ordered.map((packet) => markPacketResult(packet, true, "Prepared for sequential execution."));
   return { ...plan, workPackets: completed };
 }

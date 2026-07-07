@@ -45,7 +45,7 @@ export function doctorChecks(config: CheaterConfig, options: LaunchOptions, root
   const pi = resolvePiCommand(config);
   const node = spawnSync(process.execPath, ["--version"], { encoding: "utf8" });
   return [
-    { name: "Pi is resolvable", ok: pi.source !== "fallback", detail: pi.command.join(" ") },
+    { name: "Runtime is resolvable", ok: pi.source !== "fallback", detail: `${pi.source}: ${pi.command.join(" ")}` },
     { name: "Cheater extension exists", ok: existsSync(paths.extension), detail: paths.extension },
     { name: "Cheater prompt exists", ok: existsSync(paths.prompt), detail: paths.prompt },
     { name: "Cheater skills exist", ok: existsSync(paths.skills), detail: paths.skills },
@@ -53,7 +53,7 @@ export function doctorChecks(config: CheaterConfig, options: LaunchOptions, root
     { name: "Current folder readable", ok: canAccess(process.cwd(), constants.R_OK), detail: process.cwd() },
     { name: "Current folder writable", ok: canAccess(process.cwd(), constants.W_OK), detail: process.cwd() },
     { name: "Node is available", ok: node.status === 0, detail: node.stdout.trim() || process.execPath },
-    { name: "Old Python TUI is not entrypoint", ok: true, detail: "cheater delegates to Pi with Cheater resources" },
+    { name: "Runtime entrypoint is Cheater", ok: true, detail: "cheater runs its own bundled runtime with Cheater resources" },
     configParseCheck(),
     { name: "Recommended model sampling (set on backend)", ok: true, detail: samplingRecommendation(config.model) },
     { name: "Resolved launch command", ok: true, detail: formatCommand(buildPiCommand(config, options, root)) }

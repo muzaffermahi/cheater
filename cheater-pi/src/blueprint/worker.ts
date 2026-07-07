@@ -249,7 +249,7 @@ export function workerPrompt(plan: BlueprintPlan, packet: WorkPacket, prompt: st
     "- You are the code-changing worker, not the planner.",
     "- Execute only this one packet, then stop. You are not allowed to roll into the next file.",
     "- To CREATE a new file, use the write tool (path + full content) in ONE call. Never create files via bash heredocs, echo, cat, or node -e: shell quoting will corrupt the content.",
-    "- For existing files, read the exact target lines and use cheater_line_edit or the smallest Pi edit.",
+    "- For existing files, read the exact target lines and use cheater_line_edit or the smallest built-in edit.",
     platformNote,
     "- If this packet touches a file, do not inspect or edit unrelated sibling templates/styles/source files.",
     "- If another file seems necessary, stop with BLOCKED_NEXT_FILE instead of editing it; the planner will summon a new fresh worker.",

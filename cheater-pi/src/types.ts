@@ -284,7 +284,7 @@ export interface LaunchOptions {
 
 export interface PiCommandResolution {
   command: string[];
-  source: "config" | "env" | "path" | "fallback";
+  source: "config" | "env" | "bundled" | "path" | "fallback";
 }
 
 export interface DoctorCheck {
