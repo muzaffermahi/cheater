@@ -32,12 +32,12 @@ import {
   singleTargetFile,
   type InSessionResampleOutcome
 } from "./inSessionResample.js";
-import { computeBudget } from "../runtime/computeBudget.js";
+import { computeBudget, scoreHardness } from "../runtime/computeBudget.js";
 import { isRepairCommitlet } from "./types.js";
 import { liveSessionState } from "../reliability/sessionState.js";
 import { resolveSidecarClient, sidecarConfig, sdkSidecarClient } from "../sidecar/client.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
-import { routeGoalSidecar, prepareContextSidecar } from "../sidecar/jobs.js";
+import { routeGoalSidecar, prepareContextSidecar, triageHintSidecar, driftNoteSidecar } from "../sidecar/jobs.js";
 import { jobGate } from "../sidecar/calibration.js";
 import type { SidecarClient } from "../sidecar/types.js";
 import { mainCallGovernor, workerRoleForCommitletId } from "../runtime/mainCallGovernor.js";
@@ -432,6 +432,18 @@ async function runClosedLoopInner(
   if (scfg.parallelism === "concurrent") dispatchContextPrep(cwd, plan, userGoal, prefetchHorizon);
   liveSessionState.reset(userGoal);
   liveSessionState.ensure(config, userGoal);
+  // triage_hint (Phase 4): a second-opinion hardness nudge from the clerk, recorded as an advisory
+  // observation. Additive and non-authoritative - the deterministic hardness signals remain the floor
+  // (this is not fed into gating; it is surfaced for visibility). Gated on the sidecar, so it is a
+  // no-op by default and never blocks the run.
+  if (sidecar.available()) {
+    try {
+      const { hardness } = scoreHardness({ taskKind: decision.taskKind, risk: decision.risk, filesInScope: plan.commitlets.length });
+      const triage = await triageHintSidecar(sidecar, userGoal, { hardness });
+      liveSessionState.getLedger()?.addEntry("sidecar", `${triage.label}: ${triage.note}`, { label: triage.label, source: triage.source, extraHardness: triage.value.extraHardness });
+      sidecarUsage.record("route", triage.source);
+    } catch { /* triage is advisory; never break the run */ }
+  }
   if (config.runStateEnabled !== false) {
     // Budget generously: the per-commitlet maxToolCalls (~10) is for a BOUNDED isolated worker,
     // but in simulated/in-session mode the MAIN model does the whole multi-file build itself and
@@ -728,6 +740,16 @@ async function runClosedLoopInner(
         estTokens: getWorkerPromptShape()?.totalEstimatedTokens,
         reason: `fresh worker for ${prepared.id}`
       });
+      // drift_note (Phase 4): post-turn scan of the worker's output for off-goal/out-of-scope signs.
+      // Purely advisory - a soft ledger observation, never a hard break by itself. Gated on the
+      // sidecar (no-op by default); guarded so it never affects the run's control flow.
+      if (sidecar.available() && workerResult.summary) {
+        try {
+          const drift = await driftNoteSidecar(sidecar, userGoal, workerResult.summary);
+          liveSessionState.getLedger()?.addEntry("sidecar", `${drift.label}: ${drift.note}`, { label: drift.label, source: drift.source, offGoal: drift.value.offGoal, commitletId: prepared.id });
+          if (drift.value.offGoal && drift.value.note) activeTaskRun()?.addBlocker(`drift (advisory): ${drift.value.note}`);
+        } catch { /* drift is advisory; never break the run */ }
+      }
     }
 
     if (workerResult.error === "worker_backend_unavailable") {

@@ -549,7 +549,10 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     mainCallGovernor.recordAvoided("failure_distill", distilled.source === "sidecar" ? "sidecar" : "deterministic", distilled.note);
     if (distilled.source === "sidecar") {
       // Append, never prepend: the bare failure must stay first so createRepairCommitlet builds
-      // purpose/acceptance from the real failure and strips this distilled block as evidence.
+      // purpose/acceptance from the real failure and strips this distilled block as evidence. The
+      // distill IS the single failure-path sidecar consult; parse_failure (a structured file/test/
+      // assertion card) is available as a job but is not a second consult here - the distill already
+      // replaces raw-log noise with a repair-ready note.
       failureWithEvidence = `${failureWithEvidence}\n${renderDistillation(distilled.value)}`;
     }
   }
