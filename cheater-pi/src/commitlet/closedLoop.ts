@@ -269,6 +269,27 @@ function report(result: Omit<ClosedLoopRunResult, "summary">, goal: string, extr
 }
 
 /**
+ * Direct lane (Phase 6): a trivial task (low hardness AND at most one file in scope) should skip the
+ * blueprint / inspect / review ceremony entirely and just edit in-session with the gates + finish
+ * gate - the README-measured easy-task overhead is those extra model turns, not the ~1-2s gates. This
+ * extends the existing singleCommitletInSession lane; it never fires for a from-scratch build or when
+ * that lane is disabled. Deterministic and pure so the trigger is unit-testable.
+ */
+export function directLaneEligible(
+  decision: { taskKind?: string; risk?: string },
+  opts: { fromScratch: boolean; singleCommitletInSession: boolean; filesInScope?: number }
+): boolean {
+  if (opts.fromScratch || !opts.singleCommitletInSession) return false;
+  const files = opts.filesInScope ?? 1;
+  if (files > 1) return false;
+  // High risk keeps the full ceremony even for a nominally trivial task - skipping the blueprint's
+  // safety planning on a high-risk change is exactly where it should not be skipped.
+  if ((decision.risk ?? "").toLowerCase() === "high") return false;
+  const { hardness } = scoreHardness({ taskKind: decision.taskKind, risk: decision.risk, filesInScope: files });
+  return hardness <= 1;
+}
+
+/**
  * Run the whole task loop deterministically. The model never orchestrates: it only
  * implements inside bounded workers spawned by this loop.
  */
@@ -412,10 +433,17 @@ async function runClosedLoopInner(
   }
   const scaffolding = scaffoldFiles.length > 0;
 
+  // Direct lane (Phase 6): a trivial task skips the whole blueprint/inspect/review ceremony and edits
+  // in-session. This is the easy-task burn-down - the overhead there is extra model TURNS, not gate
+  // latency. It never fires for a from-scratch build (scaffold has its own fast path).
+  const directLane = directLaneEligible(decision, { fromScratch: scaffolding, singleCommitletInSession: config.singleCommitletInSession !== false, filesInScope: 1 });
+  if (directLane) narrate(ctx, "direct lane: trivial task - skipping blueprint/inspect/review, editing in-session with gates + finish gate");
+
   // Blueprint: reuse an active plan or build one internally for complex tasks (skipped when a
-  // model-derived scaffold is driving) - identical policy to cheater_reliability_start otherwise.
+  // model-derived scaffold is driving, OR on the direct lane) - identical policy to
+  // cheater_reliability_start otherwise. Skipping it on the direct lane saves the blueprint model turn.
   const activeBlueprint = params.useActiveBlueprint === false ? undefined : defaultBlueprintState.get().currentPlan ?? undefined;
-  const blueprintPlan = scaffolding ? undefined : (activeBlueprint ?? (decision.executionMode === "blueprint_orchestrator" || decision.needsBlueprint
+  const blueprintPlan = (scaffolding || directLane) ? undefined : (activeBlueprint ?? (decision.executionMode === "blueprint_orchestrator" || decision.needsBlueprint
     ? await deps.createBlueprint({ cwd, userGoal, taskType: decision.taskKind, modelName: ctx?.model?.id ?? config.model, config })
     : undefined));
   if (blueprintPlan && blueprintPlan !== activeBlueprint) defaultBlueprintState.setPlan(blueprintPlan);
@@ -487,6 +515,7 @@ async function runClosedLoopInner(
   // main model then thrashes. The main model, which JUST explored the repo, does a single focused task
   // far better than a cold worker. Multi-commitlet plans still fan out to fresh workers.
   const inSessionByDesign = scaffolding
+    || directLane
     || (config.singleCommitletInSession !== false && plan.commitlets.length <= 1);
   const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: inSessionByDesign ? false : params.spawnFreshWorker }, config, ctx);
   const modelName = resolveModelName(config, ctx);

@@ -172,9 +172,19 @@ export function buildPromptCapsule(input: BuildCapsuleInput): PromptCapsule {
   };
 }
 
-/** Render the worker prompt FROM the capsule - the capsule is the whole context. */
+/**
+ * Render the worker prompt FROM the capsule - the capsule is the whole context.
+ *
+ * Cache-aware ordering (Phase 6): every field that is STABLE across a commitlet's resample attempts
+ * and across turns comes first (identity, rules, contract, allowed files, static briefs, repo facts,
+ * constraints, rules, digest); the VOLATILE trio that differs per attempt / per worker (observed
+ * failure, attempt stance, world diff) comes LAST, just before the closing directive. So two renders
+ * of the same commitlet that differ only in stance/failure share a byte-identical prefix, and a
+ * stateful endpoint can reuse the KV cache for all of it. No content changed - order only.
+ */
 export function renderCapsulePrompt(capsule: PromptCapsule): string {
   const lines: string[] = [];
+  // --- STABLE PREFIX ---------------------------------------------------------------------------
   lines.push(`You are a focused ${capsule.workerRole} worker for Cheater.`);
   lines.push("Your only job:");
   lines.push(capsule.workerGoal);
@@ -191,15 +201,6 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
     lines.push("");
     lines.push("Acceptance contract (literal - do not rename or approximate):");
     for (const term of capsule.acceptanceContract) lines.push(`- ${term}`);
-  }
-  if (capsule.observedFailure) {
-    lines.push("");
-    lines.push("Observed failure (fix exactly this):");
-    lines.push(capsule.observedFailure);
-  }
-  if (capsule.attemptStance) {
-    lines.push("");
-    lines.push(capsule.attemptStance);
   }
   if (capsule.allowedFiles.length) {
     lines.push("");
@@ -247,11 +248,6 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
     lines.push("Changes so far:");
     for (const mutation of capsule.mutationSummary) lines.push(`- ${mutation}`);
   }
-  if (capsule.worldDiff?.length) {
-    lines.push("");
-    lines.push("Since the last worker:");
-    for (const line of capsule.worldDiff) lines.push(`- ${line}`);
-  }
   if (capsule.priorWorkerReports.length) {
     lines.push("");
     lines.push("Prior worker reports (compact):");
@@ -275,6 +271,21 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
   lines.push("");
   lines.push("When done, write a WorkerReport with:");
   for (const instruction of capsule.outputInstructions) lines.push(`- ${instruction}`);
+  // --- VOLATILE TAIL (differs per attempt / per worker; kept last so the prefix above stays stable)
+  if (capsule.observedFailure) {
+    lines.push("");
+    lines.push("Observed failure (fix exactly this):");
+    lines.push(capsule.observedFailure);
+  }
+  if (capsule.attemptStance) {
+    lines.push("");
+    lines.push(capsule.attemptStance);
+  }
+  if (capsule.worldDiff?.length) {
+    lines.push("");
+    lines.push("Since the last worker:");
+    for (const line of capsule.worldDiff) lines.push(`- ${line}`);
+  }
   lines.push("");
   if (capsule.inSession) {
     // In-session: the model IS the whole build - there is no separate worker to hand off to, so a
@@ -285,6 +296,25 @@ export function renderCapsulePrompt(capsule: PromptCapsule): string {
     lines.push("Stop when your narrow goal is done or blocked. Do not continue into a new concern - report it instead.");
   }
   return lines.join("\n");
+}
+
+/**
+ * The stable prefix of a rendered capsule: everything up to the volatile tail (observed failure /
+ * attempt stance / world diff). Two capsules for the same commitlet that differ only in those fields
+ * share this byte-for-byte, so a stateful endpoint reuses the KV cache for it. Exposed for the
+ * cache-stability test and for a TTFT probe.
+ */
+export function capsuleStablePrefix(capsule: PromptCapsule): string {
+  const rendered = renderCapsulePrompt(capsule);
+  const markers = ["\nObserved failure (fix exactly this):", "\nSince the last worker:"];
+  let cut = rendered.length;
+  for (const marker of markers) {
+    const at = rendered.indexOf(marker);
+    if (at >= 0) cut = Math.min(cut, at);
+  }
+  // The attempt stance renders with no fixed header; when present it follows the stable body, so the
+  // failure/world-diff markers bound the stable prefix. When neither is present the whole body is stable.
+  return rendered.slice(0, cut);
 }
 
 /** chars/4 estimate over the rendered prompt - cheap, deterministic, good enough to police bloat. */
