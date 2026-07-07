@@ -35,7 +35,7 @@ const PUBLIC_COMMAND_NAMES = [
   "gym-clean",
   "test",
   "map",
-  "pi",
+  "raw",
   "remember",
   "skills",
   "traces",
@@ -89,19 +89,19 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
   });
 
   pi.registerCommand("map", {
-    description: "Ask Pi for a compact repo overview",
+    description: "Build a compact repo overview",
     handler: async (_args: string, _ctx: CommandContext) => {
-      pi.sendUserMessage("Cheater /map: build a compact repo overview using Pi's native search/list/read tools. Keep it short and emphasize entry points, tests, and likely edit areas.");
+      pi.sendUserMessage("Cheater /map: build a compact repo overview using the built-in search/list/read tools. Keep it short and emphasize entry points, tests, and likely edit areas.");
     }
   });
 
-  pi.registerCommand("pi", {
-    description: "Toggle pi's raw tool output (Cheater collapses it by default for a clean view)",
+  pi.registerCommand("raw", {
+    description: "Toggle raw tool output (collapsed by default for a clean view)",
     handler: async (_args: string, ctx: CommandContext) => {
       try {
         const expanded = !ctx.ui.getToolsExpanded?.();
         ctx.ui.setToolsExpanded?.(expanded);
-        ctx.ui.notify?.(expanded ? "Cheater: raw pi tool output SHOWN" : "Cheater: clean view - pi tool output collapsed", "info");
+        ctx.ui.notify?.(expanded ? "Cheater: raw tool output SHOWN" : "Cheater: clean view - raw tool output collapsed", "info");
       } catch { /* best-effort; the toggle is cosmetic */ }
     }
   });
@@ -128,9 +128,9 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
 
   const historyHandler = async (_args: string, ctx: CommandContext) => {
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
-    notifyBlock(ctx, `Cheater history\nsession entries: ${entries.length}\nUse Pi's session commands for full history and resume behavior.`);
+    notifyBlock(ctx, `Cheater history\nsession entries: ${entries.length}\nUse the built-in session commands for full history and resume behavior.`);
   };
-  pi.registerCommand("traces", { description: "Show recent Cheater/Pi history summary", handler: historyHandler });
+  pi.registerCommand("traces", { description: "Show recent Cheater history summary", handler: historyHandler });
   pi.registerCommand("history", { description: "Alias for /traces", handler: historyHandler });
 
   pi.registerCommand("settings", {

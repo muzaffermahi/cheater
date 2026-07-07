@@ -33,7 +33,7 @@ export function registerAutopilotCommands(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("autopilot-run", {
-    description: "Debug: route a request and send the routed Pi instruction",
+    description: "Debug: route a request and send the routed instruction",
     handler: async (args: string, ctx: CommandContext) => {
       const message = args.trim();
       if (!message) {

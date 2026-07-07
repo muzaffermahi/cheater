@@ -9,7 +9,8 @@ import {
   mascotStateForPhase
 } from "../src/ui/mascot.js";
 import { setMascot, configureMascot, getMascotState } from "../src/ui/mascotUi.js";
-import { catFrame, CheaterMascotComponent } from "../src/ui/mascotComponent.js";
+import { CheaterMascotComponent } from "../src/ui/mascotComponent.js";
+import { cheaterCat, composeCat, renderCatRow, CAT_BASE } from "../src/ui/catPixels.js";
 import { renderRunConsole } from "../src/reliability/runConsole.js";
 
 // ---- pure mascot strings ----
@@ -82,52 +83,73 @@ test("setMascot records the mood (for the big component) and sets the working me
 test("setMascot is JSON/headless-safe: it never throws when ui methods are absent or throw", () => {
   configureMascot({});
   assert.doesNotThrow(() => setMascot(undefined, "working", "x"), "no ctx at all");
-  assert.doesNotThrow(() => setMascot({ ui: {} }, "working", "x"), "ui with no methods (noOpUIContext shape)");
+  assert.doesNotThrow(() => setMascot({ ui: {} }, "working", "x"), "ui with no methods (no-op UI context shape)");
   const throwingCtx = { ui: { setWorkingMessage: () => { throw new Error("boom"); } } };
   assert.doesNotThrow(() => setMascot(throwingCtx, "working", "x"), "a throwing ui must not break the run");
 });
 
-// ---- the big animated component (catFrame) ----
+// ---- the pixel-art cat (catPixels) ----
 
-test("catFrame renders a big centered cat whose face tracks the state, and animates over ticks", () => {
-  const cat = catFrame(1, "working");
-  assert.ok(cat.length >= 10, "the mascot is a big multi-line cat, not a one-char spinner");
-  assert.ok(cat.join("\n").includes("/@@\\"), "it has cat ears");
-  assert.match(catFrame(1, "success").join("\n"), /\(\^\)/, "success shows a happy eye");
-  assert.match(catFrame(1, "blocked").join("\n"), /\(x\)/, "blocked shows an x eye");
-  assert.match(catFrame(1, "success").join("\n"), /vvvv/, "success shows a grin");
-  // Constant motion: a blink frame (tick 0) differs from the open-eyed frame (tick 1).
-  assert.notEqual(catFrame(0, "working").join("\n"), catFrame(1, "working").join("\n"), "the face animates between ticks");
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+
+test("renderCatRow paints colored two-column blocks and spaces for background", () => {
+  assert.equal(renderCatRow("."), "  ", "background is two spaces, no color");
+  assert.match(renderCatRow("p"), /\x1b\[38;2;\d+;\d+;\d+m██\x1b\[0m/, "a pixel is a colored ██ block");
+  assert.equal(stripAnsi(renderCatRow("pp..p")).length, 10, "5 pixels -> 10 visible columns");
 });
 
-test("the animated component calls theme.fg BOUND (never detached) and never throws on a bad theme", () => {
-  const tui = { requestRender: () => {} };
-  // A theme whose fg is a METHOD that relies on `this` - exactly like pi's real Theme (this.fgColors).
-  // The old code captured `const fg = this.theme.fg` and called it detached, losing `this` -> the live
-  // "Cannot read properties of undefined (reading 'fgColors')" crash that killed the whole TUI.
-  const realish = {
-    palette: new Map([["muted", "<m>"], ["success", "<s>"]]),
-    fg(color: string, text: string): string {
-      const p = this.palette.get(color);
-      if (!p) throw new Error(`Unknown theme color: ${color}`);
-      return `${p}${text}`;
+test("CAT_BASE is a rectangular, hand-editable symbol grid", () => {
+  const w = CAT_BASE[0].length;
+  assert.ok(CAT_BASE.length >= 18, "a detailed multi-row cat");
+  assert.ok(CAT_BASE.every((r) => r.length === w), "every row is the same width");
+  assert.ok(CAT_BASE.every((r) => /^[.ofFkpPqgdwy]+$/.test(r)), "only the documented palette symbols are used");
+});
+
+test("CAT_BASE (the shared body) is left-right symmetric", () => {
+  const w = CAT_BASE[0].length;
+  CAT_BASE.forEach((row, r) => {
+    for (let c = 0; c < Math.floor(w / 2); c++) {
+      assert.equal(row[c], row[w - 1 - c], `row ${r} not symmetric at col ${c}`);
     }
-  };
-  const comp = new CheaterMascotComponent(tui, realish, () => "ready");
+  });
+});
+
+test("cheaterCat renders a big colored front-facing cat", () => {
+  const cat = cheaterCat("ready");
+  assert.equal(cat.length, CAT_BASE.length, "one terminal row per pixel row");
+  assert.ok(cat.every((l) => stripAnsi(l).length === CAT_BASE[0].length * 2), "two visible columns per pixel");
+  const joined = cat.join("\n");
+  assert.ok(joined.includes("██"), "solid pixel blocks");
+  assert.ok(joined.includes("\x1b[38;2;231;116;142m"), "pink ears/nose");
+  assert.ok(joined.includes("\x1b[38;2;66;172;82m"), "green eyes");
+  assert.ok(joined.includes("\x1b[38;2;246;246;248m"), "white catchlights");
+});
+
+test("each work-state wears the right face (idle / building / error)", () => {
+  const idle = composeCat("ready").join("\n");
+  const building = composeCat("working").join("\n");
+  const error = composeCat("blocked").join("\n");
+  assert.notEqual(idle, building, "building differs from idle");
+  assert.notEqual(idle, error, "error differs from idle");
+  assert.notEqual(building, error, "building differs from error");
+  assert.equal(composeCat("sleeping").join("\n"), idle, "sleeping shares the idle face");
+  assert.equal(composeCat("sampling").join("\n"), building, "sampling shares the building face");
+  assert.equal(composeCat("success").join("\n"), idle, "success rests on the idle face");
+});
+
+test("the mascot component centers the colored cat and never throws (any width/theme)", () => {
+  const tui = { requestRender: () => {} };
+  const comp = new CheaterMascotComponent(tui, { any: "theme" }, () => "ready");
   try {
-    const lines = comp.render(40);
-    assert.ok(lines.length >= 6, "renders the multi-line cat");
-    assert.ok(lines.join("").includes("<m>"), "themed via a BOUND this (muted color applied), not crashed");
+    const lines = comp.render(80);
+    assert.equal(lines.length, CAT_BASE.length, "renders the multi-line cat");
+    assert.ok(lines.every((l) => stripAnsi(l).length <= 80), "never wider than the terminal");
+    assert.ok(lines.some((l) => l.startsWith("  ")), "centered with a left margin at width 80");
+    assert.ok(lines.join("").includes("██"), "the colored pixels are present");
+    assert.doesNotThrow(() => comp.render(20), "a narrow terminal clips instead of crashing");
+    assert.ok(comp.render(20).every((l) => stripAnsi(l).length <= 20), "clipped to the narrow width");
   } finally {
     comp.dispose();
-  }
-  // A theme that THROWS (unknown color / any quirk) must NOT crash render - the cat shows uncolored.
-  const throwing = { fg(): string { throw new Error("Unknown theme color: boom"); } };
-  const comp2 = new CheaterMascotComponent(tui, throwing, () => "success");
-  try {
-    assert.doesNotThrow(() => comp2.render(40), "a throwing theme is swallowed; the mascot never breaks the TUI");
-  } finally {
-    comp2.dispose();
   }
 });
 

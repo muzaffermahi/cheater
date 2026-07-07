@@ -79,7 +79,7 @@ export function renderFreshCallPacket(packet: FreshCallPacket): string {
     // raw diff - this used to say "Use Pi native tools only", contradicting the commitlet
     // block's own instruction to use cheater_line_edit and pushing outputFormat:"patch" into
     // the worker's ending as a literal diff instead of a tool call.
-    "Use structured edit tools (cheater_line_edit, or Pi's native edit) to make the change; outputFormat/endSentinel describe how to REPORT the result, not how to edit. Do not execute unrelated packets. Do not include unrelated prior chat.",
+    "Use structured edit tools (cheater_line_edit, or the built-in edit tool) to make the change; outputFormat/endSentinel describe how to REPORT the result, not how to edit. Do not execute unrelated packets. Do not include unrelated prior chat.",
     "One file-change worker means one file-change worker: after editing the listed file, stop and hand off. Do not continue to another file.",
     "End with a compact handoff summary and the sentinel."
   ].join("\n");

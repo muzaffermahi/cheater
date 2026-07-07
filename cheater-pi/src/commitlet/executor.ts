@@ -161,7 +161,7 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
       inSession: freshWorkerMode === "simulated"
     });
     const rendered = renderCapsulePrompt(capsule);
-    const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or Pi's edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
+    const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or the built-in edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
     const verifyLine = verificationCommand
       ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
       : "No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). If a test file is within THIS commitlet's allowed files, add a small one in the project's language and run it; otherwise verify by running the code and report its real output. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.";

@@ -1,6 +1,6 @@
-// The mascot WIRING layer: drives "Sly" through pi's ctx.ui. Everything here is a no-op in
-// JSON/headless mode (pi's noOpUIContext makes every ui.* method a no-op), so the mascot can NEVER
-// corrupt `--print --mode json` output - no mode/hasUI guard is needed. Every call is wrapped so the
+// The mascot WIRING layer: drives "Sly" through the host agent's ctx.ui. Everything here is a no-op in
+// JSON/headless mode (the host's no-op UI context makes every ui.* method a no-op), so the mascot can
+// NEVER corrupt `--print --mode json` output - no mode/hasUI guard is needed. Every call is wrapped so the
 // mascot can never break a run. Keeping all ctx-touching code in this one file keeps mascot.ts pure
 // (string-only) and testable.
 
@@ -20,8 +20,8 @@ export function configureMascot(config?: CheaterConfig): void {
   sessionConfig = config;
 }
 
-// The mascot's current mood, updated as the work progresses. The BIG animated component
-// (mascotComponent.ts) polls this every frame so its face follows the work in real time.
+// The mascot's current mood, updated as the work progresses. The pixel-art mascot component
+// (mascotComponent.ts) reads this and re-renders when it changes, so its face follows the work.
 let currentState: MascotState = "ready";
 export function getMascotState(): MascotState {
   return currentState;

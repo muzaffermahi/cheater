@@ -15,6 +15,8 @@ import { registerCheaterTools } from "./tools.js";
 import { startupCard } from "./ui.js";
 import { configureMascot, getMascotState, mascotOff } from "./ui/mascotUi.js";
 import { CheaterMascotComponent } from "./ui/mascotComponent.js";
+import { CheaterHeaderComponent } from "./ui/headerComponent.js";
+import type { MascotStyle } from "./ui/mascot.js";
 import { loadConfig } from "./config.js";
 import { registerAutopilotCommands } from "./autopilot/commands.js";
 import { routeAutopilot, buildAutopilotInstruction } from "./autopilot/router.js";
@@ -370,7 +372,7 @@ function buildEnvBlock(cwd: string, opts: { includeGit?: boolean } = {}): string
 // auto-compacts; the working-set capsule already restates the goal afterward. So this is now
 // a single quiet line, and only when the cap is meaningfully below the model's window.
 function cheaterCapPrompt(cap: number): string {
-  return `You have room to work: aim to keep this session under about ${cap} context tokens; Cheater and Pi compact automatically when needed, so do not ration your work or cut scope to save budget.`;
+  return `You have room to work: aim to keep this session under about ${cap} context tokens; Cheater compacts automatically when needed, so do not ration your work or cut scope to save budget.`;
 }
 
 function inputRecordValue(input: Record<string, unknown> | undefined, keys: string[]): string {
@@ -510,13 +512,19 @@ export default function cheaterExtension(pi: ExtensionAPI) {
         );
       } catch { /* the mascot is best-effort and must never break startup */ }
     }
-    // Clean cheater view: collapse pi's raw tool output by default so the user isn't buried in every
-    // terminal command scrolling by. /pi toggles the raw output back on. Interactive TUI only.
+    // Replace the runtime's built-in startup header (logo + keybinding hints + onboarding) with
+    // Cheater's own banner, and collapse raw tool output by default so the user isn't buried in
+    // every terminal command scrolling by. /raw toggles the raw output back on. Interactive TUI only.
     if (ctx.mode === "tui") {
+      try {
+        const headerStyle: MascotStyle = mascotOff(config) ? "off" : config.mascotStyle === "ascii" ? "ascii" : "cat";
+        ctx.ui.setHeader?.((tui: any, theme: any) => new CheaterHeaderComponent(tui, theme, { style: headerStyle }));
+      } catch { /* the header is best-effort and must never break startup */ }
       try { ctx.ui.setToolsExpanded?.(false); } catch { /* best-effort */ }
     }
+    // A single compact info card under the banner (repo, model, the one flow, status commands).
+    // The banner already signals "Cheater is active", so no extra toast is needed.
     ctx.ui.setWidget?.("cheater-startup", startupCard(ctx.cwd, ctx.model?.id, config), { placement: "aboveEditor" });
-    ctx.ui.notify?.("Cheater mode active", "info");
   });
 
   // Pi has no "before_user_message" event; routing must hang off the real "input" event,

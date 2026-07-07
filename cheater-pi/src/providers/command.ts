@@ -10,12 +10,12 @@ type ExtensionAPI = { registerCommand: (name: string, opts: unknown) => void };
 
 export function registerProviderCommands(pi: ExtensionAPI, config: CheaterConfig): void {
   pi.registerCommand("provider-probe", {
-    description: "Probe the configured LM Studio endpoint for native stateful chat + TTFT/token stats (standalone fetch; does not rewire Pi). /provider-probe [bench]",
+    description: "Probe the configured LM Studio endpoint for native stateful chat + TTFT/token stats (standalone fetch; does not rewire the runtime). /provider-probe [bench]",
     handler: async (args: string, ctx: any) => {
       const notify = (text: string) => { try { ctx?.ui?.notify?.(text, "info"); } catch { /* ignore */ } };
       const baseUrl = providerProbeBaseUrl(config);
       if (!baseUrl) {
-        return notify("No endpoint to probe. Cheater can't see the main model's endpoint (Pi owns it), so set one to measure:\n  /sidecar endpoint http://localhost:1234  (reused), or add \"lmStudioBaseUrl\" to .cheater/config.json\nThen retry /provider-probe.");
+        return notify("No endpoint to probe. Cheater can't see the main model's endpoint (the runtime owns it), so set one to measure:\n  /sidecar endpoint http://localhost:1234  (reused), or add \"lmStudioBaseUrl\" to .cheater/config.json\nThen retry /provider-probe.");
       }
       const benchmark = (args ?? "").trim().toLowerCase() === "bench";
       notify(`Probing ${baseUrl}${benchmark ? " with a fixed-prefix reuse benchmark" : ""} ...`);

@@ -65,19 +65,36 @@ structured loop doesn't raise the pass rate here; it adds orchestration overhead
 **Takeaway:** if the model can already do it, vanilla is faster. Cheater's cost
 only pays off when correctness is actually at risk.
 
-### On genuinely hard tasks, the harness carries the model further
+### On genuinely hard tasks, a self-test gate carries the model further
 
-On a curated set of 19 hard [Terminal-Bench 2](https://github.com/laude-institute/terminal-bench)
-tasks (write a MIPS interpreter, a compressor, C/Rust polyglots, a Scheme
-evaluator…), the bare model gives up or thrashes on most. With Cheater's
-route → attempt → verify → repair loop the ornith-class model **passes 4/19** —
-tasks it otherwise refuses to even attempt correctly. *(A clean vanilla-vs-cheater
-head-to-head on this set is in progress.)*
+A clean, Docker-free head-to-head on **10 hard self-contained tasks** — each a single
+function graded by a *hidden* behavior oracle the model never sees: a cron scheduler
+(with the day-of-month/day-of-week gotcha), a stack VM, a bank ledger, a Python-subset
+expression evaluator, a glob matcher, keyed-maze pathfinding, interval scheduling, a
+JSON query language, topological ordering, a regex engine. This is exactly where a 35B
+ships a plausible-but-subtly-wrong answer that its own ad-hoc testing misses.
 
-**Bottom line:** Cheater's value is **hard tasks where the bare model fails** and
-**never shipping unverified work** (the finish gate). On easy tasks it's overhead
-— which the adaptive best-of-N and inline finish-verification keep as small as
-possible, but don't erase.
+| ornith-1.0-35b · 3 trials/task · majority-solved | pass rate |
+| --- | --- |
+| Vanilla Pi | 4 / 10 |
+| Cheater (base harness) | 4 / 10 |
+| Cheater + interface/self-test gate | **6 / 10** |
+
+Two honest takeaways. First, **the base harness alone ties vanilla** here — on a
+self-contained single-function task a capable model already self-verifies, so
+decomposition mostly adds overhead (a strong direct agent, opencode, also lands 6/10).
+Second, **one targeted gate closes the gap**: when a task ships no test command, the
+worker must expose the *exact* required interface and derive-and-run its own edge-case
+tests from every rule before finishing. That recovers the tasks the model got *almost*
+right — wrong return type, a class instead of the required function, an unhandled
+boundary — lifting per-trial pass-rate 47% → 60% and majority-solved 4 → 6. It does not
+rescue a mis-read spec convention or a task simply beyond a 35B, and it costs extra
+iteration — so it's best gated to hard tasks.
+
+**Bottom line:** Cheater's value is **hard tasks where the bare model ships subtly
+wrong work** and **never shipping unverified work** (the finish gate). On easy tasks
+it's overhead — which the adaptive best-of-N and inline finish-verification keep as
+small as possible, but don't erase.
 
 ## Configuration
 
@@ -89,12 +106,12 @@ Config lives in `.cheater/config.json` (merged over sensible defaults). Common k
 | `requireApprovalForHighRisk` | `false` | Pause + ask before destructive intent. |
 | `maxSessionContextTokens` | ~90% of window | Cap the main session's context. |
 | `adaptiveMaxSamples` | `3` | Max best-of-N tries for the hardest single-file edit. |
-| `cleanTuiEnabled` | `true` | Collapse Pi's raw tool output (`/pi` toggles it back). |
+| `cleanTuiEnabled` | `true` | Collapse raw tool output (`/raw` toggles it back). |
 | `mascotStyle` | `cat` | `cat` \| `ascii` \| `off` — the terminal mascot. |
 
 ## Slash commands
 
-`/cheater` (help + status) · `/pi` (toggle raw tool output) · `/test` · `/map` ·
+`/cheater` (help + status) · `/raw` (toggle raw tool output) · `/test` · `/map` ·
 `/remember` · `/reliability-status` · `/commitlet-status` · `/gym` (local benchmark).
 
 ## Development
