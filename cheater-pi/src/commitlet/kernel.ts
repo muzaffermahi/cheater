@@ -25,6 +25,9 @@ import { formatCommitletFinalReview, formatGuardHealthAudit } from "./ui.js";
 import { telemetryFromPlan, writeTelemetry } from "./telemetry.js";
 import { revertRollbackPoint } from "./rollback.js";
 import { runFocusedVerification } from "./verification.js";
+import { evaluateCheckFirst, buildEvidenceTable, renderEvidenceTable, resetTransientState, type CheckFirstResult, type EvidenceRow } from "./checkFirst.js";
+import { loadProjectCommands } from "../reliability/projectCommands.js";
+import { scoreHardness } from "../runtime/computeBudget.js";
 import { buildCommitletDiff } from "./diffUtil.js";
 import { probeWorkerBackend, resetWorkerBackendLatch, workerBackendState } from "../blueprint/worker.js";
 import { liveSessionState } from "../reliability/sessionState.js";
@@ -37,7 +40,7 @@ import { providerCapabilityLines } from "../providers/lmStudioStateful.js";
 import { normalizeToolError } from "../runtime/toolErrorNormalize.js";
 import { writeControllerFile } from "../runstate/workerPlans.js";
 import { artifactReread } from "../runstate/recipes.js";
-import { effectiveMode, planAllowedFileUnion } from "./types.js";
+import { effectiveMode, planAllowedFileUnion, isRepairCommitlet } from "./types.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import type { CheaterConfig } from "../types.js";
 import { existsSync, readdirSync } from "node:fs";
@@ -206,6 +209,59 @@ function projectBasenames(cwd: string): Set<string> {
   };
   walk(cwd, 0);
   return names;
+}
+
+/**
+ * Check-first stage (Phase 1): resolve a real check for a passing commitlet and, on the
+ * hard/multi-commitlet lane, red-then-green screen it. Records strong/weak evidence into the
+ * validation ledger (feeds the finish-gate evidence table + freshness) and the completion ledger
+ * (feeds the receipt + weakly-verified surfacing). Purely additive: never blocks advance, fully
+ * guarded so a throw degrades to no-op.
+ */
+function runCheckFirstStage(cwd: string, commitlet: Commitlet, config: CheaterConfig, touchedFiles: string[], verify: ReturnType<typeof runFocusedVerification>): CheckFirstResult | undefined {
+  try {
+    if (config.runStateEnabled === false) return undefined;
+    const run = activeTaskRun();
+    const plan = defaultCommitletState.get().currentPlan;
+    const implementCount = plan ? plan.commitlets.filter((c) => !isRepairCommitlet(c)).length : 1;
+    const { hardness } = scoreHardness({
+      taskKind: plan?.autopilotDecision?.taskKind,
+      risk: String(commitlet.risk ?? plan?.risk ?? ""),
+      filesInScope: touchedFiles.length || commitlet.allowedFiles.length,
+      isRepair: isRepairCommitlet(commitlet)
+    });
+    // Tier 2/3 synthesis + the mutation screen are hardness-gated: multi-commitlet or hard tasks only.
+    const synthesisAllowed = implementCount > 1 || hardness >= 2;
+    const result = evaluateCheckFirst(cwd, commitlet, {
+      contract: run?.contract ?? null,
+      projectCommands: loadProjectCommands(cwd),
+      runDir: run?.runDir,
+      synthesisAllowed,
+      precomputedGreen: verify
+    });
+    if (result.ran && run) {
+      // Weak checks are recorded "unknown" (ran but not red-proven) so they never count as a strong
+      // evaluator-mirroring pass; only a red-then-green PROVEN (or a covering tier-1 green) is "pass".
+      run.recordValidation({
+        name: `check_first:tier${result.tier}:${result.verdict}`,
+        command: result.provenCommand ?? result.commands[0],
+        actor: commitlet.id,
+        validates: touchedFiles,
+        status: result.verdict === "green_failed" ? "fail" : result.weaklyVerified ? "unknown" : "pass",
+        outputSummary: `${result.weaklyVerified ? "weak" : "strong"} (${result.kind}): ${result.note}`.slice(0, 280)
+      });
+    }
+    liveSessionState.getLedger()?.addEntry("check_first", result.note, {
+      tier: result.tier,
+      kind: result.kind,
+      verdict: result.verdict,
+      weaklyVerified: result.weaklyVerified,
+      commitletId: commitlet.id
+    });
+    return result;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: CheaterConfig, overrides: { allowLargeDeletion?: boolean; sidecar?: SidecarClient } = {}): Promise<GradeResult> {
@@ -423,6 +479,12 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   }
 
   if (verify.passed) {
+    // Check-first (Phase 1): resolve a REAL check for this commitlet and, on the hard/multi-commitlet
+    // lane, red-then-green screen it (the check must fail without the change, pass with it). This is
+    // additive - it records strong/weak evidence for the finish gate's evidence table but does not by
+    // itself block advance (the existing guard/health/verify already gate that). Fully guarded inside
+    // evaluateCheckFirst, so a throw degrades to a static-floor result and never breaks grading.
+    const checkFirst = runCheckFirstStage(cwd, commitlet, config, touchedFiles, verify);
     defaultCommitletState.updateCommitlet(commitlet.id, "passed", verify.summary, {
       filesChanged: touchedFiles,
       diffLines: countDiffLines(diffText),
@@ -441,8 +503,12 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     }
     return {
       advance: true,
-      message: [`Commitlet ${commitlet.id} passed guard, health, and focused verification.`, verify.summary].join("\n"),
-      details: { guard, health, audit, verify }
+      message: [
+        `Commitlet ${commitlet.id} passed guard, health, and focused verification.`,
+        verify.summary,
+        checkFirst?.ran ? `check-first: ${checkFirst.note}` : ""
+      ].filter(Boolean).join("\n"),
+      details: { guard, health, audit, verify, checkFirst }
     };
   }
 
@@ -591,6 +657,29 @@ export function finalizePlan(cwd: string, plan: CommitletPlan, config: CheaterCo
   };
 }
 
+/**
+ * Clean-state rule (Phase 1): before the finish gate runs its checks, move self-test debris aside -
+ * run-created data files (the expenses.json the app wrote while the model test-ran it, *.db, *.log)
+ * that are NOT contract deliverables. Non-destructive: files move into .cheater/transient-aside/, so
+ * a misclassification never loses a real artifact. Best-effort and fully guarded.
+ */
+export function resetSelfTestDebris(cwd: string, config: CheaterConfig): { removed: string[] } {
+  try {
+    if (config.runStateEnabled === false) return { removed: [] };
+    const run = activeTaskRun();
+    if (!run) return { removed: [] };
+    const created = run.mutations.summary().createdFiles;
+    const deliverables = [...run.contract.outputPaths, ...run.contract.files];
+    const result = resetTransientState(cwd, created, deliverables, { mode: "aside" });
+    if (result.removed.length) {
+      liveSessionState.getLedger()?.addEntry("clean_state", `moved ${result.removed.length} self-test data file(s) aside before finish: ${result.removed.slice(0, 5).join(", ")}`, { removed: result.removed });
+    }
+    return { removed: result.removed };
+  } catch {
+    return { removed: [] };
+  }
+}
+
 export interface FinishVerdictResult {
   allowed: boolean;
   reason: string;
@@ -598,6 +687,10 @@ export interface FinishVerdictResult {
   lines: string[];
   freshness?: { ok: boolean; warnings: string[] };
   ledgerState: ReturnType<CompletionLedger["get"]>;
+  /** Phase 1: each contract checklist item mapped to the validation evidence that proves it. */
+  evidence?: EvidenceRow[];
+  /** Phase 1: weakly-verified commitlets (tier stated) - WARNED, never a hard block. */
+  warnings?: string[];
 }
 
 /**
@@ -635,14 +728,29 @@ export function finishVerdict(config: CheaterConfig, opts: { summary?: string } 
   if (freshness && !freshness.ok) {
     lines.push("", "Run-state freshness check:", ...freshness.warnings.map((warning) => `- ${warning}`));
   }
-  if (run) {
-    const checklist = run.contract.checklist;
-    if (checklist.length && !allowed) lines.push("", "Contract checklist (validate these exactly):", ...checklist.slice(0, 5).map((item) => `- ${item}`));
+  // Phase 1 evidence table: the product's face - each contract checklist item mapped to the
+  // validation that proves it (verified / weak / unverified). Descriptive, not a new blocker.
+  let evidence: EvidenceRow[] | undefined;
+  if (run && run.contract.checklist.length) {
+    evidence = buildEvidenceTable(run.contract.checklist, run.validations.all());
+    lines.push("", ...renderEvidenceTable(evidence));
+  }
+  // Weakly-verified surfacing: commitlets whose check could not be red-proven (static floor, no
+  // rollback snapshot, or a garbage check). WARNED, never a hard block - the finish decision above
+  // still stands, but the receipt must say honestly which pieces are only weakly verified.
+  const warnings: string[] = [];
+  for (const entry of state.entries) {
+    if (entry.kind !== "check_first") continue;
+    const x = entry.extra as { tier?: number; kind?: string; commitletId?: string; weaklyVerified?: boolean };
+    if (x?.weaklyVerified) warnings.push(`${x.commitletId ?? "commitlet"} (tier ${x.tier}, ${x.kind}): ${entry.summary}`.slice(0, 200));
+  }
+  if (warnings.length) {
+    lines.push("", `WARNED: ${warnings.length} weakly-verified commitlet(s) (finish ${allowed ? "allowed" : "still blocked"}, but the check was not red-then-green proven):`, ...warnings.slice(0, 5).map((w) => `- ${w}`));
   }
   if (!allowed) {
     lines.push("", "Finish blocked. Run cheater_verification_run to collect evidence, or resolve the listed failures before finishing.");
   }
-  return { allowed, reason: verdict.reason, lines, freshness, ledgerState: state };
+  return { allowed, reason: verdict.reason, lines, freshness, ledgerState: state, evidence, warnings: warnings.length ? warnings : undefined };
 }
 
 /** Compact, code-generated completion receipt: what the harness actually observed. */

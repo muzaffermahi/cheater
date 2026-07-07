@@ -52,6 +52,7 @@ import {
   finalizePlan,
   finishVerdict,
   gradeCommitlet,
+  resetSelfTestDebris,
   resolveModelName,
   resolveRealWorkerMode,
   updateControllerFile,
@@ -652,6 +653,11 @@ async function runClosedLoopInner(
         continue; // the cleanup commitlet is now pending; keep looping into it
       }
       const accepted = finalized.details.review.accepted;
+      // Clean-state rule (Phase 1): move self-test debris (run-created data files that are not
+      // contract deliverables) aside before the finish-gate checks, so leftover app data the model
+      // wrote while test-running its own app cannot corrupt the acceptance evidence.
+      const debris = resetSelfTestDebris(cwd, config);
+      if (debris.removed.length) narrate(ctx, `clean state: moved ${debris.removed.length} self-test data file(s) aside`);
       narrate(ctx, "finish gate");
       const gate = deps.finish(config);
       const gateAllowed = gate?.allowed === true;

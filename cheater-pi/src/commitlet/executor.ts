@@ -5,6 +5,7 @@ import { createRoleSeparation, renderBlueprintArtifact } from "../blueprint/arti
 import { evaluateBlueprintQuality } from "../blueprint/qualityGate.js";
 import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgentPacketRunner } from "../blueprint/worker.js";
 import { createRollbackPoint } from "./rollback.js";
+import { synthesizedCheckDir } from "./checkFirst.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
@@ -162,9 +163,13 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
     });
     const rendered = renderCapsulePrompt(capsule);
     const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or the built-in edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
+    // Tier-2 synthesized-check hint: when the repo has no test command, the worker's own runnable
+    // check IS the oracle. Point it at the run's checks dir so the harness can discover and red-green
+    // screen it (see checkFirst.ts). Relative path so a weak model writes it without path confusion.
+    const checkDirRel = `.cheater/runs/${run.taskId}/checks/${commitlet.id.replace(/[^A-Za-z0-9._-]+/g, "-")}/`;
     const verifyLine = verificationCommand
       ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
-      : "No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). If a test file is within THIS commitlet's allowed files, add a small one in the project's language and run it; otherwise verify by running the code and report its real output. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.";
+      : `No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). Best: drop a small standalone runnable check (a .py, .mjs, or .sh file) into ${checkDirRel} and the harness will run it as this commitlet's check. Otherwise, if a test file is within THIS commitlet's allowed files, add a small one and run it. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.`;
     // Prompt shape (measurement only - does not change the prompt below). The fixed operating rules
     // sit AFTER the big dynamic capsule, so they are not a reusable leading prefix; recorded so the
     // receipt can show worker-prompt size and cache-friendliness. See runtime/promptShape.ts.
