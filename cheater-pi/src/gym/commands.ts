@@ -2,7 +2,8 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { collectTasks } from "./cli.js";
 import { createWorkspace } from "./workspace.js";
-import { buildPrompt } from "./runner.js";
+import { buildPrompt, type RunHooks } from "./runner.js";
+import { runBakeoffSuite, buildBakeoffScorecard, formatBakeoffScorecard } from "./bakeoff.js";
 import { readLatestReport, listLearningSuggestions, buildReport, writeReport, writeMarkdownReport, buildLearningSuggestions, writeLearningSuggestions, listReports } from "./report.js";
 import { formatTaskCard, formatTaskList, formatReportSummary, formatDeltaReport, formatLearningSuggestions } from "./ui.js";
 import { loadConfig } from "../config.js";
@@ -163,6 +164,41 @@ export function registerGymCommands(pi: ExtensionAPI, deps: GymCommandDeps): voi
       const suggestions = buildLearningSuggestions(enrichedResults);
       if (suggestions.length > 0) writeLearningSuggestions(cwd, suggestions);
       notifyDefault(deps, ctx, formatReportSummary(report));
+    }
+  });
+
+  pi.registerCommand("bakeoff", {
+    description: "Kitten Code bakeoff: run the local battery vanilla-vs-kitten and print a scorecard",
+    handler: async (args: string, ctx: CommandContext) => {
+      const cwd = deps.getCwd(ctx);
+      const { tasks } = collectTasks(cwd);
+      const filter = parseFilter(args);
+      const suite = applyFilter(tasks, filter).slice(0, filter.limit ?? deps.config.gymDefaultLimit);
+      if (suite.length === 0) {
+        notifyDefault(deps, ctx, "no tasks matched the bakeoff filter", "warning");
+        return;
+      }
+      if (!deps.runAgent) {
+        notifyDefault(deps, ctx, "Bakeoff needs the agent runner hook; run /bakeoff from an interactive Kitten Code session. For a true vanilla baseline (separate agent), use the harness-bakeoff/ scripts.", "warning");
+        return;
+      }
+      // Both sides run through the session's agent runner, differing only in the PROMPT (plain-fix vs
+      // the reliability flow). This is an in-session approximation - a true vanilla baseline needs a
+      // separate un-harnessed agent (harness-bakeoff/) - so the scorecard says so.
+      const hooksFor = (mode: "vanilla" | "cheater"): RunHooks => ({
+        runAgent: async (task, ws, _prompt) => deps.runAgent!(task, ws, buildPrompt(task, ws, mode)),
+        snapshotBaseline: async () => { /* runTask copies the pre-agent workspace as the baseline */ }
+      });
+      notifyDefault(deps, ctx, `Kitten Code bakeoff: running ${suite.length} task(s) vanilla-vs-kitten...`);
+      const pairs = await runBakeoffSuite({
+        rootDir: cwd,
+        tasks: suite,
+        vanillaHooks: hooksFor("vanilla"),
+        kittenHooks: hooksFor("cheater"),
+        keepWorkspaces: deps.config.gymKeepWorkspaces
+      });
+      const card = buildBakeoffScorecard(pairs, deps.config.model ?? null);
+      notifyDefault(deps, ctx, formatBakeoffScorecard(card) + "\n\n(in-session approximation: both sides use the same harnessed session, differing only in prompt strategy; for a true vanilla baseline run harness-bakeoff/)");
     }
   });
 

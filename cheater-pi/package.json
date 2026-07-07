@@ -4,7 +4,8 @@
   "description": "Cheater distribution package for Pi.",
   "type": "module",
   "bin": {
-    "cheater": "./dist/src/index.js"
+    "cheater": "./dist/src/index.js",
+    "kitten": "./dist/src/index.js"
   },
   "keywords": [
     "pi-package",

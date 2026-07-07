@@ -111,11 +111,11 @@ export function mascotBanner(opts: { subtitle?: string; lean?: boolean; style?: 
   const subtitle = opts.subtitle ?? "reliable local coding, by any means";
   if (opts.lean) {
     const tag = opts.style === "ascii" ? ";)" : "😼";
-    return `${tag} cheater — ${subtitle}`;
+    return `${tag} kitten — ${subtitle}`;
   }
   const tag = opts.style === "ascii" ? "" : " 😼";
   return [
-    `   /\\_/\\    cheater${tag}`,
+    `   /\\_/\\    kitten${tag}`,
     `  ( o.o )   ${subtitle}`,
     "   > ^ <"
   ].join("\n");

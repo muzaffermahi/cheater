@@ -1,9 +1,17 @@
-# Cheater
+# Kitten Code
 
 **A reliability layer for [Pi](https://github.com/earendil-works/pi-coding-agent) that helps a small/mid local model finish coding tasks it would otherwise botch.**
 
-Cheater is a Pi extension, not a separate agent. Pi owns the TUI, the tools, the
-editing, and the agent loop. Cheater adds a harness on top: it plans the change,
+> The local model is a kitten — fast, sharp claws, writes any single piece of code
+> beautifully, but wanders, invents doors that don't exist, and never knows when it's
+> done. The harness is the handler: it does every non-intelligent job deterministically,
+> hands the kitten one small fully-briefed piece at a time, checks every piece with a real
+> test before trusting it, and only says "done" with receipts. **Handler drives, kitten
+> writes, checks decide.** (Launch with `kitten` or `cheater`; internals still use `.cheater/`.
+> See [KITTEN-CODE.md](KITTEN-CODE.md) for what the handler does.)
+
+Kitten Code is a Pi extension, not a separate agent. Pi owns the TUI, the tools, the
+editing, and the agent loop. Kitten Code adds a harness on top: it plans the change,
 makes each edit in a bounded step, **grades and repairs it in code**, runs the
 project's tests, and refuses to say "done" until something actually passed.
 
@@ -47,7 +55,7 @@ route  →  plan into commitlets  →  for each: edit → grade (guard + health)
   no failures are unresolved. If verification genuinely can't run, the skip is
   recorded honestly — it never fakes success.
 
-## Vanilla Pi vs Cheater — the numbers
+## Vanilla Pi vs Kitten Code — the numbers
 
 Measured with **ornith-1.0-35b** (a Qwen-3.5-35B-A3B fine-tune) running locally in
 LM Studio. Two honest findings:
