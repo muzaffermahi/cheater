@@ -37,6 +37,7 @@ import { mainCallGovernor } from "../runtime/mainCallGovernor.js";
 import { sidecarUsage } from "../runtime/sidecarUsage.js";
 import { getWorkerPromptShape, promptShapeLine } from "../runtime/promptShape.js";
 import { providerCapabilityLines } from "../providers/lmStudioStateful.js";
+import { localControlLines } from "../providers/localControl.js";
 import { normalizeToolError } from "../runtime/toolErrorNormalize.js";
 import { writeControllerFile } from "../runstate/workerPlans.js";
 import { artifactReread } from "../runstate/recipes.js";
@@ -798,6 +799,9 @@ export function buildCompletionReceipt(ledger: CompletionLedger): string {
     const shapeLine = promptShapeLine(getWorkerPromptShape());
     if (shapeLine) lines.push(shapeLine);
     lines.push(...providerCapabilityLines());
+    // Owned decoding lane (Phase 5): the temperature/json_schema/logprobs capabilities actually
+    // observed this run (probe-record; only present when the lane was used).
+    lines.push(...localControlLines());
   }
   return lines.join("\n");
 }
