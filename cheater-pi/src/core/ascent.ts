@@ -22,13 +22,14 @@ import { planAttempts, repairDirective } from "./diversity.js";
 import { computeBudget, type HardnessSignal } from "../runtime/computeBudget.js";
 import { BudgetGovernor, type ComputeCeiling } from "./budget.js";
 import { classifyFamily, playbookFor, primeFromPlaybook, type TaskFamily } from "./playbooks.js";
-import { ExperienceStore, primeFromRetrieved, localizationPriorFromRetrieved, summarizeApproach } from "./experience.js";
-import { WebAugmentor, decideTrigger, webAugmentReceiptLines } from "./webAugment.js";
+import { ExperienceStore, primeFromRetrieved, localizationPriorFromRetrieved, summarizeApproach, defaultExperienceDir } from "./experience.js";
+import { WebAugmentor, decideTrigger, webAugmentReceiptLines, defaultWebAugmentor } from "./webAugment.js";
+import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
 import type { OrmScorer } from "./orm.js";
-import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
+import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
 import { EvalRegistry, defaultRegistry } from "./disjointness.js";
 
 /** Which levers are ON. Part D3 flips these one at a time to measure each lever's marginal Best@1. */
@@ -91,6 +92,26 @@ export interface AscentResult {
 }
 
 const DEFAULT_EST_TOKENS = 8000;
+
+/**
+ * Assemble the standard ascent config from env: the disjointness firewall (with the SWE-Verified
+ * manifest if KITTEN_SWE_MANIFEST is set), the experience store (loaded eagerly so a poisoned store
+ * HARD-FAILS at startup, not silently mid-run), the ORM (if a checkpoint is configured), the web
+ * augmentor, and cloud-burst (if KITTEN_CLOUD_* is set). This is what the CLI's --ascent path uses.
+ */
+export function defaultAscentConfig(llm: KittenLLM, cwd: string): AscentConfig {
+  const registry = defaultRegistry(process.env.KITTEN_SWE_MANIFEST);
+  const experienceStore = new ExperienceStore({ dir: defaultExperienceDir(cwd), registry, llm });
+  experienceStore.load(); // throws DisjointnessError on a poisoned store — the guarantee is meant to be fatal
+  const cloud = cloudBurstConfigFromEnv();
+  return {
+    llm, registry, experienceStore,
+    orm: loadOrm(llm),
+    webAugmentor: defaultWebAugmentor(registry),
+    cloudBurst: cloud,
+    levers: { ...ALL_LEVERS, cloudBurst: !!cloud }
+  };
+}
 
 /** Assemble a compact trajectory string (for the ORM + cascade) from an attempt's result. */
 function buildTrajectory(a: BurstAttempt): string {

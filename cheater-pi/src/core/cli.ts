@@ -12,13 +12,15 @@ import { resolve } from "node:path";
 import { runAgent, type AgentEvent } from "./agent.js";
 import { runReliableAgent } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
+import { runAscent, defaultAscentConfig } from "./ascent.js";
+import { DisjointnessError } from "./disjointness.js";
 import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
 
-interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; reasoning?: "low" | "medium" | "high"; }
+interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; ascent: boolean; hard: boolean; reasoning?: "low" | "medium" | "high"; }
 
 function parse(argv: string[]): CliOpts | null {
   if (argv[0] !== "run") return null;
-  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false, bon: 1 };
+  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false, bon: 1, ascent: false, hard: false };
   const rest: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -29,6 +31,8 @@ function parse(argv: string[]): CliOpts | null {
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--reliable") opts.reliable = true;
     else if (a === "--bon") { opts.bon = Math.max(1, Number(argv[++i]) || 1); opts.reliable = true; }
+    else if (a === "--ascent") opts.ascent = true;
+    else if (a === "--hard") opts.hard = true;
     else if (a === "--reasoning") { const v = argv[++i]; if (v === "low" || v === "medium" || v === "high") opts.reasoning = v; }
     else rest.push(a);
   }
@@ -39,7 +43,7 @@ function parse(argv: string[]): CliOpts | null {
 async function main(argv: string[]): Promise<number> {
   const opts = parse(argv);
   if (!opts || !opts.task) {
-    process.stderr.write('usage: kitten-core run "<task>" [--cwd DIR] [--model M] [--max-turns N] [--trace FILE] [--quiet]\n');
+    process.stderr.write('usage: kitten-core run "<task>" [--cwd DIR] [--model M] [--reliable|--bon N|--ascent [--hard]] [--max-turns N] [--trace FILE] [--quiet]\n');
     return 2;
   }
   const llm = new KittenLLM(DEFAULT_MODELS);
@@ -47,6 +51,24 @@ async function main(argv: string[]): Promise<number> {
   if (!opts.quiet) process.stderr.write(`kitten-core${opts.reliable ? " (reliable)" : ""}: ${model} @ ${DEFAULT_MODELS.baseUrl}  cwd=${opts.cwd}\n`);
 
   const onEvent = opts.quiet ? undefined : (e: AgentEvent) => process.stderr.write(`  [${e.turn}] ${e.kind}: ${e.detail.replace(/\n/g, " ").slice(0, 160)}\n`);
+
+  // --ascent: the full pass@k→pass@1 machine (coverage + verifier + affordability), gated by hardness.
+  if (opts.ascent) {
+    let config;
+    try {
+      config = defaultAscentConfig(llm, opts.cwd);
+    } catch (e) {
+      if (e instanceof DisjointnessError) { process.stderr.write(`kitten-ascent REFUSING: ${e.message}\n`); return 3; }
+      throw e;
+    }
+    const hardness = opts.hard ? { taskKind: "bug_fix", risk: "high" } : {};
+    const a = await runAscent({ task: opts.task, cwd: opts.cwd, taskId: `cli-${Date.now().toString(36)}`, hardness, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent }, config);
+    if (!opts.quiet) { process.stderr.write(`kitten-ascent receipts:\n`); for (const l of a.receipts) process.stderr.write(`  ${l}\n`); }
+    process.stdout.write(JSON.stringify({ finished: a.finished, winner: a.winner, selector: a.selector, family: a.family, samples: a.samples, rounds: a.rounds, summary: a.summary, wallMs: a.wallMs, usage: a.usage }) + "\n");
+    if (!opts.quiet) process.stderr.write(`kitten-ascent: ${a.finished ? "SOLVED" : "unfinished"} via ${a.selector} (k=${a.samples}, ${(a.wallMs / 1000).toFixed(1)}s)\n`);
+    return a.finished ? 0 : 1;
+  }
+
   const result = opts.bon > 1
     ? await runBestOfN({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent }, opts.bon)
     : opts.reliable
