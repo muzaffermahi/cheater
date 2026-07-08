@@ -18,14 +18,35 @@ export interface KittenModels {
   main: string;
   sidecar: string;
   embed?: string;
+  /** Bearer token. Defaults to "lm-studio" (LM Studio ignores it); a real key for a cloud endpoint. */
+  apiKey?: string;
+  /** Extra headers merged onto every request (e.g. a cloud provider's required header). */
+  extraHeaders?: Record<string, string>;
 }
 
 export const DEFAULT_MODELS: KittenModels = {
   baseUrl: process.env.KITTEN_BASE_URL || "http://localhost:1234/v1",
   main: process.env.KITTEN_MAIN_MODEL || "ornith-1.0-35b",
   sidecar: process.env.KITTEN_SIDECAR_MODEL || "qwen3.5-2b",
-  embed: process.env.KITTEN_EMBED_MODEL || "text-embedding-nomic-embed-text-v1.5"
+  embed: process.env.KITTEN_EMBED_MODEL || "text-embedding-nomic-embed-text-v1.5",
+  apiKey: process.env.KITTEN_API_KEY || undefined
 };
+
+/**
+ * Build a KittenLLM pointed at the Alibaba cloud endpoint that serves the EXACT SAME WEIGHTS as the
+ * local ornith (qwen3.6-35b-a3b). This is the cloud-burst substrate (Part C2): identical model,
+ * parallelisable, so large-N coverage doesn't wait hours at 25 tok/s — and the capability claim stays
+ * honest because it is not a bigger model. The sidecar stays local (a 2B on the cloud is wasteful);
+ * when only the cloud endpoint is available, main doubles as sidecar.
+ */
+export function cloudModels(opts: { baseUrl: string; apiKey: string; main?: string; sidecar?: string }): KittenModels {
+  return {
+    baseUrl: opts.baseUrl,
+    main: opts.main || "qwen3.6-35b-a3b",
+    sidecar: opts.sidecar || opts.main || "qwen3.6-35b-a3b",
+    apiKey: opts.apiKey
+  };
+}
 
 export interface ToolSchema {
   name: string;
@@ -98,6 +119,11 @@ export class KittenLLM {
     return `${this.models.baseUrl.replace(/\/+$/, "")}${path}`;
   }
 
+  /** Auth + content headers. Bearer defaults to "lm-studio" (ignored locally); a real key for cloud. */
+  private headers(): Record<string, string> {
+    return { "content-type": "application/json", authorization: `Bearer ${this.models.apiKey ?? "lm-studio"}`, ...(this.models.extraHeaders ?? {}) };
+  }
+
   /** One chat completion. Never throws — a failure returns ok:false so the caller can degrade. */
   async chat(params: ChatParams): Promise<ChatResult> {
     const started = Date.now();
@@ -125,7 +151,7 @@ export class KittenLLM {
     try {
       const res = await fetch(this.url("/chat/completions"), {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer lm-studio" },
+        headers: this.headers(),
         body: JSON.stringify(body),
         signal
       });
@@ -174,7 +200,7 @@ export class KittenLLM {
     try {
       const res = await fetch(this.url("/embeddings"), {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer lm-studio" },
+        headers: this.headers(),
         body: JSON.stringify({ model: this.models.embed, input: texts })
       });
       if (!res.ok) return [];
