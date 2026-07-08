@@ -1,12 +1,13 @@
-// Kitten Core — the interactive REPL. NO Pi, NO Pi TUI, NO Pi formatting.
+#!/usr/bin/env node
+// Kitten Core — the interactive REPL + headless entry. NO Pi, NO Pi TUI, NO Pi formatting.
 //
-// This is the last piece of "get rid of pi": a self-contained readline chat loop over the pi-free
-// runtime (agent.ts + reliable.ts + bestofn.ts). Each line you type is a task run in the current
-// working directory; tool activity streams as clean, dim lines and the run ends with a one-line
-// receipt. Slash commands switch mode / cwd. The files on disk ARE the session state, so a follow-up
-// task builds on the previous one without threading a transcript.
-//
-//   node dist/src/core/repl.js [--cwd DIR] [--mode raw|reliable|bon] [--model M]
+// This is the last piece of "get rid of pi": a self-contained runtime over agent.ts + reliable.ts +
+// bestofn.ts. This file is the global `kitten` bin:
+//   kitten                     → open the REPL in the current directory
+//   kitten "<task>"            → run one task here and exit (reliable mode)
+//   kitten run "<task>" [flags] → same, explicit
+// Flags: --cwd DIR  --raw|--reliable|--bon  --model M. In the REPL, files on disk are the session
+// state, so a follow-up task builds on the previous one without threading a transcript.
 
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
@@ -25,14 +26,22 @@ const red = (s: string): string => `\x1b[31m${s}\x1b[0m`;
 
 interface ReplState { cwd: string; mode: Mode; model: string; bon: number; }
 
-function parseArgs(argv: string[]): ReplState {
+/** Parse flags into state and collect any leftover words as a one-shot task (for `kitten "<task>"`). */
+function parseArgs(argv: string[]): { st: ReplState; task: string } {
   const st: ReplState = { cwd: process.cwd(), mode: "reliable", model: DEFAULT_MODELS.main, bon: 2 };
+  const words: string[] = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--cwd") st.cwd = resolve(argv[++i] ?? ".");
-    else if (argv[i] === "--model") st.model = argv[++i] ?? st.model;
-    else if (argv[i] === "--mode") { const m = argv[++i]; if (m === "raw" || m === "reliable" || m === "bon") st.mode = m; }
+    const a = argv[i];
+    if (a === "--cwd") st.cwd = resolve(argv[++i] ?? ".");
+    else if (a === "--model") st.model = argv[++i] ?? st.model;
+    else if (a === "--mode") { const m = argv[++i]; if (m === "raw" || m === "reliable" || m === "bon") st.mode = m; }
+    else if (a === "--raw") st.mode = "raw";
+    else if (a === "--reliable") st.mode = "reliable";
+    else if (a === "--bon") st.mode = "bon";
+    else if (a === "run") { /* explicit subcommand — ignore, the rest is the task */ }
+    else words.push(a);
   }
-  return st;
+  return { st, task: words.join(" ").trim() };
 }
 
 const HELP = [
@@ -68,8 +77,16 @@ async function runOnce(llm: KittenLLM, st: ReplState, task: string): Promise<voi
 }
 
 async function main(): Promise<void> {
-  const st = parseArgs(process.argv.slice(2));
+  const { st, task } = parseArgs(process.argv.slice(2));
   const llm = new KittenLLM(DEFAULT_MODELS);
+
+  // Headless one-shot: `kitten "<task>"` or `kitten run "<task>"` — run it here and exit.
+  if (task) {
+    process.stdout.write(bold("Kitten") + dim(` · ${st.mode} · ${st.cwd}`) + "\n");
+    await runOnce(llm, st, task);
+    return;
+  }
+
   process.stdout.write(bold("Kitten") + dim(` — pi-free coding agent · ${st.model} · ${st.cwd}`) + "\n");
   process.stdout.write(dim(`mode: ${st.mode}   (/help for commands)`) + "\n");
 
