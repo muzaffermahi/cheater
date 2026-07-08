@@ -37,10 +37,6 @@ test("config defaults enable automatic low-risk-safe blueprint behavior", () => 
   assert.equal(DEFAULT_CONFIG.telemetryLocalOnly, true);
   assert.equal(DEFAULT_CONFIG.retrievalMaxPlanningFacts, 3);
   assert.equal(DEFAULT_CONFIG.retrievalMaxFeedbackFacts, 5);
-  assert.equal(DEFAULT_CONFIG.gymDefaultLimit, 5);
-  assert.equal(DEFAULT_CONFIG.gymDefaultConcurrency, 1);
-  assert.equal(DEFAULT_CONFIG.gymRunFullTests, "if_cheap");
-  assert.equal(DEFAULT_CONFIG.gymAutoLearn, false);
 });
 
 test("loadConfig includes autopilot defaults", () => {

@@ -76,27 +76,18 @@ prefix a stateful endpoint can cache. The **direct lane** lets a trivial task (l
 ≤1 file, not high-risk) skip the blueprint/inspect/review ceremony entirely and edit
 in-session — the easy-task overhead is extra model *turns*, not gate latency.
 
-**Phase 7 — Receipts, bakeoff, and the name.** The finish output carries the evidence table
-(Phase 1). A `/bakeoff` command runs the local battery head-to-head and prints a shareable
-scorecard. And the mascot cat finally got its name: **Kitten Code**.
+**Phase 7 — Receipts and the name.** The finish output carries the evidence table (Phase 1),
+and the mascot cat finally got its name: **Kitten Code**.
 
-## How to run the bakeoff
+## How to measure it (bakeoff)
 
-From an interactive session, inside a project:
-
-```
-/bakeoff                      # run the default suite, vanilla-vs-kitten, print a scorecard
-/bakeoff --limit 10           # first 10 tasks
-/bakeoff --category off_by_one
-```
-
-The scorecard shows, per task, pass/fail and wall-clock for each side, plus totals and
-head-to-head wins. **Honest caveat:** `/bakeoff` is an *in-session approximation* — both
-sides run through the same harnessed session, differing only in prompt strategy (plain-fix
-vs the reliability flow). For a **true vanilla baseline** (a separate un-harnessed agent),
-use the external `harness-bakeoff/` scripts, which run each side as its own agent against
-LM Studio. Neither runs inside a normal work session — batteries take a while and need your
-local model up.
+Batteries run OUTSIDE a normal work session (they take a while and need your local model up),
+via the external `harness-bakeoff/` / `tbench-run` scripts, which run each side — vanilla Pi
+vs Kitten Code — as its own agent against LM Studio and score against a hidden acceptance
+oracle. (The earlier in-session `/bakeoff` command and the `gym` benchmarking subsystem were
+removed to keep the shipped package lean — measurement lives in the external rigs, not the
+product.) The standing rule: score BEHAVIOR/outcomes (does it run end-to-end, data-file
+state), never stdout format, and reset app data between the model's self-test and scoring.
 
 ## Honest notes (weak / deferred)
 

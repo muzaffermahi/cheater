@@ -8,14 +8,6 @@ import { DEFAULT_BLUEPRINT_CONFIG } from "./blueprint/config.js";
 export const VERSION = "0.7.0";
 
 export const DEFAULT_CONFIG: CheaterConfig = {
-  gymEnabled: true,
-  gymDefaultLimit: 5,
-  gymDefaultConcurrency: 1,
-  gymTempDir: ".cheater/gym/runs",
-  gymKeepWorkspaces: false,
-  gymRunFullTests: "if_cheap",
-  gymAutoLearn: false,
-  gymDeltaModeEnabled: false,
   ...DEFAULT_BLUEPRINT_CONFIG,
   blueprintOfficialDocsSearchEnabled: false,
   // Durable run state (contract, digest, ledgers, capsules, phase control, post-success

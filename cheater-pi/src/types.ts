@@ -27,14 +27,6 @@ export interface CheaterConfig {
   // editing. Default false: Cheater is autonomous - one prompt runs to completion, and
   // destructive intent is surfaced as a caution the model proceeds through, not a hard stop.
   requireApprovalForHighRisk?: boolean;
-  gymEnabled?: boolean;
-  gymDefaultLimit?: number;
-  gymDefaultConcurrency?: number;
-  gymTempDir?: string;
-  gymKeepWorkspaces?: boolean;
-  gymRunFullTests?: "never" | "if_cheap" | "always";
-  gymAutoLearn?: boolean;
-  gymDeltaModeEnabled?: boolean;
   autopilotEnabled?: boolean;
   autopilotRouteAllCodeTasks?: boolean;
   blueprintModeEnabled?: boolean;

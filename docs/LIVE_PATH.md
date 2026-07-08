@@ -42,7 +42,6 @@ The live product path is the TypeScript Pi extension at `cheater-pi/src/extensio
     verification - then prepares the next one or runs the final review),
     `cheater_finish_gate`, `cheater_verification_run`, `cheater_ledger_status`,
     `cheater_commitlet_revert`, `cheater_rollback_status`.
-- `registerGymCommands`
 - `registerReliabilityCommands` (`/reliability-status`, `/model-profile`)
 
 Invariant (pinned by `autopilot-blueprint-integration.test.ts`): **every registered

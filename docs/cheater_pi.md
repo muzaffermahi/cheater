@@ -54,7 +54,7 @@ User commands: `/cheater`, `/autopilot-status`, `/reliability-status`,
 `/commitlet-status`, `/commitlet-plan`, `/commitlet-health`,
 `/commitlet-revert`, `/rollback-status`, `/constraint-graph`, `/bench-report`,
 `/model-profile`, `/blueprint-show`, `/blueprint-cancel`, `/blueprint-docs`,
-`/blueprint-memory`, `/gym*`, `/test`, `/map`, `/bug-memory`, `/remember`,
+`/blueprint-memory`, `/test`, `/map`, `/remember`,
 `/skills`, `/sidecar`, `/traces`, `/settings`, `/doctor`. Debug-only: `/commitlet-next`,
 `/commitlet-debug`, `/autopilot-route`, `/autopilot-run`. Status commands render
 directly from harness state - no command sends the model off to call a tool.
@@ -196,11 +196,6 @@ Config (all optional, off/conservative by default): `mainCallGovernorEnabled`, `
 `mainFallbackAllowedRoles`, `sidecarPreferredRoles`, `sidecarKeepAliveEnabled`,
 `sidecarForceWarmOnRunStart`, `sidecarMinUsefulCallsPerRun`, `lmStudioBaseUrl`, `providerProbeEnabled`,
 `providerProbeBenchmark`, `leanWorkerPromptEnabled`, `sidecarPrefetchHorizon`, `sidecarMaxConcurrency`.
-
-## Cheater Gym
-
-Cheater ships a local benchmark (`cheater gym ...`) with small Python + JS/TS
-tasks and a scoring/learning layer. See [docs/gym.md](gym.md).
 
 ## Configuration
 

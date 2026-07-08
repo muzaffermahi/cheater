@@ -26,7 +26,6 @@ import { formatAutopilotDecision } from "./autopilot/ui.js";
 import { registerBlueprintCommands } from "./blueprint/commands.js";
 import { defaultBlueprintState } from "./blueprint/state.js";
 import { contextCompactRatio, isBlueprintWorkerSession, mainSessionContextCap, workerBackendState } from "./blueprint/worker.js";
-import { registerGymCommands } from "./gym/commands.js";
 import { registerReliabilityCommands } from "./reliability/commands.js";
 import { registerCommitletCommands } from "./commitlet/commands.js";
 import { registerCommitletTools } from "./commitlet/tools.js";
@@ -482,12 +481,6 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     registerCommitletTools(pi, { config });
   }
 
-  if (config.gymEnabled !== false) {
-    registerGymCommands(pi, {
-      config,
-      getCwd: (ctx) => ctx.cwd
-    });
-  }
   if (config.reliabilityModeEnabled !== false) {
     registerReliabilityCommands(pi, { config });
   }

@@ -120,7 +120,7 @@ Config lives in `.cheater/config.json` (merged over sensible defaults). Common k
 ## Slash commands
 
 `/cheater` (help + status) · `/raw` (toggle raw tool output) · `/test` · `/map` ·
-`/remember` · `/reliability-status` · `/commitlet-status` · `/gym` (local benchmark).
+`/remember` · `/reliability-status` · `/commitlet-status`.
 
 ## Development
 

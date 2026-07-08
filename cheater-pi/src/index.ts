@@ -3,7 +3,6 @@ import { loadConfig, VERSION } from "./config.js";
 import { brandResolvedPi, buildPiCommand, firstLegacyCommand, formatCommand, spawnPi } from "./launcher.js";
 import { printDoctor } from "./doctor.js";
 import { parseLaunchOptions } from "./launcher.js";
-import { runGymCli } from "./gym/cli.js";
 import { runReliabilityCli } from "./reliability/cli.js";
 
 function printHelp(): void {
@@ -13,7 +12,6 @@ Usage:
   cheater [options] [message]
   cheater --doctor
   cheater --print-pi-command
-  cheater gym <command> [args...]
   cheater bench reliability <command> [args...]
 
 Cheater opens its terminal UI with the reliability harness, prompt, skills,
@@ -26,21 +24,10 @@ Options:
   --no-theme           Keep Cheater behavior but skip the Cheater theme
   --print-pi-command   Print the resolved launch command and exit
   --help, -h           Show help
-
-Gym subcommands:
-  cheater gym list                  list available benchmark tasks
-  cheater gym show <id>             show one task card
-  cheater gym run <id>              prepare a workspace and print the prompt
-  cheater gym report [latest]       show the latest report
-  cheater gym clean                 remove all gym workspaces and reports
-  cheater gym help                  show gym subcommand help
 `);
 }
 
 export function main(argv = process.argv.slice(2)): number {
-  if (argv[0] === "gym") {
-    return runGymCli(argv.slice(1), { cwd: process.cwd() });
-  }
   if (argv[0] === "bench" && argv[1] === "reliability") {
     return runReliabilityCli(argv.slice(2), { cwd: process.cwd(), config: loadConfig() });
   }
