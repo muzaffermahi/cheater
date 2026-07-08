@@ -64,7 +64,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
 
   const verifyMandate = testCmd
     ? `Before you call finish you MUST run the project's tests with bash (\`${testCmd}\`) and see them pass.`
-    : `No test command exists in this project, so YOU are the only checker. Before you call finish you MUST: write a tiny check (a script, or a REPL one-liner via bash \`python -c\`) that exercises your change on the NORMAL case AND the obvious edge cases (empty, single, boundary, ordering), run it with bash, and confirm it prints/asserts the right answers. Do not finish on assumption.`;
+    : `No test command exists in this project, so YOU are the only checker. Before you call finish you MUST verify your change by RUNNING it — prefer a single inline \`python -c "..."\` (or \`node -e "..."\`) one-liner that asserts the NORMAL case AND the obvious edge cases (empty, single, boundary, ordering) in one bash call; only write a separate test file if the check is genuinely large. Confirm it prints/asserts the right answers. Do not finish on assumption, and do not waste turns deleting the check afterward.`;
 
   const systemPrompt = [
     "You are Kitten, a precise coding agent. You have tools: read, write, edit, bash, ls, grep, finish.",

@@ -185,7 +185,23 @@ function applyEdit(ctx: ToolContext, full: string, p: string, text: string, star
   try { writeFileSync(full, next, "utf8"); } catch (e) { return { output: `edit: write failed: ${(e as Error).message}`, isError: true }; }
   ctx.filesWritten.add(rel(ctx, full));
   ctx.filesRead.add(rel(ctx, full));
-  return { output: `edited ${p}`, isError: false };
+  // Show the applied result (SWE-agent's editor-with-feedback lever): a small model that only sees
+  // "edited" often rewrites the whole file to be sure the change landed. A line-numbered window of the
+  // changed region is concrete proof, so it trusts the edit and moves on instead of re-writing.
+  return { output: `edited ${p}\n${changedWindow(next, start, replace.length)}`, isError: false };
+}
+
+/** A line-numbered window around the just-edited region (± 3 lines) — the "here's what it looks like now". */
+function changedWindow(text: string, start: number, replaceLen: number): string {
+  const lines = text.split(/\r?\n/);
+  const startLine = text.slice(0, start).split(/\r?\n/).length - 1;              // 0-based
+  const endLine = text.slice(0, start + replaceLen).split(/\r?\n/).length - 1;
+  const from = Math.max(0, startLine - 3);
+  const to = Math.min(lines.length - 1, endLine + 3);
+  const width = String(to + 1).length;
+  const body = [];
+  for (let i = from; i <= to; i++) body.push(`${String(i + 1).padStart(width)}  ${lines[i]}`);
+  return `now reads:\n${body.join("\n")}`;
 }
 
 function nearestLines(text: string, search: string): string {

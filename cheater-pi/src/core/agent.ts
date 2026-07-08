@@ -87,8 +87,12 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set() };
   resetNounGate();
 
+  // Ground the model in its real environment. Without this, a small model invents a cwd (observed
+  // live: it tried `cd /home/user` and then burned 3 turns fumbling an `rm` at the wrong path) and
+  // wastes turns tidying scratch files. Both tanked speed with zero benefit.
+  const env = `\n\nEnvironment: your working directory is ${params.cwd}. Every tool (read/write/edit/bash) already runs from there, so use plain relative paths (e.g. \`python foo.py\`) and do NOT cd anywhere — never cd to a guess like /home/user or /app, and you don't need to cd to the working directory either. Scratch files you create while testing may be left in place; do not spend turns deleting them.`;
   const messages: ChatMessage[] = [
-    { role: "system", content: params.systemPrompt ?? DEFAULT_SYSTEM },
+    { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env },
     { role: "user", content: params.task }
   ];
   const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;

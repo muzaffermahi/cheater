@@ -45,6 +45,11 @@ test("isPathLike recognizes paths and rejects flags/globs/bare words", () => {
   assert.equal(isPathLike("src/*.ts"), false, "glob");
   assert.equal(isPathLike("$FILE"), false, "variable");
   assert.equal(isPathLike("3.14"), false, "number literal");
+  // Regression: inline code (a `/` that is division, not a separator) must NOT read as a path.
+  assert.equal(isPathLike("evaluate('10/4')"), false, "function call with division");
+  assert.equal(isPathLike("print(x/y)"), false, "expression with parens");
+  assert.equal(isPathLike("10/4"), false, "bare arithmetic");
+  assert.equal(isPathLike("a=b/c"), false, "assignment");
 });
 
 // --- command path extraction -----------------------------------------------------------------
@@ -62,6 +67,15 @@ test("extractCommandPaths does not gate pure reads, unknown verbs, or flag args 
   assert.deepEqual(extractCommandPaths("git status"), { mustExist: [], mayBeNew: [] });
   assert.deepEqual(extractCommandPaths("cat notes/x.txt"), { mustExist: [], mayBeNew: [] }, "pure read verb -> not gated (clean error, probing)");
   assert.deepEqual(extractCommandPaths("some_tool foo/bar"), { mustExist: [], mayBeNew: [] }, "unknown verb -> not gated");
+});
+
+test("extractCommandPaths does not mine inline code (-c/-e/-m) for phantom paths", () => {
+  // Regression: `python3 -c "...evaluate('10/4')..."` used to block on the phantom path evaluate('10/4').
+  assert.deepEqual(extractCommandPaths(`python3 -c "print(evaluate('10/4'))"`).mustExist, [], "python -c code is not paths");
+  assert.deepEqual(extractCommandPaths(`node -e "console.log(1/2)"`).mustExist, [], "node -e code is not paths");
+  assert.deepEqual(extractCommandPaths("python -m pytest").mustExist, [], "python -m module is not a path");
+  // real file args are still gated
+  assert.deepEqual(extractCommandPaths("python app.py").mustExist, ["app.py"], "a real script arg is still gated");
 });
 
 test("classifyPathTokens: edit target must exist; read and write are not gated", () => {

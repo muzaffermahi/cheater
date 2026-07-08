@@ -83,6 +83,11 @@ export function isPathLike(token: string): boolean {
   if (/[*?\[\]]/.test(t)) return false; // glob - existence is not meaningful
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) return false; // URL
   if (t.startsWith("$") || t.includes("$(") || t.includes("${") || t.includes("`")) return false; // expansion
+  // Code, not a path: parens/quotes/operators mean this is an inline expression (a `/` here is
+  // division, not a directory separator) — e.g. evaluate('10/4') inside `python -c`. Real filesystem
+  // paths do not contain these. Rejecting them kills the "arithmetic looks like a path" false block.
+  if (/[()'"`;=,!]/.test(t)) return false;
+  if (/^\d+\s*\/\s*\d+$/.test(t)) return false; // bare arithmetic like 10/4
   if (t.includes("/") || t.includes("\\")) return true; // has a separator -> path
   if (/^\.\.?$/.test(t)) return true; // . or ..
   // A bare filename with a real extension (server.crt, config.yaml) is path-like.
@@ -125,6 +130,10 @@ export function extractCommandPaths(command: string): { mustExist: string[]; may
     const verb = basename(tokens[0]).toLowerCase();
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
+      // Inline code / module args are not paths: the token after -c/-e/-m/--eval is a program or a
+      // module name (`python -c "..."`, `node -e "..."`, `python -m pytest`). Skip it so its contents
+      // are never mistaken for filesystem paths.
+      if (/^(-c|-e|-m|--eval|--command)$/.test(tok)) { i++; continue; }
       // Redirections: `> out` / `>> out` (new), `< in` (must exist). Also attached forms (`>out`).
       const redirOut = tok.match(/^>>?(.*)$/);
       const redirIn = tok.match(/^<(.*)$/);

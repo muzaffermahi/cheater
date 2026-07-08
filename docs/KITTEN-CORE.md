@@ -23,14 +23,35 @@ tools + TUI are replaced.
 | `agent.ts` | The OpenAI tool-calling loop. Noun/path firewall wired IN (pre-execution). Optional async gate hooks (`postToolHook`, `finishGate`). The **raw** loop is the opencode-comparable baseline. |
 | `reliable.ts` | `runReliableAgent` — the harness edge: contract + scout localization in the first message; a **post-edit syntax gate** (py_compile / node --check) that rejects a broken edit and re-asks in the same turn (Tier A2); a **finish gate** ("no done without receipts") that refuses finish until a verification actually ran, grounding a test failure via the sidecar. |
 | `sidecar.ts` | qwen-2b failure-card grounding (json_schema) with a deterministic floor. |
-| `bestofn.ts` | Sequential best-of-N with real temperature jitter (owned engine) + **execution selection** (keep the first attempt whose finish gate verified); clean-workspace reset between attempts; gated to hard tasks. |
-| `cli.ts` | `node dist/src/core/cli.js run "<task>" [--cwd DIR] [--reliable] [--bon N] [--model M] [--trace F]` — headless, prints a JSON result line. |
+| `synthtest.ts` | **Sidecar synthetic-test selection** (the sidecar's biggest job): for a single-python-function task the sidecar invents probe INPUTS (not outputs — we don't trust a 2b's answers), every best-of-N attempt is executed on them, and the winner is chosen by **execution consensus** (per-input plurality output + fewest crashes). CodeT/Agentless lever; catches a subtly-wrong-but-self-verified attempt the finish gate alone passes. |
+| `bestofn.ts` | Sequential best-of-N with real temperature jitter (owned engine). Selector ladder: **consensus** (synthtest) when the task is a single fn, else **verified** (first attempt whose finish gate passed). Attempt-1 fast path (verified + no probe crash → stop) keeps easy work ~1×; clean-workspace reset between attempts; gated to hard tasks. |
+| `cli.ts` | `node dist/src/core/cli.js run "<task>" [--cwd DIR] [--reliable] [--bon N] [--model M] [--reasoning low\|med\|high] [--trace F]` — headless, prints a JSON result line. |
+| `repl.ts` | `node dist/src/core/repl.js` — the **pi-free interactive REPL**. A readline chat loop over the same runtime with clean formatting (no Pi banners/boxes), `/raw /reliable /bon /cwd /model` commands. This is the last pi surface replaced: the files on disk are the session state. |
 
 ## Three run modes (the A/B ladder)
 
 - **kitten (raw)** — bare tool loop. The control: "is our loop already competitive with opencode?"
 - **kitrel (reliable)** — raw + contract/scout + syntax gate + finish gate. "Does the harness earn its keep?"
-- **kitbon (best-of-N)** — reliable + sequential best-of-N with temperature + execution selection. "Does test-time compute close the hard-task gap?"
+- **kitbon (best-of-N)** — reliable + sequential best-of-N with temperature + consensus/verified selection. "Does test-time compute close the hard-task gap?"
+
+## "Get rid of pi" — status
+
+The entire measured capability path is **pi-free**: `core/` imports only four pure-TS helpers (nounGate,
+projectCommands, symbolSlice, contract) plus node built-ins — no Pi runtime, tools, provider, or TUI.
+The two entry points are both ours: `cli.js` (headless, what the A/B drives) and `repl.js` (interactive).
+Pi is no longer in the loop, the tools, the provider, or the frontend for anything Kitten Core does.
+
+## Grounding fixes from A/B trace review (speed)
+
+Reading the traces showed the harness was *slower* than opencode on hard tasks by burning turns, not by
+failing — two grounding bugs, now fixed:
+- **Noun-gate false block**: `isPathLike` treated any token with `/` as a path, so `evaluate('10/4')`
+  inside `python -c "..."` was blocked as a phantom path (wasted ~2 turns/run). Fixed: reject code-like
+  tokens (parens/quotes/operators) and skip the inline-code arg after `-c/-e/-m`. Regression-tested.
+- **Hallucinated cwd**: the model invented `/home/user`, then fumbled `rm` at the wrong path and wasted
+  turns tidying scratch files. Fixed: the system prompt now states the real working directory, that all
+  tools run there, and that scratch files may be left in place. The verify mandate prefers a one-line
+  `python -c` check over writing+running+deleting a separate test file.
 
 ## The A/B rig (`~/Desktop/kitten-ab/`, not in the repo)
 
