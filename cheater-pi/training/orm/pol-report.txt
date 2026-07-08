@@ -1,0 +1,9 @@
+── ORM verifier report card ──────────────────────────────
+held-out examples : 180  (split 0.3)
+AUC (rank solved>unsolved) : 0.933   [0.5 = chance, 1.0 = perfect]
+accuracy @0.5              : 92.2%
+Best@1 (ORM picks)        : 95.5%   over 22 synthetic 8-candidate tasks
+Best@1 (random picks)     : 50.0%
+pass@k (oracle ceiling)   : 100.0%
+ORM lift over random      : +45.5 pts   (gap to oracle: 4.5 pts)
+──────────────────────────────────────────────────────────

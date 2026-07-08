@@ -1,0 +1,2 @@
+# generated training data (regenerate with gen_data.mjs)
+*.jsonl
