@@ -69,9 +69,36 @@ serves one request at a time). Key hard-won harness facts encoded there:
 Both models live: ornith-1.0-35b (GPU) + qwen3.5-2b (sidecar, CPU). opencode uses provider `ornith`
 → the same model/endpoint, so the comparison isolates the harness.
 
-## Early signal
+## Measured results (~120 A/B runs, hidden oracles, serialized)
 
-On the trivial edit task, the bare kitten loop finished faster than opencode on the same model
-(≈84 s vs ≈124 s), and reliable-mode verified its own fix (wrote+ran a check) before finishing. The
-full 3-way sweep across 13 tasks (single-file bugs, from-scratch, multi-file, stateful) is how we find
-where the harness wins and where opencode wins, and iterate from there.
+**Capability = parity.** On the local regime (single-function bugs, from-scratch, small multi-file /
+stateful), ornith-35B passes ~100% at pass@1 whether it's driven by kitten or opencode. "More capable"
+is not real here — the same model solves these either way. Genuine pass@1 failures need large multi-file
+work or the TB2 Docker suite (a 35B can't one-shot those). So the harness's job on this regime is not
+capability — it's speed and a verification guarantee.
+
+**Speed = the proven win.** Definitive head-to-head, final build, same session, 5 tasks × 2 trials:
+
+| agent | avg turns | avg sec | pass |
+|---|---|---|---|
+| **kitrel** (reliable) | **3.5** | **72** | 10/10 |
+| kitten (raw) | 4.4 | 79 | 10/10 |
+| opencode | 4.2 | 98 | 10/10 |
+
+kitten is faster than opencode on **5/5 tasks**; kitrel is **~27% faster** *and* still runs a real
+verification before finishing (opencode does not). This came entirely from **trace review → fixes**:
+the harness was slower by burning turns, not by failing. The four fixes, each measured:
+1. **Noun-gate false block** — `isPathLike` read `evaluate('10/4')` inside `python -c` as a phantom
+   path (~2 wasted turns/run). Reject code-like tokens; skip the inline-code arg after `-c/-e/-m`.
+2. **Hallucinated cwd** — the model invented `/home/user`, fumbled `rm`, tidied scratch files. The
+   prompt now states the real cwd, "never cd", "leave scratch files".
+3. **Editor feedback** — the edit tool echoes the changed region so the model trusts it and stops
+   re-writing whole files.
+4. **Lean prompts (the variance killer)** — the verbose "verify every edge" mandate primed an
+   over-verification *spiral* (word-wrap 3t one run, 12t the next; a 1-line dedup fix took 9 turns).
+   Move the detail into the finish gate, keep the upfront prompt lean → kitrel **median 3 turns**,
+   dedup 9t→3t. A verify-cap nudge tames the strict-validation tail (duration-parse 19t→≤10t).
+
+The finish gate still guarantees no unverified finish, and best-of-N consensus (synthtest) is available
+for the hard regime — but on tasks the model already solves, consensus mostly just agrees. The honest
+headline: **same model, kitten is faster and it verifies; opencode is neither faster nor safer.**
