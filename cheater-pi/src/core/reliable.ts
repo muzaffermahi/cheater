@@ -62,17 +62,21 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
   if (contract.symbols.length) contractLines.push(`Symbols named in the task: ${contract.symbols.join(", ")}`);
   if (contract.commands.length) contractLines.push(`Commands named in the task: ${contract.commands.join(" | ")}`);
 
-  const verifyMandate = testCmd
-    ? `Before you call finish you MUST run the project's tests with bash (\`${testCmd}\`) and see them pass.`
-    : `No test command exists in this project, so YOU are the only checker. Before you call finish you MUST verify your change by RUNNING it — prefer a single inline \`python -c "..."\` (or \`node -e "..."\`) one-liner that asserts the NORMAL case AND the obvious edge cases (empty, single, boundary, ordering) in one bash call; only write a separate test file if the check is genuinely large. Confirm it prints/asserts the right answers. Do not finish on assumption, and do not waste turns deleting the check afterward.`;
+  // Keep the upfront prompt LEAN. A verbose "verify the normal case AND every edge (empty, single,
+  // boundary, ordering)…" mandate primes a small model to over-explore even trivial tasks (observed:
+  // 9 turns diagnosing a one-line dedup fix). The detailed verify guidance lives in the finish gate and
+  // is injected ONLY if the model tries to finish without having run a check — lean until it matters.
+  const verifyReminder = testCmd
+    ? `Before finishing, run the project's tests (\`${testCmd}\`) and see them pass.`
+    : `Before finishing, actually run your change once (a quick \`python -c\`/\`node -e\` check) to confirm it works — don't finish on assumption.`;
 
   const systemPrompt = [
     "You are Kitten, a precise coding agent. You have tools: read, write, edit, bash, ls, grep, finish.",
-    "Work in small verified steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
+    "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
     briefs.length ? `\nRelevant code, already located for you (read more with the read tool if needed):\n${briefs.join("\n")}` : "",
-    `\n${verifyMandate}`,
-    "When the task is done AND verified, call finish with a one-line summary. Be concise; act instead of narrating."
+    `\n${verifyReminder}`,
+    "When the task is done and you've run it, call finish with a one-line summary. Be concise; act instead of narrating."
   ].filter(Boolean).join("\n");
 
   const result = await runAgent({
