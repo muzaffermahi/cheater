@@ -33,6 +33,7 @@ export interface ReliableParams {
   model?: string;
   maxTurns?: number;
   temperature?: number;
+  reasoningEffort?: "low" | "medium" | "high";
   onEvent?: AgentRunParams["onEvent"];
   signal?: AbortSignal;
 }
@@ -81,6 +82,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     model: params.model,
     maxTurns: params.maxTurns,
     temperature: params.temperature,
+    reasoningEffort: params.reasoningEffort,
     systemPrompt,
     onEvent: params.onEvent,
     signal: params.signal,

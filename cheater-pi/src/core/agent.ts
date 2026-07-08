@@ -39,6 +39,9 @@ export interface AgentRunParams {
   maxTokens?: number;
   temperature?: number;
   model?: string;
+  /** Owned-engine lever: cap ornith's reasoning depth per turn (it reasons ~130 tok even for a
+   *  trivial tool call). "low" trims the reasoning tax for speed; omit for the model default. */
+  reasoningEffort?: "low" | "medium" | "high";
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
   /** Reliability hook: after a tool runs, return extra feedback to append to the tool result the
@@ -109,6 +112,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       toolChoice: "auto",
       maxTokens: params.maxTokens,
       temperature: params.temperature,
+      reasoningEffort: params.reasoningEffort,
       signal: params.signal
     });
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;

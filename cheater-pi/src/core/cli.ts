@@ -14,7 +14,7 @@ import { runReliableAgent } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
 import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
 
-interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; }
+interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; reasoning?: "low" | "medium" | "high"; }
 
 function parse(argv: string[]): CliOpts | null {
   if (argv[0] !== "run") return null;
@@ -29,6 +29,7 @@ function parse(argv: string[]): CliOpts | null {
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--reliable") opts.reliable = true;
     else if (a === "--bon") { opts.bon = Math.max(1, Number(argv[++i]) || 1); opts.reliable = true; }
+    else if (a === "--reasoning") { const v = argv[++i]; if (v === "low" || v === "medium" || v === "high") opts.reasoning = v; }
     else rest.push(a);
   }
   opts.task = rest.join(" ").trim();
@@ -47,10 +48,10 @@ async function main(argv: string[]): Promise<number> {
 
   const onEvent = opts.quiet ? undefined : (e: AgentEvent) => process.stderr.write(`  [${e.turn}] ${e.kind}: ${e.detail.replace(/\n/g, " ").slice(0, 160)}\n`);
   const result = opts.bon > 1
-    ? await runBestOfN({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent }, opts.bon)
+    ? await runBestOfN({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent }, opts.bon)
     : opts.reliable
-      ? await runReliableAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent })
-      : await runAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent });
+      ? await runReliableAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent })
+      : await runAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent });
 
   if (opts.trace) {
     try { writeFileSync(opts.trace, JSON.stringify(result, null, 2)); } catch { /* best-effort */ }
