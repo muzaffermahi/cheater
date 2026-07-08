@@ -58,6 +58,9 @@ export interface AscentConfig {
   runOne?: RunOne;
   /** Rough per-sample token estimate for the budget governor. */
   estTokensPerSample?: number;
+  /** Measurement hook (D1): awaited with all candidate workspaces + the verdict BEFORE cleanup, so a
+   *  rig can oracle-score every candidate (pass@k) not just the winner. */
+  onVerified?: (ctx: { attempts: BurstAttempt[]; verdict: { winner: number | null; slate: Array<{ index: number }> } }) => void | Promise<void>;
 }
 
 export interface AscentParams {
@@ -65,6 +68,8 @@ export interface AscentParams {
   cwd: string;
   taskId?: string;
   hardness?: HardnessSignal;
+  /** Measurement-only (D1): force the sample count to a fixed N, overriding the hardness budget. */
+  forceSamples?: number;
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
   onEvent?: (e: AgentEvent) => void;
@@ -133,7 +138,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const budget = computeBudget(params.hardness ?? {}, { adaptiveComputeEnabled: true } as any);
   const governor = new BudgetGovernor(config.ceiling ?? {});
   const estTokens = config.estTokensPerSample ?? DEFAULT_EST_TOKENS;
-  let samples = lever(config, "diversity") ? Math.max(1, budget.samples) : 1;
+  let samples = params.forceSamples ?? (lever(config, "diversity") ? Math.max(1, budget.samples) : 1);
   samples = governor.capSamples(samples, estTokens);
   receipts.push(`budget: hardness ${budget.hardness} → k=${samples} (${budget.reason})`);
 
@@ -259,7 +264,10 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     family, samples, rounds: round, receipts, usage, wallMs: Date.now() - started
   };
 
-  // Clean up isolated workspaces AFTER adopting the winner.
+  // Measurement hook (D1): let a rig oracle-score every candidate workspace before they're removed.
+  if (config.onVerified) { try { await config.onVerified({ attempts: allAttempts, verdict }); } catch { /* rig hook best-effort */ } }
+
+  // Clean up isolated workspaces AFTER adopting the winner (and after the measurement hook).
   cleanupBurst(allAttempts);
   return result;
 }
