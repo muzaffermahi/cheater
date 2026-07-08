@@ -77,6 +77,10 @@ Rules:
 
 const DEFAULT_MAX_TURNS = 40;
 
+// A bash command that actually exercises code (not a bare read/ls) — used only to count how many times
+// the model has re-verified after editing, so the loop can nudge it to stop re-checking what passes.
+const RUN_CHECK_RE = /\b(pytest|unittest|python3?\s+\S|node\s+\S|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S)/i;
+
 export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> {
   const started = Date.now();
   const llm = params.llm;
@@ -103,6 +107,12 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let emptyStreak = 0;
   let finishRejections = 0;
   const maxFinishRejections = params.maxFinishRejections ?? 2;
+  // Verification-spiral cap: after the model has edited code and then run several PASSING checks, one
+  // gentle nudge toward finish. Fires only after thorough verification (never on the ~3-turn median),
+  // and it's a nudge not a block — a model still repairing a genuinely failing check can keep going.
+  let hasEdited = false;
+  let passingChecks = 0;
+  let nudgedToFinish = false;
   const bashOk: string[] = [];
   const bashAll: string[] = [];
 
@@ -181,7 +191,11 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         break;
       }
       const res = tool.execute(call.args, ctx);
-      if (call.name === "bash") { const c = String(call.args.command ?? ""); bashAll.push(c); if (!res.isError) bashOk.push(c); }
+      if (call.name === "edit" || call.name === "write") { if (!res.isError) hasEdited = true; }
+      if (call.name === "bash") {
+        const c = String(call.args.command ?? ""); bashAll.push(c);
+        if (!res.isError) { bashOk.push(c); if (hasEdited && RUN_CHECK_RE.test(c)) passingChecks++; }
+      }
       let output = res.output;
       // Reliability hook: append a post-edit diagnostic (type/syntax gate — Tier A2) so a broken edit
       // is rejected and re-asked in the same turn, not three tool calls later.
@@ -191,6 +205,12 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}${extra ? " +diag" : ""}`, data: { error: res.isError, output: output.slice(0, 500) } });
     }
     if (finished) { stopReason = "finish"; break; }
+    // Gentle one-time nudge once the model has run several passing checks post-edit — cap the spiral.
+    if (!nudgedToFinish && passingChecks >= 3) {
+      nudgedToFinish = true;
+      messages.push({ role: "user", content: "Your checks are passing. If the task is complete, call finish now — don't keep re-running checks that already pass." });
+      emit({ turn, kind: "nudge", detail: "verification spiral cap: nudging to finish" });
+    }
   }
 
   return {
