@@ -194,7 +194,7 @@ used to go idle because a NEW file has no repo facts to compress):
 
 Config (all optional, off/conservative by default): `mainCallGovernorEnabled`, `mainAllowedRoles`,
 `mainFallbackAllowedRoles`, `sidecarPreferredRoles`, `sidecarKeepAliveEnabled`,
-`sidecarForceWarmOnRunStart`, `sidecarMinUsefulCallsPerRun`, `lmStudioBaseUrl`, `providerProbeEnabled`,
+`sidecarForceWarmOnRunStart`, `lmStudioBaseUrl`, `providerProbeEnabled`,
 `providerProbeBenchmark`, `leanWorkerPromptEnabled`, `sidecarPrefetchHorizon`, `sidecarMaxConcurrency`.
 
 ## Configuration
