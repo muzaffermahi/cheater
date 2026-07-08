@@ -24,6 +24,7 @@ import type { ToolContext, ToolResult } from "./tools.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
 import { loadProjectCommands } from "../reliability/projectCommands.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
+import { failureCard, renderCard } from "./sidecar.js";
 
 export interface ReliableParams {
   task: string;
@@ -84,7 +85,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     onEvent: params.onEvent,
     signal: params.signal,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd)
+    finishGate: (state) => finishGate(state, testCmd, params.llm)
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -115,14 +116,17 @@ function postEditSyntaxGate(call: { name: string; args: Record<string, unknown> 
 // Does a bash command look like it actually executed the code under change (not a trivial probe)?
 const EXECUTED_RE = /\b(pytest|unittest|python3?\s+\S+\.py|python3?\s+-c|node\s+\S+\.(m|c)?js|node\s+-e|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S+)\b/i;
 
-/** Finish gate: refuse "done" without an execution receipt. */
-function finishGate(state: FinishGateState, testCmd: string | null): { allowed: boolean; feedback?: string } {
+/** Finish gate: refuse "done" without an execution receipt; ground a failure via the sidecar. */
+async function finishGate(state: FinishGateState, testCmd: string | null, llm: import("./llm.js").KittenLLM): Promise<{ allowed: boolean; feedback?: string }> {
   if (testCmd) {
     // Re-run the project tests as the receipt. Allowed only if they pass now.
     const r = spawnSync(testCmd, { cwd: state.cwd, shell: true, encoding: "utf8", timeout: 120000, windowsHide: true });
     if ((r.status ?? 1) === 0) return { allowed: true };
-    const tail = (r.stdout + "\n" + r.stderr).split(/\r?\n/).filter(Boolean).slice(-6).join("\n").slice(0, 500);
-    return { allowed: false, feedback: `\`${testCmd}\` did not pass:\n${tail}\nFix the cause and re-run it before finishing.` };
+    // The sidecar (qwen-2b, parallel to the GPU) turns the raw failure into a tight card the main
+    // model repairs against — grounded repair, not a wall of stderr. Deterministic floor inside.
+    const raw = (r.stdout + "\n" + r.stderr).slice(-4000);
+    const { card } = await failureCard(llm, raw);
+    return { allowed: false, feedback: `\`${testCmd}\` did not pass.\n${renderCard(card)}\nFix the cause and re-run it before finishing.` };
   }
   // Held-out: require an execution receipt among the successful bash commands.
   const verified = state.bashOk.some((c) => EXECUTED_RE.test(c) && !/--version|-V\b/.test(c));

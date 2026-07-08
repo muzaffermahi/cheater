@@ -42,12 +42,13 @@ export interface AgentRunParams {
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
   /** Reliability hook: after a tool runs, return extra feedback to append to the tool result the
-   *  model sees (e.g. a type/syntax diagnostic that rejects a broken edit — Tier A2). */
-  postToolHook?: (call: { name: string; args: Record<string, unknown> }, result: ToolResult, ctx: ToolContext) => string | undefined;
+   *  model sees (e.g. a type/syntax diagnostic that rejects a broken edit — Tier A2). May be async. */
+  postToolHook?: (call: { name: string; args: Record<string, unknown> }, result: ToolResult, ctx: ToolContext) => string | undefined | Promise<string | undefined>;
   /** Reliability hook: when the model calls finish, decide if it may. Returning allowed:false injects
    *  the feedback and the loop continues (the "no done without receipts" finish gate). Called at most
-   *  `maxFinishRejections` times, then finish is allowed to avoid an infinite loop. */
-  finishGate?: (state: FinishGateState) => { allowed: boolean; feedback?: string };
+   *  `maxFinishRejections` times, then finish is allowed to avoid an infinite loop. May be async
+   *  (e.g. to ground the failure via the sidecar). */
+  finishGate?: (state: FinishGateState) => { allowed: boolean; feedback?: string } | Promise<{ allowed: boolean; feedback?: string }>;
   maxFinishRejections?: number;
 }
 
@@ -158,7 +159,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         // Finish gate: "no done without receipts". A reliability hook may reject the claim (e.g. the
         // model never actually ran a verification) and send it back with guidance, up to a bound.
         if (params.finishGate && finishRejections < maxFinishRejections) {
-          const gate = params.finishGate({ cwd: params.cwd, filesWritten: [...ctx.filesWritten], bashOk, bashAll, summary: proposed });
+          const gate = await params.finishGate({ cwd: params.cwd, filesWritten: [...ctx.filesWritten], bashOk, bashAll, summary: proposed });
           if (!gate.allowed) {
             finishRejections++;
             messages.push(toolResultTurn(call.id, call.name, `NOT DONE: ${gate.feedback ?? "the task is not verified yet."}`));
@@ -177,7 +178,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       let output = res.output;
       // Reliability hook: append a post-edit diagnostic (type/syntax gate — Tier A2) so a broken edit
       // is rejected and re-asked in the same turn, not three tool calls later.
-      const extra = params.postToolHook?.({ name: call.name, args: call.args }, res, ctx);
+      const extra = await params.postToolHook?.({ name: call.name, args: call.args }, res, ctx);
       if (extra) output += `\n${extra}`;
       messages.push(toolResultTurn(call.id, call.name, output));
       emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}${extra ? " +diag" : ""}`, data: { error: res.isError, output: output.slice(0, 500) } });

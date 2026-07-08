@@ -11,13 +11,14 @@ import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runAgent, type AgentEvent } from "./agent.js";
 import { runReliableAgent } from "./reliable.js";
+import { runBestOfN } from "./bestofn.js";
 import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
 
-interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; }
+interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; }
 
 function parse(argv: string[]): CliOpts | null {
   if (argv[0] !== "run") return null;
-  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false };
+  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false, bon: 1 };
   const rest: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -27,6 +28,7 @@ function parse(argv: string[]): CliOpts | null {
     else if (a === "--trace") opts.trace = argv[++i];
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--reliable") opts.reliable = true;
+    else if (a === "--bon") { opts.bon = Math.max(1, Number(argv[++i]) || 1); opts.reliable = true; }
     else rest.push(a);
   }
   opts.task = rest.join(" ").trim();
@@ -44,9 +46,11 @@ async function main(argv: string[]): Promise<number> {
   if (!opts.quiet) process.stderr.write(`kitten-core${opts.reliable ? " (reliable)" : ""}: ${model} @ ${DEFAULT_MODELS.baseUrl}  cwd=${opts.cwd}\n`);
 
   const onEvent = opts.quiet ? undefined : (e: AgentEvent) => process.stderr.write(`  [${e.turn}] ${e.kind}: ${e.detail.replace(/\n/g, " ").slice(0, 160)}\n`);
-  const result = opts.reliable
-    ? await runReliableAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent })
-    : await runAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent });
+  const result = opts.bon > 1
+    ? await runBestOfN({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent }, opts.bon)
+    : opts.reliable
+      ? await runReliableAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent })
+      : await runAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent });
 
   if (opts.trace) {
     try { writeFileSync(opts.trace, JSON.stringify(result, null, 2)); } catch { /* best-effort */ }
