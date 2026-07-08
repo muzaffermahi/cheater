@@ -74,10 +74,15 @@ async function main(): Promise<void> {
   process.stdout.write(dim(`mode: ${st.mode}   (/help for commands)`) + "\n");
 
   const rl = createInterface({ input: process.stdin, output: process.stdout, prompt: bold("kitten› ") });
-  rl.prompt();
+  // Track close so a prompt() after the input stream ends (piped EOF while a task is still running)
+  // does not throw ERR_USE_AFTER_CLOSE. prompt() is a no-op once closed.
+  let closed = false;
+  rl.on("close", () => { closed = true; });
+  const prompt = (): void => { if (!closed) rl.prompt(); };
+  prompt();
   for await (const lineRaw of rl) {
     const line = lineRaw.trim();
-    if (!line) { rl.prompt(); continue; }
+    if (!line) { prompt(); continue; }
     if (line.startsWith("/")) {
       const [cmd, ...rest] = line.slice(1).split(/\s+/);
       const arg = rest.join(" ");
@@ -87,13 +92,13 @@ async function main(): Promise<void> {
       else if (cmd === "cwd") { if (arg) st.cwd = resolve(arg); process.stdout.write(dim(`cwd: ${st.cwd}`) + "\n"); }
       else if (cmd === "model") { if (arg) st.model = arg; process.stdout.write(dim(`model: ${st.model}`) + "\n"); }
       else process.stdout.write(red(`unknown command /${cmd} (/help)`) + "\n");
-      rl.prompt();
+      prompt();
       continue;
     }
     await runOnce(llm, st, line);
-    rl.prompt();
+    prompt();
   }
-  rl.close();
+  if (!closed) rl.close();
   process.stdout.write(dim("bye") + "\n");
 }
 
