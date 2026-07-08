@@ -36,6 +36,12 @@ export interface ReliableParams {
   reasoningEffort?: "low" | "medium" | "high";
   onEvent?: AgentRunParams["onEvent"];
   signal?: AbortSignal;
+  /** A1 diversity: a stance/plan/repair directive appended to the system prompt for this sample. */
+  extraDirective?: string;
+  /** A1 diversity: override/reorder which contract files scout slices first (the localization axis). */
+  localizationFiles?: string[];
+  /** A3 experience: primed approach-shape from similar past solves, injected into the first message. */
+  experiencePrime?: string;
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -47,10 +53,12 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
   const testCmd = project.focusedTestCommand ?? project.testCommand ?? null;
 
   // Scout: deterministically locate the files the task names (that exist) and slice the relevant
-  // symbol out of each, so the first turn already carries the code to change.
+  // symbol out of each, so the first turn already carries the code to change. The A1 localization axis
+  // may reorder the candidate list so a different file leads on different samples.
   const terms = [...contract.symbols, ...task.split(/\s+/).filter((w) => w.length > 4)].slice(0, 12);
+  const candidateFiles = (params.localizationFiles?.length ? params.localizationFiles : contract.files).slice(0, 4);
   const briefs: string[] = [];
-  for (const file of contract.files.slice(0, 4)) {
+  for (const file of candidateFiles) {
     if (existsSync(join(cwd, file))) {
       const snip = symbolSnippet(cwd, file, terms.length ? terms : [file]);
       if (snip) briefs.push(snip);
@@ -75,6 +83,8 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
     briefs.length ? `\nRelevant code, already located for you (read more with the read tool if needed):\n${briefs.join("\n")}` : "",
+    params.experiencePrime ? `\n${params.experiencePrime}` : "",
+    params.extraDirective ? `\n${params.extraDirective}` : "",
     `\n${verifyReminder}`,
     "When the task is done and you've run it, call finish with a one-line summary. Be concise; act instead of narrating."
   ].filter(Boolean).join("\n");
