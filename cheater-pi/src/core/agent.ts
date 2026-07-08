@@ -9,7 +9,7 @@
 // agent-run.ts; this file is the minimal, honest driver.
 
 import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult } from "./llm.js";
-import { CORE_TOOLS, toolByName, type Tool, type ToolContext } from "./tools.js";
+import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 
 export interface AgentEvent {
@@ -17,6 +17,16 @@ export interface AgentEvent {
   kind: "assistant" | "tool" | "gate_block" | "error" | "finish" | "nudge";
   detail: string;
   data?: Record<string, unknown>;
+}
+
+export interface FinishGateState {
+  cwd: string;
+  filesWritten: string[];
+  /** successful (exit 0) bash commands run this session — evidence of self-verification. */
+  bashOk: string[];
+  /** all bash commands run. */
+  bashAll: string[];
+  summary: string;
 }
 
 export interface AgentRunParams {
@@ -31,6 +41,14 @@ export interface AgentRunParams {
   model?: string;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
+  /** Reliability hook: after a tool runs, return extra feedback to append to the tool result the
+   *  model sees (e.g. a type/syntax diagnostic that rejects a broken edit — Tier A2). */
+  postToolHook?: (call: { name: string; args: Record<string, unknown> }, result: ToolResult, ctx: ToolContext) => string | undefined;
+  /** Reliability hook: when the model calls finish, decide if it may. Returning allowed:false injects
+   *  the feedback and the loop continues (the "no done without receipts" finish gate). Called at most
+   *  `maxFinishRejections` times, then finish is allowed to avoid an infinite loop. */
+  finishGate?: (state: FinishGateState) => { allowed: boolean; feedback?: string };
+  maxFinishRejections?: number;
 }
 
 export interface AgentRunResult {
@@ -76,6 +94,10 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let summary = "";
   let stopReason: AgentRunResult["stopReason"] = "max_turns";
   let emptyStreak = 0;
+  let finishRejections = 0;
+  const maxFinishRejections = params.maxFinishRejections ?? 2;
+  const bashOk: string[] = [];
+  const bashAll: string[] = [];
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
@@ -132,15 +154,33 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         continue;
       }
       if (call.name === "finish") {
+        const proposed = String(call.args.summary ?? "");
+        // Finish gate: "no done without receipts". A reliability hook may reject the claim (e.g. the
+        // model never actually ran a verification) and send it back with guidance, up to a bound.
+        if (params.finishGate && finishRejections < maxFinishRejections) {
+          const gate = params.finishGate({ cwd: params.cwd, filesWritten: [...ctx.filesWritten], bashOk, bashAll, summary: proposed });
+          if (!gate.allowed) {
+            finishRejections++;
+            messages.push(toolResultTurn(call.id, call.name, `NOT DONE: ${gate.feedback ?? "the task is not verified yet."}`));
+            emit({ turn, kind: "gate_block", detail: `finish rejected: ${gate.feedback ?? ""}`.slice(0, 200) });
+            continue;
+          }
+        }
         finished = true;
-        summary = String(call.args.summary ?? "");
+        summary = proposed;
         messages.push(toolResultTurn(call.id, call.name, "ok"));
         emit({ turn, kind: "finish", detail: summary });
         break;
       }
       const res = tool.execute(call.args, ctx);
-      messages.push(toolResultTurn(call.id, call.name, res.output));
-      emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}`, data: { error: res.isError, output: res.output.slice(0, 500) } });
+      if (call.name === "bash") { const c = String(call.args.command ?? ""); bashAll.push(c); if (!res.isError) bashOk.push(c); }
+      let output = res.output;
+      // Reliability hook: append a post-edit diagnostic (type/syntax gate — Tier A2) so a broken edit
+      // is rejected and re-asked in the same turn, not three tool calls later.
+      const extra = params.postToolHook?.({ name: call.name, args: call.args }, res, ctx);
+      if (extra) output += `\n${extra}`;
+      messages.push(toolResultTurn(call.id, call.name, output));
+      emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}${extra ? " +diag" : ""}`, data: { error: res.isError, output: output.slice(0, 500) } });
     }
     if (finished) { stopReason = "finish"; break; }
   }

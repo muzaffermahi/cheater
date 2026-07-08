@@ -10,13 +10,14 @@
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runAgent, type AgentEvent } from "./agent.js";
+import { runReliableAgent } from "./reliable.js";
 import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
 
-interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; }
+interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; }
 
 function parse(argv: string[]): CliOpts | null {
   if (argv[0] !== "run") return null;
-  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false };
+  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false };
   const rest: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -25,6 +26,7 @@ function parse(argv: string[]): CliOpts | null {
     else if (a === "--max-turns") opts.maxTurns = Number(argv[++i]);
     else if (a === "--trace") opts.trace = argv[++i];
     else if (a === "--quiet") opts.quiet = true;
+    else if (a === "--reliable") opts.reliable = true;
     else rest.push(a);
   }
   opts.task = rest.join(" ").trim();
@@ -39,16 +41,12 @@ async function main(argv: string[]): Promise<number> {
   }
   const llm = new KittenLLM(DEFAULT_MODELS);
   const model = opts.model ?? DEFAULT_MODELS.main;
-  if (!opts.quiet) process.stderr.write(`kitten-core: ${model} @ ${DEFAULT_MODELS.baseUrl}  cwd=${opts.cwd}\n`);
+  if (!opts.quiet) process.stderr.write(`kitten-core${opts.reliable ? " (reliable)" : ""}: ${model} @ ${DEFAULT_MODELS.baseUrl}  cwd=${opts.cwd}\n`);
 
-  const result = await runAgent({
-    task: opts.task,
-    cwd: opts.cwd,
-    llm,
-    model,
-    maxTurns: opts.maxTurns,
-    onEvent: opts.quiet ? undefined : (e: AgentEvent) => process.stderr.write(`  [${e.turn}] ${e.kind}: ${e.detail.replace(/\n/g, " ").slice(0, 160)}\n`)
-  });
+  const onEvent = opts.quiet ? undefined : (e: AgentEvent) => process.stderr.write(`  [${e.turn}] ${e.kind}: ${e.detail.replace(/\n/g, " ").slice(0, 160)}\n`);
+  const result = opts.reliable
+    ? await runReliableAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent })
+    : await runAgent({ task: opts.task, cwd: opts.cwd, llm, model, maxTurns: opts.maxTurns, onEvent });
 
   if (opts.trace) {
     try { writeFileSync(opts.trace, JSON.stringify(result, null, 2)); } catch { /* best-effort */ }
