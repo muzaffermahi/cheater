@@ -140,6 +140,35 @@ node dist/src/core/cli.js run "<task>" --cwd <dir> --ascent [--hard]
 - **The A3 localization prior** informs the generator via the primer text rather than reordering scout's
   file slice directly — a lighter wiring than the plan's ideal; the file hints reach the model either way.
 
+## Beating opencode — measured improvements (post-A/B iteration)
+
+A head-to-head on the 10-task hidden-oracle battery (same weights, qwen3.6-35b-a3b) started at **kitten
+6/10 vs opencode 5/10**. Two research-grounded levers were added and measured:
+
+**1. Worked-example anchor gate** (`workedExamples.ts` → `reliable.ts` finish gate). The worked examples
+IN THE PROMPT are real ground truth — not model-generated (which are self-flattering: a model passes its
+own tests ~41% even when they're conditioned on buggy code, arXiv:2409.09464). Research says execution
+feedback is the load-bearing component for a weak model (Self-Edit +48% rel even at tiny scale) while
+pure reflection hurts (arXiv:2310.01798); a single I/O example in the prompt is worth ~+11pp
+(Tests-as-Prompt). So kitten extracts the examples deterministically (balanced-bracket parse, ellipsis-
+abbreviation filtered, validated to never false-fail a reference solution) and **refuses to finish while
+any fails**, feeding the shortest failing call back for a bounded repair. **Measured: flipped `expr`
+FAIL(35/54)→PASS, improved `glob` 10/84→6/84 fails, zero regressions on the 6 kitten already passed.**
+
+**2. Sidecar model tiering** (`tierSidecar`). Research (Aider's weak-model for commit/summary; Claude
+Code runs Explore + claude-code-guide on Haiku): the sidecar's mechanical jobs (classify, probe-input
+generation, failure cards) don't need the full reasoning model. On a cloud endpoint the sidecar now
+auto-tiers to a cheap model (qwen3-8b) — which also fixes that the local 2b default isn't served on the
+cloud at all. The expensive model is spent only on the actual coding.
+
+**Result: kitten 7/10 vs opencode 5/10** (from 6-vs-5) — the two unique kitten wins (`intervals`, `vm`)
+plus the flipped `expr`, at ~3× opencode's wall-clock (the test-time-compute tradeoff). Remaining kitten
+fails (`cron`, `glob`, `regexlite`) are edge-case/hang bugs at the 35B's capability ceiling — an
+edge-case-enumeration prompt was tried and **reverted** (it added latency without improving them: the
+discipline that a lever which doesn't earn its keep gets cut). What the research says would move those
+next, still unbuilt: metamorphic/ambiguity resolution (sample-disagreement on an input class → force the
+model to resolve that boundary) and CodeT dual-agreement selection (√|Sx|×|Sy| over samples × tests).
+
 ## Design laws (extend the kitten laws)
 
 1. The verifier is execution-grounded or it doesn't count. 2. Coverage before cleverness (real diversity,
