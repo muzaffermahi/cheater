@@ -16,7 +16,7 @@
 // raw<->reliable on one flag and measure whether the harness earns its keep.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { runAgent, type AgentRunParams, type AgentRunResult, type FinishGateState } from "./agent.js";
 import type { KittenLLM } from "./llm.js";
@@ -26,6 +26,7 @@ import { loadProjectCommands } from "../reliability/projectCommands.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
 import { failureCard, renderCard } from "./sidecar.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures, type WorkedExample } from "./workedExamples.js";
+import { deriveBans, forbiddenScan, renderBanViolation } from "./constraints.js";
 
 export interface ReliableParams {
   task: string;
@@ -43,6 +44,12 @@ export interface ReliableParams {
   localizationFiles?: string[];
   /** A3 experience: primed approach-shape from similar past solves, injected into the first message. */
   experiencePrime?: string;
+  /** P1: capture per-token logprobs → self-certainty (owned-engine selection signal). */
+  captureConfidence?: boolean;
+  /** P2/P5: owned-inference per-sample decode controls (forbidden-token ban, sampler diversity). */
+  decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
+  /** P2: run the finish-gate forbidden-construct source scan (engine-agnostic fallback for the ban). */
+  banForbidden?: boolean;
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -112,8 +119,10 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     systemPrompt,
     onEvent: params.onEvent,
     signal: params.signal,
+    captureConfidence: params.captureConfidence,
+    decode: params.decode,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars })
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -149,9 +158,19 @@ async function finishGate(
   state: FinishGateState,
   testCmd: string | null,
   llm: import("./llm.js").KittenLLM,
-  worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[] }
+  worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[]; bans: string[] }
 ): Promise<{ allowed: boolean; feedback?: string }> {
-  // Worked-example anchor FIRST — ground truth from the task itself. If the code fails the task's own
+  // P2 — forbidden-construct scan FIRST. The oracle rejects a banned construct outright, before any
+  // behavior test, so a behaviorally-correct solution that uses `import re` still fails. Catch it here
+  // (the engine-agnostic layer; a native engine also hard-bans it at decode).
+  if (worked?.module && worked.bans?.length) {
+    try {
+      const src = readFileSync(join(state.cwd, worked.module), "utf8");
+      const violation = forbiddenScan(src, worked.bans);
+      if (violation) return { allowed: false, feedback: renderBanViolation(violation, worked.bans) };
+    } catch { /* module unreadable → let the other gates speak */ }
+  }
+  // Worked-example anchor — ground truth from the task itself. If the code fails the task's own
   // stated I/O, it is not done regardless of any other signal (and the failing case is the repair seed).
   if (worked?.module && worked.examples.length) {
     const r = runExampleTest(state.cwd, worked.module, worked.examples, worked.setupVars);

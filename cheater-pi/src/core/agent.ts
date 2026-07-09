@@ -8,9 +8,10 @@
 // The reliability harness (contract, grade-in-code, check-first, scout) layers on top of this in
 // agent-run.ts; this file is the minimal, honest driver.
 
-import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult } from "./llm.js";
+import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob } from "./llm.js";
 import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
+import { aggregateSelfCertainty } from "./selfCertainty.js";
 
 export interface AgentEvent {
   turn: number;
@@ -53,6 +54,11 @@ export interface AgentRunParams {
    *  (e.g. to ground the failure via the sidecar). */
   finishGate?: (state: FinishGateState) => { allowed: boolean; feedback?: string } | Promise<{ allowed: boolean; feedback?: string }>;
   maxFinishRejections?: number;
+  /** P1: request per-token logprobs and aggregate self-certainty across the trajectory (owned-engine
+   *  selection signal). Opt-in — adds response size, so only the ascent best-of-N path enables it. */
+  captureConfidence?: boolean;
+  /** Owned-inference per-sample decode controls (P2 ban, P5 sampler diversity) applied to every turn. */
+  decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
 }
 
 export interface AgentRunResult {
@@ -65,6 +71,8 @@ export interface AgentRunResult {
   usage: { prompt: number; completion: number; reasoning: number };
   wallMs: number;
   stopReason: "finish" | "max_turns" | "error" | "stalled" | "aborted";
+  /** P1: self-certainty aggregated over the trajectory (0.5 if not captured). Verifier tiebreaker. */
+  confidence?: { selfCertainty: number; tokens: number };
 }
 
 const DEFAULT_SYSTEM = `You are Kitten, a precise coding agent working in a real project directory. You have tools: read, write, edit, bash, ls, grep, finish.
@@ -115,6 +123,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let nudgedToFinish = false;
   const bashOk: string[] = [];
   const bashAll: string[] = [];
+  const logprobChunks: (TokenLogprob[] | undefined)[] = [];
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
@@ -126,9 +135,18 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       maxTokens: params.maxTokens,
       temperature: params.temperature,
       reasoningEffort: params.reasoningEffort,
+      logprobs: params.captureConfidence,
+      topLogprobs: params.captureConfidence ? 5 : undefined,
+      logitBias: params.decode?.logitBias,
+      topP: params.decode?.topP,
+      topK: params.decode?.topK,
+      minP: params.decode?.minP,
+      dryMultiplier: params.decode?.dryMultiplier,
+      grammar: params.decode?.grammar,
       signal: params.signal
     });
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;
+    if (params.captureConfidence && result.logprobs?.length) logprobChunks.push(result.logprobs);
 
     if (!result.ok) {
       emit({ turn, kind: "error", detail: result.error ?? "llm error" });
@@ -222,7 +240,8 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
     events,
     usage,
     wallMs: Date.now() - started,
-    stopReason
+    stopReason,
+    confidence: params.captureConfidence ? aggregateSelfCertainty(logprobChunks) : undefined
   };
 }
 

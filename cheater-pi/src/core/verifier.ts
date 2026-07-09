@@ -38,6 +38,8 @@ export interface Candidate {
   summary: string;
   /** For the ORM: a compact trajectory string (diff + test output + reasoning). Optional. */
   trajectory?: string;
+  /** P1: aggregated self-certainty of this candidate's generation (owned-engine tiebreaker signal). */
+  selfCertainty?: number;
 }
 
 export interface CandidateSignals {
@@ -52,6 +54,7 @@ export interface CandidateSignals {
   consensusRank?: number;      // 0 = best consensus agreement
   consensusCrashes?: number;
   ormScore?: number;           // B3 P(solved) in [0,1]
+  selfCertainty?: number;      // P1 tiebreaker: how decisive the generation was
   receipt: string[];
 }
 
@@ -135,7 +138,8 @@ export class Verifier {
       const weaklyEligible = !anyApplied;
       if (weaklyEligible) receipt.push(`no execution signal available → eligibility from finish gate (${c.finished ? "finished" : "unfinished"})`);
 
-      slate.push({ index: c.index, reproduction, regression, smoke, executionEligible, weaklyEligible, receipt });
+      if (c.selfCertainty !== undefined) receipt.push(`self-certainty ${c.selfCertainty.toFixed(3)}`);
+      slate.push({ index: c.index, reproduction, regression, smoke, executionEligible, weaklyEligible, selfCertainty: c.selfCertainty, receipt });
     }
 
     // B2 consensus over the probe, run on every candidate's workspace (eligible or not, so a candidate
@@ -169,11 +173,17 @@ export class Verifier {
     const pool = eligible.length ? eligible : slate;
     const usedExecution = eligible.length > 0 && eligible.some((s) => !s.weaklyEligible);
 
+    // Order: execution consensus first, then ORM, then P1 self-certainty (the owned-engine tiebreaker
+    // for the "all candidates agree but are wrong / a thin test can't separate them" case — where
+    // consensusRank is tied and there's no ORM, the more DECISIVE generation wins instead of arbitrary
+    // index order). Self-certainty is never the sole reason: eligibility (B1 execution) gates the pool.
     const ranked = [...pool].sort((a, b) => {
       const cr = (a.consensusRank ?? 99) - (b.consensusRank ?? 99);
       if (cr !== 0) return cr;
       const orm = (b.ormScore ?? -1) - (a.ormScore ?? -1);
       if (orm !== 0) return orm;
+      const sc = (b.selfCertainty ?? -1) - (a.selfCertainty ?? -1);
+      if (Math.abs(sc) > 1e-6) return sc;
       return a.index - b.index;
     });
     const winner = ranked[0]?.index ?? null;

@@ -33,6 +33,8 @@ export interface AttemptPlan {
   directive: string;
   /** Compact label for receipts, e.g. "t0.73/root-cause/plan/loc0". */
   label: string;
+  /** P5: per-sample owned-inference sampler profile (min_p / top_k / DRY) to decorrelate the batch. */
+  decode?: { topP?: number; topK?: number; minP?: number; dryMultiplier?: number };
 }
 
 export interface DiversityContext {
@@ -42,6 +44,26 @@ export interface DiversityContext {
   localizationVariants?: number;
   /** A repair directive from the previous round's best failure (round ≥ 2). */
   repairSeed?: string;
+  /** P5: give each sample a different SAMPLER (not just temperature) to decorrelate the batch. */
+  samplerDiversity?: boolean;
+}
+
+/**
+ * P5 — per-attempt sampler profile. Best-of-N pays off when the k samples' errors are UNCORRELATED;
+ * varying the sampler (nucleus vs top-k vs their mix) pushes samples into different output regions more
+ * than temperature alone. Attempt 1 is the pure-temperature baseline. Profiles use top_p/top_k (reachable
+ * on cloud + LM Studio + llama.cpp); min_p/DRY (native-only) can be layered on a native engine.
+ */
+export function attemptSampler(i: number): { topP?: number; topK?: number } {
+  if (i <= 1) return {};
+  const profiles: Array<{ topP?: number; topK?: number }> = [
+    { topP: 0.9 },
+    { topK: 40 },
+    { topP: 0.8, topK: 20 },
+    { topP: 0.95 },
+    { topK: 80 }
+  ];
+  return profiles[(i - 2) % profiles.length];
 }
 
 const STANCE_TEXT: Record<Stance, string> = {
@@ -96,6 +118,7 @@ export function planAttempts(n: number, ctx: DiversityContext = {}): AttemptPlan
     if (ctx.multiFile && !isBaseline) parts.push(DECOMPOSITION_HINTS[(i - 2 + DECOMPOSITION_HINTS.length) % DECOMPOSITION_HINTS.length]);
     if (ctx.repairSeed) parts.push(ctx.repairSeed);
 
+    const sampler = ctx.samplerDiversity ? attemptSampler(i) : undefined;
     plans.push({
       index: i,
       temperature,
@@ -103,7 +126,8 @@ export function planAttempts(n: number, ctx: DiversityContext = {}): AttemptPlan
       planFirst,
       localizationRotation,
       directive: parts.join("\n"),
-      label: `t${temperature}/${stance}${planFirst ? "/plan" : ""}${localizationRotation ? `/loc${localizationRotation}` : ""}`
+      label: `t${temperature}/${stance}${planFirst ? "/plan" : ""}${localizationRotation ? `/loc${localizationRotation}` : ""}${sampler && (sampler.topP || sampler.topK) ? `/s` : ""}`,
+      decode: sampler && (sampler.topP !== undefined || sampler.topK !== undefined) ? sampler : undefined
     });
   }
   return plans;

@@ -104,6 +104,8 @@ export interface ChatResult {
   error?: string;
   elapsedMs: number;
   raw?: unknown;
+  /** Per-token logprobs of the generated content, when requested (for self-certainty selection). */
+  logprobs?: TokenLogprob[];
 }
 
 export interface ChatParams {
@@ -116,10 +118,38 @@ export interface ChatParams {
   /** { name, schema } for response_format json_schema (structured output). */
   jsonSchema?: { name: string; schema: Record<string, unknown> };
   logprobs?: boolean;
+  /** Request top-N alternatives per token (needed for self-certainty selection). */
+  topLogprobs?: number;
   timeoutMs?: number;
   /** LM Studio / Qwen reasoning-effort hint (best-effort; ignored by models that lack it). */
   reasoningEffort?: "low" | "medium" | "high";
   signal?: AbortSignal;
+
+  // ── Owned-inference decode controls (Pi/opencode cannot send these). Each is optional and only
+  //    applied when set; on an engine that rejects one, the caller's capability latch drops it. ──
+  /** Nucleus sampling. Reachable on cloud + LM Studio + llama.cpp. */
+  topP?: number;
+  /** Top-k truncation. cloud/LM Studio/llama.cpp. */
+  topK?: number;
+  /** min-p confidence-scaled truncation. llama.cpp native only. */
+  minP?: number;
+  /** DRY (don't-repeat-yourself) multiplier. llama.cpp native only. */
+  dryMultiplier?: number;
+  /** Stop sequences. */
+  stop?: string[];
+  /** token-id → bias (OpenAI form `{id: -100}`). A hard ban is -100 (cloud/LM Studio) or `false` (native). */
+  logitBias?: Record<number, number>;
+  /** GBNF grammar string (constrain output). llama.cpp native only. */
+  grammar?: string;
+  /** Reuse the KV cache of the longest matching prefix across calls. llama.cpp native only. */
+  cachePrompt?: boolean;
+}
+
+/** One generated token's probability + its top alternatives (parsed from an OpenAI-style logprobs payload). */
+export interface TokenLogprob {
+  token: string;
+  logprob: number;
+  top: Array<{ token: string; logprob: number }>;
 }
 
 // Reasoning models need headroom: the reasoning block is counted against max_tokens, so a small
@@ -157,8 +187,18 @@ export class KittenLLM {
     if (params.jsonSchema) {
       body.response_format = { type: "json_schema", json_schema: { name: params.jsonSchema.name, strict: true, schema: params.jsonSchema.schema } };
     }
-    if (params.logprobs) body.logprobs = true;
+    if (params.logprobs) { body.logprobs = true; if (params.topLogprobs) body.top_logprobs = params.topLogprobs; }
     if (params.reasoningEffort) body.reasoning_effort = params.reasoningEffort;
+    // Owned-inference decode controls — sent only when set; a picky engine's rejection is the caller's
+    // capability-latch concern (it drops the offending field and retries).
+    if (params.topP !== undefined) body.top_p = params.topP;
+    if (params.topK !== undefined) body.top_k = params.topK;
+    if (params.minP !== undefined) body.min_p = params.minP;
+    if (params.dryMultiplier !== undefined) body.dry_multiplier = params.dryMultiplier;
+    if (params.stop?.length) body.stop = params.stop;
+    if (params.logitBias && Object.keys(params.logitBias).length) body.logit_bias = params.logitBias;
+    if (params.grammar) body.grammar = params.grammar;
+    if (params.cachePrompt) body.cache_prompt = params.cachePrompt;
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
@@ -191,7 +231,8 @@ export class KittenLLM {
         },
         ok: true,
         elapsedMs: Date.now() - started,
-        raw: json
+        raw: json,
+        logprobs: parseLogprobs(choice.logprobs)
       };
     } catch (err) {
       const e = err as Error;
@@ -221,6 +262,81 @@ export class KittenLLM {
       if (!res.ok) return [];
       const json: any = await res.json();
       return (json?.data ?? []).map((d: any) => d.embedding as number[]);
+    } catch {
+      return [];
+    }
+  }
+
+  // ── Owned-engine detection + native endpoints (the leverage Pi/opencode structurally lack) ──────────
+  // The base URL replaces "/v1"; native llama.cpp serves /props, /completion, /tokenize at the ROOT.
+  private rootUrl(path: string): string {
+    return `${this.models.baseUrl.replace(/\/+$/, "").replace(/\/v1$/i, "")}${path}`;
+  }
+
+  /**
+   * Probe the engine ONCE and cache it. `GET /props` succeeding ⇒ a native llama.cpp server (unlocks
+   * grammar, n_probs, cache_prompt, min_p/DRY, /completion, /infill, /tokenize). Anything else ⇒ an
+   * OpenAI proxy (LM Studio / cloud) where only the standard subset is reachable. Never throws.
+   */
+  async detectEngine(timeoutMs = 4000): Promise<"llamacpp" | "openai-proxy"> {
+    if (this._engine) return this._engine;
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(this.rootUrl("/props"), { headers: this.headers(), signal: controller.signal });
+      clearTimeout(t);
+      const json: any = res.ok ? await res.json().catch(() => null) : null;
+      this._engine = json && (json.default_generation_settings || json.chat_template !== undefined || json.model_path) ? "llamacpp" : "openai-proxy";
+    } catch {
+      this._engine = "openai-proxy";
+    }
+    return this._engine;
+  }
+  private _engine?: "llamacpp" | "openai-proxy";
+
+  /**
+   * Native raw completion (`POST /completion`) — the endpoint that carries the controls the chat
+   * endpoint can't (assistant-prefill via a hand-built prompt, `cache_prompt` KV reuse, `n_probs`,
+   * `grammar`). Returns ok:false when unavailable so callers degrade to chat(). Never throws.
+   */
+  async complete(params: { prompt: string; model?: string; maxTokens?: number; temperature?: number; stop?: string[]; grammar?: string; cachePrompt?: boolean; nProbs?: number; minP?: number; topK?: number; topP?: number; logitBias?: Array<[number, number | false]>; timeoutMs?: number; signal?: AbortSignal }): Promise<{ ok: boolean; content: string; logprobs?: TokenLogprob[]; error?: string }> {
+    const body: Record<string, unknown> = { prompt: params.prompt, n_predict: params.maxTokens ?? DEFAULT_MAIN_MAX_TOKENS, cache_prompt: params.cachePrompt ?? true, stream: false };
+    if (params.temperature !== undefined) body.temperature = params.temperature;
+    if (params.stop?.length) body.stop = params.stop;
+    if (params.grammar) body.grammar = params.grammar;
+    if (params.nProbs) body.n_probs = params.nProbs;
+    if (params.minP !== undefined) body.min_p = params.minP;
+    if (params.topK !== undefined) body.top_k = params.topK;
+    if (params.topP !== undefined) body.top_p = params.topP;
+    if (params.logitBias?.length) body.logit_bias = params.logitBias;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      const res = await fetch(this.rootUrl("/completion"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal: params.signal ?? controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return { ok: false, content: "", error: `HTTP ${res.status}` };
+      const json: any = await res.json();
+      // llama.cpp /completion returns { content, completion_probabilities? }
+      const probs = Array.isArray(json?.completion_probabilities)
+        ? json.completion_probabilities.map((p: any) => ({ token: String(p?.content ?? p?.token ?? ""), logprob: typeof p?.logprob === "number" ? p.logprob : Math.log(Math.max(1e-9, p?.prob ?? 0)), top: Array.isArray(p?.probs) ? p.probs.map((x: any) => ({ token: String(x?.tok_str ?? x?.token ?? ""), logprob: typeof x?.logprob === "number" ? x.logprob : Math.log(Math.max(1e-9, x?.prob ?? 0)) })) : [] }))
+        : undefined;
+      return { ok: true, content: typeof json?.content === "string" ? json.content : "", logprobs: probs };
+    } catch (err) {
+      return { ok: false, content: "", error: (err as Error).message };
+    }
+  }
+
+  /** Native `POST /tokenize` → token ids (for precise logit_bias). Returns [] when unavailable. */
+  async tokenize(text: string, timeoutMs = 10000): Promise<number[]> {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(this.rootUrl("/tokenize"), { method: "POST", headers: this.headers(), body: JSON.stringify({ content: text, add_special: false }), signal: controller.signal });
+      clearTimeout(t);
+      if (!res.ok) return [];
+      const json: any = await res.json();
+      const toks = json?.tokens;
+      return Array.isArray(toks) ? toks.map((x: any) => (typeof x === "number" ? x : x?.id)).filter((n: any) => typeof n === "number") : [];
     } catch {
       return [];
     }
@@ -257,6 +373,20 @@ function parseToolCalls(raw: unknown): ParsedToolCall[] {
     out.push({ id: tc.id ?? `call-${out.length}`, name: fn.name ?? "", args, argError, raw: argStr });
   }
   return out;
+}
+
+/** Parse an OpenAI-style `choice.logprobs` payload into a compact per-token form. Returns undefined
+ *  when absent. Handles both the chat shape (`content[]`) and the legacy completion shape (`tokens[]`). */
+function parseLogprobs(lp: any): TokenLogprob[] | undefined {
+  const content = lp?.content;
+  if (Array.isArray(content) && content.length) {
+    return content.map((c: any) => ({
+      token: String(c?.token ?? ""),
+      logprob: typeof c?.logprob === "number" ? c.logprob : 0,
+      top: Array.isArray(c?.top_logprobs) ? c.top_logprobs.map((t: any) => ({ token: String(t?.token ?? ""), logprob: typeof t?.logprob === "number" ? t.logprob : 0 })) : []
+    }));
+  }
+  return undefined;
 }
 
 function failure(error: string, started: number): ChatResult {

@@ -28,23 +28,27 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
+import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
 import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
 import { EvalRegistry, defaultRegistry } from "./disjointness.js";
 
 /** Which levers are ON. Part D3 flips these one at a time to measure each lever's marginal Best@1. */
 export interface AscentLevers {
-  diversity: boolean;   // A1 — multi-axis best-of-N (off ⇒ k=1)
-  web: boolean;         // A2 — web augmentation on an unresolved error
-  experience: boolean;  // A3 — experience RAG priming + admission
-  skills: boolean;      // A4 — task-family playbook priming
-  cascade: boolean;     // C1 — cheap→expensive pre-filter
-  cloudBurst: boolean;  // C2 — parallel cloud generation (needs a cloud config)
-  orm: boolean;         // B3 — ORM ranking (needs an orm)
+  diversity: boolean;    // A1 — multi-axis best-of-N (off ⇒ k=1)
+  web: boolean;          // A2 — web augmentation on an unresolved error
+  experience: boolean;   // A3 — experience RAG priming + admission
+  skills: boolean;       // A4 — task-family playbook priming
+  cascade: boolean;      // C1 — cheap→expensive pre-filter
+  cloudBurst: boolean;   // C2 — parallel cloud generation (needs a cloud config)
+  orm: boolean;          // B3 — ORM ranking (needs an orm)
+  confidence: boolean;   // P1 — self-certainty selection tiebreaker (owned engine, needs logprobs)
+  banForbidden: boolean; // P2 — decode-time forbidden-construct ban + finish-gate scan
+  samplerDiversity: boolean; // P5 — per-sample sampler profiles to decorrelate the batch
 }
 
-export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true };
-export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false };
+export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true };
+export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false };
 
 export interface AscentConfig {
   llm: KittenLLM;
@@ -195,6 +199,18 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const genLlm = lever(config, "cloudBurst") && config.cloudBurst ? cloudLlm(config.cloudBurst) : config.llm;
   const concurrency = lever(config, "cloudBurst") && config.cloudBurst ? (config.cloudBurst.concurrency ?? 6) : 1;
 
+  // P2 — decode-time forbidden-construct ban: derive bans from the task's stated prohibitions, and (on a
+  // native engine with /tokenize) build the logit_bias hard-ban. The finish-gate SOURCE SCAN (in
+  // reliable.ts) is the engine-agnostic layer that always runs when banForbidden is on.
+  let banDecode: { logitBias?: Record<number, number> } | undefined;
+  if (lever(config, "banForbidden")) {
+    try {
+      const ban = await buildBanDecode(config.llm, contract, params.task);
+      if (ban.bans.length) receipts.push(`forbidden: ${ban.bans.join("/")}${Object.keys(ban.logitBias).length ? ` (decode-banned ${Object.keys(ban.logitBias).length} tokens)` : " (finish-gate scan only)"}`);
+      if (Object.keys(ban.logitBias).length) banDecode = { logitBias: ban.logitBias };
+    } catch { /* ban derivation best-effort */ }
+  }
+
   // Coverage rounds (A1 + A2 repair). Round 1 primes from A3/A4; a repair round adds A2's web brief.
   let allAttempts: BurstAttempt[] = [];
   let repairSeed: string | undefined;
@@ -206,10 +222,12 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     const plans = planAttempts(samples, {
       multiFile: contract.files.length > 1,
       localizationVariants: Math.max(1, Math.min(4, contract.files.length)),
-      repairSeed
+      repairSeed,
+      samplerDiversity: lever(config, "samplerDiversity")
     });
     const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, signal: params.signal },
+      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime,
+        captureConfidence: lever(config, "confidence"), decode: banDecode, banForbidden: lever(config, "banForbidden"), signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
     );
@@ -252,7 +270,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     llm: config.llm, task: params.task, contract, testCommand,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null
   });
-  const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a) }));
+  const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
   const verdict = await verifier.verify(candidates);
   receipts.push(...verifierReceiptLines(verdict));
 

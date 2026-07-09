@@ -70,6 +70,9 @@ export interface CloudBurstParams {
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
   experiencePrime?: string;    // A3 priming (same for all attempts)
+  captureConfidence?: boolean; // P1: capture self-certainty for selection
+  decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string }; // P2 ban (global)
+  banForbidden?: boolean;      // P2: run the finish-gate forbidden-construct scan
   signal?: AbortSignal;
 }
 
@@ -95,7 +98,11 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
       result = await runOne({
         task: params.task, cwd: workspace, llm: params.llm, model: params.model,
         maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, temperature: plan.temperature,
-        extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime, signal: params.signal
+        extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime,
+        captureConfidence: params.captureConfidence,
+        decode: { ...params.decode, ...plan.decode },
+        banForbidden: params.banForbidden,
+        signal: params.signal
       });
     } catch (e) {
       result = { finished: false, summary: `burst attempt error: ${(e as Error).message}`, turns: 0, toolCalls: 0, filesWritten: [], events: [], usage: { prompt: 0, completion: 0, reasoning: 0 }, wallMs: 0, stopReason: "error", contractTargets: [] };
