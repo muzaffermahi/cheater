@@ -48,6 +48,21 @@ export function cloudModels(opts: { baseUrl: string; apiKey: string; main?: stri
   };
 }
 
+/**
+ * Model tiering (research: Aider's weak-model for commit/summary; Claude Code runs Explore/guide on
+ * Haiku): the SIDECAR does mechanical work (task-family classify, probe-input generation, failure
+ * cards) that does NOT need the full reasoning model — so on a cloud endpoint (where the local 2b isn't
+ * served anyway) tier the sidecar to a cheap cloud model. No-op locally, or when the sidecar was set
+ * explicitly (KITTEN_SIDECAR_MODEL). This keeps the expensive model spent only on the actual coding.
+ */
+export function tierSidecar(models: KittenModels): KittenModels {
+  const isCloud = /^https?:\/\//.test(models.baseUrl) && !/localhost|127\.0\.0\.1|0\.0\.0\.0/.test(models.baseUrl);
+  if (isCloud && !process.env.KITTEN_SIDECAR_MODEL) {
+    return { ...models, sidecar: process.env.KITTEN_CLOUD_SIDECAR_MODEL || "qwen3-8b" };
+  }
+  return models;
+}
+
 export interface ToolSchema {
   name: string;
   description: string;

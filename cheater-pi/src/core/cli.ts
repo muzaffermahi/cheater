@@ -14,7 +14,7 @@ import { runReliableAgent } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
 import { runAscent, defaultAscentConfig } from "./ascent.js";
 import { DisjointnessError } from "./disjointness.js";
-import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
+import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 
 interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; ascent: boolean; hard: boolean; k?: number; reasoning?: "low" | "medium" | "high"; }
 
@@ -47,7 +47,7 @@ async function main(argv: string[]): Promise<number> {
     process.stderr.write('usage: kitten-core run "<task>" [--cwd DIR] [--model M] [--reliable|--bon N|--ascent [--hard]] [--max-turns N] [--trace FILE] [--quiet]\n');
     return 2;
   }
-  const llm = new KittenLLM(DEFAULT_MODELS);
+  const llm = new KittenLLM(tierSidecar(DEFAULT_MODELS));
   const model = opts.model ?? DEFAULT_MODELS.main;
   if (!opts.quiet) process.stderr.write(`kitten-core${opts.reliable ? " (reliable)" : ""}: ${model} @ ${DEFAULT_MODELS.baseUrl}  cwd=${opts.cwd}\n`);
 
