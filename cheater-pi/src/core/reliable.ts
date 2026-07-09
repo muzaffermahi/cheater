@@ -25,6 +25,7 @@ import { extractAcceptanceContract } from "../runstate/contract.js";
 import { loadProjectCommands } from "../reliability/projectCommands.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
 import { failureCard, renderCard } from "./sidecar.js";
+import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures, type WorkedExample } from "./workedExamples.js";
 
 export interface ReliableParams {
   task: string;
@@ -70,6 +71,16 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
   if (contract.symbols.length) contractLines.push(`Symbols named in the task: ${contract.symbols.join(", ")}`);
   if (contract.commands.length) contractLines.push(`Commands named in the task: ${contract.commands.join(" | ")}`);
 
+  // Worked-example anchor: the task's own I/O examples are GROUND TRUTH (not model-generated → not
+  // self-flattering). The finish gate refuses "done" while any fail, and they're stated up front so the
+  // model targets them. The single py module the examples call is the target file.
+  const pyModule = contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null;
+  const workedExamples = pyModule ? extractWorkedExamples(task, contract.symbols) : [];
+  const setupVars = workedExamples.length ? extractSetupVars(task) : [];
+  const examplesLine = workedExamples.length
+    ? `\nThe task gives worked examples — these are GROUND TRUTH your code MUST satisfy exactly:\n${workedExamples.slice(0, 6).map((e) => `  ${e.call} == ${e.expected}`).join("\n")}\nAfter writing the code, run these exact calls and confirm each matches before finishing.`
+    : "";
+
   // Keep the upfront prompt LEAN. A verbose "verify the normal case AND every edge (empty, single,
   // boundary, ordering)…" mandate primes a small model to over-explore even trivial tasks (observed:
   // 9 turns diagnosing a one-line dedup fix). The detailed verify guidance lives in the finish gate and
@@ -83,6 +94,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
     briefs.length ? `\nRelevant code, already located for you (read more with the read tool if needed):\n${briefs.join("\n")}` : "",
+    examplesLine,
     params.experiencePrime ? `\n${params.experiencePrime}` : "",
     params.extraDirective ? `\n${params.extraDirective}` : "",
     `\n${verifyReminder}`,
@@ -101,7 +113,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     onEvent: params.onEvent,
     signal: params.signal,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm)
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars })
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -133,7 +145,20 @@ function postEditSyntaxGate(call: { name: string; args: Record<string, unknown> 
 const EXECUTED_RE = /\b(pytest|unittest|python3?\s+\S+\.py|python3?\s+-c|node\s+\S+\.(m|c)?js|node\s+-e|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S+)\b/i;
 
 /** Finish gate: refuse "done" without an execution receipt; ground a failure via the sidecar. */
-async function finishGate(state: FinishGateState, testCmd: string | null, llm: import("./llm.js").KittenLLM): Promise<{ allowed: boolean; feedback?: string }> {
+async function finishGate(
+  state: FinishGateState,
+  testCmd: string | null,
+  llm: import("./llm.js").KittenLLM,
+  worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[] }
+): Promise<{ allowed: boolean; feedback?: string }> {
+  // Worked-example anchor FIRST — ground truth from the task itself. If the code fails the task's own
+  // stated I/O, it is not done regardless of any other signal (and the failing case is the repair seed).
+  if (worked?.module && worked.examples.length) {
+    const r = runExampleTest(state.cwd, worked.module, worked.examples, worked.setupVars);
+    if (r.ran && r.failures.length) {
+      return { allowed: false, feedback: renderExampleFailures(r) + "\nFix the cause and re-check these exact calls before finishing." };
+    }
+  }
   if (testCmd) {
     // Re-run the project tests as the receipt. Allowed only if they pass now.
     const r = spawnSync(testCmd, { cwd: state.cwd, shell: true, encoding: "utf8", timeout: 120000, windowsHide: true });
