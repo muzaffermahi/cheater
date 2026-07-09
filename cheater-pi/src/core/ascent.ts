@@ -227,7 +227,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     });
     const attempts = await cloudBurstGenerate(
       { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime,
-        captureConfidence: lever(config, "confidence"), decode: banDecode, banForbidden: lever(config, "banForbidden"), signal: params.signal },
+        decode: banDecode, banForbidden: lever(config, "banForbidden"), signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
     );
@@ -268,7 +268,8 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // B — verify the survivors and select the winner.
   const verifier = new Verifier({
     llm: config.llm, task: params.task, contract, testCommand,
-    behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null
+    behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
+    confidence: lever(config, "confidence"), module: contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null
   });
   const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
   const verdict = await verifier.verify(candidates);

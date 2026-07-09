@@ -11,7 +11,7 @@
 // (1 − normalised entropy of the renormalised top-k). Length-invariant (a mean); in [0,1]; higher = more
 // certain. Used ONLY as a tiebreaker in the verifier, never as the sole reason a candidate wins (Law 1).
 
-import type { TokenLogprob } from "./llm.js";
+import type { KittenLLM, TokenLogprob } from "./llm.js";
 
 /** Mean over tokens of (1 − H(top-k)/log k): how peaked the token distributions were. 0.5 if no data. */
 export function selfCertainty(tokens: TokenLogprob[] | undefined): number {
@@ -44,4 +44,26 @@ export function aggregateSelfCertainty(chunks: Array<TokenLogprob[] | undefined>
     total += c.length;
   }
   return { selfCertainty: total ? weighted / total : 0.5, tokens: total };
+}
+
+/**
+ * P1 (the affordable form) — a BOUNDED post-hoc self-certainty pass: instead of instrumenting every
+ * slow generation turn (which bloats responses and mostly measures non-code tokens), ask the model, in
+ * ONE short logprob call, to state whether the candidate's code meets the spec, and measure how DECISIVE
+ * that verdict was. A coherent solution yields a low-entropy, confident verdict; a subtly-wrong one makes
+ * the model hedge. Bounded (~1 short call/candidate). Returns 0.5 (no signal) on any failure or when the
+ * engine returns no logprobs. This is the owned-engine tiebreaker — needs logprobs, which Pi never asks for.
+ */
+export async function reviewerConfidence(llm: KittenLLM, spec: string, code: string): Promise<number> {
+  if (!code.trim()) return 0.5;
+  try {
+    const r = await llm.chat({
+      messages: [{ role: "user", content: `Spec:\n"""${spec.slice(0, 1200)}"""\n\nCandidate solution:\n\`\`\`python\n${code.slice(0, 2500)}\n\`\`\`\n\nIn ONE sentence, state whether this solution correctly and completely implements the spec, including edge cases.` }],
+      maxTokens: 160, temperature: 0, logprobs: true, topLogprobs: 5, timeoutMs: 45000
+    });
+    if (!r.ok || !r.logprobs?.length) return 0.5;
+    return selfCertainty(r.logprobs);
+  } catch {
+    return 0.5;
+  }
 }

@@ -26,7 +26,10 @@
 import { spawnSync } from "node:child_process";
 import type { KittenLLM } from "./llm.js";
 import type { AcceptanceContract } from "../runstate/contract.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { runFnProbes, selectByConsensus, type FnProbe, type ProbeOutcome } from "./synthtest.js";
+import { reviewerConfidence } from "./selfCertainty.js";
 import type { OrmScorer } from "./orm.js";
 
 export type Signal = "pass" | "fail" | "n/a";
@@ -80,6 +83,10 @@ export interface VerifierOpts {
   probe?: FnProbe | null;
   /** B3 outcome reward model. Off (null) unless a trained checkpoint is loaded. */
   orm?: OrmScorer | null;
+  /** P1: run a bounded reviewer self-certainty pass per candidate (owned-engine tiebreaker). */
+  confidence?: boolean;
+  /** P1: the py module to read each candidate's code from (for the confidence pass). */
+  module?: string | null;
   /** Per-command timeout for execution signals. */
   timeoutMs?: number;
 }
@@ -138,8 +145,7 @@ export class Verifier {
       const weaklyEligible = !anyApplied;
       if (weaklyEligible) receipt.push(`no execution signal available → eligibility from finish gate (${c.finished ? "finished" : "unfinished"})`);
 
-      if (c.selfCertainty !== undefined) receipt.push(`self-certainty ${c.selfCertainty.toFixed(3)}`);
-      slate.push({ index: c.index, reproduction, regression, smoke, executionEligible, weaklyEligible, selfCertainty: c.selfCertainty, receipt });
+      slate.push({ index: c.index, reproduction, regression, smoke, executionEligible, weaklyEligible, receipt });
     }
 
     // B2 consensus over the probe, run on every candidate's workspace (eligible or not, so a candidate
@@ -161,6 +167,17 @@ export class Verifier {
       for (let i = 0; i < candidates.length; i++) {
         const traj = candidates[i].trajectory ?? candidates[i].summary;
         try { const p = await this.opts.orm.score(traj, this.opts.task); slate[i].ormScore = p; slate[i].receipt.push(`ORM P(solved)=${p.toFixed(2)}`); } catch { /* orm best-effort */ }
+      }
+    }
+
+    // P1 — bounded reviewer self-certainty per candidate (owned-engine tiebreaker; needs logprobs).
+    if (this.opts.confidence && this.opts.module) {
+      for (let i = 0; i < candidates.length; i++) {
+        let code = "";
+        try { code = readFileSync(join(candidates[i].workspace, this.opts.module), "utf8"); } catch { /* no code */ }
+        const sc = candidates[i].selfCertainty ?? (code ? await reviewerConfidence(this.opts.llm, this.opts.task, code) : 0.5);
+        slate[i].selfCertainty = sc;
+        slate[i].receipt.push(`self-certainty ${sc.toFixed(3)}`);
       }
     }
 
