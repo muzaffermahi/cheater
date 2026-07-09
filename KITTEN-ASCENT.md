@@ -169,6 +169,44 @@ discipline that a lever which doesn't earn its keep gets cut). What the research
 next, still unbuilt: metamorphic/ambiguity resolution (sample-disagreement on an input class → force the
 model to resolve that boundary) and CodeT dual-agreement selection (√|Sx|×|Sy| over samples × tests).
 
+## Owning the inference engine (the structural edge over Pi/opencode)
+
+Kitten talks *directly* to its local engine, so it can reach into the DECODE LOOP — controls Pi/opencode
+structurally can't send (they only ever emit the OpenAI-standard fields; swapping local↔API is a no-op for
+them). Built on branch `kitten-ascent` (foundation + 5 phased levers, all toggleable for ablation, 696
+tests green). Research basis: 3 parallel web agents on engine capabilities + technique effect-sizes.
+
+**Foundation** (`llm.ts`): an engine probe (`detectEngine` via `GET /props` → native llama.cpp vs an
+OpenAI proxy), a raw `complete()` (native `/completion` for prefill / `cache_prompt` / `n_probs` /
+`grammar`), `tokenize()` (`/tokenize`), logprob parsing into `ChatResult`, and new `ChatParams` decode
+controls (`logitBias`, `topP/topK/minP`, `dryMultiplier`, `grammar`, `cachePrompt`) threaded through the
+per-sample spine (`AttemptPlan` → cloudBurst → agent → body), each a no-op when its feature is unsupported.
+
+| Lever | What owning the engine buys | Reachable on | Status |
+|---|---|---|---|
+| **P1 self-certainty** (`selfCertainty.ts`) | Rank tied candidates by how DECISIVE the model was (KL-from-uniform over top-k logprobs; **never** mean-logprob). A bounded reviewer pass per candidate in the verifier fusion — breaks the "all agree but wrong" case (cron). | cloud + native (needs logprobs) | ✅ live: computed as verifier tiebreaker |
+| **P2 forbidden ban** (`constraints.ts`) | The model **literally cannot emit** `import re`/`eval` — a hard decode ban (native `logit_bias` via `/tokenize`) + an engine-agnostic finish-gate source scan. Fixes the oracle-enforced regexlite/expr auto-fails. | scan: everywhere; hard-ban: native | ✅ live: steered expr off eval/exec |
+| **P3 KV-cache + spec-decoding** | Reuse the shared system+task prefix's KV across the k samples; a small MTP speculative budget. The latency lever. | native llama.cpp (server-config) | ⚠️ enabler shipped (`cachePrompt`); spec-decoding = documented server flags |
+| **P4 assistant-prefill** | Seed a reasoning scaffold (edge-case analysis + fence, never the `def` body — that suppresses reasoning) via native `/completion`. | native (`complete()`); cloud reasoning-model prefill 400s | ⚠️ `complete()` shipped; native-path |
+| **P5 sampler diversity** (`attemptSampler`) | Per-sample top_p/top_k (native adds min_p/DRY) to decorrelate the batch, feeding P1/consensus. | cloud + native | ✅ live |
+
+**Honest measurement (cloud qwen3.6-35b, all owned levers on):** no regression — expr PASS (215s), ledger
+PASS (139s), cron PASS (271s this run; consensus+diversity selected the correct candidate). But the levers
+did **not** cleanly flip a *new* task beyond the worked-example gate's 7/10 on the cloud, because the
+cloud exposes only a subset: **the biggest owned wins need the native `llama-server` runtime** —
+- regexlite (both agents fail): the cloud finish-gate scan forces repair loops that time out; a **native
+  decode-time hard-ban** would stop `import re` ever being written, letting the model spend its turns on a
+  manual matcher. This is the exact owned-inference payoff, unreachable on the cloud.
+- the 150–320 s/task latency: **spec-decoding (MTP) + reliable `cache_prompt`** are native/server-config.
+- **grammar→valid-Python**, **`n_probs` generation-logprobs**, **min_p/DRY**, **FIM** — all native-only.
+
+So: the capability is built and the levers fire; the full payoff is gated on running `llama-server`
+(the chosen primary runtime) — the post-session validation. Recommended launch:
+`llama-server -m ornith.gguf --jinja -md draft.gguf --draft-max 2 --slot-save-path .kv --port 1234`
+(then kitten's `detectEngine` unlocks the native path automatically). Caveat the research flagged: on an
+A3B **MoE**, an *external* draft model can net-SLOW decode — prefer vLLM **MTP** with a small budget, and
+measure before relying.
+
 ## Design laws (extend the kitten laws)
 
 1. The verifier is execution-grounded or it doesn't count. 2. Coverage before cleverness (real diversity,

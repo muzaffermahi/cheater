@@ -143,6 +143,10 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       minP: params.decode?.minP,
       dryMultiplier: params.decode?.dryMultiplier,
       grammar: params.decode?.grammar,
+      // P3a — KV-cache reuse: harmless on cloud/LM Studio (ignored); on native llama.cpp it reuses the
+      // KV of the shared system+task prefix across the k best-of-N samples (they share everything up to
+      // the per-sample directive). Automatic prefix caching does most of this; the flag makes it explicit.
+      cachePrompt: true,
       signal: params.signal
     });
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;
