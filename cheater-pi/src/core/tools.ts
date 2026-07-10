@@ -11,7 +11,7 @@
 // Every tool returns a plain string the model sees, and never throws.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
 
@@ -21,6 +21,8 @@ export interface ToolContext {
   filesRead: Set<string>;
   /** Files the agent has written this run. */
   filesWritten: Set<string>;
+  /** Abort signal for the run — a cancellable tool (bash) kills its process tree when this fires. */
+  signal?: AbortSignal;
 }
 
 export interface ToolResult {
@@ -32,7 +34,8 @@ export interface ToolResult {
 
 export interface Tool {
   schema: ToolSchema;
-  execute(args: Record<string, unknown>, ctx: ToolContext): ToolResult;
+  /** Sync tools return a ToolResult directly; a cancellable tool (bash) returns a Promise. */
+  execute(args: Record<string, unknown>, ctx: ToolContext): ToolResult | Promise<ToolResult>;
 }
 
 const READ_WINDOW = 400;
@@ -224,22 +227,54 @@ export const bashTool: Tool = {
       required: ["command"]
     }
   },
-  execute(args, ctx) {
+  execute(args, ctx): Promise<ToolResult> {
     const command = String(args.command ?? "");
-    if (!command.trim()) return { output: "bash: empty command", isError: true };
+    if (!command.trim()) return Promise.resolve({ output: "bash: empty command", isError: true });
     const timeoutMs = Math.max(1000, Number(args.timeout_seconds ?? 120) * 1000);
-    let out = "", err = "", code = 0, timedOut = false;
-    try {
-      const r = spawnSync(command, { cwd: ctx.cwd, shell: true, encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 20 * 1024 * 1024 });
-      out = r.stdout ?? ""; err = r.stderr ?? "";
-      code = typeof r.status === "number" ? r.status : 1;
-      timedOut = r.signal === "SIGTERM";
-    } catch (e) { return { output: `bash: ${(e as Error).message}`, isError: true }; }
-    const combined = truncate([out, err].filter(Boolean).join("\n"));
-    const status = timedOut ? `(timed out after ${timeoutMs / 1000}s)` : `exit ${code}`;
-    return { output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`, isError: code !== 0 || timedOut, meta: { exitCode: code, timedOut } };
+    return new Promise<ToolResult>((resolve) => {
+      // Already-cancelled: don't even start.
+      if (ctx.signal?.aborted) { resolve({ output: `$ ${command}\n[cancelled before start]`, isError: true, meta: { cancelled: true } }); return; }
+      // detached on POSIX so we can signal the whole process GROUP; on Windows we taskkill the tree.
+      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
+      let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
+      const CAP = 12 * 1024 * 1024;
+      const onOut = (d: Buffer): void => { if (out.length < CAP) out += d.toString("utf8"); };
+      const onErr = (d: Buffer): void => { if (err.length < CAP) err += d.toString("utf8"); };
+      child.stdout?.on("data", onOut);
+      child.stderr?.on("data", onErr);
+      const timer = setTimeout(() => { killedBy = "timeout"; killTree(child); }, timeoutMs);
+      const onAbort = (): void => { killedBy = "cancelled"; killTree(child); };
+      ctx.signal?.addEventListener("abort", onAbort, { once: true });
+      const done = (code: number | null, signalName: NodeJS.Signals | null): void => {
+        clearTimeout(timer);
+        ctx.signal?.removeEventListener("abort", onAbort);
+        const combined = truncate([out, err].filter(Boolean).join("\n"));
+        const status = killedBy === "timeout" ? `(timed out after ${timeoutMs / 1000}s — process tree killed)`
+          : killedBy === "cancelled" ? "(cancelled — process tree killed)"
+          : signalName ? `killed by ${signalName}` : `exit ${code ?? 1}`;
+        resolve({
+          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`,
+          isError: killedBy !== null || (code ?? 1) !== 0 || !!signalName,
+          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName },
+        });
+      };
+      child.on("close", done);
+      child.on("error", (e) => { clearTimeout(timer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
+    });
   }
 };
+
+/** Kill a child and its whole descendant tree (a shell often spawns grandchildren — e.g. a test server). */
+function killTree(child: import("node:child_process").ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true });
+    } else {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } // negative pid = process group
+    }
+  } catch { /* already gone */ }
+}
 
 function truncate(s: string): string {
   if (s.length <= BASH_HEAD + BASH_TAIL + 100) return s;

@@ -113,7 +113,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const tools = params.tools ?? CORE_TOOLS;
   const events: AgentEvent[] = [];
   const emit = (e: AgentEvent): void => { events.push(e); params.onEvent?.(e); };
-  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set() };
+  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal };
   resetNounGate();
 
   // Ground the model in its real environment. Without this, a small model invents a cwd (observed
@@ -268,7 +268,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
           }
         }
       }
-      const res = tool.execute(call.args, ctx);
+      const res = await tool.execute(call.args, ctx);
       if (call.name === "edit" || call.name === "write") { if (!res.isError) hasEdited = true; }
       if (call.name === "bash") {
         const c = String(call.args.command ?? ""); bashAll.push(c);
