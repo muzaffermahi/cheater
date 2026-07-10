@@ -16,7 +16,8 @@
 export interface KittenModels {
   baseUrl: string;
   main: string;
-  sidecar: string;
+  /** Optional fast clerical model. Absent on a single-model endpoint → sidecar work runs on `main`. */
+  sidecar?: string;
   embed?: string;
   /** Bearer token. Defaults to "lm-studio" (LM Studio ignores it); a real key for a cloud endpoint. */
   apiKey?: string;
@@ -149,6 +150,12 @@ export interface ChatParams {
   disableThinking?: boolean;
 }
 
+/** An incremental piece of a streamed generation (content and/or reasoning that just arrived). */
+export interface StreamDelta {
+  content?: string;
+  reasoning?: string;
+}
+
 /** One generated token's probability + its top alternatives (parsed from an OpenAI-style logprobs payload). */
 export interface TokenLogprob {
   token: string;
@@ -173,16 +180,15 @@ export class KittenLLM {
     return { "content-type": "application/json", authorization: `Bearer ${this.models.apiKey ?? "lm-studio"}`, ...(this.models.extraHeaders ?? {}) };
   }
 
-  /** One chat completion. Never throws — a failure returns ok:false so the caller can degrade. */
-  async chat(params: ChatParams): Promise<ChatResult> {
-    const started = Date.now();
-    const model = params.model ?? this.models.main;
+  /** Build the OpenAI-compatible request body shared by chat() and chatStream(). */
+  private buildBody(params: ChatParams, stream: boolean): Record<string, unknown> {
     const body: Record<string, unknown> = {
-      model,
+      model: params.model ?? this.models.main,
       messages: params.messages.map(serializeMessage),
       max_tokens: params.maxTokens ?? DEFAULT_MAIN_MAX_TOKENS,
-      stream: false
+      stream,
     };
+    if (stream) body.stream_options = { include_usage: true };
     if (params.temperature !== undefined) body.temperature = params.temperature;
     if (params.tools?.length) {
       body.tools = params.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
@@ -193,8 +199,6 @@ export class KittenLLM {
     }
     if (params.logprobs) { body.logprobs = true; if (params.topLogprobs) body.top_logprobs = params.topLogprobs; }
     if (params.reasoningEffort) body.reasoning_effort = params.reasoningEffort;
-    // Owned-inference decode controls — sent only when set; a picky engine's rejection is the caller's
-    // capability-latch concern (it drops the offending field and retries).
     if (params.topP !== undefined) body.top_p = params.topP;
     if (params.topK !== undefined) body.top_k = params.topK;
     if (params.minP !== undefined) body.min_p = params.minP;
@@ -204,17 +208,18 @@ export class KittenLLM {
     if (params.grammar) body.grammar = params.grammar;
     if (params.cachePrompt) body.cache_prompt = params.cachePrompt;
     if (params.disableThinking) body.chat_template_kwargs = { ...(body.chat_template_kwargs as object ?? {}), enable_thinking: false };
+    return body;
+  }
 
+  /** One chat completion. Never throws — a failure returns ok:false so the caller can degrade. */
+  async chat(params: ChatParams): Promise<ChatResult> {
+    const started = Date.now();
+    const body = this.buildBody(params, false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const signal = params.signal ?? controller.signal;
     try {
-      const res = await fetch(this.url("/chat/completions"), {
-        method: "POST",
-        headers: this.headers(),
-        body: JSON.stringify(body),
-        signal
-      });
+      const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
@@ -241,11 +246,80 @@ export class KittenLLM {
       };
     } catch (err) {
       const e = err as Error;
-      return failure(e.name === "AbortError" ? "timeout" : `network: ${e.message}`, started);
+      // Distinguish a caller cancellation from a timeout (Goal §3/§6: a cancelled read is not a failure).
+      const reason = e.name === "AbortError" ? (params.signal?.aborted ? "cancelled" : "timeout") : `network: ${e.message}`;
+      return failure(reason, started);
     } finally {
       clearTimeout(timer);
     }
   }
+
+  /**
+   * Streaming chat completion. Parses OpenAI/llama.cpp SSE chunks, calling `onDelta` with incremental
+   * content/reasoning as they arrive, and returns the SAME reconstructed ChatResult as chat() (full
+   * content + exactly-reconstructed tool calls — partial tool arguments are NEVER surfaced to callers).
+   * Never throws; a cancelled read returns ok:false error "cancelled" (not a generic network failure).
+   */
+  async chatStream(params: ChatParams, onDelta: (d: StreamDelta) => void): Promise<ChatResult> {
+    const started = Date.now();
+    const body = this.buildBody(params, true);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const signal = params.signal ?? controller.signal;
+    const acc = new StreamAccumulator();
+    try {
+      const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
+      }
+      if (!res.body) return failure("no response body for stream", started);
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        // SSE frames are separated by a blank line; each has one or more `data:` lines.
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          for (const line of frame.split("\n")) {
+            const m = line.match(/^data:\s?(.*)$/);
+            if (!m) continue;
+            const payload = m[1];
+            if (payload === "[DONE]") continue;
+            let json: any;
+            try { json = JSON.parse(payload); } catch { continue; } // skip a malformed/partial chunk
+            const d = acc.consume(json);
+            if (d.content || d.reasoning) { try { onDelta(d); } catch { /* a bad listener never breaks the stream */ } }
+          }
+        }
+      }
+      return acc.finalize(started);
+    } catch (err) {
+      const e = err as Error;
+      const reason = e.name === "AbortError" ? (params.signal?.aborted ? "cancelled" : "timeout") : `network: ${e.message}`;
+      return failure(reason, started);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** Whether streaming works on this endpoint/model — probed once and cached. */
+  async supportsStreaming(): Promise<boolean> {
+    if (this._streamCap !== undefined) return this._streamCap;
+    let sawDelta = false;
+    const r = await this.chatStream(
+      { messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 8, timeoutMs: 20000 },
+      () => { sawDelta = true; },
+    );
+    this._streamCap = r.ok && (sawDelta || r.content.length > 0 || r.reasoning.length > 0);
+    return this._streamCap;
+  }
+  private _streamCap?: boolean;
 
   /**
    * A sidecar call: the fast CPU model, defaulted to a tight budget and (optionally) json_schema.
@@ -256,7 +330,7 @@ export class KittenLLM {
     // A reasoning model (ornith) with thinking ON burns the whole token budget in reasoning_content and
     // returns EMPTY content, which silently killed consensus/classification on the local native engine.
     // Default thinking OFF; if a picky endpoint rejects chat_template_kwargs, retry once with it on.
-    const p = { ...params, model: params.model ?? this.models.sidecar, maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000, disableThinking: params.disableThinking ?? true };
+    const p = { ...params, model: params.model ?? this.models.sidecar ?? this.models.main, maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000, disableThinking: params.disableThinking ?? true };
     const r = await this.chat(p);
     if (!r.ok && p.disableThinking) return this.chat({ ...p, disableThinking: false });
     return r;
@@ -358,6 +432,66 @@ export class KittenLLM {
   async ping(model: string): Promise<boolean> {
     const r = await this.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 64, timeoutMs: 20_000 });
     return r.ok;
+  }
+}
+
+/** Accumulates OpenAI/llama.cpp streaming chunks into a full ChatResult, exposing per-chunk deltas. */
+class StreamAccumulator {
+  private content = "";
+  private reasoning = "";
+  private finishReason = "stop";
+  private usage = { prompt: 0, completion: 0, reasoning: 0, total: 0 };
+  private readonly toolAcc = new Map<number, { id: string; name: string; args: string }>();
+  private lastRaw: unknown = null;
+
+  /** Fold one parsed SSE chunk in; return the content/reasoning that just arrived (for the UI). */
+  consume(json: any): StreamDelta {
+    this.lastRaw = json;
+    if (json?.usage) {
+      const u = json.usage;
+      this.usage = {
+        prompt: u.prompt_tokens ?? this.usage.prompt,
+        completion: u.completion_tokens ?? this.usage.completion,
+        reasoning: u.completion_tokens_details?.reasoning_tokens ?? this.usage.reasoning,
+        total: u.total_tokens ?? this.usage.total,
+      };
+    }
+    const choice = json?.choices?.[0];
+    if (!choice) return {};
+    if (choice.finish_reason) this.finishReason = choice.finish_reason;
+    const delta = choice.delta ?? {};
+    const out: StreamDelta = {};
+    if (typeof delta.content === "string" && delta.content) { this.content += delta.content; out.content = delta.content; }
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content) { this.reasoning += delta.reasoning_content; out.reasoning = delta.reasoning_content; }
+    else if (typeof delta.reasoning === "string" && delta.reasoning) { this.reasoning += delta.reasoning; out.reasoning = delta.reasoning; }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = typeof tc.index === "number" ? tc.index : this.toolAcc.size;
+        const cur = this.toolAcc.get(idx) ?? { id: "", name: "", args: "" };
+        if (tc.id) cur.id = tc.id;
+        if (tc.function?.name) cur.name = tc.function.name;
+        if (typeof tc.function?.arguments === "string") cur.args += tc.function.arguments;
+        this.toolAcc.set(idx, cur);
+      }
+    }
+    return out;
+  }
+
+  /** Reconstruct the final ChatResult — tool calls parsed EXACTLY from the assembled fragments. */
+  finalize(started: number): ChatResult {
+    const raw = [...this.toolAcc.entries()].sort((a, b) => a[0] - b[0]).map(([, t], i) => ({
+      id: t.id || `call-${i}`, type: "function" as const, function: { name: t.name, arguments: t.args },
+    }));
+    return {
+      content: this.content,
+      reasoning: this.reasoning,
+      toolCalls: parseToolCalls(raw),
+      finishReason: this.finishReason,
+      usage: this.usage,
+      ok: true,
+      elapsedMs: Date.now() - started,
+      raw: this.lastRaw,
+    };
   }
 }
 

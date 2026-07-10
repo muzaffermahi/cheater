@@ -57,7 +57,8 @@ function renderEvent(e: KittenEvent): string | null {
   switch (e.type) {
     case "user.message": return bold("you› ") + e.text;
     case "route.selected": return dim(`  route → ${e.lane}${e.k > 1 ? ` (k=${e.k})` : ""}  ${e.reasons.join("; ")}`);
-    case "assistant.delta": return e.text.trim() ? dim("  · ") + e.text.trim() : null;
+    case "assistant.delta": return null; // streamed live by the run subscriber; skipped in replay (choppy)
+    case "reasoning.delta": return null; // reasoning is streamed live, not replayed
     case "assistant.final": return e.text.trim() ? e.text.trim() : null;
     case "tool.approval_required": return red(`  ⚠ approval needed: ${e.name} — ${e.reason}`);
     case "tool.completed": return dim(`  ${e.ok ? "·" : "✗"} ${e.name}${e.output ? " " + e.output.replace(/\n/g, " ").slice(0, 80) : ""}`);
@@ -102,7 +103,15 @@ async function cmdRun(rest: string[]): Promise<number> {
   // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
   const app = new KittenApp({ store, runner: defaultRunner(), projectRoot: cwd, model, approvalPolicy: dangerous ? "auto-allow" : "auto-deny" });
   app.recover();
-  if (!json) app.subscribe((e) => { const line = renderEvent(e); if (line) process.stdout.write(line + "\n"); });
+  if (!json) {
+    // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
+    const streamed = new Set<string>();
+    app.subscribe((e) => {
+      if (e.type === "assistant.delta") { streamed.add(e.runId); process.stdout.write(dim(e.text)); return; }
+      if (e.type === "assistant.final") { process.stdout.write(streamed.has(e.runId) ? "\n" : "\n" + e.text + "\n"); return; }
+      const line = renderEvent(e); if (line) process.stdout.write(line + "\n");
+    });
+  }
 
   // Continue an existing conversation (headless multi-turn) or start a new one.
   let conv;

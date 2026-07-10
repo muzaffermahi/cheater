@@ -56,6 +56,8 @@ export interface ReliableParams {
   commandGate?: AgentRunParams["commandGate"];
   /** Model-facing conversation context (prior turns + repo truth) for multi-turn/resumed runs. */
   contextPreamble?: string;
+  /** Stream real token deltas (forwarded to the agent loop). */
+  streamDeltas?: boolean;
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -130,6 +132,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     disableThinking: params.disableThinking,
     commandGate: params.commandGate,
     contextPreamble: params.contextPreamble,
+    streamDeltas: params.streamDeltas,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
     finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
   });

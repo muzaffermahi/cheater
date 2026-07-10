@@ -1,0 +1,127 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createServer, type Server } from "node:http";
+import { KittenLLM, type StreamDelta } from "../src/core/llm.js";
+
+// A local fake SSE server that emits a scripted chunk sequence, so the streaming parser is tested
+// deterministically over the REAL chatStream path (fetch + reader + SSE framing), no live model.
+function sseServer(frames: string[]): Promise<{ url: string; close: () => void }> {
+  return new Promise((resolve) => {
+    const server: Server = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // Write frames with a tiny gap so the client sees multiple reads (incremental).
+      let i = 0;
+      const tick = (): void => {
+        if (i >= frames.length) { res.end(); return; }
+        res.write(frames[i++]);
+        setTimeout(tick, 2);
+      };
+      tick();
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      const port = addr && typeof addr === "object" ? addr.port : 0;
+      resolve({ url: `http://127.0.0.1:${port}/v1`, close: () => server.close() });
+    });
+  });
+}
+
+const d = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;
+
+test("chatStream reconstructs content from deltas and calls onDelta incrementally", async () => {
+  const s = await sseServer([
+    d({ choices: [{ delta: { role: "assistant", content: "" } }] }),
+    d({ choices: [{ delta: { content: "Hel" } }] }),
+    d({ choices: [{ delta: { content: "lo," } }] }),
+    d({ choices: [{ delta: { content: " world" } }] }),
+    d({ choices: [{ finish_reason: "stop", delta: {} }], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } }),
+    "data: [DONE]\n\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const deltas: StreamDelta[] = [];
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, (x) => deltas.push(x));
+  s.close();
+  assert.equal(r.ok, true);
+  assert.equal(r.content, "Hello, world");
+  assert.equal(r.finishReason, "stop");
+  assert.equal(r.usage.completion, 4);
+  assert.ok(deltas.length >= 3, "onDelta fired per content chunk");
+  assert.equal(deltas.map((x) => x.content ?? "").join(""), "Hello, world");
+});
+
+test("chatStream separates reasoning deltas from content", async () => {
+  const s = await sseServer([
+    d({ choices: [{ delta: { reasoning_content: "think " } }] }),
+    d({ choices: [{ delta: { reasoning_content: "more" } }] }),
+    d({ choices: [{ delta: { content: "ANSWER" } }] }),
+    d({ choices: [{ finish_reason: "stop", delta: {} }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  let reasoning = "", content = "";
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, (x) => { reasoning += x.reasoning ?? ""; content += x.content ?? ""; });
+  s.close();
+  assert.equal(r.reasoning, "think more");
+  assert.equal(r.content, "ANSWER");
+  assert.equal(reasoning, "think more");
+  assert.equal(content, "ANSWER"); // reasoning never leaks into content
+});
+
+test("chatStream reconstructs a tool call from fragmented arguments (never partial)", async () => {
+  const s = await sseServer([
+    d({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "edit", arguments: "" } }] } }] }),
+    d({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":"a' } }] } }] }),
+    d({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '.py","x":1}' } }] } }] }),
+    d({ choices: [{ finish_reason: "tool_calls", delta: {} }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, () => {});
+  s.close();
+  assert.equal(r.toolCalls.length, 1);
+  assert.equal(r.toolCalls[0].name, "edit");
+  assert.deepEqual(r.toolCalls[0].args, { path: "a.py", x: 1 }); // exact, fully assembled
+});
+
+test("chatStream skips a malformed chunk without failing", async () => {
+  const s = await sseServer([
+    d({ choices: [{ delta: { content: "A" } }] }),
+    "data: {not json}\n\n",
+    d({ choices: [{ delta: { content: "B" } }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, () => {});
+  s.close();
+  assert.equal(r.content, "AB");
+});
+
+test("chatStream returns ok:false on a server error, not a throw", async () => {
+  const server = createServer((_req, res) => { res.writeHead(500); res.end("boom"); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${port}/v1`, main: "x" });
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, () => {});
+  server.close();
+  assert.equal(r.ok, false);
+  assert.match(r.error ?? "", /HTTP 500/);
+});
+
+test("chatStream aborts as 'cancelled', not a generic network error", async () => {
+  // A server that streams slowly so we can abort mid-stream.
+  const s = await sseServer([
+    d({ choices: [{ delta: { content: "slow" } }] }),
+    d({ choices: [{ delta: { content: " ..." } }] }),
+    d({ choices: [{ delta: { content: " more" } }] }),
+    d({ choices: [{ finish_reason: "stop", delta: {} }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(), 4);
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }], signal: ctrl.signal }, () => {});
+  s.close();
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "cancelled");
+});

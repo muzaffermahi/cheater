@@ -29,11 +29,13 @@ async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   // Merge context into the ONE system message (templates reject a second system message).
   const sys = "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files."
     + (ctx.conversationContext.trim() ? `\n\n${ctx.conversationContext}` : "");
-  const r = await llm.chat({
-    model: ctx.model,
-    messages: [{ role: "system", content: sys }, { role: "user", content: ctx.task }],
-    signal: ctx.signal,
-  });
+  const chatParams = { model: ctx.model, messages: [{ role: "system" as const, content: sys }, { role: "user" as const, content: ctx.task }], signal: ctx.signal };
+  // Stream the answer live (coalesced) so a long explanation on a slow local model isn't a frozen wait.
+  let buf = "";
+  const r = typeof llm.chatStream === "function"
+    ? await llm.chatStream(chatParams, (d) => { if (d.content) { buf += d.content; if (buf.length >= 48) { ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf }); buf = ""; } } })
+    : await llm.chat(chatParams);
+  if (buf) ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf });
   const text = r.ok ? r.content : `(model error: ${r.error ?? "unknown"})`;
   ctx.emit({ type: "assistant.final", runId: ctx.runId, text });
   return {
@@ -50,10 +52,20 @@ async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
 /** Coding lanes: direct/reliable/bon/ascent. Maps AgentEvents → canonical events as they arrive. */
 async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   let toolN = 0;
+  const streamedTurns = new Set<number>();
   const onEvent = (e: AgentEvent): void => {
     switch (e.kind) {
+      case "assistant_delta":
+        streamedTurns.add(e.turn);
+        if (e.detail) ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
+        break;
+      case "reasoning_delta":
+        if (e.detail) ctx.emit({ type: "reasoning.delta", runId: ctx.runId, text: e.detail });
+        break;
       case "assistant":
-        if (e.detail && e.detail !== "(tool call)") ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
+        // Non-streaming fallback: emit the whole turn content as one delta. When this turn already
+        // streamed, skip — the deltas covered it (no duplicate text; Goal §3).
+        if (!streamedTurns.has(e.turn) && e.detail && e.detail !== "(tool call)") ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
         break;
       case "tool": {
         const name = e.detail.split("(")[0].trim() || "tool";
@@ -86,11 +98,13 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent);
 
   const preamble = ctx.conversationContext || undefined;
+  // Stream the single-trajectory lanes (direct/reliable). bon/ascent run multiple candidates in parallel
+  // isolated workspaces — interleaving their token streams would be noise, so they don't stream.
   const result = ctx.lane === "bon"
     ? await runBestOfN({ ...common, contextPreamble: preamble }, ctx.k)
     : ctx.lane === "direct"
-      ? await runAgent({ ...common, commandGate, contextPreamble: preamble })
-      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble });
+      ? await runAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true })
+      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });

@@ -74,7 +74,8 @@ function renderEvent(e: KittenEvent): string | null {
   switch (e.type) {
     case "user.message": return A.bold("\nyou › ") + e.text;
     case "route.selected": return A.dim(`  ◆ ${e.lane}${e.k > 1 ? ` k=${e.k}` : ""} — ${e.reasons.join("; ")}`);
-    case "assistant.delta": return e.text.trim() ? "  " + e.text.trim() : null;
+    case "assistant.delta": return null;   // streamed live inline by the subscriber
+    case "reasoning.delta": return null;   // model thinking; the mascot + status show it, not the log
     case "assistant.final": return e.text.trim() ? "\n" + e.text.trim() : null;
     case "tool.approval_required": return A.yellow(`  ⚠ approval needed: ${e.name} — ${e.reason}`);
     case "tool.completed": return A.dim(`  ${e.ok ? "▸" : "✗"} ${e.name}${e.output ? "  " + e.output.replace(/\s+/g, " ").slice(0, 76) : ""}`);
@@ -134,12 +135,16 @@ export async function runTui(argv: string[] = process.argv.slice(2)): Promise<vo
   out("");
 
   // Stream events → render + drive the mascot.
+  const streamedRuns = new Set<string>();
   app.subscribe((e) => {
     if (e.conversationId !== st.conversationId) return;
     const next = mascotStateForRunEvent(e.type);
     if (next) st.mascot = next;
     if (e.type === "run.started") st.activeRun = e.runId;
     if (e.type === "run.completed" || e.type === "run.failed" || e.type === "run.cancelled") st.activeRun = null;
+    // Live streaming: write content deltas inline (no per-chunk newline); finalize without re-printing.
+    if (e.type === "assistant.delta") { streamedRuns.add(e.runId); process.stdout.write(e.text); return; }
+    if (e.type === "assistant.final") { process.stdout.write(streamedRuns.has(e.runId) ? "\n" : (e.text.trim() ? "\n" + e.text.trim() + "\n" : "")); return; }
     const line = renderEvent(e);
     if (line) out(line);
   });

@@ -8,7 +8,7 @@
 // The reliability harness (contract, grade-in-code, check-first, scout) layers on top of this in
 // agent-run.ts; this file is the minimal, honest driver.
 
-import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob } from "./llm.js";
+import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob, type StreamDelta } from "./llm.js";
 import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
@@ -16,7 +16,7 @@ import { aggregateSelfCertainty } from "./selfCertainty.js";
 
 export interface AgentEvent {
   turn: number;
-  kind: "assistant" | "tool" | "gate_block" | "error" | "finish" | "nudge";
+  kind: "assistant" | "assistant_delta" | "reasoning_delta" | "tool" | "gate_block" | "error" | "finish" | "nudge";
   detail: string;
   data?: Record<string, unknown>;
 }
@@ -68,6 +68,10 @@ export interface AgentRunParams {
   /** Model-facing conversation context (prior turns + current repo truth), injected as a system block
    *  after the stable rules and before the current task, so a resumed/multi-turn run informs the model. */
   contextPreamble?: string;
+  /** Stream the model's generation (real token deltas) when the endpoint supports it, emitting coalesced
+   *  assistant_delta/reasoning_delta events. The reconstructed final ChatResult is identical to chat().
+   *  Off for measurement/tests (they use the non-streaming path). */
+  streamDeltas?: boolean;
   /** Owned-engine thinking control (iter-1 speed lever): on a single-function task ornith writes the
    *  code directly ~2x faster when its chain-of-thought is off — the harness (worked-example gate,
    *  consensus, repair) supplies the correctness, not the model's CoT. Thinking is auto-RE-ENABLED once
@@ -145,11 +149,11 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
-    const result: ChatResult = await llm.chat({
+    const chatParams = {
       model: params.model,
       messages,
       tools: tools.map((t) => t.schema),
-      toolChoice: "auto",
+      toolChoice: "auto" as const,
       maxTokens: params.maxTokens,
       temperature: params.temperature,
       reasoningEffort: params.reasoningEffort,
@@ -169,7 +173,18 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       // the per-sample directive). Automatic prefix caching does most of this; the flag makes it explicit.
       cachePrompt: true,
       signal: params.signal
-    });
+    };
+    // Real streaming when asked + supported: emit coalesced content/reasoning deltas as they arrive, so
+    // a slow local model shows live progress instead of a frozen pause. The reconstructed result is
+    // identical to the non-streaming path. Tests/measurement (streamDeltas off) take the plain chat path.
+    let result: ChatResult;
+    if (params.streamDeltas && typeof llm.chatStream === "function") {
+      const co = makeDeltaCoalescer(turn, emit);
+      result = await llm.chatStream(chatParams, (d) => co.push(d));
+      co.flush();
+    } else {
+      result = await llm.chat(chatParams);
+    }
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;
     if (params.captureConfidence && result.logprobs?.length) logprobChunks.push(result.logprobs);
 
@@ -287,6 +302,26 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
     wallMs: Date.now() - started,
     stopReason,
     confidence: params.captureConfidence ? aggregateSelfCertainty(logprobChunks) : undefined
+  };
+}
+
+/** Coalesce streamed deltas so we emit a handful of events per turn, not one per token (Goal §3):
+ *  content flushes at ~48 chars, reasoning at ~300 chars (bounded), plus a final flush at turn end. */
+function makeDeltaCoalescer(turn: number, emit: (e: AgentEvent) => void): { push: (d: StreamDelta) => void; flush: () => void } {
+  let content = "", reasoning = "";
+  let reasoningEvents = 0;
+  const MAX_REASONING_EVENTS = 60;
+  const flushContent = (): void => { if (content) { emit({ turn, kind: "assistant_delta", detail: content }); content = ""; } };
+  const flushReasoning = (): void => {
+    if (reasoning && reasoningEvents < MAX_REASONING_EVENTS) { emit({ turn, kind: "reasoning_delta", detail: reasoning }); reasoningEvents++; }
+    reasoning = "";
+  };
+  return {
+    push: (d: StreamDelta): void => {
+      if (d.content) { content += d.content; if (content.length >= 48) flushContent(); }
+      if (d.reasoning) { reasoning += d.reasoning; if (reasoning.length >= 300) flushReasoning(); }
+    },
+    flush: (): void => { flushContent(); flushReasoning(); },
   };
 }
 
