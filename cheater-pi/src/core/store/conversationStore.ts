@@ -48,6 +48,8 @@ export interface RunRow {
   error: string | null;
   startedAt: number;
   endedAt: number | null;
+  /** Pre-run git snapshot for /undo (JSON of RunSnapshot), or null. */
+  snapshot: string | null;
 }
 
 export interface CreateConversationInput {
@@ -122,6 +124,10 @@ const MIGRATIONS: string[] = [
     schema_version INTEGER NOT NULL
   );
   CREATE INDEX idx_runs_conversation ON runs(conversation_id, started_at);
+  `,
+  // v2 — pre-run git snapshot for /undo.
+  `
+  ALTER TABLE runs ADD COLUMN snapshot TEXT;
   `,
 ];
 
@@ -318,6 +324,11 @@ export class ConversationStore {
     return row ? mapRun(row) : null;
   }
 
+  /** Record the pre-run snapshot used by /undo. No-op if the run row doesn't exist yet. */
+  setRunSnapshot(runId: string, snapshotJson: string): void {
+    this.db.prepare("UPDATE runs SET snapshot = ? WHERE id = ?").run(snapshotJson, runId);
+  }
+
   listRuns(conversationId: string): RunRow[] {
     return this.db
       .prepare("SELECT * FROM runs WHERE conversation_id = ? ORDER BY started_at ASC")
@@ -380,6 +391,7 @@ function mapRun(r: Record<string, SqlValue>): RunRow {
     error: r.error != null ? String(r.error) : null,
     startedAt: Number(r.started_at),
     endedAt: r.ended_at != null ? Number(r.ended_at) : null,
+    snapshot: r.snapshot != null ? String(r.snapshot) : null,
   };
 }
 

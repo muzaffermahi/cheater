@@ -241,6 +241,15 @@ export interface RunCompleted {
   usage: { prompt: number; completion: number; reasoning: number };
 }
 
+/** A run's file changes were rolled back by `/undo` (Goal §8). Records what was reverted/deleted. */
+export interface RunUndone {
+  type: "run.undone";
+  runId: string;
+  restored: string[];
+  deleted: string[];
+  skipped: string[];
+}
+
 /** The finish receipt: the honest audit trail of what happened (Goal §4/§9 "honest receipts"). */
 export interface ReceiptFinalized {
   type: "receipt.finalized";
@@ -280,6 +289,7 @@ export type EventPayload =
   | RunInterrupted
   | RunFailed
   | RunCompleted
+  | RunUndone
   | ReceiptFinalized;
 
 export type EventType = EventPayload["type"];

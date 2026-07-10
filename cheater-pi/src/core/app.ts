@@ -17,6 +17,7 @@ import {
 } from "./store/conversationStore.js";
 import type { EventPayload, KittenEvent, Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
+import { captureSnapshot, restoreSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 
 /** Everything a Runner needs to execute one run, plus the sink it emits progress into. */
 export interface RunContext {
@@ -28,6 +29,9 @@ export interface RunContext {
   k: number;
   model: string;
   signal: AbortSignal;
+  /** Pre-run git snapshot ref (or null), so a lane that isolates its work (Ascent) can derive the
+   *  winner's changed files via git after adoption. */
+  snapshotRef: string | null;
   /** Persist + broadcast a run-scoped event. The app stamps envelope + ordering. */
   emit(payload: EventPayload): void;
 }
@@ -192,10 +196,18 @@ export class KittenApp {
     this.inflight.set(runId, controller);
     this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k });
     this.emit(conversationId, { type: "run.started", runId, request: text, lane: decision.lane });
+
+    // Capture a pre-run snapshot for /undo BEFORE the runner mutates anything (cheap; never touches the
+    // tree). Only meaningful for lanes that write files; harmless (git:false) otherwise.
+    let snapshotRef: string | null = null;
+    if (decision.lane !== "answer") {
+      try { const snap = captureSnapshot(conv.projectRoot); snapshotRef = snap.ref; this.store.setRunSnapshot(runId, JSON.stringify(snap)); } catch { /* snapshot best-effort */ }
+    }
     try {
       const ctx: RunContext = {
         runId, conversationId, task: text, cwd: conv.projectRoot,
         lane: decision.lane, k: decision.k, model: conv.model, signal: controller.signal,
+        snapshotRef,
         emit: (payload) => { this.emit(conversationId, payload); },
       };
       const outcome = await this.runner(ctx);
@@ -237,6 +249,30 @@ export class KittenApp {
     const run = this.store.getRun(runId);
     if (!run) throw new Error(`unknown run ${runId}`);
     return run.conversationId;
+  }
+
+  // ── Undo ──────────────────────────────────────────────────────────────────────────────────────
+  /** Roll back a specific run's file changes to its pre-run snapshot (Goal §8). Only that run's files
+   *  are touched; the user's pre-existing dirty work in other files is preserved. Records the evidence. */
+  undoRun(runId: string): UndoResult {
+    const run = this.store.getRun(runId);
+    if (!run) return { ok: false, restored: [], deleted: [], skipped: [], reason: `unknown run ${runId}` };
+    if (!run.filesChanged.length) return { ok: false, restored: [], deleted: [], skipped: [], reason: "this run changed no files" };
+    const conv = this.store.getConversation(run.conversationId);
+    if (!conv) return { ok: false, restored: [], deleted: [], skipped: [], reason: "conversation gone" };
+    const snap: RunSnapshot = run.snapshot ? (JSON.parse(run.snapshot) as RunSnapshot) : { git: false, ref: null };
+    const res = restoreSnapshot(conv.projectRoot, snap, run.filesChanged);
+    this.emit(run.conversationId, { type: "run.undone", runId, restored: res.restored, deleted: res.deleted, skipped: res.skipped });
+    return res;
+  }
+
+  /** Undo the most recent run in a conversation that changed files. */
+  undoLast(conversationId: string): UndoResult {
+    const runs = this.store.listRuns(conversationId);
+    for (let i = runs.length - 1; i >= 0; i--) {
+      if (runs[i].filesChanged.length) return this.undoRun(runs[i].id);
+    }
+    return { ok: false, restored: [], deleted: [], skipped: [], reason: "no run with file changes to undo" };
   }
 }
 

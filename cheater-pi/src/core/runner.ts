@@ -13,6 +13,7 @@ import { runReliableAgent } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
 import { runAscent, defaultAscentConfig } from "./ascent.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
+import { changedFilesSince } from "./undo.js";
 
 /** Build the default Runner over a KittenLLM (defaults to the local LM Studio tiering). */
 export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT_MODELS))): Runner {
@@ -117,13 +118,18 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
     { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal },
     config
   );
+  // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it
+  // doesn't self-report changed files. Derive them from git against the pre-run snapshot and surface
+  // them as events, so the diff view and /undo cover the Ascent lane too.
+  const filesChanged = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
+  for (const f of filesChanged) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
   return {
     finished: a.finished,
     summary: a.summary || (a.finished ? "solved" : "unfinished"),
     wallMs: a.wallMs,
     usage: a.usage,
     receiptLines: a.receipts,
-    filesChanged: [], // Phase B: surface the adopted candidate's changed files
+    filesChanged,
     verified: a.winnerHasExecutionReceipt,
   };
 }

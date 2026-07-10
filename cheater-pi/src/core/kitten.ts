@@ -34,6 +34,7 @@ Usage:
   kitten run "<task>"        run one task (persisted + resumable)
   kitten resume [id]         replay a stored conversation
   kitten conversations|ls    list stored conversations
+  kitten undo [id]           roll back the last file-changing run (git-backed)
   kitten doctor              check the runtime + endpoint
   kitten web                 local web UI (later preview)
   kitten help
@@ -57,6 +58,7 @@ function renderEvent(e: KittenEvent): string | null {
     case "verification.passed": return dim(`  ✓ ${e.detail.slice(0, 100)}`);
     case "file.changed": return dim(`  ✎ ${e.path}`);
     case "repair.started": return dim(`  ↻ repair round ${e.round}`);
+    case "run.undone": return dim(`  ↩ undo: restored ${e.restored.length}, deleted ${e.deleted.length}${e.skipped.length ? `, skipped ${e.skipped.length}` : ""}`);
     case "run.completed": return (e.finished ? green("  ✓ ") : red("  ✗ ")) + (e.summary || (e.finished ? "done" : "unfinished")) + dim(` · ${(e.wallMs / 1000).toFixed(1)}s`);
     case "run.failed": return red(`  ✗ failed: ${e.error}`);
     case "run.cancelled": return red("  ✗ cancelled");
@@ -155,6 +157,30 @@ function cmdResume(rest: string[]): number {
   return 0;
 }
 
+function cmdUndo(rest: string[]): number {
+  const id = rest.find((a) => !a.startsWith("--"));
+  const store = ConversationStore.open(storePath());
+  if (!id) {
+    // Undo the most recently updated conversation's last file-changing run.
+    const latest = store.listConversations({ limit: 1 })[0];
+    if (!latest) { process.stdout.write(dim("nothing to undo\n")); store.close(); return 0; }
+    return finishUndo(store, latest.id);
+  }
+  if (!store.getConversation(id)) { process.stderr.write(`kitten undo: no conversation ${id}\n`); store.close(); return 1; }
+  return finishUndo(store, id);
+}
+
+function finishUndo(store: ConversationStore, conversationId: string): number {
+  const app = new KittenApp({ store, runner: async () => ({ finished: false, summary: "", wallMs: 0, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [], verified: false }) });
+  const res = app.undoLast(conversationId);
+  if (!res.ok) { process.stdout.write(red(`undo: ${res.reason ?? "nothing to undo"}\n`)); store.close(); return 1; }
+  process.stdout.write(green(`↩ undone`) + dim(` · restored ${res.restored.length}, deleted ${res.deleted.length}${res.skipped.length ? `, skipped ${res.skipped.length}` : ""}\n`));
+  for (const f of res.restored) process.stdout.write(dim(`  restored ${f}\n`));
+  for (const f of res.deleted) process.stdout.write(dim(`  deleted  ${f}\n`));
+  store.close();
+  return 0;
+}
+
 function cmdDoctor(): number {
   // Basic Phase-A checks; the full doctor (endpoint capabilities, storage, git, node) lands in Phase E.
   const node = process.versions.node;
@@ -179,6 +205,7 @@ async function main(argv: string[]): Promise<number> {
     case "run": return cmdRun(rest);
     case "resume": return cmdResume(rest);
     case "conversations": case "ls": return cmdConversations(rest);
+    case "undo": return cmdUndo(rest);
     case "doctor": return cmdDoctor();
     case "web": process.stdout.write(dim("kitten web arrives in a later preview (Phase D).\n")); return 0;
     case "help": case "--help": case "-h": process.stdout.write(HELP); return 0;
