@@ -26,12 +26,14 @@ export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT
 /** Answer-only lane: one chat, no write tools, stream the reply as assistant deltas. */
 async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   const started = Date.now();
-  const messages: Array<{ role: "system" | "user"; content: string }> = [
-    { role: "system", content: "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files." },
-  ];
-  if (ctx.conversationContext.trim()) messages.push({ role: "system", content: ctx.conversationContext });
-  messages.push({ role: "user", content: ctx.task });
-  const r = await llm.chat({ model: ctx.model, messages, signal: ctx.signal });
+  // Merge context into the ONE system message (templates reject a second system message).
+  const sys = "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files."
+    + (ctx.conversationContext.trim() ? `\n\n${ctx.conversationContext}` : "");
+  const r = await llm.chat({
+    model: ctx.model,
+    messages: [{ role: "system", content: sys }, { role: "user", content: ctx.task }],
+    signal: ctx.signal,
+  });
   const text = r.ok ? r.content : `(model error: ${r.error ?? "unknown"})`;
   ctx.emit({ type: "assistant.final", runId: ctx.runId, text });
   return {

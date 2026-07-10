@@ -45,12 +45,22 @@ export function isGitRepo(cwd: string): boolean {
   return git(cwd, ["rev-parse", "--is-inside-work-tree"]).out === "true";
 }
 
-/** Files that changed since `ref`: modified-tracked (`git diff`) ∪ new-untracked (`ls-files --others`).
- *  Used to derive the authoritative changed-file set for lanes (Ascent) that don't self-report files. */
+// Generated/tooling artifacts that are NOT the model's work and must never appear in a diff or /undo:
+// Kitten's own .cheater cache, VCS internals, dependency/build dirs, and compiled bytecode/caches.
+const GENERATED_PATH = /(^|\/)(\.cheater|\.kitten|\.git|node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.next|dist|build|out|coverage|target|\.venv|venv)(\/|$)/;
+const GENERATED_FILE = /\.(pyc|pyo|class|o|obj)$|(^|\/)\.DS_Store$/;
+
+function isModelArtifact(path: string): boolean {
+  return !GENERATED_PATH.test(path) && !GENERATED_FILE.test(path);
+}
+
+/** Files that changed since `ref`: modified-tracked (`git diff`) ∪ new-untracked (`ls-files --others`),
+ *  excluding generated/tooling artifacts. Derives the authoritative changed-file set for lanes (Ascent)
+ *  that don't self-report files — so the diff view and /undo see the model's edits, not its side effects. */
 export function changedFilesSince(cwd: string, ref: string): string[] {
   const modified = git(cwd, ["diff", "--name-only", ref]).out.split("\n").map((s) => s.trim()).filter(Boolean);
   const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard"]).out.split("\n").map((s) => s.trim()).filter(Boolean);
-  return [...new Set([...modified, ...untracked])];
+  return [...new Set([...modified, ...untracked])].filter(isModelArtifact);
 }
 
 /** Capture a snapshot of the pre-run tracked state (with dirty edits). Cheap; never mutates the tree. */

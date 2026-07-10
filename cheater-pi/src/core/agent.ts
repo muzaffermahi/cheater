@@ -116,15 +116,14 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   // live: it tried `cd /home/user` and then burned 3 turns fumbling an `rm` at the wrong path) and
   // wastes turns tidying scratch files. Both tanked speed with zero benefit.
   const env = `\n\nEnvironment: your working directory is ${params.cwd}. Every tool (read/write/edit/bash) already runs from there, so use plain relative paths (e.g. \`python foo.py\`) and do NOT cd anywhere — never cd to a guess like /home/user or /app, and you don't need to cd to the working directory either. Scratch files you create while testing may be left in place; do not spend turns deleting them.`;
+  // Conversation context (prior turns + repo truth) is MERGED into the single system message — many
+  // chat templates (Ornith/Qwen included) reject a second system message with "System message must be
+  // at the beginning". It goes after the stable rules + env, before the task.
+  const ctxBlock = params.contextPreamble && params.contextPreamble.trim() ? `\n\n${params.contextPreamble}` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env },
+    { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env + ctxBlock },
+    { role: "user", content: params.task }
   ];
-  // Conversation context (prior turns + repo truth) goes AFTER the stable rules, BEFORE the task, so the
-  // stable system prefix stays cache-friendly and the model still sees what happened earlier.
-  if (params.contextPreamble && params.contextPreamble.trim()) {
-    messages.push({ role: "system", content: params.contextPreamble });
-  }
-  messages.push({ role: "user", content: params.task });
   const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;
   const usage = { prompt: 0, completion: 0, reasoning: 0 };
   let toolCalls = 0;

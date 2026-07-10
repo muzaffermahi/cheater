@@ -45,6 +45,7 @@ Usage:
   kitten help
 
 run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
+              -c, --conversation <id>   continue an existing conversation (headless multi-turn)
 `;
 
 function isLane(s: string | undefined): s is Lane {
@@ -81,6 +82,7 @@ async function cmdRun(rest: string[]): Promise<number> {
   let k: number | undefined;
   let json = false;
   let dangerous = false;
+  let continueId: string | undefined;
   const words: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
@@ -90,6 +92,7 @@ async function cmdRun(rest: string[]): Promise<number> {
     else if (a === "--k") k = Math.max(1, Number(rest[++i]) || 1);
     else if (a === "--json") json = true;
     else if (a === "--dangerous" || a === "--yes") dangerous = true;
+    else if (a === "--conversation" || a === "-c") continueId = rest[++i];
     else words.push(a);
   }
   const task = words.join(" ").trim();
@@ -101,8 +104,16 @@ async function cmdRun(rest: string[]): Promise<number> {
   app.recover();
   if (!json) app.subscribe((e) => { const line = renderEvent(e); if (line) process.stdout.write(line + "\n"); });
 
-  const conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
-  if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id} · ${cwd}`) + "\n");
+  // Continue an existing conversation (headless multi-turn) or start a new one.
+  let conv;
+  if (continueId) {
+    const existing = store.getConversation(continueId);
+    if (!existing) { process.stderr.write(`kitten run: no conversation ${continueId}\n`); store.close(); return 1; }
+    conv = existing;
+  } else {
+    conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
+  }
+  if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id}${continueId ? " (continued)" : ""} · ${cwd}`) + "\n");
   const run = await app.submitMessage(conv.id, task, { lane, k });
 
   if (json) {
@@ -234,17 +245,20 @@ async function cmdDoctor(): Promise<number> {
     process.stdout.write(`${red("✗")} endpoint unreachable at ${models.baseUrl}  (start LM Studio / llama.cpp, or set KITTEN_BASE_URL)\n`);
   } else {
     process.stdout.write(`${green("✓")} endpoint reachable at ${models.baseUrl}\n`);
-    const hasModel = ep.models.length === 0 || ep.models.includes(models.main);
-    if (!hasModel) {
+    // Ping is authoritative: a llama.cpp single-model server advertises the .gguf path in /v1/models but
+    // accepts ANY model id and returns the loaded model — so an id-list mismatch is NOT "model missing".
+    const responds = await llm.ping(models.main);
+    if (responds) {
+      const engine = await llm.detectEngine();
+      const advertised = ep.models.length === 0 || ep.models.includes(models.main);
+      const note = advertised ? "" : "  (server advertises a different id but accepts this one)";
+      process.stdout.write(`${green("✓")} model '${models.main}' responds${note}  (engine: ${engine}${engine === "llamacpp" ? " — grammar/min-p/logprobs available" : ""})\n`);
+    } else if (ep.models.length && !ep.models.includes(models.main)) {
       bad++;
-      process.stdout.write(`${red("✗")} model '${models.main}' not loaded  (available: ${ep.models.slice(0, 6).join(", ") || "none"}; set KITTEN_MAIN_MODEL)\n`);
+      process.stdout.write(`${red("✗")} model '${models.main}' not loaded and no probe response  (available: ${ep.models.slice(0, 4).map((m) => m.split(/[\\/]/).pop()).join(", ") || "none"}; set KITTEN_MAIN_MODEL)\n`);
     } else {
-      const responds = await llm.ping(models.main);
-      if (!responds) { bad++; process.stdout.write(`${red("✗")} model '${models.main}' did not respond to a probe\n`); }
-      else {
-        const engine = await llm.detectEngine();
-        process.stdout.write(`${green("✓")} model '${models.main}' responds  (engine: ${engine}${engine === "llamacpp" ? " — grammar/min-p/logprobs available" : ""})\n`);
-      }
+      bad++;
+      process.stdout.write(`${red("✗")} model '${models.main}' did not respond to a probe\n`);
     }
   }
 

@@ -60,5 +60,14 @@ test("runExampleTest returns ran:false when the module is missing (no false sign
 
 test("no examples => empty extraction, gate is a no-op", () => {
   assert.deepEqual(extractWorkedExamples("no examples here", ["f"]), []);
-  assert.deepEqual(extractWorkedExamples("f(1)->2", []), [], "no symbols => nothing");
+  // Prose with only builtin calls yields nothing (no worked-example shape survives validation).
+  assert.deepEqual(extractWorkedExamples("call print(x) and len(y) somewhere", []), []);
+});
+
+test("discovers the symbol from the example when the contract missed it (F1 fix)", () => {
+  // A contract that fails to extract the function name must NOT disable ground-truth verification —
+  // the example names its own function. This is the false-'weak'-verdict bug found live on int_to_roman.
+  const ex = extractWorkedExamples("Fix int_to_roman so int_to_roman(4)=='IV' and int_to_roman(9)=='IX'.", []);
+  assert.equal(ex.length, 2);
+  assert.deepEqual(ex.map((e) => e.call), ["int_to_roman(4)", "int_to_roman(9)"]);
 });
