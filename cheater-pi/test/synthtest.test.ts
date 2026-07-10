@@ -47,7 +47,7 @@ test("selectByConsensus: all attempts RAISING the same exception is agreement, n
   const pick = selectByConsensus([a, b, c]);
   assert.ok(pick);
   assert.equal(pick!.crashes[0], 0, "raising where the plurality also raises is not a crash");
-  assert.equal(pick!.scores[0], 1, "matching the plurality exception scores like matching a value");
+  assert.equal(pick!.scores[0], 2, "matches the plurality on both probes (the exception AND the value)");
 });
 
 test("selectByConsensus: a DIVERGENT exception (raises where plurality returns a value) is still a crash", () => {
