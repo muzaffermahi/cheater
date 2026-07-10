@@ -3,7 +3,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { selectByConsensus, isCleanOutcome, runFnProbes, type ProbeOutcome } from "../src/core/synthtest.js";
+import { selectByConsensus, isCleanOutcome, runFnProbes, pickFnTarget, type ProbeOutcome } from "../src/core/synthtest.js";
+
+test("pickFnTarget: a spurious second module falls back to the conventional entry (glob's x.py bug)", () => {
+  // glob's contract extraction pulled ["solution.py","x.py"]; the old code bailed (needs exactly 1) and
+  // silently disabled consensus. Now it prefers the conventional primary.
+  assert.deepEqual(pickFnTarget({ files: ["solution.py", "x.py"], symbols: ["matches"] } as any), { module: "solution.py", symbol: "matches" });
+  assert.deepEqual(pickFnTarget({ files: ["solution.py"], symbols: ["query"] } as any), { module: "solution.py", symbol: "query" });
+  // No conventional primary among several ⇒ still null (genuinely ambiguous).
+  assert.equal(pickFnTarget({ files: ["a.py", "b.py"], symbols: ["f"] } as any), null);
+  // Class-only symbols ⇒ null (consensus-by-call doesn't fit).
+  assert.equal(pickFnTarget({ files: ["solution.py"], symbols: ["Foo", "Bar"] } as any), null);
+});
 
 const out = (vals: unknown[]): ProbeOutcome => ({ results: vals.map((v) => ({ ok: true as const, val: v })) });
 const withCrash = (vals: (unknown | "CRASH")[]): ProbeOutcome => ({

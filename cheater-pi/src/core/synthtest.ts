@@ -56,7 +56,11 @@ export async function generateFnProbes(llm: KittenLLM, task: string, contract: A
   // couple of parseable cases, and consensus wants a solid handful.
   const inputs: unknown[][] = [];
   const seen = new Set<string>();
-  for (let pass = 0; pass < 2 && inputs.length < 8; pass++) {
+  // Up to three passes: complex input TYPES (a cron string + datetime, a nested busy-map, a VM program)
+  // are hard for the sidecar to emit as valid JSON tuples, so one pass often yields <2 parseable cases
+  // and consensus silently switches off. Extra passes recover the flaky ones (intervals flipped OK→NULL
+  // across runs) at the cost of a couple of cheap sidecar calls only when the earlier passes fell short.
+  for (let pass = 0; pass < 3 && inputs.length < 6; pass++) {
     let content = "";
     try {
       const r = await llm.sidecar({
@@ -96,14 +100,21 @@ export async function generateFnProbes(llm: KittenLLM, task: string, contract: A
 }
 
 /** Choose exactly one (python module, function symbol) to probe, or null if ambiguous/not applicable. */
-function pickFnTarget(contract: AcceptanceContract): { module: string; symbol: string } | null {
+export function pickFnTarget(contract: AcceptanceContract): { module: string; symbol: string } | null {
   const py = contract.files.filter((f) => f.toLowerCase().endsWith(".py"));
-  if (py.length !== 1) return null;         // need one clear module
+  if (!py.length) return null;
+  // One module ⇒ obvious. If contract extraction pulled a SPURIOUS second module (e.g. an example
+  // filename `x.py` next to the real `solution.py` — which sank glob's consensus), fall back to the
+  // conventional entry module rather than bailing. Only give up if there's genuinely no primary.
+  let module: string | null;
+  if (py.length === 1) module = py[0];
+  else module = py.find((f) => /(^|[/\\])(solution|main|impl|answer)\.py$/i.test(f)) ?? null;
+  if (!module) return null;
   if (!contract.symbols.length) return null; // need a named function
   // Prefer a symbol that reads like a function (snake_case or lower_first), not a Class.
   const fn = contract.symbols.find((s) => /^[a-z][A-Za-z0-9_]*$/.test(s)) ?? null;
   if (!fn) return null; // Capitalized-only symbols => class task; consensus-by-call doesn't fit
-  return { module: py[0], symbol: fn };
+  return { module, symbol: fn };
 }
 
 const RUNNER = `
