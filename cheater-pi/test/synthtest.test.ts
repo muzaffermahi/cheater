@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { selectByConsensus, isCleanOutcome, runFnProbes, pickFnTarget, type ProbeOutcome } from "../src/core/synthtest.js";
+import { selectByConsensus, isCleanOutcome, runFnProbes, pickFnTarget, argsFromCall, type ProbeOutcome } from "../src/core/synthtest.js";
+
+test("argsFromCall: parses positional args of a worked-example call into a JSON tuple", () => {
+  assert.deepEqual(argsFromCall('next_times("*/15 * * * *", "2024-01-01T00:07", 4)', "next_times"), ["*/15 * * * *", "2024-01-01T00:07", 4]);
+  assert.deepEqual(argsFromCall("f([1,3,4], 6)", "f"), [[1, 3, 4], 6]);
+  assert.deepEqual(argsFromCall("g()", "g"), []);
+  assert.equal(argsFromCall("h('single-quoted')", "h"), null, "non-JSON (single quotes) → null, sidecar covers it");
+  assert.equal(argsFromCall("other(1,2)", "f"), null, "symbol mismatch → null");
+});
 
 test("pickFnTarget: a spurious second module falls back to the conventional entry (glob's x.py bug)", () => {
   // glob's contract extraction pulled ["solution.py","x.py"]; the old code bailed (needs exactly 1) and

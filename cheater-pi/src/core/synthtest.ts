@@ -16,6 +16,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { KittenLLM } from "./llm.js";
 import type { AcceptanceContract } from "../runstate/contract.js";
+import { extractWorkedExamples } from "./workedExamples.js";
+
+/** Parse the positional args of a worked-example call `symbol(a, b, c)` into a JSON tuple [a,b,c], or
+ *  null if they aren't JSON-clean. These are REAL valid inputs from the prompt — the only reliable
+ *  probe inputs for a complex type the sidecar can't invent (a cron string, a VM program). */
+export function argsFromCall(call: string, symbol: string): unknown[] | null {
+  if (!call.includes(symbol + "(")) return null;
+  const open = call.indexOf("(");
+  const close = call.lastIndexOf(")");
+  if (open < 0 || close <= open) return null;
+  const inner = call.slice(open + 1, close).trim();
+  if (inner === "") return [];
+  try { const parsed = JSON.parse("[" + inner + "]"); return Array.isArray(parsed) ? parsed : null; } catch { return null; }
+}
 
 export interface FnProbe {
   module: string;      // module filename, e.g. "coins.py"
@@ -56,10 +70,26 @@ export async function generateFnProbes(llm: KittenLLM, task: string, contract: A
   // couple of parseable cases, and consensus wants a solid handful.
   const inputs: unknown[][] = [];
   const seen = new Set<string>();
+  // Seed from the prompt's WORKED EXAMPLES first — real, valid inputs (guaranteed parseable). For a task
+  // whose input type the sidecar can't invent as valid JSON (cron: a schedule string + ISO datetime),
+  // this is the ONLY way consensus gets any inputs at all; elsewhere it anchors the vote on ground truth.
+  for (const ex of extractWorkedExamples(task, [symbol])) {
+    const args = argsFromCall(ex.call, symbol);
+    if (!args) continue;
+    const key = JSON.stringify(args);
+    if (!seen.has(key)) { seen.add(key); inputs.push(args); }
+  }
   // Up to three passes: complex input TYPES (a cron string + datetime, a nested busy-map, a VM program)
   // are hard for the sidecar to emit as valid JSON tuples, so one pass often yields <2 parseable cases
   // and consensus silently switches off. Extra passes recover the flaky ones (intervals flipped OK→NULL
   // across runs) at the cost of a couple of cheap sidecar calls only when the earlier passes fell short.
+  // If the prompt gave real inputs, show them to the sidecar as VALID TEMPLATES to VARY. Inventing a
+  // well-formed cron string / VM program from scratch is where the sidecar fails; mutating a known-good
+  // one (change the schedule fields, shift the date, bump the count) is easy and yields valid inputs.
+  const templates = inputs.slice(0, 3).map((a) => JSON.stringify(a));
+  const templateHint = templates.length
+    ? `\nHere are VALID example inputs — produce MORE like these, VARYING the values to hit edges (keep the exact shape/types):\n${templates.map((t) => `  ${t}`).join("\n")}\n`
+    : "";
   for (let pass = 0; pass < 3 && inputs.length < 6; pass++) {
     let content = "";
     try {
@@ -67,7 +97,7 @@ export async function generateFnProbes(llm: KittenLLM, task: string, contract: A
         messages: [{
           role: "user",
           content:
-            `A python function \`${symbol}\` (in ${module}) must satisfy this task:\n"""${task.slice(0, 900)}"""\n\n` +
+            `A python function \`${symbol}\` (in ${module}) must satisfy this task:\n"""${task.slice(0, 900)}"""\n${templateHint}\n` +
             `Produce 8 test INPUTS that together cover the normal case AND the tricky edges (empty, single, ` +
             `zero, boundary, ordering, the specific traps the task warns about). Do NOT provide expected ` +
             `outputs — inputs only. Each case is a JSON array of the positional arguments to ${symbol}. ` +
