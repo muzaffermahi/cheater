@@ -13,8 +13,9 @@ const pkgDir = new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/,
 const log = (m) => process.stdout.write(m + "\n");
 const fail = (m) => { process.stderr.write("SMOKE FAIL: " + m + "\n"); process.exit(1); };
 
+// shell:true so Windows resolves `npm.cmd` / `kitten.cmd` (execFile can't find .cmd on PATH).
 function run(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...opts });
+  return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], shell: true, ...opts });
 }
 
 const work = mkdtempSync(join(tmpdir(), "kitten-pack-"));
@@ -41,8 +42,11 @@ try {
   if (!/Usage:/.test(help) || !/kitten run/.test(help)) fail("help output missing");
 
   log("• kitten doctor …");
-  const doctor = run(bin, ["doctor"], { cwd: proj, env });
-  if (!/store at/.test(doctor)) fail("doctor did not report the store");
+  // doctor exits nonzero when the (deliberately dead) endpoint is unreachable — that's expected here;
+  // we assert on its OUTPUT, not its exit code.
+  let doctor = "";
+  try { doctor = run(bin, ["doctor"], { cwd: proj, env }); } catch (e) { doctor = e.stdout ?? ""; }
+  if (!/store writable at/.test(doctor)) fail("doctor did not report the store");
 
   log("• kitten run (offline, persists) + resume …");
   try { run(bin, ["run", "explain what a store is", "--json"], { cwd: proj, env }); } catch { /* run may exit 1 offline; that's fine */ }
@@ -51,7 +55,7 @@ try {
 
   log("• kitten web boots + serves its page …");
   const port = 4137;
-  const web = spawn(bin, ["web", "--no-open", "--port", String(port)], { cwd: proj, env, stdio: "ignore" });
+  const web = spawn(bin, ["web", "--no-open", "--port", String(port)], { cwd: proj, env, stdio: "ignore", shell: true });
   try {
     await new Promise((r) => setTimeout(r, 2500));
     const res = await fetch(`http://127.0.0.1:${port}/`);
