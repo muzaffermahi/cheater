@@ -48,7 +48,11 @@ export interface AscentLevers {
   leanReasoning: boolean;    // iter-1 — no-think fast forward pass on easy tasks (owned engine, --jinja)
 }
 
-export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true, leanReasoning: true };
+// leanReasoning DEFAULT OFF: no-think on the MAIN agent tanks tasks that genuinely need reasoning
+// (measured: json_query, a nested JSON-path evaluator, went 0/56 → 16/56 no-think). The static hardness
+// score can't tell "mechanically trivial" from "looks easy but needs CoT", so the main agent keeps its
+// reasoning. The pure win — no-think on the MECHANICAL sidecar — lives in llm.sidecar(), not this lever.
+export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true, leanReasoning: false };
 export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false, leanReasoning: false };
 
 export interface AscentConfig {
@@ -200,8 +204,8 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // Iter-3 — consensus floor: k=2 cannot VOTE (a 1-1 split is a coin flip), and a statically-"easy" task
   // (hardness 0 → k=1) can still hide edge-case difficulty — json_query reads easy yet a lone k=1
   // candidate shipped 2/56 wrong. When a self-probe exists (consensus IS the selector) and the caller
-  // didn't pin k, floor easy tasks to k=3 so there's a real majority. Lean-reasoning (iter-1) funds it:
-  // k=3 no-think ≈ the old k=2 with-think in wall-clock. Hard tasks already earn high k from the budget.
+  // didn't pin k, floor easy tasks to k=3 so there's a real majority vote. Hard tasks already earn a
+  // high k from the budget; this only lifts the under-budgeted easy-looking ones.
   if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 3) {
     const floored = governor.capSamples(3, estTokens);
     if (floored > samples) { samples = floored; receipts.push(`consensus floor: k→${samples} (self-probe present → real majority vote)`); }

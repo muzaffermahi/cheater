@@ -183,20 +183,23 @@ export function selectByConsensus(outcomes: (ProbeOutcome | null)[]): ConsensusP
   let discriminating = false;
 
   for (let j = 0; j < nProbes; j++) {
-    // Tally plurality over successful results at probe j.
+    // Tally plurality over the UNIFIED outcome at probe j: a returned value ("v:…") OR a raised
+    // exception type ("e:…"). Raising is a legitimate outcome candidates can AGREE on — for a task
+    // whose contract says "raise ValueError on a malformed input", every correct candidate raises there,
+    // and that agreement must SCORE, not be scored as everyone crashing (which wrongly sank correct
+    // exception-raisers like json_query and made them execution-ineligible in the verifier fold).
+    const key = (res: ProbeResult | undefined): string | null => res ? (res.ok ? "v:" + canon(res.val) : "e:" + res.err) : null;
     const tally = new Map<string, number>();
-    for (const { o } of usable) {
-      const res = o!.results[j];
-      if (res && res.ok) tally.set(canon(res.val), (tally.get(canon(res.val)) ?? 0) + 1);
-    }
+    for (const { o } of usable) { const k = key(o!.results[j]); if (k !== null) tally.set(k, (tally.get(k) ?? 0) + 1); }
     let bestKey: string | null = null, bestN = 0, distinct = 0;
     for (const [k, n] of tally) { distinct++; if (n > bestN) { bestN = n; bestKey = k; } }
     if (distinct > 1) discriminating = true;
+    const pluralityIsValue = bestKey !== null && bestKey.startsWith("v:");
     for (const { o, i } of usable) {
       const res = o!.results[j];
       if (!res) continue;
-      if (!res.ok) { crashes[i]++; continue; }
-      if (bestKey !== null && canon(res.val) === bestKey) scores[i]++;
+      if (key(res) === bestKey) scores[i]++;                 // matches the plurality outcome (value OR exception)
+      else if (!res.ok && pluralityIsValue) crashes[i]++;    // broke where the consensus SUCCEEDED → a real bug signal
     }
   }
 

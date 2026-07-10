@@ -39,6 +39,27 @@ test("selectByConsensus: an attempt that crashes where others succeed is penalis
   assert.equal(pick!.crashes[2], 2);
 });
 
+test("selectByConsensus: all attempts RAISING the same exception is agreement, not a crash", () => {
+  // A malformed-input probe where every correct candidate raises ValueError. That agreement must SCORE
+  // and must NOT count as everyone crashing (which wrongly made correct exception-raisers ineligible).
+  const raise = (): ProbeOutcome => ({ results: [{ ok: false as const, err: "ValueError" }, { ok: true as const, val: 9 }] });
+  const a = raise(), b = raise(), c = raise();
+  const pick = selectByConsensus([a, b, c]);
+  assert.ok(pick);
+  assert.equal(pick!.crashes[0], 0, "raising where the plurality also raises is not a crash");
+  assert.equal(pick!.scores[0], 1, "matching the plurality exception scores like matching a value");
+});
+
+test("selectByConsensus: a DIVERGENT exception (raises where plurality returns a value) is still a crash", () => {
+  // Two candidates return a value on probe 0; the third raises there → that IS a real bug signal.
+  const good = (): ProbeOutcome => ({ results: [{ ok: true as const, val: 5 }] });
+  const bad: ProbeOutcome = { results: [{ ok: false as const, err: "KeyError" }] };
+  const pick = selectByConsensus([good(), good(), bad]);
+  assert.ok(pick);
+  assert.equal(pick!.crashes[2], 1, "raising where the consensus returned a value is a crash");
+  assert.notEqual(pick!.index, 2);
+});
+
 test("7 and 7.0 are treated as the same output (numeric canon)", () => {
   const pick = selectByConsensus([out([7]), out([7.0]), out([7])]);
   assert.ok(pick);
