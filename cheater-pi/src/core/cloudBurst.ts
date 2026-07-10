@@ -73,6 +73,7 @@ export interface CloudBurstParams {
   captureConfidence?: boolean; // P1: capture self-certainty for selection
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string }; // P2 ban (global)
   banForbidden?: boolean;      // P2: run the finish-gate forbidden-construct scan
+  disableThinking?: boolean;   // iter-1: no-think fast forward pass (re-enabled on repair)
   signal?: AbortSignal;
 }
 
@@ -102,6 +103,7 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
         captureConfidence: params.captureConfidence,
         decode: { ...params.decode, ...plan.decode },
         banForbidden: params.banForbidden,
+        disableThinking: params.disableThinking,
         signal: params.signal
       });
     } catch (e) {

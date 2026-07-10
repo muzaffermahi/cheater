@@ -16,11 +16,11 @@ import { runAscent, defaultAscentConfig } from "./ascent.js";
 import { DisjointnessError } from "./disjointness.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 
-interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; ascent: boolean; hard: boolean; k?: number; reasoning?: "low" | "medium" | "high"; }
+interface CliOpts { task: string; cwd: string; model?: string; maxTurns?: number; trace?: string; quiet: boolean; reliable: boolean; bon: number; ascent: boolean; hard: boolean; vanilla: boolean; k?: number; reasoning?: "low" | "medium" | "high"; }
 
 function parse(argv: string[]): CliOpts | null {
   if (argv[0] !== "run") return null;
-  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false, bon: 1, ascent: false, hard: false };
+  const opts: CliOpts = { task: "", cwd: process.cwd(), quiet: false, reliable: false, bon: 1, ascent: false, hard: false, vanilla: false };
   const rest: string[] = [];
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
@@ -33,6 +33,7 @@ function parse(argv: string[]): CliOpts | null {
     else if (a === "--bon") { opts.bon = Math.max(1, Number(argv[++i]) || 1); opts.reliable = true; }
     else if (a === "--ascent") opts.ascent = true;
     else if (a === "--hard") opts.hard = true;
+    else if (a === "--vanilla") { opts.vanilla = true; opts.ascent = true; }
     else if (a === "--k") { opts.k = Math.max(1, Number(argv[++i]) || 1); opts.ascent = true; }
     else if (a === "--reasoning") { const v = argv[++i]; if (v === "low" || v === "medium" || v === "high") opts.reasoning = v; }
     else rest.push(a);
@@ -62,6 +63,9 @@ async function main(argv: string[]): Promise<number> {
       if (e instanceof DisjointnessError) { process.stderr.write(`kitten-ascent REFUSING: ${e.message}\n`); return 3; }
       throw e;
     }
+    // --vanilla: turn OFF the owned-inference levers (P1 confidence, P2 forbidden-ban, P5 sampler
+    // diversity) to A/B the local-inference update against the pre-owned harness. Everything else holds.
+    if (opts.vanilla) config = { ...config, levers: { ...(config.levers ?? {}), confidence: false, banForbidden: false, samplerDiversity: false } };
     const hardness = opts.hard ? { taskKind: "bug_fix", risk: "high" } : {};
     const a = await runAscent({ task: opts.task, cwd: opts.cwd, taskId: `cli-${Date.now().toString(36)}`, hardness, forceSamples: opts.k, maxTurns: opts.maxTurns, reasoningEffort: opts.reasoning, onEvent }, config);
     if (!opts.quiet) { process.stderr.write(`kitten-ascent receipts:\n`); for (const l of a.receipts) process.stderr.write(`  ${l}\n`); }

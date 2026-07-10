@@ -143,6 +143,10 @@ export interface ChatParams {
   grammar?: string;
   /** Reuse the KV cache of the longest matching prefix across calls. llama.cpp native only. */
   cachePrompt?: boolean;
+  /** Disable the model's chain-of-thought (qwen3/ornith `enable_thinking:false` via chat_template_kwargs).
+   *  On a single-function task the model writes code directly ~2x faster; the harness supplies correctness.
+   *  Needs a native `--jinja` server. */
+  disableThinking?: boolean;
 }
 
 /** One generated token's probability + its top alternatives (parsed from an OpenAI-style logprobs payload). */
@@ -199,6 +203,7 @@ export class KittenLLM {
     if (params.logitBias && Object.keys(params.logitBias).length) body.logit_bias = params.logitBias;
     if (params.grammar) body.grammar = params.grammar;
     if (params.cachePrompt) body.cache_prompt = params.cachePrompt;
+    if (params.disableThinking) body.chat_template_kwargs = { ...(body.chat_template_kwargs as object ?? {}), enable_thinking: false };
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);

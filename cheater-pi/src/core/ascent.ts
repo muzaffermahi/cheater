@@ -45,10 +45,11 @@ export interface AscentLevers {
   confidence: boolean;   // P1 — self-certainty selection tiebreaker (owned engine, needs logprobs)
   banForbidden: boolean; // P2 — decode-time forbidden-construct ban + finish-gate scan
   samplerDiversity: boolean; // P5 — per-sample sampler profiles to decorrelate the batch
+  leanReasoning: boolean;    // iter-1 — no-think fast forward pass on easy tasks (owned engine, --jinja)
 }
 
-export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true };
-export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false };
+export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true, leanReasoning: true };
+export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false, leanReasoning: false };
 
 export interface AscentConfig {
   llm: KittenLLM;
@@ -225,9 +226,14 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       repairSeed,
       samplerDiversity: lever(config, "samplerDiversity")
     });
+    // Iter-1: on an easy task (low hardness score) run ornith with its chain-of-thought OFF — it writes
+    // the code directly ~2x faster and the harness supplies the correctness. Hard tasks keep their CoT,
+    // and any candidate that hits the finish gate gets its reasoning back for the repair turns.
+    const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
+    if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
     const attempts = await cloudBurstGenerate(
       { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime,
-        decode: banDecode, banForbidden: lever(config, "banForbidden"), signal: params.signal },
+        decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
     );

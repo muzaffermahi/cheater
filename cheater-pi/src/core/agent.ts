@@ -59,6 +59,11 @@ export interface AgentRunParams {
   captureConfidence?: boolean;
   /** Owned-inference per-sample decode controls (P2 ban, P5 sampler diversity) applied to every turn. */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
+  /** Owned-engine thinking control (iter-1 speed lever): on a single-function task ornith writes the
+   *  code directly ~2x faster when its chain-of-thought is off — the harness (worked-example gate,
+   *  consensus, repair) supplies the correctness, not the model's CoT. Thinking is auto-RE-ENABLED once
+   *  the finish gate rejects a "done" (repair genuinely needs reasoning). Native `--jinja` server only. */
+  disableThinking?: boolean;
 }
 
 export interface AgentRunResult {
@@ -143,6 +148,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       minP: params.decode?.minP,
       dryMultiplier: params.decode?.dryMultiplier,
       grammar: params.decode?.grammar,
+      // Iter-1: no-think for the fast forward pass, but the moment the finish gate has bounced a "done"
+      // the model is repairing a real failure — give it its reasoning back for every turn after that.
+      disableThinking: params.disableThinking && finishRejections === 0,
       // P3a — KV-cache reuse: harmless on cloud/LM Studio (ignored); on native llama.cpp it reuses the
       // KV of the shared system+task prefix across the k best-of-N samples (they share everything up to
       // the per-sample directive). Automatic prefix caching does most of this; the flag makes it explicit.

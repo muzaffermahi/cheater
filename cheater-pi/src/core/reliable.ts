@@ -50,6 +50,8 @@ export interface ReliableParams {
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
   /** P2: run the finish-gate forbidden-construct source scan (engine-agnostic fallback for the ban). */
   banForbidden?: boolean;
+  /** Iter-1: disable ornith's chain-of-thought for the fast forward pass (auto-re-enabled on repair). */
+  disableThinking?: boolean;
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -121,6 +123,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     signal: params.signal,
     captureConfidence: params.captureConfidence,
     decode: params.decode,
+    disableThinking: params.disableThinking,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
     finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
   });
