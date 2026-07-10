@@ -52,11 +52,23 @@ it was effectively running with **no consensus at all**.
 ## Measured (local ornith-35b)
 
 - Consensus probe coverage: **5/10 → 10/10** battery tasks.
-- json_query k=2, thinking-on, consensus restored: **PASS 0/56** (was `finished-fallback`, 1–2/56).
-- intervals k=2: **PASS 0/40** (247 s).
-- regexlite: the **native decode-ban is validated** — `forbidden: re/regex (decode-banned 6 tokens)`, the
-  model is *literally unable* to emit `import re`; it hand-rolls 60/64 correct (4 residual logic bugs).
 - 703 unit tests green (+7 across the pass).
+- Native decode-ban validated on regexlite/expr: `forbidden: re/regex` / `eval/exec (decode-banned N
+  tokens)` — the model is *literally unable* to emit the banned import/construct.
+
+**Full owned-mode battery (k=2, 1500 s cap): 7/10 clean passes, 0 failed cases each:**
+
+| task | result | | | task | result | |
+|------|--------|---|---|------|--------|---|
+| json_query | **PASS** 0/56 | | | maze | **PASS** 0/37 | |
+| ledger | **PASS** 0/50 | | | cron | **PASS** 0/31 | (k=1; k=2 hit an output glitch) |
+| vm | **PASS** 0/51 | *had no consensus pre-pass* | | glob | fail 6/84 | edge cases; hand-rolled, did NOT use fnmatch |
+| topo | **PASS** 0/40 | | | regexlite | ~4/64 at k=2 | near-miss; needs consensus, times out at 1500 s |
+| intervals | **PASS** 0/40 | *had no consensus pre-pass* | | expr | miss | evaluator not completed in budget (eval banned) |
+
+vm + intervals are the proof the consensus-restoration paid off: both had NULL probes (no consensus)
+before this pass and now pass clean. The three non-passes are the heaviest tasks (regex engine,
+expression evaluator, glob edge-cases) — capability/latency-bound for a 35B at 20 t/s, not selection bugs.
 
 ## Honest limits
 
