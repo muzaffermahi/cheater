@@ -49,6 +49,7 @@ export function openSqlite(path: string): SqlDatabase {
   // actually opened, and so environments without node:sqlite fail with a clear message, not a load error.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { DatabaseSync } = loadNodeSqlite();
+  silenceSqliteExperimentalWarning();
   const db = new DatabaseSync(path);
   // Pragmas: WAL for concurrent readers, NORMAL sync (durable enough for a local app, far faster than
   // FULL), a 5s busy timeout, and enforced foreign keys. :memory: ignores journal_mode — harmless.
@@ -76,6 +77,23 @@ function loadNodeSqlite(): NodeSqliteModule {
       `Underlying error: ${(e as Error).message}`
     );
   }
+}
+
+// node:sqlite emits a one-time "SQLite is an experimental feature" ExperimentalWarning on first use.
+// That is expected here (we pin the engine deliberately) and looks alarming to a user running `kitten`,
+// so swallow exactly that one message. Every OTHER warning — including other ExperimentalWarnings —
+// passes through untouched. Installed once, before the first DatabaseSync.
+let sqliteWarningSilenced = false;
+function silenceSqliteExperimentalWarning(): void {
+  if (sqliteWarningSilenced) return;
+  sqliteWarningSilenced = true;
+  const original = process.emitWarning.bind(process);
+  process.emitWarning = ((warning: string | Error, ...rest: unknown[]): void => {
+    const message = typeof warning === "string" ? warning : warning?.message ?? "";
+    const type = typeof rest[0] === "string" ? rest[0] : (rest[0] as { type?: string } | undefined)?.type;
+    if (type === "ExperimentalWarning" && /\bSQLite is an experimental feature\b/.test(message)) return;
+    (original as (w: string | Error, ...a: unknown[]) => void)(warning, ...rest);
+  }) as typeof process.emitWarning;
 }
 
 /** Run `fn` inside a single transaction, rolling back on any throw. Returns fn's result. */
