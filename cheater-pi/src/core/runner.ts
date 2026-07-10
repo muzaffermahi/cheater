@@ -74,13 +74,22 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
 
   const common = { task: ctx.task, cwd: ctx.cwd, llm, model: ctx.model, onEvent, signal: ctx.signal };
 
+  // Route destructive shell commands through the app's approval policy (Goal §8). Catastrophic/RCE/exfil
+  // are hard-blocked by the engine's safety floor regardless; this gates merely-destructive ("warn") ones.
+  let cmdN = 0;
+  const commandGate = async (command: string, assessment: { verdict: string; category: string; message: string }): Promise<{ allowed: boolean; feedback?: string }> => {
+    const risk = assessment.verdict === "block" ? "high" as const : "medium" as const;
+    const allowed = await ctx.requestApproval(`${ctx.runId}:cmd${cmdN++}`, "bash", `${assessment.category}: ${assessment.message}`, risk);
+    return { allowed, feedback: allowed ? undefined : `denied by approval policy: ${assessment.message}` };
+  };
+
   if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent);
 
   const result = ctx.lane === "bon"
     ? await runBestOfN({ ...common }, ctx.k)
     : ctx.lane === "direct"
-      ? await runAgent({ ...common })
-      : await runReliableAgent({ ...common });
+      ? await runAgent({ ...common, commandGate })
+      : await runReliableAgent({ ...common, commandGate });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });

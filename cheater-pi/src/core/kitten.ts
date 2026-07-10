@@ -39,7 +39,7 @@ Usage:
   kitten web                 local web UI (later preview)
   kitten help
 
-run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json
+run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
 `;
 
 function isLane(s: string | undefined): s is Lane {
@@ -53,6 +53,7 @@ function renderEvent(e: KittenEvent): string | null {
     case "route.selected": return dim(`  route → ${e.lane}${e.k > 1 ? ` (k=${e.k})` : ""}  ${e.reasons.join("; ")}`);
     case "assistant.delta": return e.text.trim() ? dim("  · ") + e.text.trim() : null;
     case "assistant.final": return e.text.trim() ? e.text.trim() : null;
+    case "tool.approval_required": return red(`  ⚠ approval needed: ${e.name} — ${e.reason}`);
     case "tool.completed": return dim(`  ${e.ok ? "·" : "✗"} ${e.name}${e.output ? " " + e.output.replace(/\n/g, " ").slice(0, 80) : ""}`);
     case "verification.failed": return dim(`  ⓘ ${e.detail.slice(0, 100)}`);
     case "verification.passed": return dim(`  ✓ ${e.detail.slice(0, 100)}`);
@@ -74,6 +75,7 @@ async function cmdRun(rest: string[]): Promise<number> {
   let lane: Lane | undefined;
   let k: number | undefined;
   let json = false;
+  let dangerous = false;
   const words: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
@@ -82,13 +84,15 @@ async function cmdRun(rest: string[]): Promise<number> {
     else if (a === "--lane") { const l = rest[++i]; if (isLane(l)) lane = l; }
     else if (a === "--k") k = Math.max(1, Number(rest[++i]) || 1);
     else if (a === "--json") json = true;
+    else if (a === "--dangerous" || a === "--yes") dangerous = true;
     else words.push(a);
   }
   const task = words.join(" ").trim();
   if (!task) { process.stderr.write('kitten run: give a task, e.g. kitten run "fix the parser"\n'); return 2; }
 
   const store = ConversationStore.open(storePath());
-  const app = new KittenApp({ store, runner: defaultRunner(), projectRoot: cwd, model });
+  // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
+  const app = new KittenApp({ store, runner: defaultRunner(), projectRoot: cwd, model, approvalPolicy: dangerous ? "auto-allow" : "auto-deny" });
   app.recover();
   if (!json) app.subscribe((e) => { const line = renderEvent(e); if (line) process.stdout.write(line + "\n"); });
 

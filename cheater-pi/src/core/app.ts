@@ -34,7 +34,14 @@ export interface RunContext {
   snapshotRef: string | null;
   /** Persist + broadcast a run-scoped event. The app stamps envelope + ordering. */
   emit(payload: EventPayload): void;
+  /** Ask the client/policy to approve a risky action. Emits tool.approval_required and resolves per the
+   *  app's approvalPolicy ("ask" waits for resolveApproval; auto-* decides immediately). */
+  requestApproval(callId: string, name: string, reason: string, risk: "low" | "medium" | "high"): Promise<boolean>;
 }
+
+/** How the app resolves approval requests. Interactive clients (TUI/web) use "ask" and respond via
+ *  resolveApproval; unattended headless runs default to "auto-deny" (safe) unless the user opts in. */
+export type ApprovalPolicy = "ask" | "auto-allow" | "auto-deny";
 
 /** The result a Runner reports; the app turns it into `run.completed` + `receipt.finalized`. */
 export interface RunOutcome {
@@ -61,6 +68,8 @@ export interface KittenAppOptions {
   now?: () => number;
   /** Injectable id generator. Tests pass a deterministic one; default is time+counter, collision-free. */
   newId?: (prefix: string) => string;
+  /** How risky actions are approved. Default "auto-deny" (safe for unattended runs). */
+  approvalPolicy?: ApprovalPolicy;
 }
 
 export interface CreateConversationInput {
@@ -90,6 +99,9 @@ export class KittenApp {
   private readonly listeners = new Set<EventListener>();
   /** In-flight runs, so cancel() can abort them. */
   private readonly inflight = new Map<string, AbortController>();
+  private approvalPolicy: ApprovalPolicy;
+  /** Pending interactive approvals keyed by `${runId}:${callId}`, resolved by resolveApproval(). */
+  private readonly pendingApprovals = new Map<string, (allowed: boolean) => void>();
 
   constructor(opts: KittenAppOptions) {
     this.store = opts.store;
@@ -98,6 +110,33 @@ export class KittenApp {
     this.model = opts.model ?? "ornith-1.0-35b";
     this.now = opts.now ?? (() => Date.now());
     this.newId = opts.newId ?? defaultIdGen();
+    this.approvalPolicy = opts.approvalPolicy ?? "auto-deny";
+  }
+
+  /** Change the approval policy (e.g. a TUI sets "ask", a --dangerous headless run sets "auto-allow"). */
+  setApprovalPolicy(policy: ApprovalPolicy): void {
+    this.approvalPolicy = policy;
+  }
+
+  /** An interactive client's answer to a tool.approval_required. Returns false if nothing was pending. */
+  resolveApproval(runId: string, callId: string, allowed: boolean): boolean {
+    const key = `${runId}:${callId}`;
+    const resolve = this.pendingApprovals.get(key);
+    if (!resolve) return false;
+    this.pendingApprovals.delete(key);
+    resolve(allowed);
+    return true;
+  }
+
+  /** Implements RunContext.requestApproval: records the request, then resolves per policy. */
+  private requestApproval(conversationId: string, runId: string, callId: string, name: string, reason: string, risk: "low" | "medium" | "high"): Promise<boolean> {
+    if (this.approvalPolicy === "auto-allow") { this.emit(conversationId, { type: "tool.approval_required", runId, callId, name, reason, risk }); return Promise.resolve(true); }
+    if (this.approvalPolicy === "auto-deny") { this.emit(conversationId, { type: "tool.approval_required", runId, callId, name, reason, risk }); return Promise.resolve(false); }
+    // "ask": register the resolver BEFORE emitting, so a synchronous client answer during the broadcast
+    // isn't lost (the same ordering guarantee cancel() relies on).
+    const p = new Promise<boolean>((resolve) => { this.pendingApprovals.set(`${runId}:${callId}`, resolve); });
+    this.emit(conversationId, { type: "tool.approval_required", runId, callId, name, reason, risk });
+    return p;
   }
 
   /** Release the underlying store (the app owns its lifecycle). */
@@ -209,6 +248,7 @@ export class KittenApp {
         lane: decision.lane, k: decision.k, model: conv.model, signal: controller.signal,
         snapshotRef,
         emit: (payload) => { this.emit(conversationId, payload); },
+        requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),
       };
       const outcome = await this.runner(ctx);
 
