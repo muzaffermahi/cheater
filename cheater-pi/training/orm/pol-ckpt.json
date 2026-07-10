@@ -1,0 +1,35 @@
+{
+  "kind": "orm-logreg",
+  "featureNames": [
+    "hasPassingRun",
+    "hasFailingRun",
+    "hasExecutionReceipt",
+    "errorDensity",
+    "diffSize",
+    "finished",
+    "reasoningLen",
+    "editCount",
+    "verifiedMarker",
+    "crashMarker"
+  ],
+  "weights": [
+    2.9708227791091013,
+    -1.4587594447122385,
+    -0.40734597145868356,
+    -0.015914379080859263,
+    -0.03086450163037662,
+    -1.743948176404146,
+    -0.01239282377309663,
+    -0.0678909952431138,
+    1.9926248506604172,
+    -0.9412113774068627
+  ],
+  "bias": -0.40734597145868356,
+  "meta": {
+    "n": 600,
+    "solved": 300,
+    "corpus": "disjoint (asserted at gen_data)",
+    "trainedAt": "2026-07-08T15:13:21.348Z",
+    "note": "proof-of-life logistic-regression ORM over execution-grounded features; scale = fine-tuned 2B (see README)."
+  }
+}

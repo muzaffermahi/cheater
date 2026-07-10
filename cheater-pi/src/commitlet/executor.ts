@@ -5,6 +5,9 @@ import { createRoleSeparation, renderBlueprintArtifact } from "../blueprint/arti
 import { evaluateBlueprintQuality } from "../blueprint/qualityGate.js";
 import { sdkFreshAgentPacketRunner, type FreshAgentPacketResult, type FreshAgentPacketRunner } from "../blueprint/worker.js";
 import { createRollbackPoint } from "./rollback.js";
+import { synthesizedCheckDir } from "./checkFirst.js";
+import { scout, type ScoutOutcome } from "../blueprint/scout.js";
+import { scoreHardness } from "../runtime/computeBudget.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import { buildRepoConstraintGraph, queryConstraintFacts } from "./constraintGraph.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
@@ -20,7 +23,7 @@ import { planToolExposure, workerModeForCommitlet } from "../runstate/toolExposu
 import { appendRunEvent } from "../runstate/runDir.js";
 import { operatingRulesFor } from "../reliability/packetPrompt.js";
 import { inferModelClass } from "../reliability/modelProfile.js";
-import { effectiveMode } from "./types.js";
+import { effectiveMode, isRepairCommitlet } from "./types.js";
 import { isManifestPath } from "../blueprint/scaffold.js";
 import type { CheaterConfig } from "../types.js";
 
@@ -162,9 +165,13 @@ export function buildCommitletExecutionPrompt(plan: CommitletPlan, commitlet: Co
     });
     const rendered = renderCapsulePrompt(capsule);
     const editGuidance = "Edit with surgical patches: read the exact region first, then prefer cheater_line_edit (or the built-in edit tool) for existing files; use the write tool ONLY to create new files - never heredocs or echo/cat redirection.";
+    // Tier-2 synthesized-check hint: when the repo has no test command, the worker's own runnable
+    // check IS the oracle. Point it at the run's checks dir so the harness can discover and red-green
+    // screen it (see checkFirst.ts). Relative path so a weak model writes it without path confusion.
+    const checkDirRel = `.cheater/runs/${run.taskId}/checks/${commitlet.id.replace(/[^A-Za-z0-9._-]+/g, "-")}/`;
     const verifyLine = verificationCommand
       ? `Run the focused verification YOURSELF with the bash tool before finishing and report its real output: ${verificationCommand}`
-      : "No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). If a test file is within THIS commitlet's allowed files, add a small one in the project's language and run it; otherwise verify by running the code and report its real output. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.";
+      : `No project test/build command was detected, so you have no automatic signal for 'done'. Create one: exercise your change by RUNNING it - a quick script, a REPL one-liner, or the project's own entrypoint - and confirm the spec holds on the normal case AND the obvious edge cases (empty/zero input, a single element, boundaries, invalid input, negatives, ordering/precedence). Best: drop a small standalone runnable check (a .py, .mjs, or .sh file) into ${checkDirRel} and the harness will run it as this commitlet's check. Otherwise, if a test file is within THIS commitlet's allowed files, add a small one and run it. A concrete passing check is your signal to STOP - do not keep rewriting code that already works.`;
     // Prompt shape (measurement only - does not change the prompt below). The fixed operating rules
     // sit AFTER the big dynamic capsule, so they are not a reusable leading prefix; recorded so the
     // receipt can show worker-prompt size and cache-friendliness. See runtime/promptShape.ts.
@@ -337,6 +344,12 @@ function buildRunCapsule(
   });
   const worldDiffFragment = fragments.find((fragment) => fragment.kind === "world_state_diff");
   const guardLine = run.guard.warningLine();
+  // Deterministic scouting (Phase 3): enrich relevantFiles with contract-noun briefs the executor's
+  // own target-file slices don't cover (symbol definitions elsewhere, references, one import hop), so
+  // a worker wanders less with read/grep. Hardness-gated: deep (symbol search + imports) only for hard
+  // work; shallow (contract/target files only) keeps the easy lane lean. The executor's own snippets
+  // are excluded so scout never duplicates them; scout is the deterministic floor beneath any rerank.
+  const scouted = scoutForCapsule(run, plan, commitlet, extras.snippets.map((entry) => entry.path));
   const capsule = buildPromptCapsule({
     taskId: run.taskId,
     workerRole: commitlet.id,
@@ -359,14 +372,20 @@ function buildRunCapsule(
     attemptStance: attemptStance(attempt) || undefined,
     operatingRules: operatingRulesFor(inferModelClass(extras.modelName ?? "")),
     worldDiff: worldDiffFragment ? worldDiffFragment.text.split(/\r?\n/).slice(1) : undefined,
-    relevantFiles: extras.snippets
-      .filter((entry) => entry.snippet)
-      .map((entry) => ({ path: entry.path, reason: "commitlet target", snippet: entry.snippet })),
+    relevantFiles: [
+      ...extras.snippets
+        .filter((entry) => entry.snippet)
+        .map((entry) => ({ path: entry.path, reason: "commitlet target", snippet: entry.snippet })),
+      ...scouted.briefs
+    ],
     allowedFiles: commitlet.allowedFiles,
     forbiddenFiles: commitlet.forbiddenFiles,
     repoFacts: extras.repoFacts,
     constraints: [
       ...plan.globalConstraints,
+      // Ambiguity: two definition sites for a symbol -> ask the worker to STATE which it used
+      // (multiple-choice selection, not exploration), so it does not guess and drift.
+      ...(scouted.ambiguous.length ? [`Two candidate definitions exist for ${scouted.ambiguous.join(", ")} - state which file's definition you built against.`] : []),
       ...(spec?.behaviorMustHold ?? []).map((item) => `must hold: ${item}`),
       ...(spec?.behaviorMustNotChange ?? []).map((item) => `must not change: ${item}`)
     ],
@@ -381,6 +400,36 @@ function buildRunCapsule(
   });
   run.noteCapsule(capsule);
   return { capsule, fragments };
+}
+
+/**
+ * Deterministic scout for a commitlet capsule. Depth follows task hardness (deep = symbol search +
+ * one import hop; shallow = contract/target files only), decoupled from the adaptive-compute flag so
+ * a hard task always gets briefed even when adaptive sampling is off. Fully guarded - a scout failure
+ * degrades to no extra briefs, never breaks capsule assembly.
+ */
+function scoutForCapsule(run: TaskRunState, plan: CommitletPlan, commitlet: Commitlet, excludePaths: string[]): ScoutOutcome {
+  try {
+    const concrete = (file: string): boolean => Boolean(file) && !file.startsWith("(") && !file.endsWith("/");
+    const { hardness } = scoreHardness({
+      taskKind: plan.autopilotDecision?.taskKind,
+      risk: String(commitlet.risk ?? plan.risk ?? ""),
+      filesInScope: commitlet.allowedFiles.filter(concrete).length,
+      isRepair: isRepairCommitlet(commitlet)
+    });
+    return scout({
+      cwd: plan.repoRoot,
+      symbols: run.contract.symbols,
+      files: [...run.contract.files, ...run.contract.outputPaths, ...commitlet.allowedFiles.filter(concrete)],
+      terms: [commitlet.title, ...(commitlet.spec?.acceptanceCriteria ?? [])],
+      depth: hardness >= 3 ? "deep" : "shallow",
+      excludePaths,
+      maxBriefs: 4,
+      byteBudget: 3500
+    });
+  } catch {
+    return { briefs: [], ambiguous: [] };
+  }
 }
 
 export async function spawnFreshWorkerForCommitlet(

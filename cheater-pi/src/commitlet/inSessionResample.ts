@@ -27,6 +27,7 @@ import { applyCandidate, captureCandidate, scoreCandidate, scoreRankVector, type
 import { createRollbackPoint, revertRollbackPoint } from "./rollback.js";
 import { attemptStance, attemptThinkingLevel } from "./executor.js";
 import { sdkSidecarClient } from "../sidecar/client.js";
+import { localControlFromConfig, resampleTemperature, noteLocalControlCapability } from "../providers/localControl.js";
 import type { Commitlet, CommitletPlan } from "./types.js";
 import type { CheaterConfig } from "../types.js";
 
@@ -351,9 +352,20 @@ export function mainModelSampler(plan: CommitletPlan, commitlet: Commitlet, conf
   const maxTokens = config.inSessionResampleMaxTokens ?? DEFAULT_SAMPLE_MAX_TOKENS;
   const timeoutMs = config.inSessionResampleTimeoutMs ?? 600_000;
   const client = sdkSidecarClient({ cwd, model: ctx?.model, timeoutMs, maxOutputTokens: maxTokens });
+  // Owned decoding lane (Phase 5): when an LM Studio endpoint is configured, cheater can call it
+  // directly and add REAL temperature jitter across samples (replacing "no temperature knob"). Null
+  // when no base URL is set, in which case the SDK path below is used unchanged.
+  const local = localControlFromConfig(config, ctx?.model as { id?: string } | undefined);
   return async (attempt: number): Promise<InSessionSample> => {
     if (!target) return { ok: false, error: "no single target file" };
     const { system, prompt } = buildDirectCompletionPrompt(plan, commitlet, target, baseContent, attemptStance(attempt));
+    if (local) {
+      // Real temperature jitter on the owned lane; keep stance jitter (already in the prompt).
+      const res = await local.complete({ model: (ctx?.model as { id?: string } | undefined)?.id, system, prompt, temperature: resampleTemperature(attempt), maxOutputTokens: maxTokens, timeoutMs });
+      noteLocalControlCapability(local.capability());
+      if (res.ok) return { ok: true, text: res.text };
+      // Any owned-lane failure (endpoint down, wrong model) falls back to the SDK path below.
+    }
     const res = await client.complete({
       system,
       prompt,

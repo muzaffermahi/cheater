@@ -6,8 +6,9 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { CheaterConfig, LaunchOptions, PiCommandResolution } from "./types.js";
 
-/** The brand Cheater stamps onto its bundled Pi runtime (Pi's own white-label field). */
-export const BRAND_NAME = "Cheater";
+/** The product name stamped onto the bundled Pi runtime (Pi's own white-label field). The mascot
+ *  cat's name. Internal identifiers (.cheater/, @cheater/cheater-pi, cheater_* tools) are unchanged. */
+export const BRAND_NAME = "Kitten Code";
 
 export const legacyCommands = new Set([
   "agent", "arena", "audit-cards", "bench", "benchmark", "build-cards", "build-index",
@@ -140,7 +141,7 @@ export function buildPiCommand(config: CheaterConfig, options: LaunchOptions, ro
     "--extension", paths.extension,
     "--skill", paths.skills,
     "--prompt-template", paths.prompts,
-    "--name", "Cheater"
+    "--name", BRAND_NAME
   ];
   if (config.provider) command.push("--provider", config.provider);
   if (config.model) command.push("--model", config.model);

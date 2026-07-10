@@ -9,8 +9,6 @@ export interface CheaterConfig {
   // to disable; mascotStyle:"ascii" uses plainer glyphs for terminals that render kaomoji poorly.
   mascotEnabled?: boolean;
   mascotStyle?: "cat" | "ascii" | "off";
-  defaultTestCommand?: string;
-  packagePath?: string;
   debug?: boolean;
   maxContextTokens?: number;
   // HTTP idle timeout (ms) for model requests. Pi's default (300000 = 5 min) kills a slow local
@@ -27,14 +25,6 @@ export interface CheaterConfig {
   // editing. Default false: Cheater is autonomous - one prompt runs to completion, and
   // destructive intent is surfaced as a caution the model proceeds through, not a hard stop.
   requireApprovalForHighRisk?: boolean;
-  gymEnabled?: boolean;
-  gymDefaultLimit?: number;
-  gymDefaultConcurrency?: number;
-  gymTempDir?: string;
-  gymKeepWorkspaces?: boolean;
-  gymRunFullTests?: "never" | "if_cheap" | "always";
-  gymAutoLearn?: boolean;
-  gymDeltaModeEnabled?: boolean;
   autopilotEnabled?: boolean;
   autopilotRouteAllCodeTasks?: boolean;
   blueprintModeEnabled?: boolean;
@@ -237,8 +227,6 @@ export interface CheaterConfig {
   sidecarPreferredRoles?: string[];
   // --- Sidecar liveness / usage (keep the CPU clerk warm and honest about whether it earned its keep) ---
   sidecarKeepAliveEnabled?: boolean;
-  sidecarHealthIntervalMs?: number;
-  sidecarMinUsefulCallsPerRun?: number;
   // Fire one TINY JSON health check at run start to warm a cold CPU endpoint. Off by default.
   sidecarForceWarmOnRunStart?: boolean;
   // --- LM Studio stateful/telemetry probe (Part B) ---

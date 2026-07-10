@@ -4,6 +4,7 @@ import { registerDevLog } from "./dev/devLog.js";
 import { registerSidecarCommands } from "./sidecar/command.js";
 import { registerProviderCommands } from "./providers/command.js";
 import { assessCommandSafety } from "./reliability/commandSafety.js";
+import { nounGateVerdict } from "./reliability/nounGate.js";
 import { registerRunConsole } from "./reliability/runConsole.js";
 import { registerSteeringCommands } from "./runstate/steering.js";
 import { registerEmptyTurnDetector } from "./reliability/emptyTurnDetector.js";
@@ -25,7 +26,6 @@ import { formatAutopilotDecision } from "./autopilot/ui.js";
 import { registerBlueprintCommands } from "./blueprint/commands.js";
 import { defaultBlueprintState } from "./blueprint/state.js";
 import { contextCompactRatio, isBlueprintWorkerSession, mainSessionContextCap, workerBackendState } from "./blueprint/worker.js";
-import { registerGymCommands } from "./gym/commands.js";
 import { registerReliabilityCommands } from "./reliability/commands.js";
 import { registerCommitletCommands } from "./commitlet/commands.js";
 import { registerCommitletTools } from "./commitlet/tools.js";
@@ -481,12 +481,6 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     registerCommitletTools(pi, { config });
   }
 
-  if (config.gymEnabled !== false) {
-    registerGymCommands(pi, {
-      config,
-      getCwd: (ctx) => ctx.cwd
-    });
-  }
   if (config.reliabilityModeEnabled !== false) {
     registerReliabilityCommands(pi, { config });
   }
@@ -786,6 +780,17 @@ export default function cheaterExtension(pi: ExtensionAPI) {
     }
     const commitletBlock = blockCommitletScopeViolation(event);
     if (commitletBlock) return commitletBlock;
+
+    // Noun firewall (Phase 2): pre-execution check that a read/exec/cd/edit path actually exists.
+    // On a phantom path (the classic /app/tls vs /app/ssl) it returns a repair-ready result with the
+    // nearest existing path instead of letting the model discover the truth by stack trace. Scope-
+    // guarded (workspace paths only) and fail-open (ambiguous tokens + repeated phantoms pass), so it
+    // can never block legitimate work. Kill-switch is the module-internal NOUN_GATE constant.
+    const nounVerdict = nounGateVerdict({ toolName: event.toolName, input: event.input, cwd: ctx.cwd });
+    if (nounVerdict.action === "block") {
+      try { ctx.ui?.notify?.(`Cheater noun gate: ${event.toolName} -> path not found (${nounVerdict.phantomPath})`, "warn"); } catch { /* best-effort */ }
+      return { block: true, reason: `Cheater noun gate: ${nounVerdict.reason}` };
+    }
 
     // Durable-run pre-tool hook pipeline: controlled-exec policy (guard, reserve, shell-edit
     // scope, long-running), phase budget, protected artifacts, read-before-write, and

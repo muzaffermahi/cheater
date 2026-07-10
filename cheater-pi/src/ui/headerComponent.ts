@@ -39,7 +39,7 @@ export class CheaterHeaderComponent {
       const subtitle = this.opts.subtitle ?? DEFAULT_SUBTITLE;
       if (style === "off") {
         // Mascot disabled: still hide Pi's banner, but show a plain wordmark instead of cat art.
-        lines = [`cheater — ${subtitle}`];
+        lines = [`kitten — ${subtitle}`];
       } else {
         // One-line banner on a narrow terminal; the small boxed cat banner otherwise. Both are a
         // fixed number of lines, so the header height is stable across renders.
@@ -47,11 +47,11 @@ export class CheaterHeaderComponent {
       }
       const fg = this.theme?.fg;
       if (fg) {
-        // Tint just the wordmark line with the accent color, matching the "Cheater" status pill.
-        lines = lines.map((line) => (line.includes("cheater") ? safeColor(fg, "accent", line) : line));
+        // Tint just the wordmark line with the accent color, matching the status pill.
+        lines = lines.map((line) => (line.includes("kitten") ? safeColor(fg, "accent", line) : line));
       }
     } catch {
-      lines = ["cheater"];
+      lines = ["kitten"];
     }
     this.cachedLines = lines;
     this.cachedWidth = width;

@@ -32,12 +32,12 @@ import {
   singleTargetFile,
   type InSessionResampleOutcome
 } from "./inSessionResample.js";
-import { computeBudget } from "../runtime/computeBudget.js";
+import { computeBudget, scoreHardness } from "../runtime/computeBudget.js";
 import { isRepairCommitlet } from "./types.js";
 import { liveSessionState } from "../reliability/sessionState.js";
 import { resolveSidecarClient, sidecarConfig, sdkSidecarClient } from "../sidecar/client.js";
 import { sidecarScheduler } from "../sidecar/scheduler.js";
-import { routeGoalSidecar, prepareContextSidecar } from "../sidecar/jobs.js";
+import { routeGoalSidecar, prepareContextSidecar, triageHintSidecar, driftNoteSidecar } from "../sidecar/jobs.js";
 import { jobGate } from "../sidecar/calibration.js";
 import type { SidecarClient } from "../sidecar/types.js";
 import { mainCallGovernor, workerRoleForCommitletId } from "../runtime/mainCallGovernor.js";
@@ -46,12 +46,14 @@ import { getWorkerPromptShape, resetWorkerPromptShape } from "../runtime/promptS
 import { runProviderProbe } from "../providers/lmStudioStateful.js";
 import { workerBackendReason } from "../blueprint/worker.js";
 import { steeringControl } from "../runstate/steering.js";
+import { resetNounGate } from "../reliability/nounGate.js";
 import { activeTaskRun, beginTaskRun, type TaskRunState } from "../runstate/runState.js";
 import {
   buildCompletionReceipt,
   finalizePlan,
   finishVerdict,
   gradeCommitlet,
+  resetSelfTestDebris,
   resolveModelName,
   resolveRealWorkerMode,
   updateControllerFile,
@@ -267,6 +269,27 @@ function report(result: Omit<ClosedLoopRunResult, "summary">, goal: string, extr
 }
 
 /**
+ * Direct lane (Phase 6): a trivial task (low hardness AND at most one file in scope) should skip the
+ * blueprint / inspect / review ceremony entirely and just edit in-session with the gates + finish
+ * gate - the README-measured easy-task overhead is those extra model turns, not the ~1-2s gates. This
+ * extends the existing singleCommitletInSession lane; it never fires for a from-scratch build or when
+ * that lane is disabled. Deterministic and pure so the trigger is unit-testable.
+ */
+export function directLaneEligible(
+  decision: { taskKind?: string; risk?: string },
+  opts: { fromScratch: boolean; singleCommitletInSession: boolean; filesInScope?: number }
+): boolean {
+  if (opts.fromScratch || !opts.singleCommitletInSession) return false;
+  const files = opts.filesInScope ?? 1;
+  if (files > 1) return false;
+  // High risk keeps the full ceremony even for a nominally trivial task - skipping the blueprint's
+  // safety planning on a high-risk change is exactly where it should not be skipped.
+  if ((decision.risk ?? "").toLowerCase() === "high") return false;
+  const { hardness } = scoreHardness({ taskKind: decision.taskKind, risk: decision.risk, filesInScope: files });
+  return hardness <= 1;
+}
+
+/**
  * Run the whole task loop deterministically. The model never orchestrates: it only
  * implements inside bounded workers spawned by this loop.
  */
@@ -359,6 +382,7 @@ async function runClosedLoopInner(
   const sidecarConcurrency = scfg.baseUrl ? Math.max(1, config.sidecarMaxConcurrency ?? 1) : 1;
   sidecarScheduler.configure(sidecar, scfg.parallelism, scfg.parallelism === "concurrent" ? undefined : jobGate(cwd, scfg.modelId ?? "main"), sidecarConcurrency);
   steeringControl.reset();
+  resetNounGate();
   if (scfg.enabled) announceSidecarHealth(sidecar, ctx);
 
   // Control plane (Main LLM Call Governor + sidecar usage accounting + prompt shape). All per-run
@@ -409,10 +433,17 @@ async function runClosedLoopInner(
   }
   const scaffolding = scaffoldFiles.length > 0;
 
+  // Direct lane (Phase 6): a trivial task skips the whole blueprint/inspect/review ceremony and edits
+  // in-session. This is the easy-task burn-down - the overhead there is extra model TURNS, not gate
+  // latency. It never fires for a from-scratch build (scaffold has its own fast path).
+  const directLane = directLaneEligible(decision, { fromScratch: scaffolding, singleCommitletInSession: config.singleCommitletInSession !== false, filesInScope: 1 });
+  if (directLane) narrate(ctx, "direct lane: trivial task - skipping blueprint/inspect/review, editing in-session with gates + finish gate");
+
   // Blueprint: reuse an active plan or build one internally for complex tasks (skipped when a
-  // model-derived scaffold is driving) - identical policy to cheater_reliability_start otherwise.
+  // model-derived scaffold is driving, OR on the direct lane) - identical policy to
+  // cheater_reliability_start otherwise. Skipping it on the direct lane saves the blueprint model turn.
   const activeBlueprint = params.useActiveBlueprint === false ? undefined : defaultBlueprintState.get().currentPlan ?? undefined;
-  const blueprintPlan = scaffolding ? undefined : (activeBlueprint ?? (decision.executionMode === "blueprint_orchestrator" || decision.needsBlueprint
+  const blueprintPlan = (scaffolding || directLane) ? undefined : (activeBlueprint ?? (decision.executionMode === "blueprint_orchestrator" || decision.needsBlueprint
     ? await deps.createBlueprint({ cwd, userGoal, taskType: decision.taskKind, modelName: ctx?.model?.id ?? config.model, config })
     : undefined));
   if (blueprintPlan && blueprintPlan !== activeBlueprint) defaultBlueprintState.setPlan(blueprintPlan);
@@ -429,6 +460,18 @@ async function runClosedLoopInner(
   if (scfg.parallelism === "concurrent") dispatchContextPrep(cwd, plan, userGoal, prefetchHorizon);
   liveSessionState.reset(userGoal);
   liveSessionState.ensure(config, userGoal);
+  // triage_hint (Phase 4): a second-opinion hardness nudge from the clerk, recorded as an advisory
+  // observation. Additive and non-authoritative - the deterministic hardness signals remain the floor
+  // (this is not fed into gating; it is surfaced for visibility). Gated on the sidecar, so it is a
+  // no-op by default and never blocks the run.
+  if (sidecar.available()) {
+    try {
+      const { hardness } = scoreHardness({ taskKind: decision.taskKind, risk: decision.risk, filesInScope: plan.commitlets.length });
+      const triage = await triageHintSidecar(sidecar, userGoal, { hardness });
+      liveSessionState.getLedger()?.addEntry("sidecar", `${triage.label}: ${triage.note}`, { label: triage.label, source: triage.source, extraHardness: triage.value.extraHardness });
+      sidecarUsage.record("route", triage.source);
+    } catch { /* triage is advisory; never break the run */ }
+  }
   if (config.runStateEnabled !== false) {
     // Budget generously: the per-commitlet maxToolCalls (~10) is for a BOUNDED isolated worker,
     // but in simulated/in-session mode the MAIN model does the whole multi-file build itself and
@@ -472,6 +515,7 @@ async function runClosedLoopInner(
   // main model then thrashes. The main model, which JUST explored the repo, does a single focused task
   // far better than a cold worker. Multi-commitlet plans still fan out to fresh workers.
   const inSessionByDesign = scaffolding
+    || directLane
     || (config.singleCommitletInSession !== false && plan.commitlets.length <= 1);
   const realWorkers = await deps.resolveWorkerMode({ spawnFreshWorker: inSessionByDesign ? false : params.spawnFreshWorker }, config, ctx);
   const modelName = resolveModelName(config, ctx);
@@ -652,6 +696,11 @@ async function runClosedLoopInner(
         continue; // the cleanup commitlet is now pending; keep looping into it
       }
       const accepted = finalized.details.review.accepted;
+      // Clean-state rule (Phase 1): move self-test debris (run-created data files that are not
+      // contract deliverables) aside before the finish-gate checks, so leftover app data the model
+      // wrote while test-running its own app cannot corrupt the acceptance evidence.
+      const debris = resetSelfTestDebris(cwd, config);
+      if (debris.removed.length) narrate(ctx, `clean state: moved ${debris.removed.length} self-test data file(s) aside`);
       narrate(ctx, "finish gate");
       const gate = deps.finish(config);
       const gateAllowed = gate?.allowed === true;
@@ -720,6 +769,16 @@ async function runClosedLoopInner(
         estTokens: getWorkerPromptShape()?.totalEstimatedTokens,
         reason: `fresh worker for ${prepared.id}`
       });
+      // drift_note (Phase 4): post-turn scan of the worker's output for off-goal/out-of-scope signs.
+      // Purely advisory - a soft ledger observation, never a hard break by itself. Gated on the
+      // sidecar (no-op by default); guarded so it never affects the run's control flow.
+      if (sidecar.available() && workerResult.summary) {
+        try {
+          const drift = await driftNoteSidecar(sidecar, userGoal, workerResult.summary);
+          liveSessionState.getLedger()?.addEntry("sidecar", `${drift.label}: ${drift.note}`, { label: drift.label, source: drift.source, offGoal: drift.value.offGoal, commitletId: prepared.id });
+          if (drift.value.offGoal && drift.value.note) activeTaskRun()?.addBlocker(`drift (advisory): ${drift.value.note}`);
+        } catch { /* drift is advisory; never break the run */ }
+      }
     }
 
     if (workerResult.error === "worker_backend_unavailable") {

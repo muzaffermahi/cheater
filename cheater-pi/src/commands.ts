@@ -25,14 +25,6 @@ const PUBLIC_COMMAND_NAMES = [
   "bench-report",
   "model-profile",
   "provider-probe",
-  "gym",
-  "gym-list",
-  "gym-run",
-  "gym-run-suite",
-  "gym-report",
-  "gym-delta",
-  "gym-learn",
-  "gym-clean",
   "test",
   "map",
   "raw",
@@ -155,7 +147,7 @@ export function registerCheaterCommands(pi: ExtensionAPI, config?: CheaterConfig
       // explicitly instead of disappearing, so this diagnostic can never again silently
       // under-report what is loaded.
       const knownCheaterCommands = new Set(PUBLIC_COMMAND_NAMES.concat(DEBUG_COMMAND_NAMES));
-      const cheaterCommandPrefixes = ["autopilot-", "blueprint-", "commitlet-", "gym-", "reliability-"];
+      const cheaterCommandPrefixes = ["autopilot-", "blueprint-", "commitlet-", "reliability-"];
       const uncategorized = commands.filter((name: string) =>
         !knownCheaterCommands.has(name) && cheaterCommandPrefixes.some((prefix) => name.startsWith(prefix))
       );

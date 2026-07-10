@@ -70,11 +70,11 @@ test("resolvePiCommand still honors an explicit configured command (no bundled o
   assert.deepEqual(resolved.command, ["C:\\custom\\pi.cmd"]);
 });
 
-test("CheaterHeaderComponent renders a Cheater wordmark and never leaks 'pi'", () => {
+test("CheaterHeaderComponent renders a kitten wordmark and never leaks 'pi'", () => {
   const header = new CheaterHeaderComponent(null, undefined, { style: "cat" });
   const lines = header.render(80);
   assert.ok(lines.length >= 1);
-  assert.ok(lines.some((l) => l.includes("cheater")), "the header must show the Cheater wordmark");
+  assert.ok(lines.some((l) => l.includes("kitten")), "the header must show the Kitten Code wordmark");
   assert.ok(!lines.join("\n").toLowerCase().includes(" pi "), "the header must not print the word pi");
 });
 
@@ -82,7 +82,7 @@ test("CheaterHeaderComponent 'off' style is a single plain wordmark line (still 
   const header = new CheaterHeaderComponent(null, undefined, { style: "off" });
   const lines = header.render(80);
   assert.equal(lines.length, 1);
-  assert.match(lines[0], /^cheater/);
+  assert.match(lines[0], /^kitten/);
 });
 
 test("CheaterHeaderComponent height is stable across renders (never forces a relayout)", () => {

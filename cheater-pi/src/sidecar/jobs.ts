@@ -272,6 +272,210 @@ export async function prepareContextSidecar(
   };
 }
 
+/**
+ * A structured failure card: the file, test, and assertion at the heart of a failure, plus the few
+ * salient lines. Feeds the capsule's observedFailure instead of a blunt raw-log tail. Advisory - the
+ * deterministic card is the floor, so this works with the sidecar off.
+ */
+export interface FailureCard {
+  file?: string;
+  test?: string;
+  assertion?: string;
+  salientLines: string[];
+}
+
+const FILE_LINE_RE = /(?:File "([^"]+\.[A-Za-z]{1,5})"|([\w./-]+\.[A-Za-z]{1,5}):\d+|at [^(]*\(([\w./-]+\.[A-Za-z]{1,5}):\d+)/;
+const TEST_NAME_RE = /(?:\bFAILED\s+([\w./:-]+)|\b(test_[A-Za-z0-9_]+)\b|\bit\(["']([^"']{3,80})["']|\bdef\s+(test_[A-Za-z0-9_]+))/;
+const ASSERT_RE = /(assert\b.*|expected\b.*|AssertionError.*|to (?:be|equal|throw).*|received\b.*)/i;
+
+/** Deterministic failure card: scan the failure text for file/test/assertion and salient lines. */
+export function deterministicFailureCard(failureText: string): FailureCard {
+  const lines = (failureText ?? "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  let file: string | undefined;
+  let test: string | undefined;
+  let assertion: string | undefined;
+  for (const line of lines) {
+    if (!file) {
+      const m = line.match(FILE_LINE_RE);
+      if (m) file = (m[1] ?? m[2] ?? m[3])?.replace(/\\/g, "/");
+    }
+    if (!test) {
+      const m = line.match(TEST_NAME_RE);
+      if (m) test = m[1] ?? m[2] ?? m[3] ?? m[4];
+    }
+    if (!assertion) {
+      const m = line.match(ASSERT_RE);
+      if (m) assertion = m[0].slice(0, 200);
+    }
+  }
+  const salientLines = lines.filter((line) => ERROR_LINE.test(line) || ASSERT_RE.test(line)).slice(0, 5);
+  return { file, test, assertion, salientLines: salientLines.length ? salientLines : lines.slice(0, 5) };
+}
+
+/** Render a failure card as a compact block for a repair worker's observedFailure field. */
+export function renderFailureCard(card: FailureCard): string {
+  const lines = ["Failure card:"];
+  if (card.file) lines.push(`- file: ${card.file}`);
+  if (card.test) lines.push(`- test: ${card.test}`);
+  if (card.assertion) lines.push(`- assertion: ${card.assertion}`);
+  if (card.salientLines.length) {
+    lines.push("- salient:");
+    for (const line of card.salientLines) lines.push(`  ${line.slice(0, 160)}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Parse a raw failing test/command output into a structured card (file, test, assertion, 5 salient
+ * lines). The sidecar sharpens the extraction from noisy output; the deterministic scan is the floor,
+ * so the card always exists. Advisory - it only ever becomes capsule text, never a verdict.
+ */
+export async function parseFailureSidecar(
+  client: SidecarClient,
+  failureText: string,
+  opts: { timeoutMs?: number } = {}
+): Promise<SidecarJobOutcome<FailureCard>> {
+  const label = "parse_failure";
+  const deterministic = deterministicFailureCard(failureText);
+  if (!client.available() || !(failureText ?? "").trim()) {
+    return { value: deterministic, source: "deterministic", confidence: 0.4, note: client.available() ? "empty failure; deterministic card" : "sidecar unavailable; deterministic card", label };
+  }
+  const prompt = [
+    "Extract the heart of this failing test/command output into EXACTLY this JSON:",
+    '{"file": "the file at fault or empty", "test": "the failing test name or empty", "assertion": "the failed assertion/expected-vs-got or empty", "salientLines": ["up to 5 most informative lines, verbatim"]}',
+    "Rules: copy exact names/paths from the output; do not invent; salientLines are verbatim from the text.",
+    "",
+    "Output:",
+    (failureText ?? "").slice(0, 4000)
+  ].join("\n");
+  const res = await client.complete({ system: SIDECAR_SYSTEM, prompt, maxOutputTokens: 320, timeoutMs: opts.timeoutMs, label });
+  if (!res.ok) return { value: deterministic, source: "deterministic", confidence: 0.4, note: `sidecar failed (${res.error}); deterministic card`, label };
+  const obj = extractJsonObject(res.text);
+  const salientLines = clampStrList(obj?.salientLines ?? (obj as Record<string, unknown> | null)?.["salient"], 5, 160);
+  const card: FailureCard = {
+    file: clampStr(obj?.file, 160) ?? deterministic.file,
+    test: clampStr(obj?.test, 120) ?? deterministic.test,
+    assertion: clampStr(obj?.assertion, 200) ?? deterministic.assertion,
+    salientLines: salientLines.length ? salientLines : deterministic.salientLines
+  };
+  if (!card.file && !card.test && !card.assertion && !card.salientLines.length) {
+    return { value: deterministic, source: "deterministic", confidence: 0.4, note: "sidecar card unusable; deterministic card", label };
+  }
+  return { value: card, source: "sidecar", confidence: 0.65, note: "sidecar parsed the failure into a card", label };
+}
+
+/** A reordering of scout's brief candidates for a goal. The order is always a subset of the input. */
+export interface RerankedBriefs {
+  order: string[];
+}
+
+/**
+ * Rerank/prune scout's FileBrief candidate paths for a goal. A wrong answer is only slightly worse
+ * context, so this is cheap and safe. Deterministic floor = the input order unchanged. The sidecar
+ * may only REORDER/PRUNE the given paths - never introduce a path outside the candidate set.
+ */
+export async function rerankBriefsSidecar(
+  client: SidecarClient,
+  goal: string,
+  briefs: Array<{ path: string; reason: string }>,
+  opts: { timeoutMs?: number } = {}
+): Promise<SidecarJobOutcome<RerankedBriefs>> {
+  const label = "rerank_briefs";
+  const inputOrder = briefs.map((b) => b.path);
+  const deterministic: RerankedBriefs = { order: inputOrder };
+  if (!client.available() || briefs.length <= 1) {
+    return { value: deterministic, source: "deterministic", confidence: 0.4, note: client.available() ? "nothing to rerank" : "sidecar unavailable; input order", label };
+  }
+  const prompt = [
+    `Goal: ${(goal ?? "").slice(0, 200)}`,
+    "Order these candidate files most-relevant-first for the goal. You may drop clearly-irrelevant ones.",
+    "Use ONLY the exact paths given; do not invent paths. Output JSON only:",
+    '{"order": ["path", "path"]}',
+    "",
+    briefs.map((b) => `- ${b.path}: ${b.reason}`).join("\n")
+  ].join("\n");
+  const res = await client.complete({ system: SIDECAR_SYSTEM, prompt, maxOutputTokens: 200, timeoutMs: opts.timeoutMs, label });
+  if (!res.ok) return { value: deterministic, source: "deterministic", confidence: 0.4, note: `sidecar failed (${res.error}); input order`, label };
+  const candidateSet = new Set(inputOrder);
+  // Clamp generously THEN filter to the candidate set (invented paths dropped) THEN cap - filtering
+  // before the count cap so a sneaked-in junk path never evicts a real one. Never widens access.
+  const order = [...new Set(clampStrList(extractJsonObject(res.text)?.order, briefs.length + 8, 200).filter((path) => candidateSet.has(path)))].slice(0, briefs.length);
+  if (!order.length) return { value: deterministic, source: "deterministic", confidence: 0.4, note: "sidecar order unusable; input order", label };
+  return { value: { order }, source: "sidecar", confidence: 0.55, note: `sidecar reranked ${order.length} brief(s)`, label };
+}
+
+/** A second-opinion nudge to the deterministic hardness score. Additive; never overrides code. */
+export interface TriageHint {
+  /** Advisory delta to add to the deterministic hardness score, clamped to a small range. */
+  extraHardness: number;
+  reason: string;
+}
+
+/**
+ * A second opinion on task hardness, consulted only as an additive nudge to computeBudget's
+ * deterministic signals - it can never lower a deterministic hard verdict below its floor, only add a
+ * small bounded delta. Deterministic floor = no nudge (0).
+ */
+export async function triageHintSidecar(
+  client: SidecarClient,
+  goal: string,
+  deterministic: { hardness: number },
+  opts: { timeoutMs?: number } = {}
+): Promise<SidecarJobOutcome<TriageHint>> {
+  const label = "triage_hint";
+  const neutral: TriageHint = { extraHardness: 0, reason: "no sidecar triage" };
+  if (!client.available()) return { value: neutral, source: "deterministic", confidence: 0.4, note: "sidecar unavailable; no nudge", label };
+  const prompt = [
+    `A coding task has a deterministic hardness score of ${deterministic.hardness} (0 easy, 5+ very hard).`,
+    "Give a SMALL second-opinion adjustment based on hidden complexity you see in the request. Output JSON only:",
+    '{"extraHardness": -1..2, "reason": "one short phrase"}',
+    "",
+    `Task: ${(goal ?? "").slice(0, 400)}`
+  ].join("\n");
+  const res = await client.complete({ system: SIDECAR_SYSTEM, prompt, maxOutputTokens: 60, timeoutMs: opts.timeoutMs, label });
+  if (!res.ok) return { value: neutral, source: "deterministic", confidence: 0.4, note: `sidecar failed (${res.error}); no nudge`, label };
+  const obj = extractJsonObject(res.text);
+  const extraHardness = clampNum(obj?.extraHardness ?? (obj as Record<string, unknown> | null)?.["extra_hardness"], -1, 2, 0);
+  return { value: { extraHardness, reason: clampStr(obj?.reason, 120) ?? "sidecar triage" }, source: "sidecar", confidence: 0.5, note: `sidecar hardness nudge ${extraHardness >= 0 ? "+" : ""}${extraHardness}`, label };
+}
+
+/** A post-turn advisory: did the worker's last output drift off-goal / out of scope? */
+export interface DriftNote {
+  offGoal: boolean;
+  note: string;
+}
+
+/**
+ * Scan a worker's last output for signs it went off-goal or out of scope. Post-turn only (never
+ * mid-stream) and purely advisory - it becomes a SOFT observation for the loop governor / a ledger
+ * note, never a hard break by itself. Deterministic floor = no drift.
+ */
+export async function driftNoteSidecar(
+  client: SidecarClient,
+  goal: string,
+  workerOutput: string,
+  opts: { timeoutMs?: number } = {}
+): Promise<SidecarJobOutcome<DriftNote>> {
+  const label = "drift_note";
+  const none: DriftNote = { offGoal: false, note: "" };
+  if (!client.available() || !(workerOutput ?? "").trim()) {
+    return { value: none, source: "deterministic", confidence: 0.4, note: client.available() ? "no output to scan" : "sidecar unavailable; no drift note", label };
+  }
+  const prompt = [
+    `Goal: ${(goal ?? "").slice(0, 200)}`,
+    "Did this worker's output drift OFF the goal or OUT of its allowed scope (working on unrelated files,",
+    "solving a different problem, broad refactor)? Output JSON only:",
+    '{"offGoal": true|false, "note": "one short phrase if off-goal, else empty"}',
+    "",
+    (workerOutput ?? "").slice(0, 2500)
+  ].join("\n");
+  const res = await client.complete({ system: SIDECAR_SYSTEM, prompt, maxOutputTokens: 60, timeoutMs: opts.timeoutMs, label });
+  if (!res.ok) return { value: none, source: "deterministic", confidence: 0.4, note: `sidecar failed (${res.error}); no drift note`, label };
+  const obj = extractJsonObject(res.text);
+  const offGoal = clampBool(obj?.offGoal ?? (obj as Record<string, unknown> | null)?.["off_goal"], false);
+  return { value: { offGoal, note: offGoal ? (clampStr(obj?.note, 160) ?? "worker output looks off-goal") : "" }, source: "sidecar", confidence: 0.5, note: offGoal ? "sidecar flagged possible drift" : "sidecar: no drift", label };
+}
+
 /** A "second pair of eyes" read of a diff: semantic concerns automated gates miss. Advisory only. */
 export interface DiffReview {
   concerns: string[];

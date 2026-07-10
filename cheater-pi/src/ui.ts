@@ -1,9 +1,5 @@
 import type { CheaterConfig } from "./types.js";
 
-function gymOn(config?: CheaterConfig): boolean {
-  return config?.gymEnabled !== false;
-}
-
 function blueprintOn(config?: CheaterConfig): boolean {
   return config?.blueprintModeEnabled !== false;
 }
@@ -19,7 +15,6 @@ export function startupCard(cwd: string, model: string | undefined, config?: Che
     "  reliability_start -> edit allowed files -> commitlet_next -> verify -> finish_gate",
     "status: /cheater /autopilot-status /reliability-status /commitlet-status /rollback-status /commitlet-health"
   ];
-  if (gymOn(config)) lines.push("gym (local benchmark): /gym /gym-list /gym-run /gym-report");
   return lines;
 }
 
@@ -47,19 +42,6 @@ export function commandHelp(config?: CheaterConfig): string {
       "/blueprint-cancel Cancel current blueprint run",
       "/blueprint-docs <query> Search official/local docs facts",
       "/blueprint-memory Show blueprint memories"
-    );
-  }
-
-  if (gymOn(config)) {
-    lines.push(
-      "/gym      Cheater Gym help and status",
-      "/gym-list List Cheater Gym tasks",
-      "/gym-run <id>        Prepare a Gym task workspace and prompt",
-      "/gym-run-suite [opts] Run a small suite of tasks",
-      "/gym-report          Show the latest Gym report",
-      "/gym-delta <id>      Show Cheater vs vanilla delta",
-      "/gym-learn           Show learning suggestions from past runs",
-      "/gym-clean           Remove Gym workspaces and reports"
     );
   }
 

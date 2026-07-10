@@ -28,8 +28,8 @@ test("mascotLine formats emoji vs ascii and appends the message", () => {
   assert.doesNotMatch(mascotLine("ready", undefined), /·/, "no separator when there is no message");
 });
 
-test("mascotBanner names cheater and its tagline; lean form is one line", () => {
-  assert.match(mascotBanner(), /cheater/i);
+test("mascotBanner names kitten and its tagline; lean form is one line", () => {
+  assert.match(mascotBanner(), /kitten/i);
   assert.match(mascotBanner(), /reliable local coding/);
   assert.equal(mascotBanner({ lean: true }).split("\n").length, 1, "lean banner is a single line");
 });

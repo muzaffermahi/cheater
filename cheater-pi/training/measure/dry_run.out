@@ -1,0 +1,22 @@
+NOTE: numbers below are ILLUSTRATIVE synthetic — proof of the rig's shape, not a capability claim.
+
+── eval set (synthetic) — pass@k → Best@1 ──────────────
+  k  tasks  pass@1   pass@k   Best@1    gap(verifier)  lift(Best@1-pass@1)
+  1     40   22.5%   22.5%   22.5%      0.0%        +0.0%
+  4     40   22.5%   60.0%   45.0%     15.0%        +22.5%
+ 16     40   20.0%   95.0%   75.0%     20.0%        +55.0%
+ 50     40   17.5%   97.5%   97.5%      0.0%        +80.0%
+──────────────────────────────────────────────────────────
+
+── Ablation ledger — held-out Best@1, leave-one-out ──────
+  all levers ON: Best@1 = 97.5%
+  lever         off→Best@1    marginal
+  diversity        2.5%      +95.0%
+  orm             77.5%      +20.0%
+  web             97.5%      ±0.0%   (not earning its keep — consider cutting)
+  experience      97.5%      ±0.0%   (not earning its keep — consider cutting)
+  skills          97.5%      ±0.0%   (not earning its keep — consider cutting)
+  cascade         97.5%      ±0.0%   (not earning its keep — consider cutting)
+──────────────────────────────────────────────────────────
+
+transfer: eval Best@1 97.5% vs held-out 77.5% (drop 20.0%) → DOES NOT TRANSFER — leakage suspected, revert per Law 6
