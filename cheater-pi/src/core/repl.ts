@@ -11,6 +11,7 @@
 
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { runAgent, type AgentEvent } from "./agent.js";
 import { runReliableAgent } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
@@ -76,8 +77,8 @@ async function runOnce(llm: KittenLLM, st: ReplState, task: string): Promise<voi
   }
 }
 
-async function main(): Promise<void> {
-  const { st, task } = parseArgs(process.argv.slice(2));
+export async function runRepl(argv: string[] = process.argv.slice(2)): Promise<void> {
+  const { st, task } = parseArgs(argv);
   const llm = new KittenLLM(DEFAULT_MODELS);
 
   // Headless one-shot: `kitten "<task>"` or `kitten run "<task>"` — run it here and exit.
@@ -119,4 +120,7 @@ async function main(): Promise<void> {
   process.stdout.write(dim("bye") + "\n");
 }
 
-main().catch((e) => { process.stderr.write(`kitten repl fatal: ${e?.stack ?? e}\n`); process.exit(1); });
+// Auto-run only when invoked directly (node .../repl.js), not when imported by the kitten dispatcher.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runRepl().catch((e) => { process.stderr.write(`kitten repl fatal: ${e?.stack ?? e}\n`); process.exit(1); });
+}

@@ -11,6 +11,7 @@
 import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob } from "./llm.js";
 import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
+import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
 import { aggregateSelfCertainty } from "./selfCertainty.js";
 
 export interface AgentEvent {
@@ -54,6 +55,11 @@ export interface AgentRunParams {
    *  (e.g. to ground the failure via the sidecar). */
   finishGate?: (state: FinishGateState) => { allowed: boolean; feedback?: string } | Promise<{ allowed: boolean; feedback?: string }>;
   maxFinishRejections?: number;
+  /** Safety/approval hook: called before a shell command with a non-"allow" safety assessment. Returning
+   *  allowed:false injects the feedback as the tool result and the loop continues (denial → feedback, no
+   *  retry loop — Goal §8). When omitted, catastrophic/RCE/exfil ("block") commands are still hard-blocked
+   *  as a safety floor; merely-destructive ("warn") commands run (preserving the permissive default). */
+  commandGate?: (command: string, assessment: SafetyResult) => Promise<{ allowed: boolean; feedback?: string }>;
   /** P1: request per-token logprobs and aggregate self-certainty across the trajectory (owned-engine
    *  selection signal). Opt-in — adds response size, so only the ascent best-of-N path enables it. */
   captureConfidence?: boolean;
@@ -219,6 +225,26 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         messages.push(toolResultTurn(call.id, call.name, "ok"));
         emit({ turn, kind: "finish", detail: summary });
         break;
+      }
+      // Safety/approval gate for shell commands (runs before execution).
+      if (call.name === "bash") {
+        const command = String(call.args.command ?? "");
+        const assessment = assessCommandSafety(command);
+        if (assessment.verdict !== "allow") {
+          if (params.commandGate) {
+            const decision = await params.commandGate(command, assessment);
+            if (!decision.allowed) {
+              messages.push(toolResultTurn(call.id, call.name, `blocked: ${decision.feedback ?? assessment.message}. Do not retry this command; choose a safe alternative.`));
+              emit({ turn, kind: "gate_block", detail: `command denied (${assessment.category}): ${assessment.message}` });
+              continue;
+            }
+          } else if (assessment.verdict === "block") {
+            // Safety floor: catastrophic / remote-code-execution / secret-exfiltration never run.
+            messages.push(toolResultTurn(call.id, call.name, `blocked (safety): ${assessment.message}. Do not retry; this class of command is not permitted.`));
+            emit({ turn, kind: "gate_block", detail: `safety block (${assessment.category}): ${assessment.message}` });
+            continue;
+          }
+        }
       }
       const res = tool.execute(call.args, ctx);
       if (call.name === "edit" || call.name === "write") { if (!res.isError) hasEdited = true; }

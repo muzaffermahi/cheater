@@ -1,24 +1,51 @@
 {
   "name": "@cheater/cheater-pi",
   "version": "0.7.0",
-  "description": "Cheater distribution package for Pi.",
+  "description": "Kitten — a reliable local-first coding agent (terminal + web UI) for local models, with durable conversations and an adaptive reliability engine.",
   "type": "module",
   "bin": {
-    "cheater": "./dist/src/index.js",
-    "kitten": "./dist/src/core/repl.js"
+    "kitten": "./dist/src/core/kitten.js",
+    "cheater": "./dist/src/index.js"
   },
   "keywords": [
-    "pi-package",
-    "cheater",
-    "coding-agent"
+    "kitten",
+    "coding-agent",
+    "local-first",
+    "llm",
+    "tui",
+    "lm-studio",
+    "pi-package"
+  ],
+  "license": "MIT",
+  "author": "Muzaffer Mahi Can",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/muzaffermahi/cheater.git"
+  },
+  "homepage": "https://github.com/muzaffermahi/cheater#readme",
+  "bugs": {
+    "url": "https://github.com/muzaffermahi/cheater/issues"
+  },
+  "files": [
+    "dist",
+    "src",
+    "prompts",
+    "skills",
+    "themes",
+    "LICENSE",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "kitten": "node dist/src/core/repl.js"
+    "prepack": "npm run build",
+    "smoke": "node scripts/pack-smoke.mjs",
+    "kitten": "node dist/src/core/kitten.js"
   },
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.5.0"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",

@@ -25,7 +25,7 @@ import type { MascotState } from "./mascot.js";
 type Rgb = [number, number, number];
 
 // The mascot's own fixed palette (not the app theme - this cat owns its colors). `null` = transparent.
-const PALETTE: Record<string, Rgb | null> = {
+export const PALETTE: Record<string, Rgb | null> = {
   ".": null,
   o: [17, 17, 21],    // darkest fur / soft edge
   f: [31, 31, 37],    // fur (dark charcoal -> reads as a black cat)

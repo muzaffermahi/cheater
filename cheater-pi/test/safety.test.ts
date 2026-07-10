@@ -1,0 +1,85 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { runAgent } from "../src/core/agent.js";
+import { KittenApp, type Runner } from "../src/core/app.js";
+import { ConversationStore } from "../src/core/store/conversationStore.js";
+import { openSqlite } from "../src/core/store/db.js";
+
+// A scripted LLM that emits a fixed sequence of tool calls (then finish). No network.
+function scriptedLlm(steps: Array<{ tool: string; args: Record<string, unknown> } | { finish: string }>): unknown {
+  let i = 0;
+  const ok = { ok: true as const, content: "", reasoning: "", finishReason: "stop", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, elapsedMs: 1 };
+  return {
+    chat: async () => {
+      const s = steps[Math.min(i, steps.length - 1)]; i++;
+      if ("finish" in s) return { ...ok, toolCalls: [{ id: "f", name: "finish", args: { summary: s.finish }, raw: "{}" }] };
+      return { ...ok, toolCalls: [{ id: `t${i}`, name: s.tool, args: s.args, raw: JSON.stringify(s.args) }] };
+    },
+    sidecar: async () => ({ ok: false }),
+    embed: async () => [],
+  };
+}
+
+test("safety floor: a catastrophic command is hard-blocked even without an approval gate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-safe-"));
+  const llm = scriptedLlm([{ tool: "bash", args: { command: "rm -rf /" } }, { finish: "done" }]) as never;
+  const res = await runAgent({ task: "x", cwd: dir, llm });
+  assert.ok(res.events.some((e) => e.kind === "gate_block" && /safety block/.test(e.detail)), "expected a safety block");
+  assert.ok(!res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "the command must not have executed");
+});
+
+test("commandGate: a denied destructive command is blocked and fed back", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-safe-"));
+  const llm = scriptedLlm([{ tool: "bash", args: { command: "git push --force origin main" } }, { finish: "done" }]) as never;
+  let asked = "";
+  const res = await runAgent({
+    task: "x", cwd: dir, llm,
+    commandGate: async (cmd, a) => { asked = a.category; return { allowed: false, feedback: "nope" }; },
+  });
+  assert.equal(asked, "destructive");
+  assert.ok(res.events.some((e) => e.kind === "gate_block" && /denied/.test(e.detail)));
+  assert.ok(!res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "denied command must not execute");
+});
+
+test("commandGate: an approved warn-level command is allowed to run", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-safe-"));
+  const llm = scriptedLlm([{ tool: "bash", args: { command: "rm -rf ./does-not-exist-subdir" } }, { finish: "done" }]) as never;
+  const res = await runAgent({ task: "x", cwd: dir, llm, commandGate: async () => ({ allowed: true }) });
+  assert.ok(res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "approved command should execute");
+});
+
+// A runner that just asks for approval and reports the answer — exercises the app's policy machinery.
+const askingRunner: Runner = async (ctx) => {
+  const allowed = await ctx.requestApproval("cmd0", "bash", "destructive: rm -rf build", "high");
+  return { finished: allowed, summary: allowed ? "approved" : "denied", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [], verified: false };
+};
+
+function app(policy: "ask" | "auto-allow" | "auto-deny"): KittenApp {
+  return new KittenApp({ store: new ConversationStore(openSqlite(":memory:")), runner: askingRunner, approvalPolicy: policy });
+}
+
+test("approvalPolicy auto-deny blocks and emits tool.approval_required", async () => {
+  const a = app("auto-deny");
+  const conv = a.createConversation();
+  const run = await a.submitMessage(conv.id, "rm the build dir");
+  assert.equal(run.finished, false);
+  assert.ok(a.getEvents(conv.id).some((e) => e.type === "tool.approval_required"));
+});
+
+test("approvalPolicy auto-allow approves", async () => {
+  const a = app("auto-allow");
+  const conv = a.createConversation();
+  const run = await a.submitMessage(conv.id, "rm the build dir");
+  assert.equal(run.finished, true);
+});
+
+test("approvalPolicy ask waits for an interactive resolveApproval", async () => {
+  const a = app("ask");
+  const conv = a.createConversation();
+  a.subscribe((e) => { if (e.type === "tool.approval_required") a.resolveApproval(e.runId, e.callId, true); });
+  const run = await a.submitMessage(conv.id, "rm the build dir");
+  assert.equal(run.finished, true); // resolved allow → runner saw allowed:true
+});
