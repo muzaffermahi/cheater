@@ -70,7 +70,7 @@ test("kitten doctor reports node + store health", () => {
   const { env } = withHome();
   const { out } = run(env, "doctor");
   assert.match(out, /Node/);
-  assert.match(out, /store at/);
+  assert.match(out, /store writable at/);
 });
 
 test("kitten resume with an unknown id fails cleanly", () => {

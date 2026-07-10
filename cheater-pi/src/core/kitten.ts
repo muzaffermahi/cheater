@@ -13,12 +13,15 @@
 // replayable. This is the entry that proves the Phase-A spine end to end from a real command.
 
 import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
+import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { runRepl } from "./repl.js";
 import { runTui } from "./tui.js";
+import { runWeb } from "./web.js";
 import type { KittenEvent, Lane } from "./events.js";
 import type { ConversationRow } from "./store/conversationStore.js";
 
@@ -27,6 +30,7 @@ const bold = (s: string): string => `\x1b[1m${s}\x1b[0m`;
 const green = (s: string): string => `\x1b[32m${s}\x1b[0m`;
 const red = (s: string): string => `\x1b[31m${s}\x1b[0m`;
 const cyan = (s: string): string => `\x1b[36m${s}\x1b[0m`;
+const yellow = (s: string): string => `\x1b[33m${s}\x1b[0m`;
 
 const HELP = `${bold("Kitten")} — a reliable local-first coding agent
 
@@ -186,27 +190,70 @@ function finishUndo(store: ConversationStore, conversationId: string): number {
   return 0;
 }
 
-function cmdWeb(_rest: string[]): number {
-  process.stdout.write(dim("kitten web is being wired up in this preview.\n"));
-  return 0;
+async function endpointModels(models = DEFAULT_MODELS): Promise<{ reachable: boolean; models: string[] }> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    const res = await fetch(`${models.baseUrl.replace(/\/+$/, "")}/models`, {
+      headers: { authorization: `Bearer ${models.apiKey ?? "lm-studio"}` }, signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) return { reachable: true, models: [] };
+    const j = await res.json() as { data?: Array<{ id?: string }> };
+    return { reachable: true, models: (j.data ?? []).map((m) => String(m.id ?? "")).filter(Boolean) };
+  } catch { return { reachable: false, models: [] }; }
 }
 
-function cmdDoctor(): number {
-  // Basic Phase-A checks; the full doctor (endpoint capabilities, storage, git, node) lands in Phase E.
+async function cmdDoctor(): Promise<number> {
+  let bad = 0;
+  const ok = (b: boolean): string => (b ? green("✓") : red("✗"));
+
+  // Node.
   const node = process.versions.node;
   const okNode = Number(node.split(".")[0]) >= 22;
-  process.stdout.write(`${okNode ? green("✓") : red("✗")} Node ${node} ${okNode ? "" : "(need >= 22.5 for the durable store)"}\n`);
+  if (!okNode) bad++;
+  process.stdout.write(`${ok(okNode)} Node ${node}${okNode ? "" : "  (need >= 22.5 for the durable store)"}\n`);
+
+  // Storage.
   try {
     const store = ConversationStore.open(storePath());
     const n = store.listConversations({ includeArchived: true, limit: 1000 }).length;
     store.close();
-    process.stdout.write(`${green("✓")} store at ${storePath()} (${n} conversation${n === 1 ? "" : "s"})\n`);
+    process.stdout.write(`${green("✓")} store writable at ${storePath()} (${n} conversation${n === 1 ? "" : "s"})\n`);
   } catch (e) {
+    bad++;
     process.stdout.write(`${red("✗")} store: ${(e as Error).message}\n`);
-    return 1;
   }
-  process.stdout.write(dim("endpoint + model checks arrive with the full `kitten doctor` in a later preview.\n"));
-  return okNode ? 0 : 1;
+
+  // Endpoint + model + engine.
+  const models = tierSidecar(DEFAULT_MODELS);
+  const llm = new KittenLLM(models);
+  const ep = await endpointModels(models);
+  if (!ep.reachable) {
+    bad++;
+    process.stdout.write(`${red("✗")} endpoint unreachable at ${models.baseUrl}  (start LM Studio / llama.cpp, or set KITTEN_BASE_URL)\n`);
+  } else {
+    process.stdout.write(`${green("✓")} endpoint reachable at ${models.baseUrl}\n`);
+    const hasModel = ep.models.length === 0 || ep.models.includes(models.main);
+    if (!hasModel) {
+      bad++;
+      process.stdout.write(`${red("✗")} model '${models.main}' not loaded  (available: ${ep.models.slice(0, 6).join(", ") || "none"}; set KITTEN_MAIN_MODEL)\n`);
+    } else {
+      const responds = await llm.ping(models.main);
+      if (!responds) { bad++; process.stdout.write(`${red("✗")} model '${models.main}' did not respond to a probe\n`); }
+      else {
+        const engine = await llm.detectEngine();
+        process.stdout.write(`${green("✓")} model '${models.main}' responds  (engine: ${engine}${engine === "llamacpp" ? " — grammar/min-p/logprobs available" : ""})\n`);
+      }
+    }
+  }
+
+  // Git (affects /undo).
+  const inGit = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd: process.cwd(), encoding: "utf8" }).stdout?.trim() === "true";
+  process.stdout.write(`${inGit ? green("✓") : yellow("○")} git repository${inGit ? "" : "  (not a git repo — allowed, but /undo needs git for rollback)"}\n`);
+
+  process.stdout.write(bad ? red(`\n${bad} issue${bad === 1 ? "" : "s"} to resolve.\n`) : green("\nall good.\n"));
+  return bad ? 1 : 0;
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -216,8 +263,8 @@ async function main(argv: string[]): Promise<number> {
     case "resume": return cmdResume(rest);
     case "conversations": case "ls": return cmdConversations(rest);
     case "undo": return cmdUndo(rest);
-    case "doctor": return cmdDoctor();
-    case "web": return cmdWeb(rest);
+    case "doctor": return await cmdDoctor();
+    case "web": await runWeb(rest); return 0;
     case "repl": await runRepl(rest); return 0; // the minimal readline REPL (compatibility)
     case "help": case "--help": case "-h": process.stdout.write(HELP); return 0;
     case undefined: await runTui([]); return 0; // bare `kitten` → the full TUI

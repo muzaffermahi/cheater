@@ -61,7 +61,11 @@ interface TuiState {
   mascot: MascotState;
   activeRun: string | null;
   model: string;
+  /** Sticky lane override from /mode; undefined = automatic routing. */
+  lane?: Lane;
 }
+
+const LANES: Lane[] = ["answer", "direct", "reliable", "bon", "ascent"];
 
 function out(s: string): void { process.stdout.write(s + "\n"); }
 
@@ -170,7 +174,7 @@ export async function runTui(argv: string[] = process.argv.slice(2)): Promise<vo
     const line = raw.trim();
     if (!line) return;
     if (line.startsWith("/")) { await slash(line.slice(1)); return; }
-    await app.submitMessage(st.conversationId, line);
+    await app.submitMessage(st.conversationId, line, st.lane ? { lane: st.lane } : {});
   };
 
   const slash = async (body: string): Promise<void> => {
@@ -196,7 +200,12 @@ export async function runTui(argv: string[] = process.argv.slice(2)): Promise<vo
       }
       case "rename": { if (arg) { app.rename(st.conversationId, arg); out(A.dim(`renamed → ${arg}`)); } break; }
       case "model": { if (arg) { st.model = arg; out(A.dim(`model: ${arg} (new conversations)`)); } else out(A.dim(`model: ${st.model}`)); break; }
-      case "mode": { out(A.dim("lane override is per-message; use `/mode` guidance — routing is automatic by default.")); if (arg) out(A.dim(`(tip: prefix a task nuance to steer; the router is deterministic)`)); break; }
+      case "mode": {
+        if (!arg || arg === "auto") { st.lane = undefined; out(A.dim("mode: auto (adaptive routing)")); }
+        else if (LANES.includes(arg as Lane)) { st.lane = arg as Lane; out(A.dim(`mode: ${arg} (override for this session)`)); }
+        else out(A.red(`unknown mode '${arg}' — one of: auto ${LANES.join(" ")}`));
+        break;
+      }
       case "diff": { const r = spawnSync("git", ["diff", "--stat"], { cwd, encoding: "utf8" }); out(r.stdout?.trim() ? r.stdout : A.dim("(no changes / not a git repo)")); break; }
       case "undo": { const res = app.undoLast(st.conversationId); out(res.ok ? A.green(`↩ restored ${res.restored.length}, deleted ${res.deleted.length}`) : A.red(`undo: ${res.reason}`)); break; }
       case "cat": { st.mascot = "ready"; for (const row of catAnsi(st.mascot)) out(row); break; }
