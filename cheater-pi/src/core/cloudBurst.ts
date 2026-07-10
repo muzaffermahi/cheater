@@ -70,6 +70,7 @@ export interface CloudBurstParams {
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
   experiencePrime?: string;    // A3 priming (same for all attempts)
+  contextPreamble?: string;    // conversation context (same for all attempts) — multi-turn/resume
   captureConfidence?: boolean; // P1: capture self-certainty for selection
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string }; // P2 ban (global)
   banForbidden?: boolean;      // P2: run the finish-gate forbidden-construct scan
@@ -100,6 +101,7 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
         task: params.task, cwd: workspace, llm: params.llm, model: params.model,
         maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, temperature: plan.temperature,
         extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime,
+        contextPreamble: params.contextPreamble,
         captureConfidence: params.captureConfidence,
         decode: { ...params.decode, ...plan.decode },
         banForbidden: params.banForbidden,

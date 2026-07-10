@@ -18,6 +18,7 @@ import {
 import type { EventPayload, KittenEvent, Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
 import { captureSnapshot, restoreSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
+import { ContextBuilder } from "./context.js";
 
 /** Everything a Runner needs to execute one run, plus the sink it emits progress into. */
 export interface RunContext {
@@ -29,6 +30,10 @@ export interface RunContext {
   k: number;
   model: string;
   signal: AbortSignal;
+  /** The model-facing conversation context (prior turns + current repo truth), assembled by the
+   *  ContextBuilder from durable state. Empty on a brand-new conversation's first turn. Every lane
+   *  injects this so a resumed/multi-turn conversation actually informs the model. */
+  conversationContext: string;
   /** Pre-run git snapshot ref (or null), so a lane that isolates its work (Ascent) can derive the
    *  winner's changed files via git after adoption. */
   snapshotRef: string | null;
@@ -102,10 +107,12 @@ export class KittenApp {
   private approvalPolicy: ApprovalPolicy;
   /** Pending interactive approvals keyed by `${runId}:${callId}`, resolved by resolveApproval(). */
   private readonly pendingApprovals = new Map<string, (allowed: boolean) => void>();
+  private readonly context: ContextBuilder;
 
   constructor(opts: KittenAppOptions) {
     this.store = opts.store;
     this.runner = opts.runner;
+    this.context = new ContextBuilder(opts.store);
     this.projectRoot = opts.projectRoot ?? process.cwd();
     this.model = opts.model ?? "ornith-1.0-35b";
     this.now = opts.now ?? (() => Date.now());
@@ -225,6 +232,10 @@ export class KittenApp {
     const conv = this.store.getConversation(conversationId);
     if (!conv) throw new Error(`submitMessage: unknown conversation ${conversationId}`);
 
+    // Assemble the model-facing conversation context from PRIOR turns BEFORE persisting the new message
+    // (so the current request isn't duplicated into its own context). This is what makes resume real.
+    const built = this.context.build(conversationId, conv.projectRoot);
+
     this.emit(conversationId, { type: "user.message", text });
 
     const decision: RouteDecision = routeMessage(text, { lane: opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode), k: opts.k, cwd: conv.projectRoot });
@@ -246,6 +257,7 @@ export class KittenApp {
       const ctx: RunContext = {
         runId, conversationId, task: text, cwd: conv.projectRoot,
         lane: decision.lane, k: decision.k, model: conv.model, signal: controller.signal,
+        conversationContext: built.preamble,
         snapshotRef,
         emit: (payload) => { this.emit(conversationId, payload); },
         requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),

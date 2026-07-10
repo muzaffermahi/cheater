@@ -26,14 +26,12 @@ export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT
 /** Answer-only lane: one chat, no write tools, stream the reply as assistant deltas. */
 async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   const started = Date.now();
-  const r = await llm.chat({
-    model: ctx.model,
-    messages: [
-      { role: "system", content: "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files." },
-      { role: "user", content: ctx.task },
-    ],
-    signal: ctx.signal,
-  });
+  const messages: Array<{ role: "system" | "user"; content: string }> = [
+    { role: "system", content: "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files." },
+  ];
+  if (ctx.conversationContext.trim()) messages.push({ role: "system", content: ctx.conversationContext });
+  messages.push({ role: "user", content: ctx.task });
+  const r = await llm.chat({ model: ctx.model, messages, signal: ctx.signal });
   const text = r.ok ? r.content : `(model error: ${r.error ?? "unknown"})`;
   ctx.emit({ type: "assistant.final", runId: ctx.runId, text });
   return {
@@ -85,11 +83,12 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
 
   if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent);
 
+  const preamble = ctx.conversationContext || undefined;
   const result = ctx.lane === "bon"
-    ? await runBestOfN({ ...common }, ctx.k)
+    ? await runBestOfN({ ...common, contextPreamble: preamble }, ctx.k)
     : ctx.lane === "direct"
-      ? await runAgent({ ...common, commandGate })
-      : await runReliableAgent({ ...common, commandGate });
+      ? await runAgent({ ...common, commandGate, contextPreamble: preamble })
+      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
@@ -116,7 +115,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: ctx.model, onEvent, signal: ctx.signal });
+    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: ctx.model, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
@@ -124,7 +123,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
     };
   }
   const a = await runAscent(
-    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal },
+    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined },
     config
   );
   // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it

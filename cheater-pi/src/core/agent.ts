@@ -65,6 +65,9 @@ export interface AgentRunParams {
   captureConfidence?: boolean;
   /** Owned-inference per-sample decode controls (P2 ban, P5 sampler diversity) applied to every turn. */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
+  /** Model-facing conversation context (prior turns + current repo truth), injected as a system block
+   *  after the stable rules and before the current task, so a resumed/multi-turn run informs the model. */
+  contextPreamble?: string;
   /** Owned-engine thinking control (iter-1 speed lever): on a single-function task ornith writes the
    *  code directly ~2x faster when its chain-of-thought is off — the harness (worked-example gate,
    *  consensus, repair) supplies the correctness, not the model's CoT. Thinking is auto-RE-ENABLED once
@@ -115,8 +118,13 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const env = `\n\nEnvironment: your working directory is ${params.cwd}. Every tool (read/write/edit/bash) already runs from there, so use plain relative paths (e.g. \`python foo.py\`) and do NOT cd anywhere — never cd to a guess like /home/user or /app, and you don't need to cd to the working directory either. Scratch files you create while testing may be left in place; do not spend turns deleting them.`;
   const messages: ChatMessage[] = [
     { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env },
-    { role: "user", content: params.task }
   ];
+  // Conversation context (prior turns + repo truth) goes AFTER the stable rules, BEFORE the task, so the
+  // stable system prefix stays cache-friendly and the model still sees what happened earlier.
+  if (params.contextPreamble && params.contextPreamble.trim()) {
+    messages.push({ role: "system", content: params.contextPreamble });
+  }
+  messages.push({ role: "user", content: params.task });
   const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;
   const usage = { prompt: 0, completion: 0, reasoning: 0 };
   let toolCalls = 0;

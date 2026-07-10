@@ -83,6 +83,8 @@ export interface AscentParams {
   forceSamples?: number;
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
+  /** Model-facing conversation context (prior turns + repo truth); every candidate gets the same one. */
+  contextPreamble?: string;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
 }
@@ -259,7 +261,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
     if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
     const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime,
+      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
         decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
