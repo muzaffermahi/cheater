@@ -202,14 +202,15 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // B2 target (single-fn consensus), computed once.
   const probe = await generateFnProbes(config.llm, params.task, contract).catch(() => null);
 
-  // Iter-3 — consensus floor: k=2 cannot VOTE (a 1-1 split is a coin flip), and a statically-"easy" task
-  // (hardness 0 → k=1) can still hide edge-case difficulty — json_query reads easy yet a lone k=1
-  // candidate shipped 2/56 wrong. When a self-probe exists (consensus IS the selector) and the caller
-  // didn't pin k, floor easy tasks to k=3 so there's a real majority vote. Hard tasks already earn a
-  // high k from the budget; this only lifts the under-budgeted easy-looking ones.
-  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 3) {
-    const floored = governor.capSamples(3, estTokens);
-    if (floored > samples) { samples = floored; receipts.push(`consensus floor: k→${samples} (self-probe present → real majority vote)`); }
+  // Consensus floor: a statically-"easy" task (hardness 0 → k=1) can still hide edge-case difficulty —
+  // json_query reads easy yet a lone k=1 candidate shipped 2/56 wrong. When a self-probe exists and the
+  // caller didn't pin k, floor easy tasks to k=2 so there are ≥2 candidates to select between. Originally
+  // k=3 (for a majority vote), but the ground-truth eligibility gate + mid-loop repair now filter wrong
+  // candidates directly — so k=2 recovers json_query (measured 0/56) at ⅓ less latency than k=3, and a
+  // task that stays wrong earns more depth from the repair round anyway. Hard tasks keep their budgeted k.
+  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 2) {
+    const floored = governor.capSamples(2, estTokens);
+    if (floored > samples) { samples = floored; receipts.push(`consensus floor: k→${samples} (self-probe present → select between candidates)`); }
   }
 
   const genLlm = lever(config, "cloudBurst") && config.cloudBurst ? cloudLlm(config.cloudBurst) : config.llm;
