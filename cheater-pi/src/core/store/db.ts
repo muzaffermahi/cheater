@@ -45,11 +45,11 @@ export function sql(v: unknown): SqlValue {
  * corrupt each other's writes. Never throws lazily: a bad path fails here, loudly, at open.
  */
 export function openSqlite(path: string): SqlDatabase {
-  // Lazy require so importing this module doesn't emit the experimental-SQLite warning until a store is
-  // actually opened, and so environments without node:sqlite fail with a clear message, not a load error.
+  // Silence BEFORE requiring node:sqlite: the experimental warning can fire during module load, not only
+  // on `new DatabaseSync`. Lazy require keeps the import cheap and surfaces a clear error if unavailable.
+  silenceSqliteExperimentalWarning();
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { DatabaseSync } = loadNodeSqlite();
-  silenceSqliteExperimentalWarning();
   const db = new DatabaseSync(path);
   // Pragmas: WAL for concurrent readers, NORMAL sync (durable enough for a local app, far faster than
   // FULL), a 5s busy timeout, and enforced foreign keys. :memory: ignores journal_mode — harmless.

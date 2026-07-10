@@ -18,6 +18,7 @@ import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { runRepl } from "./repl.js";
+import { runTui } from "./tui.js";
 import type { KittenEvent, Lane } from "./events.js";
 import type { ConversationRow } from "./store/conversationStore.js";
 
@@ -185,6 +186,11 @@ function finishUndo(store: ConversationStore, conversationId: string): number {
   return 0;
 }
 
+function cmdWeb(_rest: string[]): number {
+  process.stdout.write(dim("kitten web is being wired up in this preview.\n"));
+  return 0;
+}
+
 function cmdDoctor(): number {
   // Basic Phase-A checks; the full doctor (endpoint capabilities, storage, git, node) lands in Phase E.
   const node = process.versions.node;
@@ -211,13 +217,13 @@ async function main(argv: string[]): Promise<number> {
     case "conversations": case "ls": return cmdConversations(rest);
     case "undo": return cmdUndo(rest);
     case "doctor": return cmdDoctor();
-    case "web": process.stdout.write(dim("kitten web arrives in a later preview (Phase D).\n")); return 0;
+    case "web": return cmdWeb(rest);
+    case "repl": await runRepl(rest); return 0; // the minimal readline REPL (compatibility)
     case "help": case "--help": case "-h": process.stdout.write(HELP); return 0;
-    case undefined: await runRepl([]); return 0; // bare `kitten` → interactive session
+    case undefined: await runTui([]); return 0; // bare `kitten` → the full TUI
     default:
-      // Unknown leading token: treat the whole argv as REPL flags/one-shot (back-compat with `kitten "<task>"`).
-      await runRepl(argv);
-      return 0;
+      // Unknown leading token → treat the whole argv as a one-shot task (back-compat with `kitten "<task>"`).
+      return cmdRun(argv);
   }
 }
 
