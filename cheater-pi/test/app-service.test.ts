@@ -137,6 +137,28 @@ test("router: question -> answer lane, change -> reliable lane", async () => {
   assert.ok(route && "reasons" in route && (route as { reasons: string[] }).reasons.length > 0);
 });
 
+test("two app instances over the same store (TUI + web) observe each other without corruption", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-shared-"));
+  const dbfile = join(dir, "kitten.db");
+  const appTui = makeApp(ConversationStore.open(dbfile), scripted);
+  const appWeb = makeApp(ConversationStore.open(dbfile), scripted);
+
+  // TUI creates + runs; web (a separate connection) sees the full, correctly-ordered history.
+  const conv = appTui.createConversation({ title: "shared" });
+  await appTui.submitMessage(conv.id, "task from the terminal");
+  const fromWeb = appWeb.getEvents(conv.id);
+  assert.ok(fromWeb.some((e) => e.type === "run.completed"), "web connection sees the TUI's run");
+
+  // Web runs the next turn; TUI sees it, and seq stays gap-free across both writers.
+  await appWeb.submitMessage(conv.id, "task from the browser");
+  const fromTui = appTui.getEvents(conv.id);
+  const seqs = fromTui.map((e) => e.seq);
+  assert.deepEqual(seqs, Array.from({ length: seqs.length }, (_, i) => i + 1), "seq is gap-free across both writers");
+  assert.equal(fromTui.filter((e) => e.type === "run.completed").length, 2);
+  appTui.close();
+  appWeb.close();
+});
+
 test("a runner that throws is recorded as run.failed, history intact", async () => {
   const boom: Runner = async () => { throw new Error("engine exploded"); };
   const app = makeApp(new ConversationStore(openSqlite(":memory:")), boom);

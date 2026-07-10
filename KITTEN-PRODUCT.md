@@ -26,9 +26,13 @@ Kitten application core  (cheater-pi/src/core/, Pi-free)
   ├── store/             durable SQLite conversation/event/run store
   ├── router.ts          adaptive lane router (answer / reliable / ascent)
   ├── runner.ts          lane → engine (answer/direct/reliable/bon/ascent)
-  ├── app.ts             KittenApp service: route → run → persist → broadcast
-  └── kitten.ts          canonical `kitten` command (run / resume / conversations / doctor)
-        └── clients: headless CLI (now) · TUI (Phase C) · web UI (Phase D)
+  ├── undo.ts            git-snapshot rollback (/undo)
+  ├── mascot.ts          runtime-independent pixel-cat (catAnsi for TUI, catCells for web)
+  ├── app.ts             KittenApp service: route → run → persist → broadcast + approvals + undo
+  └── kitten.ts          canonical `kitten` command dispatcher
+        ├── tui.ts       streaming terminal UI
+        ├── web/         local web UI (server.ts + page.ts) over SSE
+        └── headless     kitten run / resume / conversations / undo / doctor
 ```
 
 One implementation of conversation state, execution state, persistence, events, and routing. Clients
@@ -94,44 +98,78 @@ tasks never pay best-of-N latency:
 
 Every decision records its reasons in `route.selected`, surfaced in the CLI and persisted.
 
-## Status
+### Terminal UI (`core/tui.ts`)
+
+`kitten` opens a streaming, event-driven TUI over the app service (no Pi). Linear streaming (native
+scrollback — robust on Windows). Renders the pixel-cat mascot (state driven by the event stream), routes
+every canonical event to a styled line, and covers the workflow with slash commands (`/new`, `/resume`,
+`/conversations`, `/rename`, `/model`, `/mode`, `/diff`, `/undo`, `/cat`, `/doctor`, `/help`, `/exit`).
+Interactive approvals (y/N), Ctrl+C cancels an active run (again to exit), `/resume` replays a stored
+conversation's full history. `kitten repl` keeps the old minimal REPL for compatibility.
+
+### Web UI (`core/web/`)
+
+`kitten web` starts a dependency-free HTTP + SSE server on `127.0.0.1` over the SAME core and store. A
+per-launch secret token authenticates every `/api/*` call (header for fetch; query for the EventSource);
+Origin is allowlisted to loopback; no secrets reach the browser. The frontend is one self-contained HTML
+string (no framework, no build step, no CDN): sidebar with search, streamed conversation, composer with
+Stop, inline approvals, changed-files + unified diff, the mascot painted from `catCells`, safe markdown
+(DOM nodes, never innerHTML), a11y + reduced-motion + light/dark. Refresh and server-restart restore the
+conversation via `?c=` + replay-after-seq.
+
+### Safety + undo
+
+- **Safety floor** (`agent.ts` + `reliability/commandSafety.ts`): catastrophic / RCE / secret-exfil
+  shell commands are hard-blocked in every lane. Merely-destructive commands route through an approval
+  policy (`ask` / `auto-allow` / `auto-deny`; the CLI defaults to safe, `--dangerous` opts in).
+- **`/undo`** (`core/undo.ts`): a pre-run `git stash create` snapshot lets undo restore only the run's
+  own files (revert modified, delete created) while preserving your other dirty work. Never a whole-tree
+  reset. Covers all lanes including Ascent (winner files derived from git).
+
+## Status — all phases landed
 
 | Phase | State |
 |---|---|
 | **A — spine** (events, store, app service, headless CLI, recovery) | ✅ landed, tested |
-| **B — Ascent as adaptive default** (router) | ✅ router landed; candidate-isolation for in-place lanes, `/undo`, approval policy layer **still to do** |
-| **C — Pi-free TUI + mascot port** | ⏳ not started (audit + extraction plan ready) |
-| **D — local web UI** | ⏳ not started |
-| **E — packaging / CI / onboarding / docs / compat alias** | ⏳ not started (Node floor already set to ≥ 22.5) |
+| **B — Ascent as adaptive default** (router, undo, safety/approvals, Ascent file events) | ✅ landed, tested |
+| **C — Pi-free TUI + mascot port** | ✅ landed, tested + verified live |
+| **D — local web UI** (SSE, security, mascot) | ✅ landed, tested + verified live in a browser |
+| **E — packaging / CI / doctor / compat alias / docs** | ✅ landed; packed-install smoke passes |
 
-**Exit condition met (Phase A):** a headless run persists and replays a complete conversation through
-the shared API — proven by `test/app-service.test.ts` (EXIT CONDITION) and live via `kitten run` →
-`kitten resume`.
+**Exit conditions met:** a headless run persists and replays a complete conversation through the shared
+API (`test/app-service.test.ts`, live `kitten run`→`resume`); interrupted runs recover honestly; losing
+candidates leave no changes (Ascent isolation) and `/undo` preserves dirty work; a browser refresh +
+server restart restore the conversation; `npm pack` installs clean and launches the TUI + web + a
+persisted run (`npm run smoke`).
 
-**Tests:** 729 green (703 pre-existing preserved + 26 new: store, app service, CLI, router). All new
-tests are offline/deterministic (fake/scripted runner, `:memory:` or temp-file store) — no model needed.
+**Tests:** **754 green** (703 pre-existing preserved + 51 new: store, app service, CLI, router, undo,
+safety, mascot, TUI, web). All offline/deterministic (fake/scripted runner, `:memory:`/temp store, local
+web server) — no model needed. CI runs them on {ubuntu, windows} × node {22, 24} plus a packed-install
+smoke.
 
 ## Honest limitations / not-yet-true
 
-- `kitten` (bare) is still the old REPL, not the new TUI. No web UI yet.
-- The reliability wins (worked examples, execution consensus, repair resampling, disjointness, owned
-  decode) are preserved in `core/` and reachable through the Ascent lane, but the router→Ascent path
-  has not yet been measured on a real battery *through the app service* (the engine's own battery
-  numbers stand; the plumbing is new).
-- `runner.ts` maps the Ascent lane but does not yet surface the adopted candidate's changed files as
-  `file.changed` events (marked TODO).
-- No approvals/undo/candidate-isolation for in-place lanes yet; cancellation is wired (`app.cancel`).
-- `kitten doctor` does not yet probe the endpoint/model/capabilities (Phase E).
+- **Not measured through the app service on a real battery.** The Ascent engine's own numbers stand, but
+  the router→Ascent product path is new plumbing; the headline battery/real-repo numbers should be
+  re-measured through `kitten run` before being cited as product results. The only CI-backed figure is
+  the test suite.
+- **Live model UX is unverified in this environment** (no local model was running). The TUI and web UI
+  were exercised offline (routing, persistence, streaming, approvals, mascot) and against a dead endpoint
+  (graceful degradation); an end-to-end coding session against a real model is the obvious next check.
+- **Config unification is partial.** Kitten core reads `KITTEN_*` env + defaults; a single validated
+  config file layer shared with the Pi path (`~/.config/kitten`, project `.kitten/config.json`) is
+  sketched in docs but not fully implemented.
+- **Package name** is still `@cheater/cheater-pi`; the bins are `kitten`/`cheater`. Renaming the npm
+  package to `kitten` is a deliberate follow-up (name availability + redirect).
+- The web UI has no syntax-highlighting library (monospace diffs only, by design — zero deps).
 
-## Smallest next milestones
+## Next milestones (smallest first)
 
-1. **Finish Phase B**: surface Ascent winner file changes as events; add `/undo` (snapshot before a
-   run, restore last adopted run without touching pre-existing dirty work); a shared approval policy
-   layer used by every client.
-2. **Phase C**: extract the mascot (`ui/catPixels.ts` + `ui/mascot.ts` are already Pi-free;
-   `composeCat(state)` is the pure `(state)→frame` fn) into a runtime-independent module, then build the
-   streaming TUI over the app's event stream.
-3. **Phase D**: `kitten web` — a 127.0.0.1 server streaming the same events over WebSocket/SSE with
-   reconnect + replay-after-seq (the store already supports `readEvents(afterSeq)`).
-4. **Phase E**: LICENSE + repo metadata + `files` allowlist, `prepack` + packed-install smoke test,
-   cross-platform CI, first-run onboarding, `cheater` → compat alias, retire stale Pi-only surface.
+1. Run the hard-task battery **through `kitten run`** (not the raw Ascent CLI) and record honest
+   product-path numbers.
+2. Drive one real end-to-end coding session against a local model in both the TUI and web UI; fix
+   whatever friction surfaces.
+3. Unify configuration behind one validated loader for all clients; add first-run onboarding that
+   detects the endpoint and lists models.
+4. Rename the npm package to `kitten`; retire the Pi extension behind a dated removal boundary once the
+   TUI/web fully cover its workflows.
