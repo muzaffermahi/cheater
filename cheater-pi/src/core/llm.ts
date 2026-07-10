@@ -252,7 +252,14 @@ export class KittenLLM {
    * Used everywhere Kitten needs a clerical/structured answer without spending the GPU model's turn.
    */
   async sidecar(params: Omit<ChatParams, "model"> & { model?: string }): Promise<ChatResult> {
-    return this.chat({ ...params, model: params.model ?? this.models.sidecar, maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000 });
+    // Sidecar work is MECHANICAL (JSON test-inputs, family label, failure card) — it must NOT reason.
+    // A reasoning model (ornith) with thinking ON burns the whole token budget in reasoning_content and
+    // returns EMPTY content, which silently killed consensus/classification on the local native engine.
+    // Default thinking OFF; if a picky endpoint rejects chat_template_kwargs, retry once with it on.
+    const p = { ...params, model: params.model ?? this.models.sidecar, maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000, disableThinking: params.disableThinking ?? true };
+    const r = await this.chat(p);
+    if (!r.ok && p.disableThinking) return this.chat({ ...p, disableThinking: false });
+    return r;
   }
 
   /** Embed texts with the local embedding model. Returns [] on any failure. */
