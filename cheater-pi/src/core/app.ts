@@ -184,7 +184,7 @@ export class KittenApp {
 
     this.emit(conversationId, { type: "user.message", text });
 
-    const decision: RouteDecision = routeMessage(text, { lane: opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode), k: opts.k });
+    const decision: RouteDecision = routeMessage(text, { lane: opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode), k: opts.k, cwd: conv.projectRoot });
     const runId = this.newId("run");
     // Register the abort controller BEFORE emitting run events, so a synchronous subscriber can cancel
     // the instant the run appears (the run row already exists by the time run.started broadcasts).
