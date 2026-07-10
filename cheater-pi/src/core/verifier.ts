@@ -50,6 +50,9 @@ export interface CandidateSignals {
   reproduction: Signal;
   regression: Signal;
   smoke: Signal;
+  /** Self-generated consensus probe outcome folded into eligibility: "fail" ⇒ crashed on its own probe
+   *  (demonstrably broken), "pass" ⇒ ran clean (a real execution receipt for a single-function task). */
+  probe?: Signal;
   /** Passed every APPLICABLE execution signal (B1) → eligible to be final (Law 1). */
   executionEligible: boolean;
   /** True when no execution signal was available at all — eligibility fell back to the finish gate. */
@@ -158,6 +161,15 @@ export class Verifier {
           slate[i].consensusRank = pick.scores.map((s, j) => ({ s: s - pick.crashes[j] * 0.5, j })).sort((a, b) => b.s - a.s).findIndex((x) => x.j === i);
           slate[i].consensusCrashes = pick.crashes[i];
           slate[i].receipt.push(`consensus score ${pick.scores[i]} / crashes ${pick.crashes[i]}`);
+          // Fold the self-probe into execution eligibility. For a single-function task the probe is
+          // usually the ONLY execution evidence: a candidate that CRASHES on its own probe is broken
+          // (drop it); one that runs clean carries a real execution receipt, not the "weak" fallback.
+          const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
+          slate[i].probe = probe;
+          const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, probe].filter((s) => s !== "n/a");
+          slate[i].executionEligible = applied.every((s) => s === "pass");
+          slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
+          slate[i].receipt.push(`self-probe execution: ${probe}`);
         }
       }
     }
@@ -222,7 +234,7 @@ export class Verifier {
 export function verifierReceiptLines(result: VerifierResult): string[] {
   const lines = [`verifier: winner=attempt ${result.winner ?? "none"} via ${result.selector}${result.winnerHasExecutionReceipt ? " (green execution receipt)" : " (NO execution receipt — weak)"}`];
   for (const s of result.slate) {
-    lines.push(`  #${s.index}: repro=${s.reproduction} regr=${s.regression} smoke=${s.smoke} elig=${s.executionEligible ? "Y" : "n"}${s.consensusRank !== undefined ? ` crank=${s.consensusRank}` : ""}${s.ormScore !== undefined ? ` orm=${s.ormScore.toFixed(2)}` : ""}`);
+    lines.push(`  #${s.index}: repro=${s.reproduction} regr=${s.regression} smoke=${s.smoke}${s.probe ? ` probe=${s.probe}` : ""} elig=${s.executionEligible ? "Y" : "n"}${s.consensusRank !== undefined ? ` crank=${s.consensusRank}` : ""}${s.ormScore !== undefined ? ` orm=${s.ormScore.toFixed(2)}` : ""}`);
   }
   return lines;
 }

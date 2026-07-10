@@ -86,6 +86,29 @@ test("consensus (B2) breaks ties among candidates via execution vote", async () 
   assert.notEqual(res.winner, 3);
 });
 
+test("self-probe fold: a candidate that crashes on its own probe is execution-INELIGIBLE and loses", async () => {
+  const good = ws("good", "def f(x):\n    return x * 2\n");
+  const crasher = ws("crash", "def f(x):\n    return x.nope()\n"); // AttributeError on an int → crashes
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({
+    llm: dummyLlm, task: "double", contract,
+    probe: { module: "impl.py", symbol: "f", inputs: [[2], [3], [4]] }
+  });
+  const res = await v.verify([
+    { index: 1, workspace: good, finished: true, summary: "" },
+    { index: 2, workspace: crasher, finished: true, summary: "" }
+  ]);
+  const g = res.slate.find((s) => s.index === 1)!;
+  const c = res.slate.find((s) => s.index === 2)!;
+  assert.equal(g.probe, "pass");
+  assert.equal(g.executionEligible, true, "clean candidate carries a real execution receipt");
+  assert.equal(g.weaklyEligible, false, "the probe is a real execution signal, not the weak fallback");
+  assert.equal(c.probe, "fail", "crasher's self-probe fails");
+  assert.equal(c.executionEligible, false, "a candidate that crashes on its own probe is ineligible");
+  assert.equal(res.winner, 1);
+  assert.equal(res.winnerHasExecutionReceipt, true, "winner now has a green execution receipt (not weak)");
+});
+
 test("verifierReceiptLines renders the full audit slate", async () => {
   const a = ws("a", "def f(x):\n    return x*2\n");
   const contract = extractAcceptanceContract("impl f");
