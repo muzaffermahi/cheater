@@ -4,8 +4,8 @@
   "description": "Cheater distribution package for Pi.",
   "type": "module",
   "bin": {
-    "cheater": "./dist/src/index.js",
-    "kitten": "./dist/src/core/repl.js"
+    "kitten": "./dist/src/core/kitten.js",
+    "cheater": "./dist/src/index.js"
   },
   "keywords": [
     "pi-package",
@@ -15,10 +15,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "kitten": "node dist/src/core/repl.js"
+    "kitten": "node dist/src/core/kitten.js"
   },
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.5.0"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.2",
