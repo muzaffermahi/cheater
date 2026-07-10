@@ -109,6 +109,28 @@ test("self-probe fold: a candidate that crashes on its own probe is execution-IN
   assert.equal(res.winnerHasExecutionReceipt, true, "winner now has a green execution receipt (not weak)");
 });
 
+test("ground truth: a candidate that fails the prompt's worked examples is INELIGIBLE and loses", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ver-gt-"));
+  const right = join(dir, "right"); mkdirSync(right); writeFileSync(join(right, "solution.py"), "def f(x):\n    return x * 2\n");
+  const wrong = join(dir, "wrong"); mkdirSync(wrong); writeFileSync(join(wrong, "solution.py"), "def f(x):\n    return x + 2\n"); // passes f(2)==4 but not f(3)==6
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({
+    llm: dummyLlm, task: "double", contract,
+    workedExamples: [{ call: "f(2)", expected: "4" }, { call: "f(3)", expected: "6" }], workedModule: "solution.py"
+  });
+  const res = await v.verify([
+    { index: 1, workspace: wrong, finished: true, summary: "" },
+    { index: 2, workspace: right, finished: true, summary: "" }
+  ]);
+  const w = res.slate.find((s) => s.index === 1)!;
+  const r = res.slate.find((s) => s.index === 2)!;
+  assert.equal(w.groundTruth, "fail");
+  assert.equal(w.executionEligible, false, "failing the prompt's own examples ⇒ ineligible");
+  assert.equal(r.groundTruth, "pass");
+  assert.equal(res.winner, 2, "the ground-truth-correct candidate wins");
+  assert.equal(res.winnerHasExecutionReceipt, true);
+});
+
 test("verifierReceiptLines renders the full audit slate", async () => {
   const a = ws("a", "def f(x):\n    return x*2\n");
   const contract = extractAcceptanceContract("impl f");

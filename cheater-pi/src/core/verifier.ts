@@ -30,6 +30,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runFnProbes, selectByConsensus, type FnProbe, type ProbeOutcome } from "./synthtest.js";
 import { reviewerConfidence } from "./selfCertainty.js";
+import { runExampleTest, type WorkedExample } from "./workedExamples.js";
 import type { OrmScorer } from "./orm.js";
 
 export type Signal = "pass" | "fail" | "n/a";
@@ -53,6 +54,9 @@ export interface CandidateSignals {
   /** Self-generated consensus probe outcome folded into eligibility: "fail" ⇒ crashed on its own probe
    *  (demonstrably broken), "pass" ⇒ ran clean (a real execution receipt for a single-function task). */
   probe?: Signal;
+  /** GROUND TRUTH: does the candidate satisfy the prompt's own worked examples? The strongest signal —
+   *  real I/O, not model-generated. "fail" ⇒ ineligible no matter what consensus says. */
+  groundTruth?: Signal;
   /** Passed every APPLICABLE execution signal (B1) → eligible to be final (Law 1). */
   executionEligible: boolean;
   /** True when no execution signal was available at all — eligibility fell back to the finish gate. */
@@ -90,6 +94,11 @@ export interface VerifierOpts {
   confidence?: boolean;
   /** P1: the py module to read each candidate's code from (for the confidence pass). */
   module?: string | null;
+  /** Ground-truth worked examples from the prompt (real I/O) + the module they call. When present, a
+   *  candidate that fails them is execution-INELIGIBLE regardless of consensus — real beats model-voted. */
+  workedExamples?: WorkedExample[];
+  workedModule?: string | null;
+  setupVars?: string[];
   /** Per-command timeout for execution signals. */
   timeoutMs?: number;
 }
@@ -140,15 +149,23 @@ export class Verifier {
         receipt.push(`behavioral smoke: ${smoke}`);
       }
 
+      // GROUND TRUTH — the prompt's own worked examples (real I/O, not model-generated). The strongest
+      // execution signal: fail here ⇒ definitely wrong, whatever consensus votes.
+      let groundTruth: Signal = "n/a";
+      if (this.opts.workedExamples?.length && this.opts.workedModule) {
+        const r = runExampleTest(c.workspace, this.opts.workedModule, this.opts.workedExamples, this.opts.setupVars ?? []);
+        if (r.ran) { groundTruth = r.failures.length ? "fail" : "pass"; receipt.push(`worked examples: ${groundTruth}${r.failures.length ? ` (${r.failures.length} fail)` : ""}`); }
+      }
+
       // Eligibility (B1): pass every APPLICABLE signal. If none applied, fall back to the finish gate
       // but flag it weak (Law 1: no non-execution signal may be the SOLE reason a candidate is final).
-      const applied = [regression, reproduction, smoke].filter((s) => s !== "n/a");
+      const applied = [regression, reproduction, smoke, groundTruth].filter((s) => s !== "n/a");
       const anyApplied = applied.length > 0;
       const executionEligible = anyApplied ? applied.every((s) => s === "pass") : c.finished;
       const weaklyEligible = !anyApplied;
       if (weaklyEligible) receipt.push(`no execution signal available → eligibility from finish gate (${c.finished ? "finished" : "unfinished"})`);
 
-      slate.push({ index: c.index, reproduction, regression, smoke, executionEligible, weaklyEligible, receipt });
+      slate.push({ index: c.index, reproduction, regression, smoke, groundTruth, executionEligible, weaklyEligible, receipt });
     }
 
     // B2 consensus over the probe, run on every candidate's workspace (eligible or not, so a candidate
@@ -166,7 +183,7 @@ export class Verifier {
           // (drop it); one that runs clean carries a real execution receipt, not the "weak" fallback.
           const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
           slate[i].probe = probe;
-          const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, probe].filter((s) => s !== "n/a");
+          const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, slate[i].groundTruth ?? "n/a", probe].filter((s) => s !== "n/a");
           slate[i].executionEligible = applied.every((s) => s === "pass");
           slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
           slate[i].receipt.push(`self-probe execution: ${probe}`);

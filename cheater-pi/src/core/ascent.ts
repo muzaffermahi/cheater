@@ -28,6 +28,7 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
+import { extractWorkedExamples, extractSetupVars } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
 import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
@@ -285,11 +286,15 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const survivorsByIndex = new Map(allAttempts.map((a) => [a.index, a]));
   const survivors = survivorIdx.map((i) => survivorsByIndex.get(i)!).filter(Boolean);
 
-  // B — verify the survivors and select the winner.
+  // B — verify the survivors and select the winner. The prompt's worked examples are ground truth: a
+  // candidate that fails them is ineligible regardless of consensus (real I/O beats model-generated votes).
+  const pyModule = contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null;
+  const workedExamples = pyModule ? extractWorkedExamples(params.task, contract.symbols) : [];
   const verifier = new Verifier({
     llm: config.llm, task: params.task, contract, testCommand,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
-    confidence: lever(config, "confidence"), module: contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null
+    confidence: lever(config, "confidence"), module: pyModule,
+    workedExamples, workedModule: pyModule, setupVars: workedExamples.length ? extractSetupVars(params.task) : []
   });
   const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
   const verdict = await verifier.verify(candidates);
