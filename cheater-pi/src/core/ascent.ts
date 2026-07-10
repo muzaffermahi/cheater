@@ -28,7 +28,7 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
-import { extractWorkedExamples, extractSetupVars } from "./workedExamples.js";
+import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
 import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
@@ -227,6 +227,17 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     } catch { /* ban derivation best-effort */ }
   }
 
+  // Ground truth (the prompt's worked examples) — extracted once, used both to decide mid-loop whether a
+  // finished candidate is actually RIGHT (not just done) and later to gate verifier eligibility.
+  const pyModule = contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null;
+  const workedExamples = pyModule ? extractWorkedExamples(params.task, contract.symbols) : [];
+  const setupVars = workedExamples.length ? extractSetupVars(params.task) : [];
+  const passesGroundTruth = (ws: string): boolean => {
+    if (!workedExamples.length || !pyModule) return true; // no ground truth ⇒ can't refute; treat as ok
+    const r = runExampleTest(ws, pyModule, workedExamples, setupVars);
+    return !r.ran || r.failures.length === 0; // couldn't run ⇒ don't block; ran clean ⇒ good
+  };
+
   // Coverage rounds (A1 + A2 repair). Round 1 primes from A3/A4; a repair round adds A2's web brief.
   let allAttempts: BurstAttempt[] = [];
   let repairSeed: string | undefined;
@@ -255,9 +266,21 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
     allAttempts = allAttempts.concat(attempts);
 
-    // Did anything finish? If so, stop; the verifier will confirm. Otherwise consider a repair round.
-    if (attempts.some((a) => a.result.finished)) break;
+    // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
+    // not enough — a candidate can pass its own finish gate yet be wrong on the worked examples, and
+    // stopping here would just hand the verifier a slate of wrong answers to pick the least-bad from.
+    // Keep a repair round in reserve for exactly this: finished-but-wrong seeds a grounded resample.
+    const finished = attempts.filter((a) => a.result.finished);
+    if (finished.some((a) => passesGroundTruth(a.workspace))) break;
+    if (finished.length && workedExamples.length) receipts.push(`round ${round}: ${finished.length} finished but none pass the worked examples → repair`);
     if (round < maxRounds) {
+      // Prefer a ground-truth failure as the repair seed (concrete got≠expected), else the error sig.
+      let gtFailSeed = "";
+      const failing = finished.find((a) => !passesGroundTruth(a.workspace));
+      if (failing && pyModule) {
+        const r = runExampleTest(failing.workspace, pyModule, workedExamples, setupVars);
+        if (r.ran && r.failures.length) gtFailSeed = renderExampleFailures(r);
+      }
       const worst = attempts.find((a) => errorSignatureOf(a)) ?? attempts[0];
       const errSig = worst ? errorSignatureOf(worst) : undefined;
       let webBrief = "";
@@ -269,7 +292,9 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
           if (brief && brief.brief) webBrief = brief.brief;
         }
       }
-      repairSeed = [repairDirective(errSig ?? "the previous attempt did not finish", worst?.plan.stance), webBrief].filter(Boolean).join("\n");
+      // A concrete got≠expected on a real example is the strongest repair signal — lead with it.
+      const failReason = gtFailSeed ? `Your previous attempt finished but FAILED the task's own examples:\n${gtFailSeed}` : (errSig ?? "the previous attempt did not finish");
+      repairSeed = [repairDirective(failReason, worst?.plan.stance), webBrief].filter(Boolean).join("\n");
     }
   }
 
@@ -288,13 +313,11 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
 
   // B — verify the survivors and select the winner. The prompt's worked examples are ground truth: a
   // candidate that fails them is ineligible regardless of consensus (real I/O beats model-generated votes).
-  const pyModule = contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null;
-  const workedExamples = pyModule ? extractWorkedExamples(params.task, contract.symbols) : [];
   const verifier = new Verifier({
     llm: config.llm, task: params.task, contract, testCommand,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
     confidence: lever(config, "confidence"), module: pyModule,
-    workedExamples, workedModule: pyModule, setupVars: workedExamples.length ? extractSetupVars(params.task) : []
+    workedExamples, workedModule: pyModule, setupVars
   });
   const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
   const verdict = await verifier.verify(candidates);

@@ -80,3 +80,26 @@ test("runAscent still finishes with NO levers (pure single-shot verify path)", a
   assert.equal(res.finished, true);
   assert.ok(existsSync(join(cwd, "impl.py")));
 });
+
+test("mid-loop ground truth: a finished-but-WRONG round triggers a repair round instead of shipping it", async () => {
+  // Base workspace + a task carrying worked examples the extractor recognizes.
+  const cwd = mkdtempSync(join(tmpdir(), "ascent-gt-"));
+  writeFileSync(join(cwd, "solution.py"), "def f(x):\n    return None\n");
+  const taskGT = "Implement `def f(x)` in solution.py so it doubles its input. Examples: `f(2)` -> `4`; `f(3)` -> `6`.";
+  // Round 1 writes a WRONG impl (passes finish gate but fails the examples); round 2 (repair) writes the
+  // correct one. Tracked by a call counter so the first batch is all wrong.
+  let calls = 0;
+  const runOneGT: RunOne = async (p) => {
+    calls++;
+    const correct = calls > 2; // forceSamples:2 ⇒ calls 1,2 are round 1 (wrong), 3,4 are the repair (right)
+    writeFileSync(join(p.cwd, "solution.py"), correct ? "def f(x):\n    return x * 2\n" : "def f(x):\n    return x + 1\n");
+    return {
+      finished: true, summary: correct ? "doubled" : "wrong", turns: 1, toolCalls: 1, filesWritten: ["solution.py"],
+      events: [], usage: { prompt: 10, completion: 10, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: []
+    };
+  };
+  const res = await runAscent({ task: taskGT, cwd, forceSamples: 2, hardness: {} }, { llm: fakeLlm, runOne: runOneGT, levers: { ...ALL_LEVERS } });
+  assert.ok(res.receipts.some((l) => /finished but none pass the worked examples → repair/.test(l)), "the finished-but-wrong round must trigger a repair");
+  assert.equal(res.rounds >= 2, true, "a second (repair) round ran");
+  assert.match(readFileSync(join(cwd, "solution.py"), "utf8"), /return x \* 2/, "the repaired, ground-truth-correct impl is adopted");
+});
