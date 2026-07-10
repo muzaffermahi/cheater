@@ -199,9 +199,14 @@ export class Verifier {
       }
     }
 
-    // P1 — bounded reviewer self-certainty per candidate (owned-engine tiebreaker; needs logprobs).
-    if (this.opts.confidence && this.opts.module) {
+    // P1 — bounded reviewer self-certainty as a TIEBREAKER. It's a full main-model judgment call per
+    // candidate, so only pay for it when it can actually change the outcome: ≥2 execution-eligible
+    // candidates that ground truth + consensus + ORM left indistinguishable. With those signals now
+    // robust, most tasks have a decided winner and skip this entirely (a big latency save on slow local
+    // inference). Only the genuinely-tied eligible candidates are scored, not the whole slate.
+    if (this.opts.confidence && this.opts.module && this.tieAmongEligible(slate)) {
       for (let i = 0; i < candidates.length; i++) {
+        if (!slate[i].executionEligible) continue; // an ineligible candidate can't win — don't score it
         let code = "";
         try { code = readFileSync(join(candidates[i].workspace, this.opts.module), "utf8"); } catch { /* no code */ }
         const sc = candidates[i].selfCertainty ?? (code ? await reviewerConfidence(this.opts.llm, this.opts.task, code) : 0.5);
@@ -211,6 +216,16 @@ export class Verifier {
     }
 
     return this.fuse(slate);
+  }
+
+  /** Do the top execution-eligible candidates tie on (consensus rank, ORM)? Only then does the P1
+   *  self-certainty tiebreaker change anything — otherwise it's pure latency. */
+  private tieAmongEligible(slate: CandidateSignals[]): boolean {
+    const elig = slate.filter((s) => s.executionEligible);
+    if (elig.length <= 1) return false;
+    const key = (s: CandidateSignals): string => `${s.consensusRank ?? 99}|${s.ormScore ?? -1}`;
+    const sorted = [...elig].sort((a, b) => (a.consensusRank ?? 99) - (b.consensusRank ?? 99) || (b.ormScore ?? -1) - (a.ormScore ?? -1));
+    return key(sorted[0]) === key(sorted[1]);
   }
 
   /** B4 fusion: eligible = passed B1; order by (consensus rank, ORM), winner = top. */
