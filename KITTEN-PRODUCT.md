@@ -147,20 +147,28 @@ safety, mascot, TUI, web). All offline/deterministic (fake/scripted runner, `:me
 web server) — no model needed. CI runs them on {ubuntu, windows} × node {22, 24} plus a packed-install
 smoke.
 
+## Reality pass (live against Ornith)
+
+A follow-up pass (**`KITTEN-REALITY.md`**, branch `kitten-reality`) proved the product true under the
+real local **Ornith-1.0-35B** (llama.cpp @ `:8080`) and fixed the general failures it exposed:
+- **Conversation context is now real** (`core/context.ts`): a follow-up in a *fresh process* answers
+  from prior-turn context — proven live. (Before: the model got only the latest sentence.)
+- **Streaming is now real** (`KittenLLM.chatStream`): proven live — a 3-sentence answer streamed as 10
+  incremental deltas + one final. (Before: whole-response only.)
+- **Verified ≠ finished** (§4): honest completion grades — verified / checked / unverified — never a
+  green check for lifecycle completion.
+- **Cancellation** kills the shell process tree; **config** is unified (file + env, validated); the
+  worked-example verifier, doctor, and changed-file/undo bugs found live are fixed.
+- **9/9 live stress tasks solved correctly with zero false-positive verifications** (single-function,
+  hidden-oracle). Test suite: **775 green**.
+
 ## Honest limitations / not-yet-true
 
-- **Not measured through the app service on a real battery.** The Ascent engine's own numbers stand, but
-  the router→Ascent product path is new plumbing; the headline battery/real-repo numbers should be
-  re-measured through `kitten run` before being cited as product results. The only CI-backed figure is
-  the test suite.
-- **Live model UX is unverified in this environment** (no local model was running). The TUI and web UI
-  were exercised offline (routing, persistence, streaming, approvals, mascot) and against a dead endpoint
-  (graceful degradation); an end-to-end coding session against a real model is the obvious next check.
-- **Config unification is partial.** Kitten core reads `KITTEN_*` env + defaults; a single validated
-  config file layer shared with the Pi path (`~/.config/kitten`, project `.kitten/config.json`) is
-  sketched in docs but not fully implemented.
-- **Package name** is still `@cheater/cheater-pi`; the bins are `kitten`/`cheater`. Renaming the npm
-  package to `kitten` is a deliberate follow-up (name availability + redirect).
+- **Battery ablation + real-repo suite not completed.** The 9/9 live stress result is single-function,
+  product-path solved/grade — NOT a direct-`k=1` vs adaptive vs Ascent-`k=2` comparison, and not
+  multi-file. Those (and a live browser session) are the reality pass's own next steps.
+- **Package name** is still `@cheater/cheater-pi`; the bins are `kitten`/`cheater`. Renaming to `kitten`
+  is a deliberate follow-up (name availability + redirect).
 - The web UI has no syntax-highlighting library (monospace diffs only, by design — zero deps).
 
 ## Next milestones (smallest first)
