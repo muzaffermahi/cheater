@@ -33,7 +33,7 @@ function seed(home: string): string {
   store.createConversation({ id: "conv_seed", title: "seeded task", projectRoot: "/proj", projectId: "/proj", model: "ornith", mode: "auto", ts: 1000 });
   store.appendEvent("conv_seed", { type: "user.message", text: "do the seeded thing" }, 1001);
   store.appendEvent("conv_seed", { type: "run.started", runId: "r1", request: "do the seeded thing", lane: "reliable" }, 1002);
-  store.appendEvent("conv_seed", { type: "run.completed", runId: "r1", finished: true, lane: "reliable", summary: "seeded done", wallMs: 3, usage: { prompt: 1, completion: 1, reasoning: 0 } }, 1003);
+  store.appendEvent("conv_seed", { type: "run.completed", runId: "r1", finished: true, verified: true, lane: "reliable", summary: "seeded done", wallMs: 3, usage: { prompt: 1, completion: 1, reasoning: 0 } }, 1003);
   store.close();
   return "conv_seed";
 }

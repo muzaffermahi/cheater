@@ -159,6 +159,23 @@ test("two app instances over the same store (TUI + web) observe each other witho
   appWeb.close();
 });
 
+test("§4: a run that finishes WITHOUT verification is recorded checked-not-verified (no upgrade)", async () => {
+  // The runner reports it stopped intentionally (finished) but has no independent evidence (verified:false).
+  // Kitten must NOT collapse these — the badge/store keep them distinct so no green 'verified' is faked.
+  const unproven: Runner = async (ctx) => {
+    ctx.emit({ type: "file.changed", runId: ctx.runId, path: "a.py", added: 1, removed: 0 });
+    return { finished: true, summary: "changed a.py", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: ["ran, no independent check"], filesChanged: ["a.py"], verified: false };
+  };
+  const app = makeApp(new ConversationStore(openSqlite(":memory:")), unproven);
+  const conv = app.createConversation();
+  const run = await app.submitMessage(conv.id, "change a.py");
+  assert.equal(run.finished, true);
+  assert.equal(run.verified, false, "finished must not imply verified");
+  const completed = app.getEvents(conv.id).find((e) => e.type === "run.completed") as { verified: boolean; finished: boolean } | undefined;
+  assert.equal(completed?.finished, true);
+  assert.equal(completed?.verified, false);
+});
+
 test("a runner that throws is recorded as run.failed, history intact", async () => {
   const boom: Runner = async () => { throw new Error("engine exploded"); };
   const app = makeApp(new ConversationStore(openSqlite(":memory:")), boom);

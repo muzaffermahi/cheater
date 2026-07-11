@@ -234,7 +234,10 @@ export interface RunFailed {
 export interface RunCompleted {
   type: "run.completed";
   runId: string;
+  /** The run produced/adopted work and stopped intentionally (NOT the same as verified). */
   finished: boolean;
+  /** Independent execution evidence confirmed the change (finished && !verified = "checked", §4). */
+  verified: boolean;
   lane: Lane;
   summary: string;
   wallMs: number;

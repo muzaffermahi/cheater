@@ -67,7 +67,11 @@ function renderEvent(e: KittenEvent): string | null {
     case "file.changed": return dim(`  ✎ ${e.path}`);
     case "repair.started": return dim(`  ↻ repair round ${e.round}`);
     case "run.undone": return dim(`  ↩ undo: restored ${e.restored.length}, deleted ${e.deleted.length}${e.skipped.length ? `, skipped ${e.skipped.length}` : ""}`);
-    case "run.completed": return (e.finished ? green("  ✓ ") : red("  ✗ ")) + (e.summary || (e.finished ? "done" : "unfinished")) + dim(` · ${(e.wallMs / 1000).toFixed(1)}s`);
+    case "run.completed": {
+      // Honest completion grade (§4): verified ≠ merely finished. Never a green check for lifecycle-only.
+      const badge = e.verified ? green("  ✓ verified ") : e.finished ? yellow("  ~ checked (not independently verified) ") : yellow("  • finished, unverified ");
+      return badge + (e.summary || "") + dim(` · ${(e.wallMs / 1000).toFixed(1)}s`);
+    }
     case "run.failed": return red(`  ✗ failed: ${e.error}`);
     case "run.cancelled": return red("  ✗ cancelled");
     case "run.interrupted": return red(`  ✗ interrupted (was ${e.fromStatus})`);
@@ -144,7 +148,7 @@ function convLine(c: ConversationRow, store: ConversationStore): string {
   const last = runs[runs.length - 1];
   // Show the task outcome, not just the run lifecycle: a run can reach "completed" without solving.
   const state = !last ? "—"
-    : last.status === "completed" ? (last.finished ? (last.verified ? "verified" : "done") : "unfinished")
+    : last.status === "completed" ? (last.verified ? "verified" : last.finished ? "checked" : "unverified")
     : last.status;
   return `${cyan(c.id.padEnd(16))} ${fmtWhen(c.updatedAt)}  ${dim(state.padEnd(11))} ${c.title}`;
 }

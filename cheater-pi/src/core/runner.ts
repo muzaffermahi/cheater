@@ -119,7 +119,9 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
       `files: ${result.filesWritten.join(", ") || "none"}`,
     ],
     filesChanged: result.filesWritten,
-    verified: result.finished,
+    // The reliable lane's finish gate requires an execution receipt, so a reliable finish is verified.
+    // The DIRECT lane has NO finish gate — "finished" only means the model stopped, never verified (§4).
+    verified: ctx.lane === "direct" ? false : result.finished,
   };
 }
 
@@ -147,9 +149,14 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   // them as events, so the diff view and /undo cover the Ascent lane too.
   const filesChanged = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
   for (const f of filesChanged) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
+  // Distinguish FINISHED (a winner was selected + adopted — work was produced and a candidate self-
+  // verified) from VERIFIED (independent execution proof). A correct stateful/class solve with no clean
+  // worked examples adopts a winner but earns no receipt → finished:true, verified:false = "checked",
+  // NOT a red failure (§4: don't collapse these). Measurement (cli.ts --ascent) still uses the receipt.
+  const adopted = a.winner != null;
   return {
-    finished: a.finished,
-    summary: a.summary || (a.finished ? "solved" : "unfinished"),
+    finished: adopted,
+    summary: a.summary || (adopted ? (a.winnerHasExecutionReceipt ? "solved (verified)" : "implemented (not independently verified)") : "no candidate adopted"),
     wallMs: a.wallMs,
     usage: a.usage,
     receiptLines: a.receipts,

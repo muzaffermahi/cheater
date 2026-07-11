@@ -85,7 +85,10 @@ function renderEvent(e: KittenEvent): string | null {
     case "file.changed": return A.cyan(`  ✎ ${e.path}`);
     case "repair.started": return A.magenta(`  ↻ repair round ${e.round}`);
     case "run.undone": return A.dim(`  ↩ undo: restored ${e.restored.length}, deleted ${e.deleted.length}`);
-    case "run.completed": return (e.finished ? A.green("  ✓ ") : A.yellow("  • ")) + (e.summary || (e.finished ? "done" : "unfinished")) + A.dim(` · ${(e.wallMs / 1000).toFixed(1)}s`);
+    case "run.completed": {
+      const badge = e.verified ? A.green("  ✓ verified ") : e.finished ? A.yellow("  ~ checked ") : A.yellow("  • unverified ");
+      return badge + (e.summary || "") + A.dim(` · ${(e.wallMs / 1000).toFixed(1)}s`);
+    }
     case "run.failed": return A.red(`  ✗ failed: ${e.error}`);
     case "run.cancelled": return A.red("  ✗ cancelled");
     case "receipt.finalized": return e.lines.length ? A.dim("  receipt: " + e.lines.join(" | ").slice(0, 160)) : null;

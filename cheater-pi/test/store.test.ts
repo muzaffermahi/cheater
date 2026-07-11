@@ -49,7 +49,7 @@ test("run projection tracks lifecycle: started -> files -> completed", () => {
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "a.py", added: 2, removed: 0 }, 2001);
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "a.py", added: 1, removed: 0 }, 2002); // dedup
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "b.py", added: 5, removed: 1 }, 2003);
-  s.appendEvent("c1", { type: "run.completed", runId: "r1", finished: true, lane: "reliable", summary: "done", wallMs: 12, usage: { prompt: 3, completion: 4, reasoning: 1 } }, 2004);
+  s.appendEvent("c1", { type: "run.completed", runId: "r1", finished: true, verified: true, lane: "reliable", summary: "done", wallMs: 12, usage: { prompt: 3, completion: 4, reasoning: 1 } }, 2004);
   const run = s.getRun("r1")!;
   assert.equal(run.status, "completed");
   assert.equal(run.finished, true);
@@ -75,7 +75,7 @@ test("recoverInterruptedRuns flips transient runs to interrupted and logs an eve
   seedConversation(s);
   s.appendEvent("c1", { type: "run.started", runId: "live", request: "x", lane: "reliable" }, 4000);
   s.appendEvent("c1", { type: "run.started", runId: "done", request: "y", lane: "reliable" }, 4001);
-  s.appendEvent("c1", { type: "run.completed", runId: "done", finished: true, lane: "reliable", summary: "ok", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 } }, 4002);
+  s.appendEvent("c1", { type: "run.completed", runId: "done", finished: true, verified: true, lane: "reliable", summary: "ok", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 } }, 4002);
   const recovered = s.recoverInterruptedRuns(9999);
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0].type, "run.interrupted");

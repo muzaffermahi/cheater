@@ -297,8 +297,8 @@ export class ConversationStore {
       case "run.completed":
         ensure();
         set(
-          "status = 'completed', finished = ?, summary = ?, usage = ?, ended_at = ?",
-          payload.finished ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts
+          "status = 'completed', finished = ?, verified = ?, summary = ?, usage = ?, ended_at = ?",
+          payload.finished ? 1 : 0, payload.verified ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts
         );
         break;
       case "run.failed":

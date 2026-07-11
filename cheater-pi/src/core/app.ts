@@ -268,7 +268,7 @@ export class KittenApp {
         this.emit(conversationId, { type: "run.cancelled", runId });
       } else {
         this.emit(conversationId, {
-          type: "run.completed", runId, finished: outcome.finished, lane: decision.lane,
+          type: "run.completed", runId, finished: outcome.finished, verified: outcome.verified, lane: decision.lane,
           summary: outcome.summary, wallMs: outcome.wallMs, usage: outcome.usage,
         });
         this.emit(conversationId, {

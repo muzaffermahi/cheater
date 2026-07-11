@@ -17,7 +17,7 @@ function seededStore(): { store: ConversationStore; id: string } {
   store.appendEvent(id, { type: "run.started", runId: "r1", request: "fix int_to_roman in roman.py", lane: "reliable" }, 3);
   store.appendEvent(id, { type: "file.changed", runId: "r1", path: "roman.py", added: 5, removed: 2 }, 4);
   store.appendEvent(id, { type: "receipt.finalized", runId: "r1", lines: ["ok"], filesChanged: ["roman.py"], verified: true }, 5);
-  store.appendEvent(id, { type: "run.completed", runId: "r1", finished: true, lane: "reliable", summary: "added subtractive pairs", wallMs: 10, usage: { prompt: 1, completion: 1, reasoning: 0 } }, 6);
+  store.appendEvent(id, { type: "run.completed", runId: "r1", finished: true, verified: true, lane: "reliable", summary: "added subtractive pairs", wallMs: 10, usage: { prompt: 1, completion: 1, reasoning: 0 } }, 6);
   return { store, id };
 }
 
