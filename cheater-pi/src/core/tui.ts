@@ -20,6 +20,7 @@ import { defaultRunner } from "./runner.js";
 import { ConversationStore, type ConversationRow } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
+import { loadKittenSettings } from "./settings.js";
 import { catAnsi, mascotStateForRunEvent, type MascotState } from "./mascot.js";
 import type { KittenEvent, Lane } from "./events.js";
 
@@ -121,8 +122,11 @@ export async function runTui(argv: string[] = process.argv.slice(2)): Promise<vo
   const interactive = process.stdin.isTTY === true;
 
   const store = ConversationStore.open(storePath());
-  const llm = new KittenLLM(tierSidecar({ ...DEFAULT_MODELS, main: model }));
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model, approvalPolicy: interactive ? "ask" : "auto-deny" });
+  const settings = loadKittenSettings(cwd);
+  const resolvedModel = model !== DEFAULT_MODELS.main ? model : settings.models.main; // --model overrides config
+  const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
+  model = resolvedModel;
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: interactive ? settings.approvalPolicy : "auto-deny" });
   app.recover();
 
   const conv = app.createConversation({ projectRoot: cwd, model });

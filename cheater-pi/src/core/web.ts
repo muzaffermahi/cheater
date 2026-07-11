@@ -13,6 +13,7 @@ import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
+import { loadKittenSettings } from "./settings.js";
 import { startWebServer } from "./web/server.js";
 
 const dim = (s: string): string => `\x1b[2m${s}\x1b[0m`;
@@ -40,8 +41,10 @@ export async function runWeb(argv: string[] = process.argv.slice(2)): Promise<vo
   }
 
   const store = ConversationStore.open(storePath());
-  const llm = new KittenLLM(tierSidecar({ ...DEFAULT_MODELS, main: model }));
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model, approvalPolicy: "ask" });
+  const settings = loadKittenSettings(cwd);
+  const resolvedModel = model !== DEFAULT_MODELS.main ? model : settings.models.main;
+  const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: settings.approvalPolicy });
   app.recover();
 
   const server = await startWebServer({ app, store, cwd, port });

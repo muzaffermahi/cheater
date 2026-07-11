@@ -19,6 +19,7 @@ import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
+import { loadKittenSettings } from "./settings.js";
 import { runRepl } from "./repl.js";
 import { runTui } from "./tui.js";
 import { runWeb } from "./web.js";
@@ -104,8 +105,12 @@ async function cmdRun(rest: string[]): Promise<number> {
   if (!task) { process.stderr.write('kitten run: give a task, e.g. kitten run "fix the parser"\n'); return 2; }
 
   const store = ConversationStore.open(storePath());
+  // Resolve endpoint/model from config (env > project .kitten > user config > defaults); --model wins.
+  const settings = loadKittenSettings(cwd);
+  const resolvedModel = model ?? settings.models.main;
+  const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
   // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
-  const app = new KittenApp({ store, runner: defaultRunner(), projectRoot: cwd, model, approvalPolicy: dangerous ? "auto-allow" : "auto-deny" });
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: dangerous ? "auto-allow" : "auto-deny" });
   app.recover();
   if (!json) {
     // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
@@ -249,8 +254,14 @@ async function cmdDoctor(): Promise<number> {
     process.stdout.write(`${red("✗")} store: ${(e as Error).message}\n`);
   }
 
+  // Config transparency (§7): show which files were merged + any validation warnings.
+  const settings = loadKittenSettings(process.cwd());
+  if (settings.sources.length) process.stdout.write(`${green("✓")} config: ${settings.sources.join(", ")}\n`);
+  else process.stdout.write(dim("○ config: defaults + env (no config file)\n"));
+  for (const w of settings.warnings) { process.stdout.write(`${yellow("!")} ${w}\n`); }
+
   // Endpoint + model + engine.
-  const models = tierSidecar(DEFAULT_MODELS);
+  const models = tierSidecar(settings.models);
   const llm = new KittenLLM(models);
   const ep = await endpointModels(models);
   if (!ep.reachable) {
