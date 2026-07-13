@@ -151,6 +151,9 @@ export const editTool: Tool = {
     // 2. Lenient (whitespace-normalized) match: find the line span whose normalized form equals the
     //    normalized search. This rescues a small model that got indentation/spacing slightly wrong.
     const lenient = findLenient(text, search);
+    if (lenient && "ambiguous" in lenient) {
+      return { output: `edit: 'search' leniently matched ${lenient.ambiguous} places — add more surrounding context so it is unique.`, isError: true };
+    }
     if (lenient) return applyEdit(ctx, full, p, text, lenient.start, lenient.len, replace);
 
     // 3. No match — repair-ready error with the nearest lines.
@@ -166,22 +169,28 @@ function indexAllExact(text: string, needle: string): number[] {
   return out;
 }
 
-function findLenient(text: string, search: string): { start: number; len: number } | null {
+function findLenient(text: string, search: string): { start: number; len: number } | { ambiguous: number } | null {
   const normSearch = normWs(search);
   if (!normSearch) return null;
   const searchLineCount = search.split(/\r?\n/).length;
-  const lines = text.split(/\r?\n/);
-  // Precompute cumulative char offsets per line (accounting for the \n we split on — assume \n; if
-  // the file has \r\n this is approximate but applyEdit re-reads via indexOf so we snap to exact).
-  let matchWindow: string | null = null;
-  for (let i = 0; i + searchLineCount <= lines.length; i++) {
-    const window = lines.slice(i, i + searchLineCount).join("\n");
-    if (normWs(window) === normSearch) { matchWindow = window; break; }
+  // Map matched line spans back to EXACT char offsets in the ORIGINAL text. A prior version rejoined
+  // lines with "\n" and indexOf'd that, which never matched a \r\n (Windows) file — so the lenient
+  // rescue was dead on CRLF. lineStarts[k] = char offset where line k begins (terminators preserved).
+  const lineStarts = [0];
+  for (let k = 0; k < text.length; k++) if (text.charCodeAt(k) === 10) lineStarts.push(k + 1);
+  const matches: Array<{ start: number; len: number }> = [];
+  for (let i = 0; i + searchLineCount <= lineStarts.length; i++) {
+    const start = lineStarts[i];
+    let end = i + searchLineCount < lineStarts.length ? lineStarts[i + searchLineCount] : text.length;
+    // Trim the trailing terminator of the last window line so the replaced span is line CONTENT (the
+    // following newline stays intact, matching the exact-match path) — handles both \n and \r\n.
+    if (end > start && text.charCodeAt(end - 1) === 10) { end--; if (end > start && text.charCodeAt(end - 1) === 13) end--; }
+    if (normWs(text.slice(start, end)) === normSearch) matches.push({ start, len: end - start });
   }
-  if (matchWindow === null) return null;
-  const start = text.indexOf(matchWindow);
-  if (start < 0) return null;
-  return { start, len: matchWindow.length };
+  // Mirror the exact-match path: a lenient search matching 2+ regions is ambiguous — never guess which.
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return { ambiguous: matches.length };
+  return null;
 }
 
 function applyEdit(ctx: ToolContext, full: string, p: string, text: string, start: number, len: number, replace: string): ToolResult {

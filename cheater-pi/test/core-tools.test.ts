@@ -28,6 +28,28 @@ test("edit matches leniently when whitespace differs", async () => {
   assert.match(readFileSync(join(ctx.cwd, "m.py"), "utf8"), /return 2/);
 });
 
+test("edit matches leniently on a CRLF file (Windows line endings)", async () => {
+  // Regression: findLenient rejoined lines with "\n" and indexOf'd that against the raw text, so on a
+  // \r\n file it never matched — the lenient rescue was dead on the primary platform.
+  const ctx = ctxAt();
+  writeFileSync(join(ctx.cwd, "m.py"), "def f():\r\n        return 1\r\n"); // CRLF, 8-space indent
+  const r = await editTool.execute({ path: "m.py", search: "    return 1", replace: "    return 2" }, ctx); // 4-space
+  assert.equal(r.isError, false, "lenient match must work on CRLF files, not just LF");
+  assert.match(readFileSync(join(ctx.cwd, "m.py"), "utf8"), /return 2/);
+});
+
+test("edit refuses an ambiguous lenient match (2+ normalized regions) instead of guessing", async () => {
+  // Regression: findLenient applied the FIRST normalized match, unlike the exact path which errors on
+  // multiple matches — so it could silently edit the wrong one of two similar blocks.
+  const ctx = ctxAt();
+  writeFileSync(join(ctx.cwd, "m.py"), "if a:\n    x = 1\n    return x\nif b:\n        x = 1\n        return x\n");
+  const before = readFileSync(join(ctx.cwd, "m.py"), "utf8");
+  const r = await editTool.execute({ path: "m.py", search: "  x = 1\n  return x", replace: "  x = 2\n  return x" }, ctx);
+  assert.equal(r.isError, true, "an ambiguous lenient match must error, not edit");
+  assert.match(r.output, /matched 2 places|add more surrounding context/);
+  assert.equal(readFileSync(join(ctx.cwd, "m.py"), "utf8"), before, "file is unchanged on an ambiguous match");
+});
+
 test("edit on a missing snippet returns a repair-ready error, not a silent write", async () => {
   const ctx = ctxAt();
   writeFileSync(join(ctx.cwd, "m.py"), "def f():\n    return 1\n");
