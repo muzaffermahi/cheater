@@ -457,8 +457,8 @@ const SCRIPT = `
   var stick = true;
   var mascotState = "";
   var mascotGrids = {};
-  var assistantBubbles = {};
-  var reasoningBoxes = {};
+  var openAssistant = null;  // the currently-streaming assistant bubble (null = none open)
+  var openReasoning = null;  // the currently-streaming reasoning box
   var toolCards = {};
   var activeRuns = {};
   var activeRunId = null;
@@ -608,26 +608,25 @@ const SCRIPT = `
     wrap.appendChild(bubble);
     append(wrap);
   }
-  function assistantBubble(runId){
-    var b = assistantBubbles[runId];
-    if(b) return b;
+  function assistantBubble(){
+    if(openAssistant) return openAssistant;
     var wrap = mk("div", "msg assistant");
     wrap.appendChild(txt("div", "role", "Kitten"));
     var bubble = mk("div", "bubble");
     wrap.appendChild(bubble);
     append(wrap);
-    b = { wrap: wrap, bubble: bubble, acc: "" };
-    assistantBubbles[runId] = b;
-    return b;
+    openAssistant = { wrap: wrap, bubble: bubble, acc: "" };
+    return openAssistant;
   }
   function appendAssistant(runId, text, isFinal){
-    var b = assistantBubble(runId);
+    var b = assistantBubble();
     b.acc = isFinal ? String(text || "") : (b.acc + String(text || ""));
     renderMarkdown(b.bubble, b.acc);
+    if(isFinal) openAssistant = null; // the final answer closes this assistant segment
     if(stick) scrollToBottom();
   }
   function appendReasoning(runId, text){
-    var box = reasoningBoxes[runId];
+    var box = openReasoning;
     if(!box){
       var wrap = mk("div", "reason");
       var det = mk("details", null);
@@ -637,7 +636,7 @@ const SCRIPT = `
       wrap.appendChild(det);
       append(wrap);
       box = { pre: pre, acc: "" };
-      reasoningBoxes[runId] = box;
+      openReasoning = box;
     }
     box.acc += String(text || "");
     box.pre.textContent = box.acc;
@@ -687,9 +686,15 @@ const SCRIPT = `
     var yes = txt("button", "btn btn-approve", "Approve"); yes.type = "button";
     var no = txt("button", "btn btn-deny", "Deny"); no.type = "button";
     function respond(allowed){
-      api("/api/approve", { runId: ev.runId, callId: ev.callId, allowed: allowed }).then(function(){
-        card.classList.add(allowed ? "resolved-approve" : "resolved-deny");
+      api("/api/approve", { runId: ev.runId, callId: ev.callId, allowed: allowed }).then(function(r){
         yes.disabled = true; no.disabled = true;
+        // The server returns {ok:false} when nothing is pending (a stale card replayed from history, or
+        // already answered elsewhere). Don't show a fake "Approved"/"Denied" for a no-op.
+        if(!r || r.ok === false){
+          card.appendChild(txt("div", "approval-result", "No longer pending"));
+          return;
+        }
+        card.classList.add(allowed ? "resolved-approve" : "resolved-deny");
         card.appendChild(txt("div", "approval-result", allowed ? "Approved" : "Denied"));
       }).catch(function(){ toast("Could not send your approval"); });
     }
@@ -794,6 +799,10 @@ const SCRIPT = `
     var wasStuck = stick;
     hideMainEmpty();
     var t = ev.type;
+    // Any non-streaming event closes the open assistant/reasoning bubble so the NEXT delta starts a
+    // fresh bubble in chronological position (interleaved with the tool cards), instead of collapsing
+    // all of a run's prose into one bubble rendered above the cards it actually follows.
+    if(t !== "assistant.delta" && t !== "reasoning.delta" && t !== "assistant.final"){ openAssistant = null; openReasoning = null; }
     if(t === "conversation.created"){ if(ev.title) setTitle(ev.title); }
     else if(t === "conversation.renamed"){ setTitle(ev.title); scheduleListRefresh(); }
     else if(t === "conversation.archived"){ scheduleListRefresh(); }
@@ -876,7 +885,7 @@ const SCRIPT = `
   // ── Conversation selection / history load ────────────────────────────────────
   function resetMain(){
     messagesEl.innerHTML = "";
-    assistantBubbles = {}; reasoningBoxes = {}; toolCards = {}; activeRuns = {};
+    openAssistant = null; openReasoning = null; toolCards = {}; activeRuns = {};
     activeRunId = null; changedFiles = {}; diffAvailable = false; lastSeq = 0; stick = true;
     routeEl.textContent = "";
     hideRunBanner();
