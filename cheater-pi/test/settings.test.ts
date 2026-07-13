@@ -42,6 +42,31 @@ test("unknown keys and invalid approvalPolicy produce warnings (no silent wrong 
   });
 });
 
+test("an empty env var is ignored (falls through to the file), not applied as a blank override", () => {
+  // Regression: `KITTEN_BASE_URL=""` short-circuited `?? file ?? default` on the empty string, yielding
+  // an unusable empty base URL. An unset shell var expands to "", so empty must mean "not provided".
+  const dir = projectWith({ baseUrl: "http://file/v1" });
+  withEnv({ KITTEN_BASE_URL: "" }, () => {
+    const s = loadKittenSettings(dir);
+    assert.equal(s.models.baseUrl, "http://file/v1", "empty env must not blank the file value");
+    assert.ok(s.warnings.some((w) => /KITTEN_BASE_URL is set but empty/.test(w)));
+  });
+});
+
+test("an invalid KITTEN_CONTEXT_TOKENS warns and falls through to the file value (no silent default)", () => {
+  // Regression: `Number("oops")` = NaN, and `NaN ?? file` returns NaN (not nullish), so the file's valid
+  // value was silently discarded to the hardcoded 16384 with no warning.
+  const dir = projectWith({ contextWindowTokens: 32768 });
+  withEnv({ KITTEN_CONTEXT_TOKENS: "oops" }, () => {
+    const s = loadKittenSettings(dir);
+    assert.equal(s.contextWindowTokens, 32768, "invalid env must not discard the file's valid value");
+    assert.ok(s.warnings.some((w) => /KITTEN_CONTEXT_TOKENS "oops" is not a positive number/.test(w)));
+  });
+  withEnv({ KITTEN_CONTEXT_TOKENS: "8000" }, () => {
+    assert.equal(loadKittenSettings(dir).contextWindowTokens, 8000, "a valid env value still overrides the file");
+  });
+});
+
 test("invalid JSON is a warning, not a crash", () => {
   const dir = mkdtempSync(join(tmpdir(), "kitten-cfg-"));
   mkdirSync(join(dir, ".kitten"), { recursive: true });

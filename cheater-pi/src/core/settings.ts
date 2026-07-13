@@ -67,15 +67,31 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
   if (user) sources.push(userPath);
   if (project) sources.push(projectPath);
 
-  // env highest (below explicit CLI flags, which the caller applies).
+  // env highest (below explicit CLI flags, which the caller applies). An env var that is SET but empty/
+  // blank is treated as UNSET (a shell that expands an undefined variable yields "") so it falls through
+  // to the file value instead of silently blanking it; a set-but-invalid value warns rather than
+  // vanishing into a hardcoded default (§7: a typo that silently uses the wrong value is a bug).
+  const envStr = (name: string): string | undefined => {
+    const v = process.env[name];
+    if (v === undefined) return undefined;
+    if (!v.trim()) { warnings.push(`${name} is set but empty — ignored (using config/default)`); return undefined; }
+    return v;
+  };
+  let envContextTokens: number | undefined;
+  const rawCtx = process.env.KITTEN_CONTEXT_TOKENS;
+  if (rawCtx !== undefined && rawCtx.trim()) {
+    const n = Number(rawCtx);
+    if (Number.isFinite(n) && n > 0) envContextTokens = n;
+    else warnings.push(`KITTEN_CONTEXT_TOKENS "${rawCtx}" is not a positive number — ignored (using config/default)`);
+  }
   const env = {
-    baseUrl: process.env.KITTEN_BASE_URL,
-    mainModel: process.env.KITTEN_MAIN_MODEL,
-    sidecarModel: process.env.KITTEN_SIDECAR_MODEL,
-    embedModel: process.env.KITTEN_EMBED_MODEL,
-    apiKey: process.env.KITTEN_API_KEY,
-    approvalPolicy: process.env.KITTEN_APPROVAL_POLICY,
-    contextWindowTokens: process.env.KITTEN_CONTEXT_TOKENS ? Number(process.env.KITTEN_CONTEXT_TOKENS) : undefined,
+    baseUrl: envStr("KITTEN_BASE_URL"),
+    mainModel: envStr("KITTEN_MAIN_MODEL"),
+    sidecarModel: envStr("KITTEN_SIDECAR_MODEL"),
+    embedModel: envStr("KITTEN_EMBED_MODEL"),
+    apiKey: envStr("KITTEN_API_KEY"),
+    approvalPolicy: envStr("KITTEN_APPROVAL_POLICY"),
+    contextWindowTokens: envContextTokens,
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
