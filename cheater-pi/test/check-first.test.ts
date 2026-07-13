@@ -249,6 +249,33 @@ test("runRedGreenScreen proves a discriminating check red-then-green", () => {
   assert.equal(readFileSync(join(cwd, "src", "mod.js"), "utf8"), "// IMPL\n", "green restored");
 });
 
+test("runRedGreenScreen restores a contract output artifact the red run clobbered", () => {
+  // Regression: the red re-run re-executes the app and overwrites a deliverable (output.json) that lives
+  // outside allowedFiles; the finally restored only the source, leaving a STALE deliverable on disk that
+  // the finish gate's existence/parse-only artifact check would accept.
+  const cwd = mkdtempSync(join(tmpdir(), "cf-artifact-"));
+  const snap = join(cwd, ".cheater", "snap");
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  mkdirSync(join(snap, "src"), { recursive: true });
+  writeFileSync(join(snap, "src", "mod.js"), "// PRE\n", "utf8");
+  writeFileSync(join(cwd, "src", "mod.js"), "// IMPL\n", "utf8");
+  const commitlet = fakeCommitlet({
+    allowedFiles: ["src/mod.js"],
+    rollbackPoint: { id: "r", createdAt: "", snapshotDir: snap, existedFiles: ["src/mod.js"], description: "" }
+  });
+  // The check "runs the app": it writes output.json derived from the source, and passes only on IMPL.
+  const runCheck = (): VerificationResult => {
+    const impl = readFileSync(join(cwd, "src", "mod.js"), "utf8").includes("IMPL");
+    writeFileSync(join(cwd, "output.json"), JSON.stringify({ ok: impl }));
+    return impl ? pass() : fail();
+  };
+  writeFileSync(join(cwd, "output.json"), JSON.stringify({ ok: true })); // the green run's correct deliverable
+  const screen = runRedGreenScreen(cwd, commitlet, runCheck, pass(), ["output.json"]);
+  assert.equal(screen.verdict, "proven");
+  assert.deepEqual(JSON.parse(readFileSync(join(cwd, "output.json"), "utf8")), { ok: true }, "green deliverable restored, not the red clobber");
+  assert.equal(readFileSync(join(cwd, "src", "mod.js"), "utf8"), "// IMPL\n", "green source restored");
+});
+
 test("runRedGreenScreen is unscreened when there is no rollback snapshot", () => {
   const cwd = mkdtempSync(join(tmpdir(), "cf-unscreened-"));
   const commitlet = fakeCommitlet({ allowedFiles: ["src/mod.js"] });
