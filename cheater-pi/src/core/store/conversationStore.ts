@@ -132,12 +132,19 @@ const MIGRATIONS: string[] = [
 ];
 
 function migrate(db: SqlDatabase): void {
-  const from = userVersion(db);
-  if (from >= MIGRATIONS.length) return;
+  if (userVersion(db) >= MIGRATIONS.length) return; // fast path: already current, no write lock needed
+  // Read the version, apply migrations, AND bump the version all inside ONE BEGIN IMMEDIATE. This store
+  // is explicitly opened by two processes (a TUI and a web client on the same file), so a concurrent
+  // first-open must not double-migrate: BEGIN IMMEDIATE serializes them, and the loser re-reads the
+  // bumped version inside the lock and finds nothing to do (rather than re-running CREATE TABLE →
+  // "table already exists"). Setting the version in the SAME transaction also makes a crash atomic —
+  // it can never leave committed tables with a stale user_version.
   transact(db, () => {
+    const from = userVersion(db);
+    if (from >= MIGRATIONS.length) return; // another process migrated while we waited for the write lock
     for (let v = from; v < MIGRATIONS.length; v++) db.exec(MIGRATIONS[v]);
+    setUserVersion(db, MIGRATIONS.length);
   });
-  setUserVersion(db, MIGRATIONS.length);
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────────────────────────

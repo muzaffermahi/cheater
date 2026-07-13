@@ -86,6 +86,18 @@ test("recoverInterruptedRuns flips transient runs to interrupted and logs an eve
   assert.equal(s.recoverInterruptedRuns(10000).length, 0);
 });
 
+test("a second store on the same file migrates cleanly (no double-migrate) and reads the data", () => {
+  // Migration reads/applies/bumps the version inside one transaction, so re-opening (or a concurrent
+  // opener) re-reads the current version and no-ops instead of re-running CREATE TABLE.
+  const path = join(mkdtempSync(join(tmpdir(), "kitten-store-")), "conv.db");
+  const s1 = ConversationStore.open(path);
+  s1.createConversation({ id: "x", title: "t", projectRoot: "/p", projectId: "/p", model: "m", mode: "auto", ts: 1 });
+  s1.close();
+  const s2 = ConversationStore.open(path); // must not throw "table already exists"
+  assert.equal(s2.getConversation("x")?.id, "x", "the second store reads the migrated data");
+  s2.close();
+});
+
 test("appendEvent to an unknown conversation throws", () => {
   const s = memStore();
   assert.throws(() => s.appendEvent("nope", { type: "user.message", text: "x" }, 1), /unknown conversation/);
