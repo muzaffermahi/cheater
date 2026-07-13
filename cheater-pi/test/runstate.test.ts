@@ -51,6 +51,24 @@ test("contract extraction preserves exact paths, endpoints, ports, commands, and
   assert.ok(summary.length <= 700);
 });
 
+test("an input file sharing a sentence with a write verb is NOT tagged an output path", () => {
+  // Regression: extractOutputPaths tagged every file in any sentence containing an output verb, so a read
+  // INPUT became an output artifact (and could be outputPaths[0], the primary evaluator hint / guard target).
+  const c = extractAcceptanceContract("Read the input from data.csv and write the summary to report.json.");
+  assert.ok(c.files.includes("data.csv") && c.files.includes("report.json"));
+  assert.ok(c.outputPaths.includes("report.json"), "the written file is an output");
+  assert.ok(!c.outputPaths.includes("data.csv"), "the read input file must NOT be tagged an output");
+});
+
+test("symbol extraction ignores prose after a declaration keyword (no garbage symbols)", () => {
+  // Regression: SYMBOL_DECL_RE pushed the raw next token, so "a function that…" → "that", "the type of…" → "of".
+  const c = extractAcceptanceContract("Write a function that parses the file and returns the type of each row.");
+  assert.ok(!c.symbols.includes("that"), "must not extract the English word after 'function'");
+  assert.ok(!c.symbols.includes("of"), "must not extract the English word after 'type'");
+  const c2 = extractAcceptanceContract("Implement def median(xs) in solution.py.");
+  assert.ok(c2.symbols.includes("median"), "a real code-shaped def declaration is still a symbol");
+});
+
 test("contract extraction is calm on prose with no literal artifacts", () => {
   const contract = extractAcceptanceContract("Please make the app feel a bit snappier overall.");
   assert.equal(contract.files.length, 0);

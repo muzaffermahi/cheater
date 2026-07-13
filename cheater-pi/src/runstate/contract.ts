@@ -50,7 +50,14 @@ const COMMAND_RUNNER_RE =
 
 const ENDPOINT_RE = /(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+|\b(?:endpoint|route|url|path|serve[sd]? at|listen(?:s|ing)? (?:at|on))s?\s*:?\s*)[`"']?(\/[A-Za-z0-9_\-./:{}<>]*)/gi;
 
-const SYMBOL_DECL_RE = /\b(?:function|class|method|def|interface|struct|trait|type)\s+`?([A-Za-z_][A-Za-z0-9_]*)`?/g;
+// Capture the (optional) leading backtick separately so we can tell a real code declaration from prose:
+// "a function that parses" would otherwise yield the symbol "that". Accepted only when backticked or the
+// name is immediately followed by a declaration character (see extractSymbols).
+const SYMBOL_DECL_RE = /\b(?:function|class|method|def|interface|struct|trait|type)\s+(`?)([A-Za-z_][A-Za-z0-9_]*)`?/g;
+
+// A file that is the object of a read/input verb must NOT be tagged an output, even if the sentence also
+// contains an output verb ("Read from data.csv and write report.json" — data.csv is an input).
+const READ_GOVERNS_RE = /\b(?:from|reads?|loads?|loaded|loading|inputs?|opens?|opened|opening|parses?|parsed|parsing)\s+(?:the\s+)?(?:input\s+)?$/i;
 
 function sentences(text: string): string[] {
   return (text ?? "").split(/(?<=[.!?;])\s+|\n+/).map((s) => s.trim()).filter(Boolean);
@@ -80,8 +87,15 @@ function extractOutputPaths(text: string, files: string[]): string[] {
   const out: string[] = [];
   for (const sentence of sentences(text)) {
     if (!OUTPUT_VERB_RE.test(sentence)) continue;
+    const norm = sentence.replace(/\\/g, "/");
     for (const file of files) {
-      if (sentence.includes(file) || sentence.replace(/\\/g, "/").includes(file)) out.push(file);
+      const idx = norm.indexOf(file);
+      if (idx < 0) continue;
+      // The output verb must GOVERN this file: it appears BEFORE the file, and the file is not the object
+      // of a read/from/input verb. Otherwise an input file sharing a sentence with a write verb ("read
+      // from data.csv and write report.json") was wrongly tagged as an output artifact.
+      const before = norm.slice(0, idx);
+      if (OUTPUT_VERB_RE.test(before) && !READ_GOVERNS_RE.test(before)) out.push(file);
     }
   }
   return dedupe(out, 8);
@@ -140,7 +154,14 @@ function extractSymbols(text: string, files: string[], commands: string[]): stri
   const symbols: string[] = [];
   let match: RegExpExecArray | null;
   SYMBOL_DECL_RE.lastIndex = 0;
-  while ((match = SYMBOL_DECL_RE.exec(text ?? "")) !== null) symbols.push(match[1]);
+  const src = text ?? "";
+  while ((match = SYMBOL_DECL_RE.exec(src)) !== null) {
+    const backticked = match[1] === "`";
+    const after = src.slice(SYMBOL_DECL_RE.lastIndex, SYMBOL_DECL_RE.lastIndex + 4);
+    // Accept only a code-shaped declaration: backticked, or the name is immediately followed by a
+    // declaration character ( ( : < { = ). Rejects prose — "a function that…" → "that", "type of…" → "of".
+    if (backticked || /^\s*[(:<{=]/.test(after)) symbols.push(match[2]);
+  }
   for (const span of backtickSpans(text)) {
     const bare = span.replace(/\(\)$/, "");
     if (
