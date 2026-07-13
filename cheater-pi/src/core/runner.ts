@@ -119,9 +119,11 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
       `files: ${result.filesWritten.join(", ") || "none"}`,
     ],
     filesChanged: result.filesWritten,
-    // The reliable lane's finish gate requires an execution receipt, so a reliable finish is verified.
-    // The DIRECT lane has NO finish gate — "finished" only means the model stopped, never verified (§4).
-    verified: ctx.lane === "direct" ? false : result.finished,
+    // The reliable lane's finish gate requires an execution receipt, so a gate-APPROVED reliable finish
+    // is verified. A FORCED finish (rejection budget exhausted → auto-allowed to avoid a loop) obtained
+    // no receipt and must not be verified. The DIRECT lane has NO finish gate — "finished" only means the
+    // model stopped, never verified (§4).
+    verified: ctx.lane === "direct" ? false : (result.finished && !result.forcedFinish),
   };
 }
 
@@ -137,7 +139,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
-      receiptLines: [`ascent→reliable fallback: ${result.stopReason} in ${result.turns} turns`], filesChanged: result.filesWritten, verified: result.finished,
+      receiptLines: [`ascent→reliable fallback: ${result.stopReason} in ${result.turns} turns`], filesChanged: result.filesWritten, verified: result.finished && !result.forcedFinish,
     };
   }
   const a = await runAscent(

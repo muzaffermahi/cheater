@@ -31,6 +31,21 @@ test("safety floor: a catastrophic command is hard-blocked even without an appro
   assert.ok(!res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "the command must not have executed");
 });
 
+test("a finish forced past the rejection budget is flagged forcedFinish (so callers never mark it verified)", async () => {
+  // Regression: after maxFinishRejections the gate is bypassed and finished=true is set unconditionally.
+  // The reliable/bon lanes derived verified:=finished, recording a run whose verification NEVER passed as
+  // verified (a false green). forcedFinish must distinguish a gate-APPROVED finish from a forced one.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-forced-"));
+  const llm = scriptedLlm([{ finish: "done" }]) as never; // the model keeps calling finish every turn
+  const res = await runAgent({
+    task: "x", cwd: dir, llm,
+    finishGate: async () => ({ allowed: false, feedback: "not verified" }), // gate always rejects
+    maxTurns: 8,
+  });
+  assert.equal(res.finished, true, "finish is force-allowed after the budget to avoid an infinite loop");
+  assert.equal(res.forcedFinish, true, "but it is flagged forced (no receipt) so the lane won't record it verified");
+});
+
 test("commandGate: a denied destructive command is blocked and fed back", async () => {
   const dir = mkdtempSync(join(tmpdir(), "kitten-safe-"));
   const llm = scriptedLlm([{ tool: "bash", args: { command: "git push --force origin main" } }, { finish: "done" }]) as never;

@@ -81,6 +81,9 @@ export interface AgentRunParams {
 
 export interface AgentRunResult {
   finished: boolean;
+  /** finished was FORCE-allowed after exhausting the finish-gate rejection budget (no receipt obtained).
+   *  Callers must NOT treat a forced finish as verified. Absent ⇒ not forced. */
+  forcedFinish?: boolean;
   summary: string;
   turns: number;
   toolCalls: number;
@@ -136,6 +139,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let stopReason: AgentRunResult["stopReason"] = "max_turns";
   let emptyStreak = 0;
   let finishRejections = 0;
+  let forcedFinish = false;
   const maxFinishRejections = params.maxFinishRejections ?? 2;
   // Verification-spiral cap: after the model has edited code and then run several PASSING checks, one
   // gentle nudge toward finish. Fires only after thorough verification (never on the ~3-turn median),
@@ -241,6 +245,11 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
             emit({ turn, kind: "gate_block", detail: `finish rejected: ${gate.feedback ?? ""}`.slice(0, 200) });
             continue;
           }
+        } else if (params.finishGate) {
+          // A finish gate exists but the rejection budget is exhausted: finish is FORCE-allowed to avoid
+          // an infinite loop — it was NOT gate-approved, so no execution receipt was obtained. Mark it so
+          // the caller never records this as verified (§4: finished ≠ verified).
+          forcedFinish = true;
         }
         finished = true;
         summary = proposed;
@@ -293,6 +302,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
 
   return {
     finished,
+    forcedFinish,
     summary,
     turns: Math.min(events.filter((e) => e.kind === "assistant").length, maxTurns),
     toolCalls,
