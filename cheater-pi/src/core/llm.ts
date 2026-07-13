@@ -217,7 +217,7 @@ export class KittenLLM {
     const body = this.buildBody(params, false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    const signal = params.signal ?? controller.signal;
+    const signal = effectiveSignal(params.signal, controller.signal);
     try {
       const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
       if (!res.ok) {
@@ -265,7 +265,7 @@ export class KittenLLM {
     const body = this.buildBody(params, true);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    const signal = params.signal ?? controller.signal;
+    const signal = effectiveSignal(params.signal, controller.signal);
     const acc = new StreamAccumulator();
     try {
       const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
@@ -398,7 +398,7 @@ export class KittenLLM {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-      const res = await fetch(this.rootUrl("/completion"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal: params.signal ?? controller.signal });
+      const res = await fetch(this.rootUrl("/completion"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal: effectiveSignal(params.signal, controller.signal) });
       clearTimeout(timer);
       if (!res.ok) return { ok: false, content: "", error: `HTTP ${res.status}` };
       const json: any = await res.json();
@@ -533,6 +533,16 @@ function parseLogprobs(lp: any): TokenLogprob[] | undefined {
     }));
   }
   return undefined;
+}
+
+/**
+ * Combine a caller's optional AbortSignal with the internal timeout controller so BOTH can abort the
+ * fetch: the timer always bounds a stalled endpoint, and the caller's signal still cancels first. Using
+ * only `params.signal ?? controller.signal` silently disabled the timeout whenever a caller passed a
+ * signal (the normal agent/stream path) — a stalled local model could then hang indefinitely.
+ */
+function effectiveSignal(caller: AbortSignal | undefined, timeout: AbortSignal): AbortSignal {
+  return caller ? AbortSignal.any([caller, timeout]) : timeout;
 }
 
 function failure(error: string, started: number): ChatResult {

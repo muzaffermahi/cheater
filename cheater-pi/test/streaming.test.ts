@@ -108,6 +108,44 @@ test("chatStream returns ok:false on a server error, not a throw", async () => {
   assert.match(r.error ?? "", /HTTP 500/);
 });
 
+test("chat() still enforces its timeout when the caller also passes a signal", async () => {
+  // Regression: the timeout timer aborted an internal controller, but fetch listened to the caller's
+  // signal — so a caller-supplied signal (the normal agent/stream path) silently disabled the timeout.
+  // A server that accepts the request and NEVER responds: the only bound is the client timeout.
+  const server = createServer(() => { /* hang: never write, never end */ });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${port}/v1`, main: "x" });
+  const caller = new AbortController(); // provided but never aborted
+  const started = Date.now();
+  const r = await llm.chat({ messages: [{ role: "user", content: "hi" }], signal: caller.signal, timeoutMs: 150 });
+  const elapsed = Date.now() - started;
+  server.close();
+  (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "timeout"); // NOT "cancelled" (caller never aborted), NOT a 10-minute hang
+  assert.ok(elapsed < 3000, `timed out promptly (was ${elapsed}ms)`);
+});
+
+test("chatStream() still enforces its timeout when the caller also passes a signal", async () => {
+  // Server sends SSE headers, then hangs without any frame — reader.read() would block forever.
+  const server = createServer((_req, res) => { res.writeHead(200, { "content-type": "text/event-stream" }); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${port}/v1`, main: "x" });
+  const caller = new AbortController(); // provided but never aborted
+  const started = Date.now();
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }], signal: caller.signal, timeoutMs: 150 }, () => {});
+  const elapsed = Date.now() - started;
+  server.close();
+  (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
+  assert.equal(r.ok, false);
+  assert.equal(r.error, "timeout");
+  assert.ok(elapsed < 3000, `timed out promptly (was ${elapsed}ms)`);
+});
+
 test("chatStream aborts as 'cancelled', not a generic network error", async () => {
   // A server that streams slowly so we can abort mid-stream.
   const s = await sseServer([
