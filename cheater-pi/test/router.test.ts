@@ -30,6 +30,19 @@ test("from-scratch multi-part build → Ascent k>=2", () => {
   assert.ok(d.hardness >= 3, `hardness ${d.hardness}`);
 });
 
+test("a single generic complexity signal does NOT over-escalate an ordinary task to Ascent", () => {
+  // Regression: escalating on >=1 signal sent "test failure" / "config" tasks through best-of-N,
+  // contradicting the documented "ordinary bug fix / test failure → reliable k=1" policy. Only >=2
+  // signals (the codebase-wide high-complexity threshold) escalate.
+  const testFix = routeMessage("fix the failing test in parser.py");
+  assert.equal(testFix.lane, "reliable", `single-signal task should be reliable, got ${testFix.lane}`);
+  assert.equal(testFix.k, 1);
+  // Two+ complexity signals still escalate to Ascent.
+  const complex = routeMessage("refactor the auth module to add caching, retries, and rate limiting across the api and the worker");
+  assert.equal(complex.lane, "ascent");
+  assert.ok(complex.reasons.some((r) => /multiple complexity signals/.test(r)));
+});
+
 test("explicit lane override is obeyed and recorded", () => {
   const d = routeMessage("do whatever", { lane: "bon", k: 4 });
   assert.equal(d.lane, "bon");
