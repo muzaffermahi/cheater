@@ -193,6 +193,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
     if (params.captureConfidence && result.logprobs?.length) logprobChunks.push(result.logprobs);
 
     if (!result.ok) {
+      // A caller cancellation DURING the in-flight LLM call is a clean stop, not an error — the
+      // top-of-loop abort check only catches a cancel BETWEEN turns, not one mid-generation.
+      if (params.signal?.aborted || result.error === "cancelled") { stopReason = "aborted"; break; }
       emit({ turn, kind: "error", detail: result.error ?? "llm error" });
       // One retry on a transient error, then stop.
       if (turn < maxTurns && /timeout|network/.test(result.error ?? "")) continue;

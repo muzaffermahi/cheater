@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAgent } from "../src/core/agent.js";
 import { KittenApp, type Runner } from "../src/core/app.js";
+import { defaultRunner } from "../src/core/runner.js";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 
@@ -29,6 +30,19 @@ test("safety floor: a catastrophic command is hard-blocked even without an appro
   const res = await runAgent({ task: "x", cwd: dir, llm });
   assert.ok(res.events.some((e) => e.kind === "gate_block" && /safety block/.test(e.detail)), "expected a safety block");
   assert.ok(!res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "the command must not have executed");
+});
+
+test("a cancelled LLM call mid-generation stops as 'aborted', not 'error'", async () => {
+  // Regression: on a mid-generation cancel the LLM returns ok:false error:"cancelled", which
+  // /timeout|network/ did not match, so the run was mislabeled stopReason:"error".
+  const dir = mkdtempSync(join(tmpdir(), "kitten-cancel-agent-"));
+  const cancelledLlm = {
+    chat: async () => ({ ok: false, error: "cancelled", content: "", reasoning: "", toolCalls: [], finishReason: "error", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, elapsedMs: 1 }),
+    sidecar: async () => ({ ok: false }), embed: async () => [],
+  } as never;
+  const res = await runAgent({ task: "x", cwd: dir, llm: cancelledLlm });
+  assert.equal(res.stopReason, "aborted");
+  assert.equal(res.finished, false);
 });
 
 test("a finish forced past the rejection budget is flagged forcedFinish (so callers never mark it verified)", async () => {
@@ -108,4 +122,20 @@ test("cancel() unblocks a run parked on a pending interactive approval (no deadl
   const run = await a.submitMessage(conv.id, "rm the build dir"); // must RESOLVE, not hang
   assert.equal(run.finished, false, "a cancelled run did not finish");
   assert.ok(a.getEvents(conv.id).some((e) => e.type === "run.cancelled"), "the run reached the terminal cancelled state");
+});
+
+test("an answer-lane model error is recorded as failed, not completed", async () => {
+  // Regression: runAnswer returned finished:false without throwing on a model error, so the app took the
+  // success branch and recorded run.completed — an LLM error looked like a completed run (unlike coding lanes).
+  const failingLlm = {
+    chat: async () => ({ ok: false, error: "boom", content: "", reasoning: "", toolCalls: [], finishReason: "error", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, elapsedMs: 1 }),
+    sidecar: async () => ({ ok: false }), embed: async () => [],
+  } as never;
+  const store = new ConversationStore(openSqlite(":memory:"));
+  const kapp = new KittenApp({ store, runner: defaultRunner(failingLlm), projectRoot: process.cwd() });
+  const conv = kapp.createConversation({ projectRoot: process.cwd() });
+  await kapp.submitMessage(conv.id, "explain how the tokenizer works"); // routes to the answer lane
+  const events = kapp.getEvents(conv.id);
+  assert.ok(events.some((e) => e.type === "run.failed"), "a model error must terminate as run.failed");
+  assert.ok(!events.some((e) => e.type === "run.completed"), "must NOT be recorded as a completed run");
 });

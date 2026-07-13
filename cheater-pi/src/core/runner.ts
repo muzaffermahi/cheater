@@ -36,14 +36,17 @@ async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     ? await llm.chatStream(chatParams, (d) => { if (d.content) { buf += d.content; if (buf.length >= 48) { ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf }); buf = ""; } } })
     : await llm.chat(chatParams);
   if (buf) ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf });
-  const text = r.ok ? r.content : `(model error: ${r.error ?? "unknown"})`;
-  ctx.emit({ type: "assistant.final", runId: ctx.runId, text });
+  // A model error / cancel in the answer lane must terminate as failed/cancelled — not be recorded as a
+  // "completed" run like a successful answer (the coding lanes already fail on error via a throw). The
+  // app's submitMessage maps this throw to run.failed, or run.cancelled when the signal was aborted.
+  if (!r.ok) throw new Error(r.error ? `model error: ${r.error}` : "model error");
+  ctx.emit({ type: "assistant.final", runId: ctx.runId, text: r.content });
   return {
-    finished: r.ok,
-    summary: text.slice(0, 200),
+    finished: true,
+    summary: r.content.slice(0, 200),
     wallMs: Date.now() - started,
     usage: { prompt: r.usage.prompt, completion: r.usage.completion, reasoning: r.usage.reasoning },
-    receiptLines: [`answer-only lane: ${r.ok ? "answered" : "model error"}`],
+    receiptLines: ["answer-only lane: answered"],
     filesChanged: [],
     verified: false,
   };
