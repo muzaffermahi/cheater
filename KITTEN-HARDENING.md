@@ -2,11 +2,15 @@
 
 An overnight, fully-offline correctness pass on branch `kitten-hardening` (off `kitten-reality`).
 No live model or Docker was available, so every fix is verified by the deterministic test suite
-(**775 → 802 tests green**, +27 regression tests; build + typecheck clean throughout).
+(**775 → 814 tests green**, +39 regression tests; build + typecheck clean throughout). Run in **two
+waves** of adversarial bug-hunters (14 agents total): the first over the freshest reality-pass code,
+the second over the run orchestrator, agent loop, planner/resampler, best-of-N, validation ledger, and
+web server. **30 fix commits** in all. The first wave's fixes are catalogued below; the second wave's
+are in *Second wave* near the end.
 
 ## Method
 
-Eight adversarial bug-hunter agents were fanned out across the hottest and most-recently-changed
+Fourteen adversarial bug-hunter agents were fanned out across the hottest and most-recently-changed
 subsystems, each instructed to report only defects it could trigger with a concrete input/state
 (the project's cardinal rule: **zero false positives**). Every finding was then re-verified by hand
 against the real code before any change, fixed with a regression test that fails without the fix, and
@@ -107,15 +111,78 @@ are the highest-confidence items below.
     keyed by a non-plan-scoped id let an interrupted build's counts skip the grace re-asks of a later
     same-process build. Now reset at the start of each run.
 
+## Second wave (run orchestrator, agent loop, planner, best-of-N, ledger, web)
+
+### More false greens / verification honesty
+
+21. **reliable/bon lanes recorded `verified:true` for a force-allowed finish** — `core/agent.ts` +
+    `runner.ts`. After the finish-gate rejection budget, finish is force-allowed (anti-loop) but was
+    recorded as verified though no receipt was obtained. New `forcedFinish` flag; `verified = finished &&
+    !forcedFinish`.
+22. **`rm -Rf` deleted verified output** — `runstate/postSuccessGuard.ts`. The broad-destruction pattern
+    was case-sensitive, so the BSD/macOS `-Rf` form slipped the block. Now `/i`. (Also: a substring match
+    false-blocked `output.json.bak`; now boundary-anchored.)
+
+### Ascent-pipeline correctness
+
+23. **Round-local attempt indices collided across repair rounds** — `core/ascent.ts`. cloudBurst assigns
+    round-local `1..k`, but cascade/verifier/measure use `index` as a global identity — round 2 shadowed
+    round 1, so the wrong workspace could be adopted and Best@1 mis-scored. Reindex on concat.
+
+### Command gating (false blocks of legitimate commands)
+
+24. **Noun gate false-blocked create-then-use and `mkdir -p`** — `reliability/nounGate.ts`.
+    `echo … > t.py && python t.py` blocked (t.py not yet on disk); `mkdir -p a/b` blocked on a missing
+    parent it creates. Skip a must-exist path created earlier in the same command; don't parent-gate
+    `mkdir -p`.
+
+### Diff accounting / dependency intent
+
+25. **Diff under-count on `---` + dependency-intent over-match** — `commitlet/guard.ts`. An unanchored
+    `---` dropped real content lines from the count (feeds the size cap, health, selection tiebreak);
+    "package"/"module" as bare nouns demoted an incidental manifest edit. Anchored the header exclusion;
+    tightened dependency intent to package-manager commands / the word "dependency" / an article-led
+    count-noun.
+
+### Web server security + robustness
+
+26. **Web-augment fetch followed redirects off the allow-list (SSRF-lite)** — `core/webAugment.ts`. The
+    allow-list was checked only on the initial URL, and `redirect:"follow"` let a 3xx to an off-list host
+    (or `169.254.169.254`) be fetched and injected. Now manual redirects with a per-hop allow-list check.
+27. **`readJson` returned null for a JSON `null` body** — `core/web/server.ts`. Handlers destructured null
+    → 500. Treat a non-object body as empty.
+
+### Run lifecycle honesty
+
+28. **cancel() deadlocked a run parked on an "ask" approval** — `core/app.ts`. Abort didn't resolve the
+    pending approval promise; the agent hung forever. cancel() now denies pending approvals so the run
+    reaches a terminal state.
+29. **Mid-generation cancel / answer-lane model error mislabeled** — `core/agent.ts` + `runner.ts`. A
+    cancel during the LLM call reported `stopReason:"error"` (now `"aborted"`); an answer-lane model error
+    was recorded `completed` (now `failed`/`cancelled` like the coding lanes).
+30. **Scoped "do not modify X" misrouted a fix request to answer-only** — `autopilot/classifier.ts`. A
+    scoped negation suppressed the real "fix" verb. Strip only the negated clause (verb adjacent to the
+    negation) before intent tests; a global read-only and a positive "don't forget to fix" are preserved.
+
+### Second-wave finding acknowledged but not changed
+
+- **Web-augment anti-leakage refusal is inert for the id-only eval sets** (`webAugment.ts` +
+  `disjointness.ts`) — the TB2 / local-battery sets are registered with ids but no task *texts*, so the
+  fingerprint refusal can't fire for them. Low practical impact (the augment query is an error signature,
+  not the task text, and web knowledge about error *classes* is explicitly permitted; the actual
+  task-solving firewall — `isEvalId` on the experience store — works independently). A full fix needs the
+  eval task texts, which are not in the repo; fail-closing would disable the feature. Left as-is.
+
 ## Not changed (verified clean)
 
-`core/bestofn.ts` and `core/selfCertainty.ts` were read in full and found correct (the selection-index
-bookkeeping across rounds is consistent; the self-certainty math is careful). Several tempting
-hypotheses were refuted during verification rather than shipped (e.g. the ascent `verdict.winner` index
-is 1-based, not an off-by-one; crash/exception paths correctly mark `failed`).
+`core/bestofn.ts`, `core/selfCertainty.ts`, `commitlet/rollback.ts`, and `reliability/failureCompressor.ts`
+were read in full and found correct. Several tempting hypotheses were refuted during verification rather
+than shipped (e.g. the ascent `verdict.winner` index is 1-based, not an off-by-one; crash/exception paths
+correctly mark `failed`; the validation-ledger/computeBudget/phaseController "suspicions" were unreachable
+in the live wiring).
 
 ## What was NOT done
 
 - No live-model or browser verification (endpoint down, Docker off) — all fixes are offline-verified.
-- Uncovered subsystems (`blueprint/*`, `sidecar/jobs`, `core/web/page.ts`, `core/app.ts`, `core/agent.ts`,
-  parts of `commitlet/`) were not deeply hunted in the first wave.
+- A few deep subsystems remain un-hunted (`blueprint/*` web-scout/scaffold internals, `core/web/page.ts`
+  client JS, `commitlet/executor` prompt assembly, `core/tui.ts`), and the one acknowledged non-fix above.
