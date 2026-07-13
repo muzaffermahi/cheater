@@ -23,7 +23,8 @@ export interface GuardVerdict {
 }
 
 const DESTRUCTIVE_PATTERNS: Array<{ re: RegExp; label: string; broad: boolean }> = [
-  { re: /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b/, label: "rm -rf", broad: true },
+  // Case-INsensitive: `-Rf`/`-fR`/`-RF` (the BSD/macOS recursive form) must block just like `-rf`.
+  { re: /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r)\b/i, label: "rm -rf", broad: true },
   { re: /\brm\s+/, label: "rm", broad: false },
   { re: /\bRemove-Item\b.*-Recurse/i, label: "Remove-Item -Recurse", broad: true },
   { re: /\bRemove-Item\b/i, label: "Remove-Item", broad: false },
@@ -41,6 +42,16 @@ const BROAD_FORMAT_RE = /\b(?:prettier\s+(?:--write|-w)|black\s+\.|gofmt\s+-w|ca
 
 function normalizePath(path: string): string {
   return (path ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+/** Does the command reference the protected path (full path or basename) at a TOKEN boundary? A raw
+ *  substring test falsely flagged `rm output.json.bak` / `temp_output.json` as touching `output.json`. */
+function commandMentions(cmd: string, path: string): boolean {
+  const norm = cmd.replace(/\\/g, "/");
+  const base = path.split("/").pop() ?? path;
+  const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(^|[\\s/'"=:(])(?:${esc(path)}|${esc(base)})([\\s'";,)]|$)`);
+  return re.test(norm);
 }
 
 export class PostSuccessGuard {
@@ -92,7 +103,7 @@ export class PostSuccessGuard {
     const cmd = (command ?? "").trim();
     if (!cmd || !this.hasProtections()) return { verdict: "allow" };
     const protectedPaths = [...this.artifacts.keys()];
-    const mentioned = protectedPaths.filter((p) => cmd.replace(/\\/g, "/").includes(p) || cmd.includes(p.split("/").pop() ?? p));
+    const mentioned = protectedPaths.filter((p) => commandMentions(cmd, p));
 
     for (const pattern of DESTRUCTIVE_PATTERNS) {
       if (!pattern.re.test(cmd)) continue;

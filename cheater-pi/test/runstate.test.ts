@@ -226,8 +226,10 @@ test("post-success guard protects artifacts and blocks destructive commands over
   assert.equal(guard.isProtected("dist/bundle.js"), true, "directory protection covers children");
   assert.equal(guard.isProtected("src/app.ts"), false);
   assert.equal(guard.assessCommand("rm -rf output.json").verdict, "block");
+  assert.equal(guard.assessCommand("rm -Rf dist").verdict, "block", "capital -Rf (macOS recursive) must block just like -rf");
   assert.equal(guard.assessCommand("git reset --hard").verdict, "block", "broad destruction endangers every protected artifact");
   assert.equal(guard.assessCommand("cat output.json").verdict, "allow", "reading protected output is fine");
+  assert.equal(guard.assessCommand("rm output.json.bak").verdict, "allow", "a different file (output.json.bak) must not match the protected output.json");
   assert.match(guard.warningLine() ?? "", /Protected artifacts exist/);
 });
 
