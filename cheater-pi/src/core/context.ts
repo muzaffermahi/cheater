@@ -133,6 +133,13 @@ export class ContextBuilder {
         turns.push({ request: pendingRequest ?? "(request not recorded)", lane: null, outcome: `failed: ${e.error}`, files: [], verification: "failed", answer: pendingAnswer });
         pendingRequest = null;
         pendingAnswer = undefined;
+      } else if (e.type === "run.cancelled" || e.type === "run.interrupted") {
+        // Both are terminal (Goal §6). Surface them honestly — files may be partially changed — instead
+        // of leaving pendingRequest to fall through to the end-of-loop "(in progress / no outcome)".
+        const outcome = e.type === "run.cancelled" ? "cancelled" : "interrupted (left mid-run)";
+        turns.push({ request: pendingRequest ?? "(request not recorded)", lane: null, outcome, files: filesForRun(e.runId), verification: outcome, answer: pendingAnswer });
+        pendingRequest = null;
+        pendingAnswer = undefined;
       }
     }
     if (pendingRequest !== null) {

@@ -32,6 +32,21 @@ test("ContextBuilder folds prior turns (request, outcome, files, verification) i
   assert.ok(built.coveredSeq >= 6);
 });
 
+test("ContextBuilder surfaces a cancelled run honestly (not '(in progress)')", () => {
+  // Regression: digestTurns ignored run.cancelled/run.interrupted, so pendingRequest fell through to the
+  // end-of-loop push and a cancelled run was described to the model as "in progress / no outcome".
+  const store = new ConversationStore(openSqlite(":memory:"));
+  const id = "cc";
+  store.createConversation({ id, title: "t", projectRoot: "/proj", projectId: "/proj", model: "m", mode: "auto", ts: 1 });
+  store.appendEvent(id, { type: "user.message", text: "refactor auth.py" }, 2);
+  store.appendEvent(id, { type: "run.started", runId: "r1", request: "refactor auth.py", lane: "reliable" }, 3);
+  store.appendEvent(id, { type: "file.changed", runId: "r1", path: "auth.py", added: 3, removed: 1 }, 4);
+  store.appendEvent(id, { type: "run.cancelled", runId: "r1" }, 5);
+  const built = new ContextBuilder(store).build(id, "/nonexistent-cwd");
+  assert.match(built.preamble, /cancelled/, "a cancelled run must be labeled cancelled");
+  assert.doesNotMatch(built.preamble, /in progress/, "must NOT be mislabeled as in progress");
+});
+
 test("ContextBuilder returns no prior-turn block for a brand-new conversation", () => {
   const store = new ConversationStore(openSqlite(":memory:"));
   store.createConversation({ id: "fresh", title: "t", projectRoot: "/proj", projectId: "/proj", model: "m", mode: "auto", ts: 1 });
