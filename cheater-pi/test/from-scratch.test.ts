@@ -513,3 +513,18 @@ test("classifyScaffoldFile: a React index entry in ANY directory is 'entry'; a b
   assert.equal(classifyScaffoldFile("app/index.tsx"), "entry", "entry-last ordering must apply regardless of directory");
   assert.equal(classifyScaffoldFile("src/components/index.ts"), "features", "a barrel index.ts is not the app entry");
 });
+
+test("stampProfile skips the coupled entry set when the model relocated it off the canonical layout (no broken cross-links)", () => {
+  const stamp = (planned: string[]): string[] => {
+    const cwd = mkdtempSync(join(tmpdir(), "stamp-"));
+    return stampProfile(cwd, VITE_REACT_TS, { appName: "x", usesTailwind: false, entryComponent: "./App" }, planned).map((s) => s.path);
+  };
+  // Canonical layout: the entry set (index.html + src/main.tsx) is stamped, cross-links valid.
+  const canonical = stamp(["package.json", "vite.config.ts", "index.html", "src/main.tsx", "src/App.tsx", "src/index.css"]);
+  assert.ok(canonical.includes("index.html") && canonical.some((p) => /main\.tsx$/.test(p)), "canonical layout stamps the entry set");
+  // Flat layout (main.tsx at root): stamping index.html's hardcoded `/src/main.tsx` would dangle, so the
+  // entry set is SKIPPED (the model authors it); only cross-link-free config files are stamped.
+  const flat = stamp(["package.json", "vite.config.ts", "index.html", "main.tsx", "App.tsx"]);
+  assert.ok(!flat.includes("index.html") && !flat.some((p) => /main\.tsx$/.test(p)), "a relocated entry set is not stamped with broken links");
+  assert.ok(flat.includes("package.json"), "standalone config files are still stamped");
+});
