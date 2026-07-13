@@ -131,6 +131,30 @@ test("ground truth: a candidate that fails the prompt's worked examples is INELI
   assert.equal(res.winnerHasExecutionReceipt, true);
 });
 
+test("a weakly-eligible candidate never outranks a ground-truth-verified one (no false green)", async () => {
+  // Regression: with no consensus/ORM, fuse tie-broke on index, so a lower-index candidate that only
+  // passed the finish gate (its worked-example module never ran) could WIN and be applied over a
+  // verified one — and was even credited with a green execution receipt because SOME OTHER candidate
+  // had execution evidence. Both are false greens.
+  const dir = mkdtempSync(join(tmpdir(), "ver-weak-"));
+  const weak = join(dir, "weak"); mkdirSync(weak);               // index 1: NO solution.py → examples can't run
+  writeFileSync(join(weak, "notes.txt"), "wrote to the wrong file\n");
+  const strong = join(dir, "strong"); mkdirSync(strong);
+  writeFileSync(join(strong, "solution.py"), "def f(x):\n    return x * 2\n"); // index 2: passes the examples
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({
+    llm: dummyLlm, task: "double", contract,
+    workedExamples: [{ call: "f(2)", expected: "4" }, { call: "f(3)", expected: "6" }], workedModule: "solution.py"
+  });
+  const res = await v.verify([
+    { index: 1, workspace: weak, finished: true, summary: "" },
+    { index: 2, workspace: strong, finished: true, summary: "" }
+  ]);
+  assert.equal(res.slate.find((s) => s.index === 1)!.weaklyEligible, true, "the module-less candidate is only weakly eligible");
+  assert.equal(res.winner, 2, "the ground-truth-verified candidate wins, not the lower-index weak one");
+  assert.equal(res.winnerHasExecutionReceipt, true, "receipt reflects the winner's OWN evidence");
+});
+
 test("verifierReceiptLines renders the full audit slate", async () => {
   const a = ws("a", "def f(x):\n    return x*2\n");
   const contract = extractAcceptanceContract("impl f");

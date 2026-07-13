@@ -232,13 +232,16 @@ export class Verifier {
   private fuse(slate: CandidateSignals[]): VerifierResult {
     const eligible = slate.filter((s) => s.executionEligible);
     const pool = eligible.length ? eligible : slate;
-    const usedExecution = eligible.length > 0 && eligible.some((s) => !s.weaklyEligible);
 
     // Order: execution consensus first, then ORM, then P1 self-certainty (the owned-engine tiebreaker
     // for the "all candidates agree but are wrong / a thin test can't separate them" case — where
     // consensusRank is tied and there's no ORM, the more DECISIVE generation wins instead of arbitrary
     // index order). Self-certainty is never the sole reason: eligibility (B1 execution) gates the pool.
     const ranked = [...pool].sort((a, b) => {
+      // A candidate with a real execution signal always outranks a merely-finished (weak) one — else a
+      // weakly-eligible candidate could win on index order alone and be applied over a verified one.
+      const we = (a.weaklyEligible ? 1 : 0) - (b.weaklyEligible ? 1 : 0);
+      if (we !== 0) return we;
       const cr = (a.consensusRank ?? 99) - (b.consensusRank ?? 99);
       if (cr !== 0) return cr;
       const orm = (b.ormScore ?? -1) - (a.ormScore ?? -1);
@@ -257,8 +260,10 @@ export class Verifier {
     else if (win.consensusRank !== undefined) selector = "execution+consensus";
     else selector = "execution";
 
+    // The receipt must reflect the WINNER's OWN execution evidence — not merely that some OTHER candidate
+    // had a signal. A weakly-eligible winner (finish-gate fallback) is honestly NOT a green receipt.
     const winnerHasExecutionReceipt = !!win && win.executionEligible && !win.weaklyEligible;
-    return { slate, winner, selector, winnerHasExecutionReceipt: winnerHasExecutionReceipt || (!!win && usedExecution && win.executionEligible) };
+    return { slate, winner, selector, winnerHasExecutionReceipt };
   }
 }
 
