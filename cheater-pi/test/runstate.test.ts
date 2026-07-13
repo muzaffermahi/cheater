@@ -94,6 +94,17 @@ test("mutationsFromCommand classifies installs, deletes, and git operations; rea
   assert.ok(git.some((entry) => entry.action === "git_operation"));
 });
 
+test("mutationsFromCommand records BOTH truncating (>) and appending (>>) redirects as file_modified", () => {
+  const trunc = mutationsFromCommand("echo hi > out.json", "m");
+  assert.equal(trunc[0]?.action, "file_modified");
+  assert.deepEqual(trunc[0]?.paths, ["out.json"]);
+  // Regression: `>>` appends were silently missed, so an append after a passing check never marked the
+  // earlier validation stale — a stale green could then be repeated as fresh.
+  const append = mutationsFromCommand("cat extra >> out.json", "m");
+  assert.equal(append[0]?.action, "file_modified", ">> append must be recorded as a mutation");
+  assert.deepEqual(append[0]?.paths, ["out.json"]);
+});
+
 // ---------------------------------------------------------------------------
 // Validation ledger (Phase 6): a pass is only proof until a dependency mutates.
 // ---------------------------------------------------------------------------

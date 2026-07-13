@@ -184,7 +184,10 @@ export function mutationsFromCommand(command: string, actor: string): Array<Omit
   if (/\bchmod\b|\bchown\b|\bicacls\b/.test(cmd)) {
     out.push({ actor, action: "permission_change", paths: [], source: cmd.slice(0, 120) });
   }
-  const redirect = cmd.match(/(?:^|[^>])>\s*([\w\/.\\-]+\.[a-z0-9]{1,6})\b/i);
+  // `>` truncates and `>>` appends — BOTH modify the file. The `[^>]` guard avoids matching the second
+  // `>` of `>>` as its own redirect; `>>?` then lets the append form match too (previously `>>` was
+  // silently missed, so an append after a passing check never marked the old validation stale).
+  const redirect = cmd.match(/(?:^|[^>])>>?\s*([\w\/.\\-]+\.[a-z0-9]{1,6})\b/i);
   if (redirect) out.push({ actor, action: "file_modified", paths: [redirect[1]], source: cmd.slice(0, 120), reason: "shell redirection" });
   return out;
 }
