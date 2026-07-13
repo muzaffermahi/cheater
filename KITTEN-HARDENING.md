@@ -2,11 +2,11 @@
 
 An overnight, fully-offline correctness pass on branch `kitten-hardening` (off `kitten-reality`).
 No live model or Docker was available, so every fix is verified by the deterministic test suite
-(**775 → 814 tests green**, +39 regression tests; build + typecheck clean throughout). Run in **two
-waves** of adversarial bug-hunters (14 agents total): the first over the freshest reality-pass code,
-the second over the run orchestrator, agent loop, planner/resampler, best-of-N, validation ledger, and
-web server. **30 fix commits** in all. The first wave's fixes are catalogued below; the second wave's
-are in *Second wave* near the end.
+(**775 → 820 tests green**, +45 regression tests; build + typecheck clean throughout). Run in **three
+waves** of adversarial bug-hunters (17 agents total): (1) the freshest reality-pass code; (2) the run
+orchestrator, agent loop, planner/resampler, best-of-N, validation ledger, and web server; (3) the
+from-scratch scaffolding, routing policy, and the served-page client JS. **36 fix commits** in all. The
+first wave's fixes are catalogued below; waves two and three follow near the end.
 
 ## Method
 
@@ -173,9 +173,52 @@ are the highest-confidence items below.
   task-solving firewall — `isEvalId` on the experience store — works independently). A full fix needs the
   eval task texts, which are not in the repo; fail-closing would disable the feature. Left as-is.
 
+## Third wave (from-scratch scaffolding, routing policy, served-page client JS)
+
+### From-scratch build path (the flagship natural-prompt → app use case)
+
+31. **Scaffold stamped an un-runnable app when the model relocated the entry set** — `blueprint/stackTemplates.ts`.
+    The Vite entry triple (index.html → /src/main.*, main.* → ./index.css) is stamped with hardcoded
+    canonical cross-links, but the model's own non-canonical paths (flat layout, public/index.html) were
+    honored — so `vite build` failed on inconsistent bytes the harness wrote. Skip stamping the entry
+    group when a coupled file is relocated; the model then authors them coherently.
+32. **`npm install` hardcoded for any manifest** — `blueprint/scaffold.ts` + planner/executor. A
+    Python/Go/Rust build (the literal Flask+React case) got a JS-only install instruction. Pick the
+    command from the manifest (`installCommandForManifest`).
+33. **isFromScratchBuild false-positived over an existing repo** — `blueprint/scaffold.ts`. repoHasManifest
+    checked only the root (missing a monorepo's `frontend/package.json`), and the verb-less branch fired on
+    fix goals. Check one subdir level; exclude edit/fix verbs.
+34. **Non-`src/` React entry mis-ordered** — `commitlet/planner.ts`. `index.{jsx,tsx}` in any directory is
+    now the app `entry` (built last), not `foundation`.
+
+### Worker prompt / impact classifier
+
+35. **Contradictory multi-file acceptance criteria** — `commitlet/spec.ts`. A multi-file phase got one
+    "X is the only edit target" line PER file (mutually exclusive), rendered into the model's prompt. Name
+    them jointly. (Same commit: two benchmark-scoped impact-classifier regex mislabels — keyword-less TS
+    signatures missed, `a/b` flagged as a command registration.)
+
+### Web UI honesty
+
+36. **Prose collapsed above tool cards + fake approvals** — `core/web/page.ts`. Assistant deltas keyed by
+    runId reused one bubble, so all of a run's prose rendered above the tool cards it followed; and the
+    approval card showed "Approved" even when the server reported nothing pending. Track a single open
+    bubble closed by any non-streaming event; check the approve response's `ok`.
+
+### Third-wave findings acknowledged but not changed
+
+- **TUI mascot state is tracked but never live-rendered** (`core/tui.ts`) — the streaming terminal writes
+  content inline and has no cursor-based status redraw, so the compact face is shown only at boot / via
+  `/cat`; the `st.mascot` transitions (thinking/working/verifying) drive nothing. A proper fix is a TUI
+  status-redraw feature, not a correctness change — left as a known limitation.
+- **A web approval replayed from history renders as actionable** — the deeper fix (stop showing a fake
+  success, done in #36) is landed; making a *historical* approval non-actionable needs an
+  approval-resolution event in the log, deferred.
+
 ## Not changed (verified clean)
 
-`core/bestofn.ts`, `core/selfCertainty.ts`, `commitlet/rollback.ts`, and `reliability/failureCompressor.ts`
+`core/bestofn.ts`, `core/selfCertainty.ts`, `commitlet/rollback.ts`, `reliability/failureCompressor.ts`,
+`autopilot/policy.ts`, and `blueprint/worker.ts`
 were read in full and found correct. Several tempting hypotheses were refuted during verification rather
 than shipped (e.g. the ascent `verdict.winner` index is 1-based, not an off-by-one; crash/exception paths
 correctly mark `failed`; the validation-ledger/computeBudget/phaseController "suspicions" were unreachable
