@@ -294,6 +294,12 @@ export class KittenApp {
     if (!c) return false;
     this.emit(this.runConversation(runId), { type: "run.status", runId, status: "cancelling" });
     c.abort();
+    // Unblock any interactive ("ask") approval this run is parked on — abort alone doesn't resolve it, so
+    // the agent stays awaiting a resolver that never comes and the run would hang forever (never terminal).
+    // Deny the pending approvals; the agent then returns and the aborted signal drives it to a clean stop.
+    for (const key of [...this.pendingApprovals.keys()]) {
+      if (key.startsWith(`${runId}:`)) { this.pendingApprovals.get(key)!(false); this.pendingApprovals.delete(key); }
+    }
     return true;
   }
 

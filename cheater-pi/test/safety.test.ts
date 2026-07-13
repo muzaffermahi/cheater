@@ -98,3 +98,14 @@ test("approvalPolicy ask waits for an interactive resolveApproval", async () => 
   const run = await a.submitMessage(conv.id, "rm the build dir");
   assert.equal(run.finished, true); // resolved allow → runner saw allowed:true
 });
+
+test("cancel() unblocks a run parked on a pending interactive approval (no deadlock)", async () => {
+  // Regression: cancel() aborted the signal but never resolved the "ask" approval the run was awaiting,
+  // so submitMessage hung forever and the run never reached a terminal state.
+  const a = app("ask");
+  const conv = a.createConversation();
+  a.subscribe((e) => { if (e.type === "tool.approval_required") a.cancel(e.runId); }); // cancel instead of answering
+  const run = await a.submitMessage(conv.id, "rm the build dir"); // must RESOLVE, not hang
+  assert.equal(run.finished, false, "a cancelled run did not finish");
+  assert.ok(a.getEvents(conv.id).some((e) => e.type === "run.cancelled"), "the run reached the terminal cancelled state");
+});
