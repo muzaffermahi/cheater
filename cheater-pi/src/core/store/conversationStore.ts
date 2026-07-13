@@ -243,8 +243,11 @@ export class ConversationStore {
     if (payload.type === "user.message") searchAdd = payload.text;
     else if (payload.type === "assistant.final") searchAdd = payload.text;
     if (searchAdd) {
+      // Keep the NEWEST 20000 chars (negative substr counts from the right). `1, 20000` kept the OLDEST
+      // instead, so once a long conversation filled the index every later message fell past position
+      // 20000 and became unsearchable. The full text is retained in the event log; this is just the index.
       this.db.prepare(
-        "UPDATE conversations SET last_seq = ?, updated_at = ?, search_text = substr(search_text || ' ' || ?, 1, 20000) WHERE id = ?"
+        "UPDATE conversations SET last_seq = ?, updated_at = ?, search_text = substr(search_text || ' ' || ?, -20000) WHERE id = ?"
       ).run(seq, ts, searchAdd.toLowerCase(), conversationId);
     } else {
       this.db.prepare("UPDATE conversations SET last_seq = ?, updated_at = ? WHERE id = ?").run(seq, ts, conversationId);

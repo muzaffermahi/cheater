@@ -104,6 +104,16 @@ test("listConversations filters by project, archive, and search", () => {
   assert.equal(s.listConversations({ includeArchived: true }).length, 2);
 });
 
+test("recent messages stay searchable in a long conversation (index keeps the newest text, not the oldest)", () => {
+  // Regression: the search index kept the FIRST 20000 chars, so after a long conversation filled it,
+  // every later message fell past the cutoff and became unsearchable.
+  const s = memStore();
+  s.createConversation({ id: "long", title: "t", projectRoot: "/p", projectId: "/p", model: "m", mode: "auto", ts: 1 });
+  s.appendEvent("long", { type: "user.message", text: "alpha ".repeat(5000) }, 2); // ~30000 chars of early bulk
+  s.appendEvent("long", { type: "user.message", text: "please add rate limiting to the uploader" }, 3);
+  assert.deepEqual(s.listConversations({ search: "rate limiting" }).map((c) => c.id), ["long"], "the newest message must remain searchable");
+});
+
 test("data survives close + reopen (durability across process restart)", () => {
   const dir = mkdtempSync(join(tmpdir(), "kitten-store-"));
   const dbfile = join(dir, "kitten.db");
