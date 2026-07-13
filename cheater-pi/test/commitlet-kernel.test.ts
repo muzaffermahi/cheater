@@ -505,3 +505,18 @@ test("taskInvolvesDependency: real dependency intent yes; product 'package'/'mod
   assert.equal(t("integrate the payments module"), false);
   assert.equal(t("add a user module to the admin area"), false);
 });
+
+test("forgeCommitletSpec: multi-file acceptance criteria name targets jointly, not contradictory 'only' lines", () => {
+  const multi = forgeCommitletSpec({ expectedFilesTouched: ["a.ts", "b.ts", "c.ts"], focusedVerification: [], purpose: "p", scope: "edit" } as never, "feature_addition", "build");
+  assert.equal(multi.acceptanceCriteria.length, 1, "one joint line, not one contradictory 'only' line per file");
+  assert.match(multi.acceptanceCriteria[0], /a\.ts, b\.ts, c\.ts/);
+  const single = forgeCommitletSpec({ expectedFilesTouched: ["only.ts"], focusedVerification: [], purpose: "p", scope: "edit" } as never, "feature_addition", "build");
+  assert.match(single.acceptanceCriteria[0], /only\.ts is the only expected edit target/);
+});
+
+test("classifyImpact: TS method/arrow signatures counted; slash paths are not command registrations", () => {
+  assert.ok(classifyImpact(["src/foo.ts"], "-  run(a) {\n+  run(a, b) {\n").includes("method_signature_change"), "keyword-less TS method sig change");
+  assert.ok(!classifyImpact(["src/x.ts"], "+  if (cond) {\n").includes("method_signature_change"), "an if-statement is not a signature change");
+  assert.ok(!classifyImpact(["src/math.py"], "+def add(a,b):\n+    return a/b\n").includes("command_registration_change"), "integer division a/b is not a command registration");
+  assert.ok(classifyImpact(["src/x.ts"], '+ pi.registerCommand("hi", {})').includes("command_registration_change"), "a real registerCommand call still counts");
+});
