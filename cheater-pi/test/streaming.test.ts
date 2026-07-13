@@ -27,6 +27,7 @@ function sseServer(frames: string[]): Promise<{ url: string; close: () => void }
 }
 
 const d = (o: unknown): string => `data: ${JSON.stringify(o)}\n\n`;
+const dcrlf = (o: unknown): string => `data: ${JSON.stringify(o)}\r\n\r\n`;
 
 test("chatStream reconstructs content from deltas and calls onDelta incrementally", async () => {
   const s = await sseServer([
@@ -81,6 +82,37 @@ test("chatStream reconstructs a tool call from fragmented arguments (never parti
   assert.equal(r.toolCalls.length, 1);
   assert.equal(r.toolCalls[0].name, "edit");
   assert.deepEqual(r.toolCalls[0].args, { path: "a.py", x: 1 }); // exact, fully assembled
+});
+
+test("chatStream handles CRLF-framed SSE (does not drop the whole stream)", async () => {
+  // Regression: some gateways reframe SSE with CRLF. Splitting only on `\n\n` never matched `\r\n\r\n`,
+  // so the entire response buffered and was returned as a silent empty ok:true.
+  const s = await sseServer([
+    dcrlf({ choices: [{ delta: { content: "Hel" } }] }),
+    dcrlf({ choices: [{ delta: { content: "lo" } }] }),
+    dcrlf({ choices: [{ finish_reason: "stop", delta: {} }] }),
+    "data: [DONE]\r\n\r\n",
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const deltas: StreamDelta[] = [];
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, (x) => deltas.push(x));
+  s.close();
+  assert.equal(r.ok, true);
+  assert.equal(r.content, "Hello");
+  assert.equal(deltas.map((x) => x.content ?? "").join(""), "Hello");
+});
+
+test("chatStream flushes a final frame that arrives without a trailing blank line", async () => {
+  // The last content frame ends with a single `\n` and the server closes — it must still be folded in.
+  const s = await sseServer([
+    d({ choices: [{ delta: { content: "A" } }] }),
+    d({ choices: [{ delta: { content: "B" } }] }),
+    `data: ${JSON.stringify({ choices: [{ delta: { content: "C" }, finish_reason: "stop" }] })}\n`,
+  ]);
+  const llm = new KittenLLM({ baseUrl: s.url, main: "x" });
+  const r = await llm.chatStream({ messages: [{ role: "user", content: "hi" }] }, () => {});
+  s.close();
+  assert.equal(r.content, "ABC"); // "C" would be dropped without the end-of-stream flush
 });
 
 test("chatStream skips a malformed chunk without failing", async () => {

@@ -277,27 +277,35 @@ export class KittenLLM {
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
+      // SSE events are separated by a blank line in ANY newline form (LF `\n\n`, CRLF `\r\n\r\n`, or
+      // CR `\r\r`). Matching only `\n\n` meant a CRLF-framed stream (some gateways reframe it) never
+      // split — the whole response buffered and was dropped as a silent empty ok:true. Match all three,
+      // split each frame's lines the same way, and flush a final frame that lacks a trailing blank line.
+      const FRAME = /\r\n\r\n|\n\n|\r\r/;
+      const processFrame = (frame: string): void => {
+        for (const line of frame.split(/\r\n|\n|\r/)) {
+          const m = line.match(/^data:\s?(.*)$/);
+          if (!m) continue;
+          const payload = m[1];
+          if (payload === "[DONE]") continue;
+          let json: any;
+          try { json = JSON.parse(payload); } catch { continue; } // skip a malformed/partial chunk
+          const d = acc.consume(json);
+          if (d.content || d.reasoning) { try { onDelta(d); } catch { /* a bad listener never breaks the stream */ } }
+        }
+      };
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
         buf += dec.decode(value, { stream: true });
-        // SSE frames are separated by a blank line; each has one or more `data:` lines.
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          for (const line of frame.split("\n")) {
-            const m = line.match(/^data:\s?(.*)$/);
-            if (!m) continue;
-            const payload = m[1];
-            if (payload === "[DONE]") continue;
-            let json: any;
-            try { json = JSON.parse(payload); } catch { continue; } // skip a malformed/partial chunk
-            const d = acc.consume(json);
-            if (d.content || d.reasoning) { try { onDelta(d); } catch { /* a bad listener never breaks the stream */ } }
-          }
+        let m2: RegExpExecArray | null;
+        while ((m2 = FRAME.exec(buf))) {
+          const frame = buf.slice(0, m2.index);
+          buf = buf.slice(m2.index + m2[0].length);
+          processFrame(frame);
         }
       }
+      if (buf.length) processFrame(buf); // a final frame can arrive without a trailing blank line before EOF
       return acc.finalize(started);
     } catch (err) {
       const e = err as Error;
