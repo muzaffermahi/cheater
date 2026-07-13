@@ -232,6 +232,10 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
     chunks.push(chunk as Buffer);
   }
   if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>; }
-  catch { return {}; }
+  try {
+    // A non-object JSON body (`null`, `42`, `[…]`) parses fine but is not a Record — callers destructure
+    // it and would throw (surfacing a 500 instead of a clean 400). Treat it as an empty/invalid body.
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch { return {}; }
 }
