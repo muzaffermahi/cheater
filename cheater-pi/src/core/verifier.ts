@@ -181,12 +181,19 @@ export class Verifier {
           // Fold the self-probe into execution eligibility. For a single-function task the probe is
           // usually the ONLY execution evidence: a candidate that CRASHES on its own probe is broken
           // (drop it); one that runs clean carries a real execution receipt, not the "weak" fallback.
-          const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
-          slate[i].probe = probe;
-          const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, slate[i].groundTruth ?? "n/a", probe].filter((s) => s !== "n/a");
-          slate[i].executionEligible = applied.every((s) => s === "pass");
-          slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
-          slate[i].receipt.push(`self-probe execution: ${probe}`);
+          // A candidate whose MODULE never loaded (outcome null) has NO probe signal — crashes[i] stays 0
+          // there, so folding it as "pass" would falsely credit un-loadable code with a green probe and
+          // mark it strongly execution-eligible. Leave such a candidate's B1 eligibility untouched.
+          if (outcomes[i] == null) {
+            slate[i].receipt.push("self-probe execution: n/a (module did not load)");
+          } else {
+            const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
+            slate[i].probe = probe;
+            const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, slate[i].groundTruth ?? "n/a", probe].filter((s) => s !== "n/a");
+            slate[i].executionEligible = applied.every((s) => s === "pass");
+            slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
+            slate[i].receipt.push(`self-probe execution: ${probe}`);
+          }
         }
       }
     }

@@ -109,6 +109,24 @@ test("self-probe fold: a candidate that crashes on its own probe is execution-IN
   assert.equal(res.winnerHasExecutionReceipt, true, "winner now has a green execution receipt (not weak)");
 });
 
+test("a candidate whose module fails to load is NOT folded as a passing probe (honest audit)", async () => {
+  // Regression: runFnProbes returns null for a module that won't load, leaving crashes[i]=0, so the fold
+  // credited un-loadable code with probe="pass" and marked it strongly execution-eligible.
+  const good1 = ws("g1", "def f(x):\n    return x * 2\n");
+  const good2 = ws("g2", "def f(x):\n    return x * 2\n");
+  const broken = ws("bad", "def f(x):\n    return x *\n"); // syntax error → module never loads
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({ llm: dummyLlm, task: "double", contract, probe: { module: "impl.py", symbol: "f", inputs: [[2], [3], [4]] } });
+  const res = await v.verify([
+    { index: 1, workspace: good1, finished: true, summary: "" },
+    { index: 2, workspace: good2, finished: true, summary: "" },
+    { index: 3, workspace: broken, finished: true, summary: "" },
+  ]);
+  const b = res.slate.find((s) => s.index === 3)!;
+  assert.notEqual(b.probe, "pass", "an un-loadable module must not be folded as a passing probe");
+  assert.notEqual(res.winner, 3, "the broken candidate does not win");
+});
+
 test("ground truth: a candidate that fails the prompt's worked examples is INELIGIBLE and loses", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ver-gt-"));
   const right = join(dir, "right"); mkdirSync(right); writeFileSync(join(right, "solution.py"), "def f(x):\n    return x * 2\n");
