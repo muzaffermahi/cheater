@@ -45,8 +45,10 @@ function grabExpected(text: string, from: number): { value: string; end: number 
   const c = text[i];
   if (c === "[" || c === "{" || c === "(") { const end = matchBalanced(text, i); if (end < 0) return null; return { value: text.slice(i, end), end }; }
   if (c === '"' || c === "'") { let j = i + 1; while (j < text.length && text[j] !== c) { if (text[j] === "\\") j++; j++; } return { value: text.slice(i, j + 1), end: j + 1 }; }
-  // bare token: number / True/False/None / identifier, up to a terminator.
-  const m = text.slice(i).match(/^(-?\d+(?:\.\d+)?|True|False|None|-?\w[\w.]*)/);
+  // bare token: number / True/False/None / identifier, up to a terminator. The number branch must cover
+  // scientific notation (1e6) and digit-group underscores (1_000) — otherwise `1e6` captured only `1`
+  // and a correct solution returning 1000000 FALSE-FAILED against the truncated expected value.
+  const m = text.slice(i).match(/^(-?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?|True|False|None|-?\w[\w.]*)/);
   if (m) return { value: m[1], end: i + m[1].length };
   return null;
 }
@@ -137,6 +139,9 @@ export function extractSetupVars(task: string): string[] {
     const from = m.index + m[0].length;
     const val = grabExpected(text, from - 0);
     if (!val || !looksLikeLiteral(val.value)) continue;
+    // Skip abbreviated setup data (`grid = [[1, ...]]`): `...` runs as Python Ellipsis and would
+    // false-fail a correct solution. Mirrors the same guard in extractWorkedExamples.
+    if (/\.\.\.|…/.test(val.value)) continue;
     if (seen.has(name)) continue;
     seen.add(name);
     out.push(`${name} = ${val.value}`);

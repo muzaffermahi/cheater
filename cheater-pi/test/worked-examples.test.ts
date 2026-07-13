@@ -28,6 +28,19 @@ test("skips abbreviated (ellipsis) examples that would false-fail", () => {
   assert.equal(extractWorkedExamples(task, ["query"]).length, 0, "an ellipsis expected is not a real literal");
 });
 
+test("captures scientific-notation and underscored numeric expected values in full (no truncation false-fail)", () => {
+  // Regression: `1e6` captured only `1`, so a correct solution returning 1000000 false-failed.
+  assert.deepEqual(extractWorkedExamples("scale(3) -> 1e6", ["scale"]), [{ call: "scale(3)", expected: "1e6" }]);
+  assert.deepEqual(extractWorkedExamples("avogadro() -> 6.02e23", ["avogadro"]), [{ call: "avogadro()", expected: "6.02e23" }]);
+  assert.deepEqual(extractWorkedExamples("thousand() -> 1_000", ["thousand"]), [{ call: "thousand()", expected: "1_000" }]);
+});
+
+test("extractSetupVars skips abbreviated (ellipsis) setup data (would run as Python Ellipsis and false-fail)", () => {
+  assert.deepEqual(extractSetupVars("grid = [[1, 1], [1, ...]]\ncount(grid) -> 7"), [], "abbreviated setup data is not usable");
+  const ok = extractSetupVars('data = {"a": 1}\nq(data) -> 1');
+  assert.ok(ok.some((v) => v.startsWith("data =")), "a clean setup var is still extracted");
+});
+
 test("extractSetupVars picks up `data = {...}` definitions", () => {
   const task = 'data = {"users": [{"name": "ann"}], "count": 2}\nquery(data, "$.count") -> [2]';
   const vars = extractSetupVars(task);
