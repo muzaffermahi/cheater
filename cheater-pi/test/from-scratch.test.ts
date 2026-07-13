@@ -10,6 +10,7 @@ import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
 import { isCreationDiff } from "../src/commitlet/guard.js";
 import { scorePatchHealth } from "../src/commitlet/health.js";
 import { gradeCommitlet } from "../src/commitlet/kernel.js";
+import { ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
 import { createRollbackPoint } from "../src/commitlet/rollback.js";
 import { defaultCommitletState } from "../src/commitlet/state.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
@@ -264,6 +265,38 @@ test("gradeCommitlet records a REAL WORKER's file edit into the main ledger (the
   assert.ok(changed.some((f) => /stats\.py/.test(f)), `worker edit must be in the main ledger, got: ${JSON.stringify(changed)}`);
   // And that recorded work now makes a same-goal re-entry PRESERVE the ledger (the two fixes combine).
   assert.equal(liveSessionState.isReentryGoal("fix the median function in src/stats.py"), true, "recorded work makes a restart preserve, not wipe");
+  defaultCommitletState.clear();
+});
+
+test("a command-less commitlet records a SKIPPED stage (not a vacuous ok) → finishes honestly-unverified, never 'verified'", async () => {
+  // Regression (triple-confirmed): runFocusedVerification returns a vacuous passed:true when a commitlet
+  // has no command-backed step. The kernel recorded that as focused_tests:ok, so isTerminalVerified /
+  // ledgerAllowsFinish reported "verified" with ZERO commands run — a false green — and the honest
+  // noRunnableCheck path was defeated. It must record skipped + noCommandAvailable instead.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-nocmd-verify-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    return 0\n", "utf8");
+  const decision = routeAutopilot({ cwd, message: "fix median in src/stats.py" });
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "fix median in src/stats.py", autopilotDecision: decision });
+  const commitlet = {
+    ...plan.commitlets[0], status: "running" as const, allowedFiles: ["src/stats.py"], expectedFilesTouched: ["src/stats.py"],
+    focusedVerification: [{ purpose: "manual review — no test command in this project", required: false }],
+  };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet);
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("fix median in src/stats.py");
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    s = sorted(xs)\n    return s[len(s)//2]\n", "utf8");
+
+  await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG);
+
+  const ledger = liveSessionState.getLedger()!;
+  const focused = ledger.get().verification.find((v) => v.stage === "focused_tests");
+  assert.equal(focused?.status, "skipped", "a command-less verification is skipped, not a vacuous ok");
+  assert.equal((focused?.signals as Record<string, unknown> | undefined)?.noCommandAvailable, true);
+  const verdict = ledgerAllowsFinish(ledger);
+  assert.equal(verdict.allowed, true, "no runnable check → honest unverified finish, not forever-blocked");
+  assert.notEqual(verdict.reason, "verified", "must NOT claim verified when zero commands ran");
+  assert.match(verdict.reason, /unverified|no runnable/);
   defaultCommitletState.clear();
 });
 

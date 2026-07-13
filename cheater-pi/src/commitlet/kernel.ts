@@ -404,6 +404,11 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
   }
 
   let verify = runFocusedVerification(cwd, commitlet);
+  // Did a real command actually run? A command-less commitlet returns a VACUOUS passed:true. Recording
+  // that as `ok` would let isTerminalVerified/ledgerAllowsFinish report "verified" with zero commands
+  // executed (a false green) AND defeat the honest noRunnableCheck path. Record it as skipped +
+  // noCommandAvailable instead (mirrors extension.ts harnessAutoVerify).
+  const ranFocused = verify.commandsRun.length > 0;
   const ledger = liveSessionState.getLedger();
   if (ledger) {
     // Record the files this commitlet touched into the MAIN completion ledger. This is the load-
@@ -419,11 +424,11 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
     for (const cmd of verify.commandsRun) ledger.recordCommand(cmd);
     ledger.recordVerificationStage({
       stage: "focused_tests",
-      status: verify.passed ? "ok" : "failed",
+      status: !ranFocused ? "skipped" : (verify.passed ? "ok" : "failed"),
       summary: verify.summary,
       failureClass: verify.passed ? "unknown" : classifyFailure({ exitCode: 1, stdout: "", stderr: verify.failures.join("\n") }),
       artifacts: [],
-      signals: { commitletId: commitlet.id }
+      signals: { commitletId: commitlet.id, ...(ranFocused ? {} : { noCommandAvailable: true }) }
     });
   }
 
@@ -461,7 +466,8 @@ export async function gradeCommitlet(cwd: string, commitlet: Commitlet, config: 
       command: commitlet.focusedVerification.find((step) => step.command)?.command,
       actor: commitlet.id,
       validates: touchedFiles,
-      status: verify.passed ? "pass" : "fail",
+      // No command ran ⇒ "unknown", never a vacuous "pass" that would freshen the run state as validated.
+      status: !ranFocused ? "unknown" : (verify.passed ? "pass" : "fail"),
       outputSummary: verify.summary
     });
     run.integrateWorkerReport({
