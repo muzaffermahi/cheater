@@ -5,13 +5,13 @@ No live model or Docker was available, so every fix is verified by the determini
 (**775 → 820 tests green**, +45 regression tests; build + typecheck clean throughout). Run in **three
 waves** of adversarial bug-hunters (17 agents total): (1) the freshest reality-pass code; (2) the run
 orchestrator, agent loop, planner/resampler, best-of-N, validation ledger, and web server; (3) the
-from-scratch scaffolding, routing policy, and the served-page client JS. **36 fix commits** in all. The
+from-scratch scaffolding, routing policy, and the served-page client JS. **34 fix commits** in all (several bundle two related findings). The
 first wave's fixes are catalogued below; waves two and three follow near the end.
 
 ## Method
 
-Fourteen adversarial bug-hunter agents were fanned out across the hottest and most-recently-changed
-subsystems, each instructed to report only defects it could trigger with a concrete input/state
+Seventeen adversarial bug-hunter agents (across three waves) were fanned out over the hottest and
+most-recently-changed subsystems, each instructed to report only defects it could trigger with a concrete input/state
 (the project's cardinal rule: **zero false positives**). Every finding was then re-verified by hand
 against the real code before any change, fixed with a regression test that fails without the fix, and
 committed on its own. Two findings were independently confirmed by two agents, one by three — those
