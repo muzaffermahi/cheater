@@ -267,6 +267,12 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       { concurrency, runOne: config.runOne }
     );
     for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
+    // cloudBurst assigns round-local indices 1..k, but cascade/verifier/measure use `index` as a stable
+    // GLOBAL identity. Without reindexing, a repair round's indices collide with round 1 — collapsing the
+    // survivorsByIndex map (round 2 shadows round 1), adopting the wrong round's workspace, and
+    // misattributing Best@1. Give each attempt a unique index across rounds.
+    const indexBase = allAttempts.length;
+    attempts.forEach((a, j) => { a.index = indexBase + j + 1; });
     allAttempts = allAttempts.concat(attempts);
 
     // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
