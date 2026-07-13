@@ -69,6 +69,13 @@ test("symbol extraction ignores prose after a declaration keyword (no garbage sy
   assert.ok(c2.symbols.includes("median"), "a real code-shaped def declaration is still a symbol");
 });
 
+test("a filesystem directory path is not extracted as an HTTP endpoint", () => {
+  // Regression: "/var/tmp/cache" was tagged an endpoint (even the PRIMARY evaluator hint) alongside a real one.
+  const c = extractAcceptanceContract("Store the cache at the path /var/tmp/cache and serve /api/health.");
+  assert.ok(c.endpoints.includes("/api/health"), "the real endpoint is kept");
+  assert.ok(!c.endpoints.includes("/var/tmp/cache"), "a filesystem path is not an endpoint");
+});
+
 test("contract extraction is calm on prose with no literal artifacts", () => {
   const contract = extractAcceptanceContract("Please make the app feel a bit snappier overall.");
   assert.equal(contract.files.length, 0);

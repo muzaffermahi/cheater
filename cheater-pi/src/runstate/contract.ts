@@ -133,8 +133,11 @@ function extractEndpoints(text: string, files: string[]): string[] {
   const bareMultiSegment = /(?:^|\s)(\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_{}-]+)+)(?=[\s.,;!?)]|$)/g;
   let bare: RegExpExecArray | null;
   while ((bare = bareMultiSegment.exec(text ?? "")) !== null) endpoints.push(bare[1]);
-  // A path with a file extension is a file, not an endpoint.
-  return dedupe(endpoints.filter((e) => !/\.[a-z0-9]{1,5}$/i.test(e) || e.includes("{")), 8);
+  // A path with a file extension is a file, not an endpoint; and a well-known filesystem root
+  // (/var/tmp/cache, /usr/local/bin) is a directory path, not an HTTP endpoint — even when introduced
+  // by "the path …". Both would otherwise pollute the endpoint list and the primary evaluator hint.
+  const FS_ROOT = /^\/(var|etc|usr|tmp|home|opt|bin|sbin|proc|sys|dev|root|mnt|srv|lib|boot)(\/|$)/;
+  return dedupe(endpoints.filter((e) => (!/\.[a-z0-9]{1,5}$/i.test(e) || e.includes("{")) && !FS_ROOT.test(e)), 8);
 }
 
 function extractPorts(text: string): number[] {
