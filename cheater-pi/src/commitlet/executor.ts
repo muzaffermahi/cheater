@@ -24,7 +24,7 @@ import { appendRunEvent } from "../runstate/runDir.js";
 import { operatingRulesFor } from "../reliability/packetPrompt.js";
 import { inferModelClass } from "../reliability/modelProfile.js";
 import { effectiveMode, isRepairCommitlet } from "./types.js";
-import { isManifestPath } from "../blueprint/scaffold.js";
+import { isManifestPath, installCommandForManifest } from "../blueprint/scaffold.js";
 import type { CheaterConfig } from "../types.js";
 
 export type FreshWorkerMode = "simulated" | "real";
@@ -270,7 +270,8 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
   const files = allPhaseFiles.filter((file) => !stampedPaths.has(file));
   const phaseIndex = plan.commitlets.findIndex((entry) => entry.id === commitlet.id) + 1;
   const total = plan.commitlets.length;
-  const hasManifest = allPhaseFiles.some(isManifestPath);
+  const manifestPath = allPhaseFiles.find(isManifestPath);
+  const hasManifest = !!manifestPath;
   const constraints = (plan.globalConstraints ?? []).slice(0, 6);
   const createBlock = files.length
     ? ["Create these files now (this phase only):", ...files.map((file) => `- ${file}`)]
@@ -280,7 +281,7 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
         "",
         "=== FILES THE HARNESS ALREADY WROTE (do NOT recreate or rewrite these) ===",
         ...stamp.stamped.map((entry) => entry.exportsSummary ? `- ${entry.path} - ${entry.exportsSummary}` : `- ${entry.path}`),
-        "Import from these; author only the files listed above. Need another library? Add it to package.json and re-run `npm install`."
+        "Import from these; author only the files listed above. Need another library? Add it to the project manifest and re-run its install step."
       ]
     : [];
   const prompt = [
@@ -292,7 +293,7 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
     ...createBlock,
     ...stampNote,
     "",
-    hasManifest ? "After the manifest exists, run `npm install` and confirm it exits 0." : "",
+    manifestPath ? `After the manifest exists, run \`${installCommandForManifest(manifestPath)}\` and confirm it exits 0.` : "",
     "Rules:",
     "- BE FAST: do NOT write long planning narration or restate the plan between files - every sentence you generate costs real seconds on a local model. Write each file's code directly and move on.",
     "- Use the write tool to create each new file (never heredocs or echo/cat redirection).",

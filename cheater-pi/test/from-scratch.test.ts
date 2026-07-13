@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { isFromScratchBuild, proposeScaffoldFiles, repoHasManifest } from "../src/blueprint/scaffold.js";
+import { isFromScratchBuild, proposeScaffoldFiles, repoHasManifest, installCommandForManifest } from "../src/blueprint/scaffold.js";
 import { buildScaffoldCommitlets, createCommitletPlan, classifyScaffoldFile, groupScaffoldFilesIntoPhases } from "../src/commitlet/planner.js";
 import { runCommitletFinalReview } from "../src/commitlet/reviewer.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
@@ -488,4 +488,28 @@ test("scaffold phase prompt lists stamped files as existing, drops them from 'cr
   assert.match(on, /npm install/, "the install step survives even though package.json was stamped");
   endTaskRun();
   defaultCommitletState.clear();
+});
+
+test("isFromScratchBuild: empty-repo build yes; a fix goal or a monorepo subdir manifest is not from-scratch", () => {
+  const empty = mkdtempSync(join(tmpdir(), "sf-empty-"));
+  assert.equal(isFromScratchBuild(empty, "build a flask+react weather app"), true);
+  assert.equal(isFromScratchBuild(empty, "React + TypeScript todo app with components"), true, "terse verb-less build still detected");
+  assert.equal(isFromScratchBuild(empty, "fix the flask service routing in my app"), false, "a fix goal is not a from-scratch build");
+  const mono = mkdtempSync(join(tmpdir(), "sf-mono-"));
+  mkdirSync(join(mono, "frontend"), { recursive: true });
+  writeFileSync(join(mono, "frontend", "package.json"), "{}", "utf8");
+  assert.equal(isFromScratchBuild(mono, "create a new admin dashboard app"), false, "a subdir manifest means the project already exists");
+});
+
+test("installCommandForManifest picks the stack's install step, not always npm", () => {
+  assert.equal(installCommandForManifest("requirements.txt"), "pip install -r requirements.txt");
+  assert.equal(installCommandForManifest("Cargo.toml"), "cargo build");
+  assert.equal(installCommandForManifest("go.mod"), "go mod download");
+  assert.equal(installCommandForManifest("package.json"), "npm install");
+});
+
+test("classifyScaffoldFile: a React index entry in ANY directory is 'entry'; a barrel index.ts is not", () => {
+  assert.equal(classifyScaffoldFile("index.tsx"), "entry");
+  assert.equal(classifyScaffoldFile("app/index.tsx"), "entry", "entry-last ordering must apply regardless of directory");
+  assert.equal(classifyScaffoldFile("src/components/index.ts"), "features", "a barrel index.ts is not the app entry");
 });
