@@ -128,6 +128,9 @@ export function extractCommandPaths(command: string): { mustExist: string[]; may
     const tokens = tokenizeSegment(segment.trim());
     if (!tokens.length) continue;
     const verb = basename(tokens[0]).toLowerCase();
+    // `mkdir -p a/b/c` creates all intermediate dirs, so its target's parent need NOT pre-exist — it
+    // must not be parent-gated (blocking it told the model to "run mkdir -p", which it just did).
+    const mkdirParents = verb === "mkdir" && tokens.some((t) => /^-[a-z]*p/i.test(t) || t === "--parents");
     for (let i = 0; i < tokens.length; i++) {
       const tok = tokens[i];
       // Inline code / module args are not paths: the token after -c/-e/-m/--eval is a program or a
@@ -150,7 +153,7 @@ export function extractCommandPaths(command: string): { mustExist: string[]; may
       if (i === 0) continue; // the verb itself
       if (!isPathLike(tok)) continue;
       if (CD_VERBS.has(verb)) mustExist.push(tok);
-      else if (CREATE_VERBS.has(verb)) mayBeNew.push(tok);
+      else if (CREATE_VERBS.has(verb)) { if (!mkdirParents) mayBeNew.push(tok); }
       else if (READ_EXEC_VERBS.has(verb)) mustExist.push(tok);
       // any other verb: not gated (fail-open)
     }
@@ -290,10 +293,14 @@ export function nounGateVerdict(inp: NounGateInput): NounGateVerdict {
   try {
     if (!NOUN_GATE.enabled) return { action: "allow" };
     const { mustExist, mayBeNew } = classifyPathTokens(inp.toolName, inp.input);
+    // A path an earlier segment of the SAME command creates ("echo … > t.py && python t.py") is not a
+    // missing must-exist path — it will exist by the time it is read. Don't block on it.
+    const createdHere = new Set(mayBeNew.filter((p) => isWorkspacePath(p, inp.cwd)).map((p) => normKey(resolve(inp.cwd, p))));
     for (const path of mustExist) {
       if (!isWorkspacePath(path, inp.cwd)) continue;
       const abs = resolve(inp.cwd, path);
       if (existsSync(abs)) continue;
+      if (createdHere.has(normKey(abs))) continue;
       const key = normKey(abs);
       const count = (blockCounts.get(key) ?? 0) + 1;
       blockCounts.set(key, count);
