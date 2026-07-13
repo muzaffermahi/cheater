@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  decideTrigger, domainAllowed, htmlToText, WebAugmentor, webAugmentReceiptLines,
+  decideTrigger, domainAllowed, htmlToText, WebAugmentor, webAugmentReceiptLines, defaultFetchTextImpl,
   type SearchResult
 } from "../src/core/webAugment.js";
 import { EvalRegistry } from "../src/core/disjointness.js";
@@ -21,6 +21,29 @@ test("decideTrigger: unresolved symbol and external spec triggers", () => {
 
 test("decideTrigger: offline suppresses everything", () => {
   assert.equal(decideTrigger({ repairRound: 2, errorSignature: "boom boom boom", offline: true }), null);
+});
+
+test("defaultFetchTextImpl never follows a redirect to an off-allow-list host (SSRF guard)", async () => {
+  // Regression: fetch defaulted to redirect:"follow", so an allow-listed URL that 3xx-redirected to an
+  // off-list host (or 169.254.169.254) had that host's body fetched and injected into the model brief.
+  const realFetch = (globalThis as { fetch?: unknown }).fetch;
+  const fetchedHosts: string[] = [];
+  (globalThis as any).fetch = async (u: string, init: { redirect?: string }) => {
+    const host = new URL(u).host;
+    fetchedHosts.push(host);
+    if (host === "docs.python.org") {
+      // Simulate a redirect to an internal metadata address.
+      return { status: 302, ok: false, headers: { get: (h: string) => (h.toLowerCase() === "location" ? "http://169.254.169.254/latest/meta-data/" : null) }, text: async () => "" };
+    }
+    return { status: 200, ok: true, headers: { get: () => null }, text: async () => "SECRET-METADATA" };
+  };
+  try {
+    const body = await defaultFetchTextImpl("https://docs.python.org/3/library/json.html");
+    assert.equal(body, null, "the off-list redirect target's body must not be returned");
+    assert.ok(!fetchedHosts.includes("169.254.169.254"), "the off-list host must never be fetched");
+  } finally {
+    (globalThis as any).fetch = realFetch;
+  }
 });
 
 test("domainAllowed enforces the allow-list, subdomain-safe", () => {

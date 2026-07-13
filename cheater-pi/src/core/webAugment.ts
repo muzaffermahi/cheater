@@ -231,12 +231,25 @@ export const defaultSearchImpl: SearchImpl = async (query: string): Promise<Sear
   }
 };
 
-/** Plain page fetch, allow-list enforced at the call site. Returns null on any failure. */
+/** Plain page fetch, allow-list enforced at the call site AND on every redirect hop. Returns null on any
+ *  failure. Redirects are followed MANUALLY so a 3xx to an off-allow-list host (or an internal address
+ *  like 169.254.169.254) can't be followed and its body injected into the model brief (SSRF-lite). */
 export const defaultFetchTextImpl: FetchTextImpl = async (url: string): Promise<string | null> => {
   try {
-    const res = await (globalThis as any).fetch(url, { headers: { "user-agent": "Mozilla/5.0 (kitten-ascent web-augment)" } });
-    if (!res.ok) return null;
-    return await res.text();
+    let current = url;
+    for (let hop = 0; hop < 4; hop++) {
+      if (!domainAllowed(current)) return null; // re-check every hop, not just the initial call site
+      const res = await (globalThis as any).fetch(current, { headers: { "user-agent": "Mozilla/5.0 (kitten-ascent web-augment)" }, redirect: "manual" });
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        if (!loc) return null;
+        current = new URL(loc, current).toString(); // resolve a relative Location against the current URL
+        continue;
+      }
+      if (!res.ok) return null;
+      return await res.text();
+    }
+    return null; // too many redirects
   } catch {
     return null;
   }
