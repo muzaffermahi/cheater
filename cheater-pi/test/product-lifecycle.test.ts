@@ -466,6 +466,27 @@ test("a project with no runnable verification command finishes honestly-unverifi
   assert.match(verdict.reason, /no runnable verification command|unverified/);
 });
 
+test("bookkeeping-only ok stages are NOT verified; a CLI project with no real check finishes honestly-unverified", () => {
+  // Regression (E-F2): defaultCliPlan makes prepare_env/collect_artifacts/summarize required + ok by
+  // construction while focused_tests/full_tests skip for lack of a command. Those bookkeeping oks must
+  // not satisfy isTerminalVerified, and the no-command skips carry noCommandAvailable so the finish gate
+  // allows an honest UNVERIFIED finish rather than claiming "verified" (a false green) or blocking forever.
+  const ledger = new CompletionLedger("edit a plain CLI script");
+  ledger.recordFileChange("app.py");
+  ledger.recordVerificationStage({ stage: "prepare_env", status: "ok", summary: "no deps", failureClass: "unknown", artifacts: [], signals: {} });
+  ledger.recordVerificationStage({ stage: "focused_tests", status: "skipped", summary: "no command", failureClass: "unknown", artifacts: [], signals: { noCommandAvailable: true } });
+  ledger.recordVerificationStage({ stage: "collect_artifacts", status: "ok", summary: "logs", failureClass: "unknown", artifacts: [], signals: {} });
+  ledger.recordVerificationStage({ stage: "summarize", status: "ok", summary: "done", failureClass: "unknown", artifacts: [], signals: {} });
+  assert.equal(isTerminalVerified(ledger.get().verification), false, "bookkeeping oks are not correctness evidence");
+  const verdict = ledgerAllowsFinish(ledger);
+  assert.equal(verdict.allowed, true, "no runnable check → honest unverified finish, not forever-blocked");
+  assert.notEqual(verdict.reason, "verified", "must NOT claim verified when only bookkeeping ran");
+  assert.match(verdict.reason, /unverified|no runnable/);
+  // A real evidence stage then flips it to a genuine verified.
+  ledger.recordVerificationStage({ stage: "focused_tests", status: "ok", summary: "tests pass", failureClass: "unknown", artifacts: [], signals: {} });
+  assert.equal(ledgerAllowsFinish(ledger).reason, "verified");
+});
+
 test("a real later failure still blocks finish even after a no-command marker", () => {
   const ledger = new CompletionLedger("edit then a check fails");
   ledger.recordFileChange("app.py");
