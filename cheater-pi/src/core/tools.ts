@@ -12,6 +12,7 @@
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
 
@@ -230,7 +231,11 @@ export const bashTool: Tool = {
   execute(args, ctx): Promise<ToolResult> {
     const command = String(args.command ?? "");
     if (!command.trim()) return Promise.resolve({ output: "bash: empty command", isError: true });
-    const timeoutMs = Math.max(1000, Number(args.timeout_seconds ?? 120) * 1000);
+    // A non-numeric timeout_seconds (the model can emit "5 minutes"; args aren't schema-coerced) would
+    // make Number(...) NaN → setTimeout(NaN) ≈ 0ms → the command is killed instantly and falsely reported
+    // as timed out. Fall back to the 120s default for anything that doesn't parse to a finite number.
+    const rawTimeout = Number(args.timeout_seconds ?? 120);
+    const timeoutMs = Math.max(1000, (Number.isFinite(rawTimeout) ? rawTimeout : 120) * 1000);
     return new Promise<ToolResult>((resolve) => {
       // Already-cancelled: don't even start.
       if (ctx.signal?.aborted) { resolve({ output: `$ ${command}\n[cancelled before start]`, isError: true, meta: { cancelled: true } }); return; }
@@ -238,8 +243,11 @@ export const bashTool: Tool = {
       const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
       let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
       const CAP = 12 * 1024 * 1024;
-      const onOut = (d: Buffer): void => { if (out.length < CAP) out += d.toString("utf8"); };
-      const onErr = (d: Buffer): void => { if (err.length < CAP) err += d.toString("utf8"); };
+      // Decode via StringDecoder so a multibyte UTF-8 char split across two chunks isn't corrupted into
+      // U+FFFD (a plain per-chunk d.toString("utf8") mangles boundary-straddling sequences).
+      const decOut = new StringDecoder("utf8"), decErr = new StringDecoder("utf8");
+      const onOut = (d: Buffer): void => { if (out.length < CAP) out += decOut.write(d); };
+      const onErr = (d: Buffer): void => { if (err.length < CAP) err += decErr.write(d); };
       child.stdout?.on("data", onOut);
       child.stderr?.on("data", onErr);
       const timer = setTimeout(() => { killedBy = "timeout"; killTree(child); }, timeoutMs);
@@ -248,6 +256,7 @@ export const bashTool: Tool = {
       const done = (code: number | null, signalName: NodeJS.Signals | null): void => {
         clearTimeout(timer);
         ctx.signal?.removeEventListener("abort", onAbort);
+        out += decOut.end(); err += decErr.end(); // flush any trailing partial multibyte sequence
         const combined = truncate([out, err].filter(Boolean).join("\n"));
         const status = killedBy === "timeout" ? `(timed out after ${timeoutMs / 1000}s — process tree killed)`
           : killedBy === "cancelled" ? "(cancelled — process tree killed)"

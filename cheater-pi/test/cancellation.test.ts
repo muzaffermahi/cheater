@@ -10,6 +10,8 @@ function ctx(signal?: AbortSignal): ToolContext {
 }
 // A command that would run for ~10s if not killed (node is always present).
 const LONG = 'node -e "setTimeout(function(){}, 10000)"';
+// A command that runs ~400ms then exits 0 — long enough to detect a false instant-kill.
+const MED = 'node -e "setTimeout(function(){}, 400)"';
 
 test("bash is cancelled promptly when the signal aborts (not after the full command)", async () => {
   const c = new AbortController();
@@ -30,6 +32,17 @@ test("bash enforces a timeout by killing the process tree", async () => {
   assert.ok(elapsed < 5000, `timeout should fire, took ${elapsed}ms`);
   assert.equal((r.meta as { timedOut?: boolean }).timedOut, true);
   assert.match(r.output, /timed out/);
+});
+
+test("bash falls back to the default timeout when timeout_seconds is non-numeric (no instant kill)", async () => {
+  // Regression: a non-numeric timeout_seconds made Number(...) NaN → setTimeout(NaN) ≈ 0ms → the command
+  // was killed instantly and falsely reported as timed out.
+  const t0 = Date.now();
+  const r = await bashTool.execute({ command: MED, timeout_seconds: "oops" as unknown as number }, ctx());
+  const elapsed = Date.now() - t0;
+  assert.equal((r.meta as { timedOut?: boolean }).timedOut, false, "must not be killed as timed out");
+  assert.equal((r.meta as { exitCode?: number }).exitCode, 0);
+  assert.ok(elapsed >= 350, `ran to completion (~400ms), took ${elapsed}ms`);
 });
 
 test("bash returns cancelled immediately if the signal is already aborted", async () => {
