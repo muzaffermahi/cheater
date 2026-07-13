@@ -192,6 +192,13 @@ const SCAFFOLD_WALK_SKIP = new Set([".git", "node_modules", ".cheater", ".pisess
 // loop more than twice before the phase advances. Keyed by commitlet id; cleared when the phase advances.
 const scaffoldIncompleteAttempts = new Map<string, number>();
 
+/** Clear the module-global scaffold-incomplete counters at the start of a run. Scaffold commitlet ids
+ *  (c1-scaffold-<phase>) are not plan-scoped, so without this a prior — possibly interrupted — build's
+ *  counts leak into a later same-process build via a reused id, skipping the intended grace re-asks. */
+export function resetScaffoldAttempts(): void {
+  scaffoldIncompleteAttempts.clear();
+}
+
 function projectBasenames(cwd: string): Set<string> {
   const names = new Set<string>();
   const walk = (dir: string, depth: number): void => {

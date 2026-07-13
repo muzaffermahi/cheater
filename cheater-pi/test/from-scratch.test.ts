@@ -9,7 +9,7 @@ import { runCommitletFinalReview } from "../src/commitlet/reviewer.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
 import { isCreationDiff } from "../src/commitlet/guard.js";
 import { scorePatchHealth } from "../src/commitlet/health.js";
-import { gradeCommitlet } from "../src/commitlet/kernel.js";
+import { gradeCommitlet, resetScaffoldAttempts } from "../src/commitlet/kernel.js";
 import { ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
 import { createRollbackPoint } from "../src/commitlet/rollback.js";
 import { defaultCommitletState } from "../src/commitlet/state.js";
@@ -315,6 +315,30 @@ test("scaffold phase STILL blocks when an expected file is genuinely absent by n
   assert.equal(grade.advance, false, "a genuinely absent expected file keeps the phase incomplete");
   assert.match(grade.message, /not complete yet/);
   defaultCommitletState.clear();
+});
+
+test("resetScaffoldAttempts restarts the grace period so an interrupted build's counts don't leak into the next run", async () => {
+  // Regression: the scaffold-incomplete counter is a module-global keyed by a non-plan-scoped commitlet
+  // id. An interrupted build that reached the 2-attempt cap left the count behind, so a later same-process
+  // build reusing the id advanced immediately, skipping the intended "here's what's missing" grace re-asks.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-scaffold-reset-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  const decision = routeAutopilot({ cwd, message: "build a new app from scratch" });
+  const commitlets = buildScaffoldCommitlets([{ path: "src/index.tsx", purpose: "entry" }], "build a new app", decision);
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "build a new app", autopilotDecision: decision, commitlets, buildMode: "scaffold" });
+  const commitlet = { ...plan.commitlets[0], status: "running" as const };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet);
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("build a new app");
+  resetScaffoldAttempts(); // isolate from any prior test's leftover counts (the very leak under test)
+  writeFileSync(join(cwd, "src", "main.tsx"), "export const x = 1;\n", "utf8"); // never creates the exact name
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false); // attempt 1
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false); // attempt 2 (cap)
+  // A new run resets the counter; the same id must restart the grace period, not advance early.
+  resetScaffoldAttempts();
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false, "grace restarts after reset (would be true without the fix)");
+  defaultCommitletState.clear();
+  resetScaffoldAttempts(); // don't pollute later tests sharing this scaffold id
 });
 
 test("a scaffold phase advances after 2 incomplete grades even if the exact expected NAME is never created (rename escape; build is the gate)", async () => {

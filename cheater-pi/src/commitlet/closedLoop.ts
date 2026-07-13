@@ -53,6 +53,7 @@ import {
   finalizePlan,
   finishVerdict,
   gradeCommitlet,
+  resetScaffoldAttempts,
   resetSelfTestDebris,
   resolveModelName,
   resolveRealWorkerMode,
@@ -320,6 +321,7 @@ async function runClosedLoopInner(
   const deps: ClosedLoopDeps = { ...DEFAULT_DEPS, ...depOverrides };
   const { cwd, userGoal, config, ctx } = params;
   const steps: ClosedLoopStep[] = [];
+  resetScaffoldAttempts(); // fresh run: never inherit a prior build's scaffold-incomplete counts
 
   narrate(ctx, "routing and planning");
   let decision = deps.route({ cwd, message: userGoal, requireApproval: config.requireApprovalForHighRisk === true });
