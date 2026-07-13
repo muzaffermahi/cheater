@@ -8,7 +8,7 @@ import { routeAutopilot } from "../src/autopilot/router.js";
 import { createCommitletPlan } from "../src/commitlet/planner.js";
 import { forgeCommitletSpec } from "../src/commitlet/spec.js";
 import { cleanupOldRollbackSnapshots, createRollbackPoint, revertRollbackPoint, rollbackAvailable } from "../src/commitlet/rollback.js";
-import { runDiffGuard } from "../src/commitlet/guard.js";
+import { runDiffGuard, countDiffLines, taskInvolvesDependency } from "../src/commitlet/guard.js";
 import { scorePatchHealth } from "../src/commitlet/health.js";
 import { auditTestChanges } from "../src/commitlet/testAudit.js";
 import { runCommitletFinalReview } from "../src/commitlet/reviewer.js";
@@ -477,4 +477,31 @@ test("reliability benchmark includes variant E kernel metrics", () => {
   const results = runReliabilityBenchmark({ cwd: process.cwd(), variant: "E", limit: 2 });
   assert.equal(results.length, 2);
   assert.ok(results.every((result) => typeof result.healthScore === "number"));
+});
+
+test("countDiffLines counts content lines containing --- and excludes only the diff headers", () => {
+  // Regression: an unanchored `---` dropped real content lines (front-matter/YAML/`"---"` literals),
+  // under-counting the diff (which feeds the size cap, health scoring, and the smaller-is-better tiebreak).
+  const diff = [
+    "--- a/notes.md", "+++ b/notes.md",
+    "+---",                       // markdown front-matter fence — a real added line
+    "+title: hi",
+    "+const sep = \"---\";",     // a real added line containing ---
+    "+ok",
+    "-old --- line",              // a real removed line containing ---
+  ].join("\n");
+  assert.equal(countDiffLines(diff), 5, "5 real +/- content lines; the 2 headers excluded");
+});
+
+test("taskInvolvesDependency: real dependency intent yes; product 'package'/'module' nouns no", () => {
+  const t = (title: string): boolean => taskInvolvesDependency({ title, purpose: "", spec: undefined } as never);
+  // real dependency tasks
+  assert.equal(t("npm install axios"), true);
+  assert.equal(t("add a dependency on lodash"), true);
+  assert.equal(t("add the axios package and use it in api.ts"), true, "naming a package (head noun) is a dep task");
+  assert.equal(t("add a package"), true);
+  // product features that merely contain the words — must NOT demote the manifest-edit block
+  assert.equal(t("add package tracking to the shipping dashboard"), false, "package modifies 'tracking' → product feature");
+  assert.equal(t("integrate the payments module"), false);
+  assert.equal(t("add a user module to the admin area"), false);
 });
