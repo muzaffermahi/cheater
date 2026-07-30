@@ -10,10 +10,10 @@
 //   - bash = truncated output (a verbose result floods a small model's context; -worse than nothing).
 // Every tool returns a plain string the model sees, and never throws.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, statSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
 
 export interface ToolContext {
@@ -55,11 +55,45 @@ function rel(ctx: ToolContext, p: string): string {
   return relative(ctx.cwd, p).replace(/\\/g, "/") || p;
 }
 
+/** Windows and macOS compare paths case-insensitively; a scope check that does not would be bypassable. */
+const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
+function fold(value: string): string {
+  return CASE_INSENSITIVE_PATHS ? value.toLowerCase() : value;
+}
+
+/**
+ * Resolve a tool path against the project root and return it as a root-relative POSIX path, or
+ * `null` when it lands outside the root. Resolution walks to the nearest existing ancestor first, so
+ * a file that does not exist yet is judged by the real directory it would be created in: a lexical
+ * check alone is satisfied by a `..` chain, and also by a symlink or NTFS junction inside the project
+ * that points at the rest of the disk.
+ */
+function rootRelative(root: string, target: string): string | null {
+  const segments: string[] = [];
+  let probe = resolve(target);
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    segments.unshift(basename(probe));
+    probe = parent;
+  }
+  const real = (value: string): string => { try { return realpathSync(value); } catch { return resolve(value); } };
+  const resolvedRoot = real(root);
+  const full = segments.length ? join(real(probe), ...segments) : real(probe);
+  const relativePath = relative(resolvedRoot, full).replace(/\\/g, "/");
+  if (relativePath.startsWith("../") || relativePath === ".." || isAbsolute(relativePath)) return null;
+  return relativePath;
+}
+
 function scopeError(ctx: ToolContext, p: string): string | undefined {
-  const normalized = rel(ctx, abs(ctx, p)).replace(/^\.\//, "");
+  // Two independent gates. The project root is absolute: every tool path must land inside it, task
+  // scope or not. The task scope then narrows further for a bounded subagent.
+  const normalized = rootRelative(ctx.cwd, abs(ctx, p));
+  if (normalized === null) return `path scope denied: ${p} resolves outside the project root`;
   const matches = (candidate: string): boolean => {
-    const value = candidate.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
-    return normalized === value || normalized.startsWith(`${value}/`);
+    const value = fold(candidate.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, ""));
+    const subject = fold(normalized);
+    return Boolean(value) && (subject === value || subject.startsWith(`${value}/`));
   };
   if ((ctx.forbiddenFiles ?? []).some(matches)) return `path scope denied: ${p} is forbidden for this task`;
   if ((ctx.allowedFiles?.length ?? 0) > 0 && !ctx.allowedFiles!.some(matches)) return `path scope denied: ${p} is outside the task's allowed files`;

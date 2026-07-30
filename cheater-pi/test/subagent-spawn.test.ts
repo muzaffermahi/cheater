@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 import { KittenApp } from "../src/core/app.js";
-import { taskTool, readTool, writeTool } from "../src/core/tools.js";
+import { taskTool, readTool, writeTool, editTool } from "../src/core/tools.js";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 test("spawnChild creates a navigable child conversation and parent receipts", async () => {
   const store = new ConversationStore(openSqlite(":memory:"));
@@ -70,4 +74,66 @@ test("task file scopes are enforced by the real read/write tools", async () => {
   assert.equal((await writeTool.execute({ path: "other.ts", content: "x" }, ctx)).isError, true);
   const forbidden = { ...ctx, allowedFiles: [], forbiddenFiles: ["secrets"] };
   assert.equal((await writeTool.execute({ path: "secrets/key.txt", content: "x" }, forbidden)).isError, true);
+});
+
+// The project root is an absolute boundary, not something the task scope opts into. An unbounded
+// task (empty allow-list) is "anywhere in the workspace" — never anywhere on the disk.
+test("file tools cannot escape the project root, with or without a task scope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kitten-scope-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "kitten-scope-outside-"));
+  await writeFile(join(outside, "secret.txt"), "top secret\n", "utf8");
+  const ctx = { cwd: root, filesRead: new Set<string>(), filesWritten: new Set<string>(), allowedFiles: [] as string[] };
+  try {
+    for (const path of ["../secret.txt", "../../etc/passwd", join(outside, "secret.txt")]) {
+      const read = await readTool.execute({ path }, ctx);
+      assert.equal(read.isError, true, `read escaped the root via ${path}`);
+      assert.match(read.output, /outside the project root/);
+      const written = await writeTool.execute({ path, content: "owned" }, ctx);
+      assert.equal(written.isError, true, `write escaped the root via ${path}`);
+      assert.match(written.output, /outside the project root/);
+      const edited = await editTool.execute({ path, search: "top secret", replace: "owned" }, ctx);
+      assert.equal(edited.isError, true, `edit escaped the root via ${path}`);
+    }
+    assert.equal(await readFile(join(outside, "secret.txt"), "utf8"), "top secret\n");
+
+    // Ordinary in-project work, including a file that does not exist yet, still succeeds.
+    const created = await writeTool.execute({ path: "src/new/created.ts", content: "export const ok = 1;\n" }, ctx);
+    assert.equal(created.isError, false, created.output);
+    assert.equal((await readTool.execute({ path: "src/new/created.ts" }, ctx)).isError, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("a symlink inside the project cannot be used to write outside it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kitten-scope-link-"));
+  const outside = await mkdtemp(join(tmpdir(), "kitten-scope-link-target-"));
+  const ctx = { cwd: root, filesRead: new Set<string>(), filesWritten: new Set<string>(), allowedFiles: [] as string[] };
+  try {
+    try { await symlink(outside, join(root, "escape"), "dir"); }
+    catch { return; } // unprivileged Windows sessions cannot create symlinks; nothing to assert
+    const written = await writeTool.execute({ path: "escape/owned.txt", content: "owned" }, ctx);
+    assert.equal(written.isError, true, "a junction/symlink must not widen the project root");
+    assert.match(written.output, /outside the project root/);
+    assert.equal(existsSync(join(outside, "owned.txt")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("scope matching follows the filesystem's own case rules", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kitten-scope-case-"));
+  const ctx = { cwd: root, filesRead: new Set<string>(), filesWritten: new Set<string>(), allowedFiles: [] as string[], forbiddenFiles: ["secrets"] };
+  try {
+    assert.equal((await writeTool.execute({ path: "secrets/key.txt", content: "x" }, ctx)).isError, true);
+    const mixedCase = await writeTool.execute({ path: "Secrets/key.txt", content: "x" }, ctx);
+    if (process.platform === "win32" || process.platform === "darwin") {
+      // Same file to the OS, so it must be the same answer to the scope gate.
+      assert.equal(mixedCase.isError, true, "a case variant bypassed a forbidden path");
+    } else {
+      assert.equal(mixedCase.isError, false, mixedCase.output);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
