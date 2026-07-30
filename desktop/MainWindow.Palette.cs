@@ -74,6 +74,16 @@ public partial class MainWindow
     /// <summary>Used by `--snapshot --palette` so the palette can be reviewed like any other surface.</summary>
     internal void OpenPaletteForSnapshot() => OpenPalette();
 
+    /// <summary>
+    /// Submit a real task for `--snapshot --task "…"`. This is the one path that cannot be reviewed from
+    /// replayed history: streaming into the open card, tool steps arriving live, Stop becoming available.
+    /// </summary>
+    internal void SubmitForSnapshot(string text)
+    {
+        Prompt.Text = text;
+        Submit(this, new RoutedEventArgs());
+    }
+
     /// <summary>Open one secondary surface by name for `--snapshot --view <name>`, so every screen the
     /// app can show is reviewable without a human driving the mouse.</summary>
     internal void OpenViewForSnapshot(string view)

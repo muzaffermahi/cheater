@@ -1761,6 +1761,14 @@ public partial class MainWindow : Window
                 case "run.failed":
                     text.Append($"Outcome: failed — {(frame.TryGetProperty("error", out var historicError) ? historicError.GetString() : "unknown error")}\n\n");
                     break;
+                case "run.cancelled":
+                    text.Append("Outcome: stopped by you\n\n");
+                    break;
+                case "run.interrupted":
+                    // Replayed history has to account for every run it started. An interrupted run used
+                    // to leave a user message with nothing after it, as if the request had been ignored.
+                    text.Append("Outcome: interrupted — Kitten closed while this run was in flight. Nothing was left running; use Resume to continue.\n\n");
+                    break;
                 case "sidecar.postflight":
                     var historicSecrets = ReadStringArray(frame, "secrets");
                     var historicWarnings = ReadStringArray(frame, "warnings");
@@ -1945,7 +1953,17 @@ public partial class MainWindow : Window
                     _activeRunAdded = 0;
                     _activeRunRemoved = 0;
                     Activity.Text = runId is null ? "Run started" : $"Run {ShortId(runId)} started";
+                    // The panels describe THIS run. Leaving the previous run's receipt and file count on
+                    // screen while a new one is in flight reads as if they belong to it.
+                    Evidence.Text = "Receipts appear as this run produces them.";
+                    SetChangesSummary(0, 0, 0);
+                    SetComposerHint("");
                     SetRunControls(true);
+                    break;
+                case "reasoning.delta":
+                    // The card already reads "thinking…" from the moment it opens; this only confirms
+                    // in the run panel that the model is reasoning. The reasoning itself is never shown.
+                    Activity.Text = "Thinking…";
                     break;
                 case "assistant.delta":
                     if (payload.TryGetProperty("text", out var delta))

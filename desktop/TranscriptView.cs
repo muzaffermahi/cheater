@@ -24,6 +24,8 @@ public sealed class TranscriptView
     private SelectableTextBlock? _streamingBody;
     private Panel? _streamingCard;
     private string _streamingText = "";
+    private bool _thinking;
+    private Border? _streamingBorder;
 
     private static readonly FontFamily Mono = new("Cascadia Mono,Consolas,Menlo,monospace");
     private static readonly IBrush Text = new SolidColorBrush(Color.Parse("#e8e8ec"));
@@ -100,6 +102,7 @@ public sealed class TranscriptView
         _streamingBody = null;
         _streamingCard = null;
         _streamingText = "";
+        _thinking = false;
     }
 
     /// <summary>Show a standalone message with no conversation history behind it.</summary>
@@ -119,7 +122,12 @@ public sealed class TranscriptView
         var card = CreateCard(Role.Assistant, header, "");
         _streamingCard = card.body;
         _streamingBody = card.first;
+        _streamingBorder = card.border;
         _streamingText = "";
+        _thinking = false;
+        // Seed the card as thinking straight away. A local 35B can take half a minute to produce its
+        // first token, and an empty card for that long looks like the app has stalled.
+        MarkThinking();
     }
 
     public void AppendAssistant(string delta)
@@ -127,8 +135,28 @@ public sealed class TranscriptView
         if (string.IsNullOrEmpty(delta)) return;
         if (_streamingBody is null) BeginAssistant("Kitten");
         _streamingText += delta;
-        if (_streamingBody is not null) _streamingBody.Text = _streamingText;
+        if (_streamingBody is not null)
+        {
+            _streamingBody.Text = _streamingText;
+            _streamingBody.Foreground = Text;
+            _streamingBody.FontStyle = FontStyle.Normal;
+        }
+        _thinking = false;
         ScrollToEnd();
+    }
+
+    /// <summary>
+    /// Mark the open card as thinking. A reasoning model emits its reasoning before any answer, so the
+    /// card it streams into would otherwise sit empty for a minute with no sign of life. The reasoning
+    /// itself is never shown — only that it is happening.
+    /// </summary>
+    public void MarkThinking()
+    {
+        if (_thinking || _streamingText.Length > 0 || _streamingBody is null) return;
+        _thinking = true;
+        _streamingBody.Text = "thinking…";
+        _streamingBody.Foreground = Faint;
+        _streamingBody.FontStyle = FontStyle.Italic;
     }
 
     /// <summary>
@@ -138,6 +166,18 @@ public sealed class TranscriptView
     public void CompleteAssistant(string? finalText = null)
     {
         var text = string.IsNullOrWhiteSpace(finalText) ? _streamingText : finalText!;
+        // A turn that only called tools produces no prose. Drop the card rather than leaving an empty
+        // one — or worse, one still reading "thinking…" after the turn is over.
+        if (string.IsNullOrWhiteSpace(text) && _streamingBorder is not null)
+        {
+            _host.Children.Remove(_streamingBorder);
+            _streamingBorder = null;
+            _streamingBody = null;
+            _streamingCard = null;
+            _streamingText = "";
+            _thinking = false;
+            return;
+        }
         if (_streamingCard is not null)
         {
             _streamingCard.Children.Clear();
@@ -146,6 +186,7 @@ public sealed class TranscriptView
         _streamingBody = null;
         _streamingCard = null;
         _streamingText = "";
+        _thinking = false;
         ScrollToEnd();
     }
 
@@ -231,7 +272,7 @@ public sealed class TranscriptView
         AddTool(name, target, ok, durationMs, detail);
     }
 
-    private (Panel body, SelectableTextBlock? first) CreateCard(Role role, string? header, string text)
+    private (Panel body, SelectableTextBlock? first, Border border) CreateCard(Role role, string? header, string text)
     {
         var body = new StackPanel { Spacing = 6 };
         SelectableTextBlock? first = null;
@@ -273,7 +314,7 @@ public sealed class TranscriptView
         };
         _host.Children.Add(card);
         ScrollToEnd();
-        return (body, first);
+        return (body, first, card);
     }
 
     /// <summary>Split a message into prose paragraphs and fenced code blocks.</summary>

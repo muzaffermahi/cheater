@@ -18,7 +18,7 @@ internal static class Program
         if (snapshot is not null)
         {
             var delay = ArgValue(args, "--delay") is { } raw && int.TryParse(raw, out var ms) ? ms : 2500;
-            RunSnapshot(snapshot, delay, HasFlag(args, "--palette"), ArgValue(args, "--view"));
+            RunSnapshot(snapshot, delay, HasFlag(args, "--palette"), ArgValue(args, "--view"), ArgValue(args, "--task"));
             return;
         }
 
@@ -35,7 +35,7 @@ internal static class Program
 
     private static bool HasFlag(string[] args, string name) => Array.IndexOf(args, name) >= 0;
 
-    private static void RunSnapshot(string path, int delayMs, bool withPalette, string? view)
+    private static void RunSnapshot(string path, int delayMs, bool withPalette, string? view, string? task)
     {
         BuildAvaloniaApp().Start((_, _) =>
         {
@@ -47,6 +47,9 @@ internal static class Program
                 {
                     if (withPalette) window.OpenPaletteForSnapshot();
                     if (view is not null) window.OpenViewForSnapshot(view);
+                    // A live task is submitted first and captured after --delay, so the frame shows a run
+                    // in flight rather than a finished transcript.
+                    if (task is not null) window.SubmitForSnapshot(task);
                     // A second beat lets the opened surface finish its own layout and first data load.
                     DispatcherTimer.RunOnce(() =>
                     {
@@ -59,14 +62,16 @@ internal static class Program
                         catch (Exception error) { Console.Error.WriteLine($"snapshot failed: {error.Message}"); }
                         window.Close();
                         Dispatcher.UIThread.InvokeShutdown();
-                    }, TimeSpan.FromMilliseconds(view is not null ? 2500 : withPalette ? 400 : 1));
+                    }, TimeSpan.FromMilliseconds(task is not null ? delayMs : view is not null ? 2500 : withPalette ? 400 : 1));
                 }
                 catch (Exception error)
                 {
                     Console.Error.WriteLine($"snapshot failed: {error.Message}");
                     Dispatcher.UIThread.InvokeShutdown();
                 }
-            }, TimeSpan.FromMilliseconds(Math.Max(0, delayMs)));
+                // With a live task, the first wait only covers the engine handshake; --delay then decides
+                // how far into the run the frame is taken.
+            }, TimeSpan.FromMilliseconds(task is not null ? 4000 : Math.Max(0, delayMs)));
             Dispatcher.UIThread.MainLoop(CancellationToken.None);
         }, Array.Empty<string>());
     }
