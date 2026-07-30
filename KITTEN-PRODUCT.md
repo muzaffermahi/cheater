@@ -98,6 +98,19 @@ engine fails the release rather than shipping. `.github/workflows/desktop.yml` r
 gate for the C# shell (`-warnaserror`) plus the bundle + IPC smoke, because no Node test can catch a
 break in the native shell.
 
+## Native workbench (in progress)
+
+The transcript is no longer one concatenated `TextBlock`: `desktop/TranscriptView.cs` renders each turn
+as a card (role header, prose/fenced-code split, monospaced scrollable code, per-block selection),
+streams into the open card, labels harness output as harness output, and only follows the tail when the
+user is already at the bottom. Local gate: `dotnet build desktop/Kitten.Desktop.csproj -c Release
+-warnaserror` plus a launch smoke; the SDK lives repo-locally in `.dotnet/` (gitignored).
+
+Still outstanding against the plan's Milestone 3 gate: inline native diff review, a subagent tree, an
+activity drawer of process cards, a first-run wizard, and collapsing the 22-button left rail into one
+Settings/Models screen. `MainWindow.axaml.cs` remains ~2250 lines of code-behind with modal dialogs
+built inline.
+
 ## Tests
 
 Core and desktop-engine tests: **924 green** (912 before the sweep; +12 regression tests).
