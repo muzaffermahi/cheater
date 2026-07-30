@@ -22,6 +22,7 @@ public partial class MainWindow : Window
     }
 
     private EngineClient? _engine;
+    private readonly TranscriptView _transcript;
     private readonly EngineProcess _engineProcess = new();
     private readonly List<ConversationItem> _conversationItems = new();
     private string? _conversationId;
@@ -45,7 +46,11 @@ public partial class MainWindow : Window
     private int _activeRunAdded;
     private int _activeRunRemoved;
 
-    public MainWindow() => InitializeComponent();
+    public MainWindow()
+    {
+        InitializeComponent();
+        _transcript = new TranscriptView(TranscriptHost, TranscriptScroll);
+    }
 
     private async void OnOpened(object? sender, EventArgs e)
     {
@@ -127,7 +132,7 @@ public partial class MainWindow : Window
         {
             _conversationId = null;
             ProjectText.Text = "No project selected";
-            Transcript.Text = "Welcome to Kitten.\n\nOpen a project to start a durable coding task. Kitten will inspect the workspace, use the sidecar for bounded planning, and keep the main model focused on implementation.\n\nYou can configure a local endpoint or managed llama.cpp runtime from Configure in the Model controls.";
+            _transcript.ShowSystem("Welcome to Kitten.\n\nOpen a project to start a durable coding task. Kitten will inspect the workspace, use the sidecar for bounded planning, and keep the main model focused on implementation.\n\nYou can configure a local endpoint or managed llama.cpp runtime from Configure in the Model controls.");
             Evidence.Text = "Open a project to begin.";
             Activity.Text = "Ready — open a project to start.";
             SetRunControls(false);
@@ -1667,7 +1672,7 @@ public partial class MainWindow : Window
                     break;
             }
         }
-        Transcript.Text = text.ToString();
+        _transcript.Replay(text.ToString());
         if (historicPostflight is not null && !string.IsNullOrWhiteSpace(historicVerificationOutputText)) historicPostflight += $"\n\n{historicVerificationOutputText}";
         if (historicPostflight is not null) Evidence.Text = historicPostflight;
         _assistantStreamed = false;
@@ -1807,12 +1812,14 @@ public partial class MainWindow : Window
                 case "assistant.delta":
                     if (payload.TryGetProperty("text", out var delta))
                     {
-                        Transcript.Text += delta.GetString() ?? "";
+                        _transcript.AppendAssistant(delta.GetString() ?? "");
                         _assistantStreamed = true;
                     }
                     break;
                 case "assistant.final":
-                    if (!_assistantStreamed && payload.TryGetProperty("text", out var finalText)) Transcript.Text += finalText.GetString() ?? "";
+                    // A non-streaming lane delivers the whole answer at once; either way the card closes here.
+                    if (!_assistantStreamed && payload.TryGetProperty("text", out var finalText)) _transcript.CompleteAssistant(finalText.GetString() ?? "");
+                    else if (_transcript.IsStreaming) _transcript.CompleteAssistant();
                     _assistantStreamed = false;
                     break;
                 case "file.changed":
@@ -1969,7 +1976,8 @@ public partial class MainWindow : Window
         }
         _submissionActive = true;
         Activity.Text = "Running...";
-        Transcript.Text += $"\n\nYou: {text}\n\nKitten: ";
+        _transcript.AddUser(text);
+        _transcript.BeginAssistant("Kitten");
         SetRunControls(true);
         try
         {
@@ -1990,7 +1998,8 @@ public partial class MainWindow : Window
         var parentRunId = $"mention-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
         _activeTaskId = parentRunId;
         Activity.Text = $"Starting @{agent} subagent...";
-        Transcript.Text += $"\n\nYou: @{agent} {objective}\n\nKitten: launching bounded subagent…\n";
+        _transcript.AddUser($"@{agent} {objective}");
+        _transcript.AddNote($"@{agent} subagent", "Launching a bounded subagent…");
         SetRunControls(true);
         try
         {
@@ -2004,7 +2013,7 @@ public partial class MainWindow : Window
                 var run = value.TryGetProperty("run", out var runValue) && runValue.ValueKind == JsonValueKind.Object ? runValue : default;
                 var status = run.ValueKind == JsonValueKind.Object && run.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : "completed";
                 var summary = run.ValueKind == JsonValueKind.Object && run.TryGetProperty("summary", out var summaryValue) ? summaryValue.GetString() : "No summary returned.";
-                Transcript.Text += $"@{agent} subagent: {status}\n{summary}\n";
+                _transcript.AddNote($"@{agent} subagent · {status}", summary ?? "");
                 Evidence.Text = $"@{agent} child session completed{(string.IsNullOrWhiteSpace(child) ? "" : $" ({child})")}. Open it from the conversation list to inspect the full transcript and receipts.";
                 Activity.Text = $"@{agent} subagent completed.";
             }
@@ -2029,7 +2038,8 @@ public partial class MainWindow : Window
         ResumeButton.IsEnabled = false;
         Activity.Text = "Resuming the interrupted task with its persisted context...";
         _submissionActive = true;
-        Transcript.Text += "\n\nYou: Continue the interrupted task from the last durable state.\n\nKitten: ";
+        _transcript.AddUser("Continue the interrupted task from the last durable state.");
+        _transcript.BeginAssistant("Kitten");
         SetRunControls(true);
         try
         {
@@ -2067,7 +2077,7 @@ public partial class MainWindow : Window
                     var report = row.TryGetProperty("report", out var reportValue) ? reportValue.GetString() : "";
                     return $"{agent}: {status}\n{report}";
                 });
-                Transcript.Text += $"\n\nSidecar plan for: {text}\n\n{string.Join("\n\n", summaries)}\n";
+                _transcript.AddNote($"Sidecar plan for: {text}", string.Join("\n\n", summaries));
                 Evidence.Text = "Read-only subagent reports completed. Review them, then use Run for the implementation step.";
             }
             _lastPlanRequest = text;
@@ -2118,7 +2128,7 @@ public partial class MainWindow : Window
                     var report = row.TryGetProperty("report", out var reportValue) ? reportValue.GetString() : "";
                     return $"{agent}: {status}\n{report}";
                 });
-                Transcript.Text += $"\n\nBounded implementation results (approved files only):\n\n{string.Join("\n\n", summaries)}\n";
+                _transcript.AddNote("Bounded implementation results (approved files only)", string.Join("\n\n", summaries));
                 Evidence.Text = "Implementation and verification subagents returned durable reports. Inspect the changed files before continuing.";
             }
             await RefreshConversationsAsync(_conversationId);
