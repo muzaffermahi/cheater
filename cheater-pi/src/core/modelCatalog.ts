@@ -2,7 +2,7 @@
 // Downloads are resumable, cancellable, and verified before a model becomes visible to the runtime.
 
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, statSync } from "node:fs";
+import { createWriteStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, rename, unlink, open } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
@@ -102,6 +102,38 @@ async function hashFile(path: string, signal?: AbortSignal): Promise<string> {
   }
 }
 
+/**
+ * A partial download is only resumable if we know which artifact produced those bytes. The claim
+ * file is written before the first byte lands, so a crashed or cancelled download can be continued,
+ * while a partial from another model — or from an entry whose URL/hash has since changed — is
+ * discarded instead of being appended to. Appending to foreign bytes produced a file that could
+ * never verify, and because the partial survived the failure, every later retry resumed from it and
+ * failed again: a download that broke once stayed broken.
+ */
+interface PartialClaim {
+  id: string;
+  url: string;
+  sha256: string;
+}
+
+function claimPath(destination: string): string {
+  return `${destination}.part.json`;
+}
+
+function readClaim(destination: string): PartialClaim | null {
+  try {
+    const value = JSON.parse(readFileSync(claimPath(destination), "utf8")) as Partial<PartialClaim>;
+    if (typeof value.id !== "string" || typeof value.url !== "string" || typeof value.sha256 !== "string") return null;
+    return { id: value.id, url: value.url, sha256: value.sha256 };
+  } catch { return null; }
+}
+
+async function discardPartial(destination: string): Promise<void> {
+  for (const path of [`${destination}.part`, claimPath(destination)]) {
+    try { await unlink(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+
 /** Download a catalog model into destination, atomically renaming only after hash verification. */
 export async function downloadModel(entry: ModelCatalogEntry, destination: string, options: ModelDownloadOptions = {}): Promise<string> {
   validateCatalogEntry(entry);
@@ -109,6 +141,16 @@ export async function downloadModel(entry: ModelCatalogEntry, destination: strin
   const part = `${destination}.part`;
   await mkdir(dirname(destination), { recursive: true });
   let existing = existsSync(part) ? statSync(part).size : 0;
+  if (existing > 0) {
+    const claim = readClaim(destination);
+    const sameArtifact = claim?.id === entry.id && claim?.url === entry.url && claim?.sha256.toLowerCase() === entry.sha256.toLowerCase();
+    const plausibleSize = entry.bytes === undefined || existing < entry.bytes;
+    if (!sameArtifact || !plausibleSize) {
+      await discardPartial(destination);
+      existing = 0;
+    }
+  }
+  writeFileSync(claimPath(destination), JSON.stringify({ id: entry.id, url: entry.url, sha256: entry.sha256 } satisfies PartialClaim), { mode: 0o600 });
   const headers: Record<string, string> = {};
   if (existing > 0) headers.Range = `bytes=${existing}-`;
   emit(options, { id: entry.id, destination, receivedBytes: existing, totalBytes: entry.bytes, phase: existing ? "resuming" : "downloading" });
@@ -136,20 +178,27 @@ export async function downloadModel(entry: ModelCatalogEntry, destination: strin
   emit(options, { id: entry.id, destination, receivedBytes: received, totalBytes, phase: "verifying" });
   const actual = await hashFile(part, options.signal);
   if (actual.toLowerCase() !== entry.sha256.toLowerCase()) {
-    throw new Error(`model checksum mismatch for ${entry.id}: expected ${entry.sha256}, got ${actual}`);
+    // These bytes are proven wrong. Keeping them would make every retry resume from a file that can
+    // never verify, so the partial goes and the next attempt starts clean.
+    await discardPartial(destination);
+    throw new Error(`model checksum mismatch for ${entry.id}: expected ${entry.sha256}, got ${actual}. The partial download was discarded; retrying starts a fresh transfer.`);
   }
-  if (entry.bytes !== undefined && statSync(part).size !== entry.bytes) throw new Error(`model size mismatch for ${entry.id}`);
+  if (entry.bytes !== undefined && statSync(part).size !== entry.bytes) {
+    await discardPartial(destination);
+    throw new Error(`model size mismatch for ${entry.id}. The partial download was discarded; retrying starts a fresh transfer.`);
+  }
   if (existsSync(destination)) {
     const current = await hashFile(destination, options.signal);
     if (current.toLowerCase() !== entry.sha256.toLowerCase()) throw new Error(`refusing to replace an existing model at ${destination}`);
-    await unlink(part);
+    await discardPartial(destination);
   } else {
     await rename(part, destination);
+    try { await unlink(claimPath(destination)); } catch { /* the claim is an optimization, not state */ }
   }
   emit(options, { id: entry.id, destination, receivedBytes: statSync(destination).size, totalBytes: entry.bytes ?? statSync(destination).size, phase: "complete" });
   return destination;
 }
 
 export async function discardPartialModel(destination: string): Promise<void> {
-  try { await unlink(`${destination}.part`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  await discardPartial(destination);
 }
