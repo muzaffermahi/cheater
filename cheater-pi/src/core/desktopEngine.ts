@@ -2,7 +2,8 @@
 // exposes only typed local IPC; no HTTP listener, browser, or terminal is needed by the user.
 
 import { createServer, type Socket } from "node:net";
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
@@ -38,11 +39,51 @@ export interface DesktopEngineOptions {
   models?: Partial<KittenModels>;
   /** Injectable client for deterministic native-engine tests; production constructs the local HTTP client. */
   llm?: KittenLLM;
+  /** Handshake secret. Generated per launch when omitted; never logged and never sent in an event. */
+  token?: string;
+  /**
+   * Where the shell reads the socket path + handshake token from. Defaults to
+   * `<kittenHome>/engine.json` for a production launch (no explicit `socketPath`); an explicit
+   * path is used verbatim, and `null` keeps a test/fixture engine off the shared file entirely.
+   */
+  infoPath?: string | null;
+  /** How long an unauthenticated connection may stay open before the engine closes it. */
+  handshakeTimeoutMs?: number;
 }
 
 export interface DesktopEngineHandle {
   socketPath: string;
+  /** The handshake secret a client must present in its `hello` frame. */
+  token: string;
+  /** Where the socket path + token were published, when they were. */
+  infoPath: string | null;
   close(): Promise<void>;
+}
+
+/** The file the native shell reads to find and authenticate to the hidden engine. */
+export interface DesktopEngineInfo {
+  socketPath: string;
+  token: string;
+  pid: number;
+  startedAt: number;
+  protocolVersion: number;
+}
+
+function defaultInfoPath(): string {
+  return join(kittenHome(), "engine.json");
+}
+
+/** One in-flight sidecar workflow: the job running now, plus the pack-wide cancellation flag. */
+interface ActiveSidecarWorkflow {
+  jobId: string;
+  cancelled: boolean;
+}
+
+function tokenOk(given: unknown, token: string): boolean {
+  if (typeof given !== "string" || !given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(token);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 function defaultSocketPath(): string {
@@ -51,12 +92,14 @@ function defaultSocketPath(): string {
 }
 
 function response(id: string, result: unknown): DesktopResponse {
-  return { protocolVersion: DESKTOP_PROTOCOL_VERSION, id, ok: true, result };
+  // A successful frame always carries `result`. JSON.stringify drops an `undefined` value, and a
+  // typed client that requires the field would otherwise report a clean success as a hard failure.
+  return { protocolVersion: DESKTOP_PROTOCOL_VERSION, id, ok: true, result: result ?? null };
 }
 
-function failure(id: string, error: unknown): DesktopResponse {
+function failure(id: string, error: unknown, code = "ENGINE_ERROR"): DesktopResponse {
   const message = error instanceof Error ? error.message : String(error);
-  return { protocolVersion: DESKTOP_PROTOCOL_VERSION, id, ok: false, error: { code: "ENGINE_ERROR", message: message.slice(0, 1000) } };
+  return { protocolVersion: DESKTOP_PROTOCOL_VERSION, id, ok: false, error: { code, message: message.slice(0, 1000) } };
 }
 
 function eventFromKitten(e: KittenEvent): DesktopEvent {
@@ -601,12 +644,17 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     approvalPolicy: settings.approvalPolicy,
   });
   appRef = app;
-  app.recover();
 
+  const token = opts.token ?? randomBytes(24).toString("hex");
+  const infoPath = opts.infoPath === null ? null : (opts.infoPath ?? (opts.socketPath ? null : defaultInfoPath()));
+  const handshakeTimeoutMs = Math.max(250, opts.handshakeTimeoutMs ?? 10_000);
   const clients = new Set<Socket>();
+  const unauthenticated = new Set<Socket>();
+  // Stop must stop the whole workflow, not just the step that happens to be running when the user
+  // presses it, so the pack's remaining steps observe one shared cancellation flag.
   const indexes = new Map<string, WorkspaceIndex>();
   const sidecar = new SidecarControlPlane(sidecarConcurrency(initialModels));
-  const sidecarWorkflowActive = new Map<string, string>();
+  const sidecarWorkflowActive = new Map<string, ActiveSidecarWorkflow>();
   const taskControllers = new Map<string, AbortController>();
   const submitControllers = new Map<string, AbortController>();
   const modelDownloadControllers = new Map<string, AbortController>();
@@ -619,22 +667,72 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
   };
   const unsubscribe = app.subscribe((e) => broadcast(eventFromKitten(e)));
 
+  // The local socket is reachable by other processes running as this user, and on Windows the
+  // default named-pipe ACL is wider still. Nothing is served — not even liveness, and above all not
+  // the event stream, which carries prompts, code and diffs — until a connection presents the
+  // per-launch handshake token published in the engine info file.
   const server = createServer((socket) => {
-    clients.add(socket);
+    unauthenticated.add(socket);
+    const deadline = setTimeout(() => {
+      if (clients.has(socket)) return;
+      try { socket.write(encodeFrame(failure("handshake", "engine handshake timed out", "EUNAUTHORIZED"))); } catch { /* closing anyway */ }
+      socket.destroy();
+    }, handshakeTimeoutMs);
+    deadline.unref();
+    const forget = (): void => { clearTimeout(deadline); clients.delete(socket); unauthenticated.delete(socket); };
     const decoder = new FrameDecoder();
     socket.on("data", (chunk) => {
       let frames;
       try { frames = decoder.push(chunk); } catch (e) { socket.destroy(new Error(String(e))); return; }
-      for (const frame of frames) void handleCommand(frame as DesktopCommand, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
+      for (const frame of frames) {
+        const cmd = frame as DesktopCommand;
+        const id = typeof cmd.id === "string" && cmd.id ? cmd.id : "unauthenticated";
+        if (cmd.type === "hello" || !clients.has(socket)) {
+          if (cmd.protocolVersion !== DESKTOP_PROTOCOL_VERSION) {
+            socket.write(encodeFrame(failure(id, `unsupported protocol version ${cmd.protocolVersion}`)));
+            continue;
+          }
+          // One wrong or missing token closes the connection: a local process must not be able to
+          // probe the engine, guess the secret, or linger on the channel.
+          if (cmd.type !== "hello" || !tokenOk((cmd.payload as { token?: unknown } | undefined)?.token, token)) {
+            socket.write(encodeFrame(failure(id, cmd.type === "hello" ? "engine handshake token is invalid" : "engine handshake required", "EUNAUTHORIZED")));
+            socket.destroy();
+            return;
+          }
+          clearTimeout(deadline);
+          unauthenticated.delete(socket);
+          clients.add(socket);
+          socket.write(encodeFrame(response(id, { authenticated: true, protocolVersion: DESKTOP_PROTOCOL_VERSION, pid: process.pid })));
+          continue;
+        }
+        void handleCommand(cmd, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
+      }
     });
-    socket.on("close", () => clients.delete(socket));
-    socket.on("error", () => clients.delete(socket));
+    socket.on("close", forget);
+    socket.on("error", forget);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); });
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); });
+    });
+  } catch (error) {
+    // Losing the socket lock (another engine already owns it) must not leave this process holding an
+    // open store handle and a live subscription: the loser exits without touching the live run ledger.
+    unsubscribe();
+    sidecar.cancelAll();
+    app.close();
+    throw error;
+  }
+
+  // Recovery runs only once the socket is bound. Binding is also the single-instance lock: a second
+  // engine that loses the race must not flip the live instance's in-flight runs to `interrupted`.
+  app.recover();
+  if (infoPath) {
+    const info: DesktopEngineInfo = { socketPath, token, pid: process.pid, startedAt: Date.now(), protocolVersion: DESKTOP_PROTOCOL_VERSION };
+    writeFileSync(infoPath, JSON.stringify(info, null, 2), { mode: 0o600 });
+  }
 
   // A configured local runtime should be a remembered app setting, not a per-launch ritual. Do not
   // auto-start injected test engines; production native launches recover the configured process only
@@ -671,23 +769,28 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
 
   return {
     socketPath,
+    token,
+    infoPath,
     async close() {
       unsubscribe();
       sidecar.cancelAll();
       await stopManagedRuntime(managedRuntime);
       for (const controller of submitControllers.values()) controller.abort("engine-closing");
+      for (const controller of taskControllers.values()) controller.abort("engine-closing");
       for (const controller of modelDownloadControllers.values()) controller.abort("engine-closing");
-    for (const controller of verificationControllers.values()) controller.abort("engine-closing");
-    for (const controller of benchmarkControllers.values()) controller.abort("engine-closing");
+      for (const controller of verificationControllers.values()) controller.abort("engine-closing");
+      for (const controller of benchmarkControllers.values()) controller.abort("engine-closing");
       for (const client of clients) client.destroy();
+      for (const client of unauthenticated) client.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       app.close();
+      if (infoPath) { try { unlinkSync(infoPath); } catch { /* a later launch overwrites it anyway */ } }
       if (process.platform !== "win32") { try { unlinkSync(socketPath); } catch {} }
     },
   };
 }
 
-async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, string>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; emit: (type: string, payload: unknown) => void }): Promise<void> {
+async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, ActiveSidecarWorkflow>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; emit: (type: string, payload: unknown) => void }): Promise<void> {
   const { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime } = context;
   if (frame.protocolVersion !== DESKTOP_PROTOCOL_VERSION) {
     socket.write(encodeFrame(failure(frame.id, `unsupported protocol version ${frame.protocolVersion}`)));
@@ -1132,16 +1235,22 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         if (!workflow) throw new Error(`unknown sidecar workflow: ${requestedWorkflow}`);
         const workflowId = String(p.id ?? `workflow_${Date.now().toString(36)}`);
         if (sidecarWorkflowActive.has(workflowId)) throw new Error(`sidecar workflow already running: ${workflowId}`);
-        const root = String(p.root ?? opts.projectRoot ?? process.cwd());
-        const active = runtimeForProject(root, runtime, opts);
-        sidecar.setMaxConcurrent(sidecarConcurrency(active.models));
-        const index = getWorkspaceIndex(root, indexes);
-        if (workflow.steps.some((step) => step.type === "rank_files" || step.type === "select_tests" || step.type === "map_dependencies" || step.type === "summarize_tree") && !index.overview().files) { await index.refresh(root); persistWorkspaceIndex(root, index); }
+        // One state object for the whole pack, registered before the first await: the workflow stays
+        // cancellable while the index warms and in the gaps between steps, not only while a step is
+        // in flight. A Stop pressed during a slow refresh used to be dropped and every step then ran.
+        const state: ActiveSidecarWorkflow = { jobId: "", cancelled: false };
+        sidecarWorkflowActive.set(workflowId, state);
         const results: Array<{ id: string; type: SidecarJobType; label: string; result: Awaited<ReturnType<typeof runCatalogJob>> }> = [];
         try {
+          const root = String(p.root ?? opts.projectRoot ?? process.cwd());
+          const active = runtimeForProject(root, runtime, opts);
+          sidecar.setMaxConcurrent(sidecarConcurrency(active.models));
+          const index = getWorkspaceIndex(root, indexes);
+          if (workflow.steps.some((step) => step.type === "rank_files" || step.type === "select_tests" || step.type === "map_dependencies" || step.type === "summarize_tree") && !index.overview().files) { await index.refresh(root); persistWorkspaceIndex(root, index); }
           for (const step of workflow.steps) {
+            if (state.cancelled) break;
             const jobId = `${workflowId}:${step.id}`;
-            sidecarWorkflowActive.set(workflowId, jobId);
+            state.jobId = jobId;
             const stepResult = await runCatalogJob(sidecar, active.llm, index, {
               id: jobId,
               type: step.type,
@@ -1156,15 +1265,29 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
               maxChars: typeof p.maxChars === "number" ? p.maxChars : undefined,
             });
             results.push({ id: step.id, type: step.type, label: step.label, result: stepResult });
-            sidecarWorkflowActive.delete(workflowId);
           }
         } finally { sidecarWorkflowActive.delete(workflowId); }
-        result = { id: workflowId, workflow: workflow.id, name: workflow.name, source: results.some((step) => step.result.source === "sidecar") ? "sidecar" : "deterministic", results };
+        result = {
+          id: workflowId, workflow: workflow.id, name: workflow.name,
+          source: results.some((step) => step.result.source === "sidecar") ? "sidecar" : "deterministic",
+          cancelled: state.cancelled,
+          completedSteps: results.length,
+          totalSteps: workflow.steps.length,
+          results,
+        };
         break;
       }
       case "sidecar.cancel": {
         const id = String(p.id ?? "");
-        result = sidecar.cancel(sidecarWorkflowActive.get(id) ?? id);
+        const workflowState = sidecarWorkflowActive.get(id);
+        if (workflowState) {
+          // Cancelling a workflow is authoritative even between steps, where there is no job to kill.
+          workflowState.cancelled = true;
+          sidecar.cancel(workflowState.jobId || id);
+          result = true;
+        } else {
+          result = sidecar.cancel(id);
+        }
         break;
       }
       case "sidecar.cancel-all": sidecar.cancelAll(); result = true; break;

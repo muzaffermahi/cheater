@@ -24,12 +24,71 @@ public sealed class EngineClient : IAsyncDisposable
         _reader = Task.Run(ReadLoopAsync);
     }
 
+    /// <summary>
+    /// The engine publishes its socket path and a per-launch handshake token to
+    /// &lt;kitten home&gt;/engine.json when it starts. The engine serves nothing at all — not liveness,
+    /// and never its event stream — until that token is presented, so another local process cannot
+    /// drive the agent or read this session's prompts, code and diffs.
+    /// </summary>
+    private sealed record EngineInfo(string SocketPath, string Token);
+
+    public static string InfoPath()
+    {
+        var home = Environment.GetEnvironmentVariable("KITTEN_HOME");
+        if (string.IsNullOrWhiteSpace(home)) home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".kitten");
+        return Path.Combine(home, "engine.json");
+    }
+
+    private static EngineInfo? ReadInfo()
+    {
+        try
+        {
+            var path = InfoPath();
+            if (!File.Exists(path)) return null;
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            var root = document.RootElement;
+            var socketPath = root.TryGetProperty("socketPath", out var s) ? s.GetString() : null;
+            var token = root.TryGetProperty("token", out var t) ? t.GetString() : null;
+            if (string.IsNullOrWhiteSpace(socketPath) || string.IsNullOrWhiteSpace(token)) return null;
+            return new EngineInfo(socketPath!, token!);
+        }
+        catch { return null; }
+    }
+
+    private static string PipeName(string socketPath)
+    {
+        const string prefix = @"\\.\pipe\";
+        return socketPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ? socketPath.Substring(prefix.Length) : socketPath;
+    }
+
     public static async Task<EngineClient> ConnectAsync(CancellationToken cancellationToken = default)
     {
-        var name = $"kitten-engine-{Environment.UserName}";
-        var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
+        // The engine writes its info file only once it owns the socket, so waiting for the file is
+        // also how the shell waits for a ready engine.
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        EngineInfo? info;
+        while ((info = ReadInfo()) is null)
+        {
+            if (DateTime.UtcNow >= deadline) throw new TimeoutException("The Kitten engine did not publish its local connection details.");
+            await Task.Delay(150, cancellationToken);
+        }
+        var pipe = new NamedPipeClientStream(".", PipeName(info.SocketPath), PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(5000, cancellationToken);
-        return new EngineClient(pipe);
+        var client = new EngineClient(pipe);
+        try
+        {
+            var hello = await client.CallAsync("hello", new { token = info.Token }, cancellationToken);
+            if (hello is null || !hello.Value.TryGetProperty("authenticated", out var ok) || !ok.GetBoolean())
+            {
+                throw new InvalidOperationException("The Kitten engine rejected this session's handshake.");
+            }
+            return client;
+        }
+        catch
+        {
+            await client.DisposeAsync();
+            throw;
+        }
     }
 
     public async Task<JsonElement?> CallAsync(string type, object? payload = null, CancellationToken cancellationToken = default)

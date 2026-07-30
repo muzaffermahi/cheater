@@ -2,7 +2,8 @@
 // This is intentionally a process-level smoke test: static package scans cannot catch a
 // missing transitive import or a runtime that exits before Avalonia can connect.
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { connect } from "node:net";
 
@@ -19,18 +20,31 @@ if (!existsSync(engineEntry)) throw new Error(`native engine entry is missing: $
 if (!existsSync(runtime)) throw new Error(`bundled Node runtime is missing: ${runtime}`);
 
 const smokeUser = `kitten-smoke-${process.pid}`;
+// An isolated Kitten home keeps the smoke run off the user's real store and gives us the engine's
+// published socket path + handshake token, which is the only way in: the engine answers nothing,
+// health included, before a client presents that token.
+const smokeHome = mkdtempSync(join(tmpdir(), "kitten-engine-smoke-"));
 const child = spawn(runtime, [engineEntry, "--parent-pid", String(process.pid), "--project-root", projectRoot], {
   cwd: bundle,
-  env: { ...process.env, USERNAME: smokeUser },
+  env: { ...process.env, USERNAME: smokeUser, KITTEN_HOME: smokeHome },
   stdio: ["ignore", "ignore", "pipe"],
   windowsHide: true,
 });
 let stderr = "";
 child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
 
-const pipeName = process.platform === "win32"
-  ? `\\\\.\\pipe\\kitten-engine-${smokeUser}`
-  : join(process.env.XDG_STATE_HOME ?? join(process.env.HOME ?? ".", ".local", "state"), "kitten", "engine.sock");
+async function readEngineInfo(timeoutMs = 10_000) {
+  const infoPath = join(smokeHome, "engine.json");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const info = JSON.parse(readFileSync(infoPath, "utf8"));
+      if (info?.socketPath && info?.token) return info;
+    } catch { /* the engine has not published yet */ }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  }
+  throw new Error(`native engine did not publish ${infoPath}`);
+}
 
 function frame(value) {
   const body = Buffer.from(JSON.stringify(value), "utf8");
@@ -57,7 +71,7 @@ function readFrame(socket) {
   });
 }
 
-async function connectWithRetry(timeoutMs = 7000) {
+async function connectWithRetry(pipeName, timeoutMs = 7000) {
   const deadline = Date.now() + timeoutMs;
   let lastError = "not attempted";
   while (Date.now() < deadline) {
@@ -76,15 +90,32 @@ async function connectWithRetry(timeoutMs = 7000) {
 }
 
 try {
-  const socket = await connectWithRetry();
+  const info = await readEngineInfo();
+  const socket = await connectWithRetry(info.socketPath);
+
+  // An unauthenticated peer must be refused. If this ever succeeds the shipped engine is open to
+  // every local process, so the release fails here rather than in the field.
+  const intruder = await connectWithRetry(info.socketPath);
+  intruder.write(frame({ protocolVersion: 1, id: "native-smoke-intruder", type: "health" }));
+  const refused = await readFrame(intruder);
+  intruder.destroy();
+  if (refused?.ok !== false || refused?.error?.code !== "EUNAUTHORIZED") {
+    throw new Error(`engine served an unauthenticated client: ${JSON.stringify(refused)}`);
+  }
+
+  socket.write(frame({ protocolVersion: 1, id: "native-smoke-hello", type: "hello", payload: { token: info.token } }));
+  const hello = await readFrame(socket);
+  if (!hello?.ok || hello?.result?.authenticated !== true) throw new Error(`engine handshake failed: ${JSON.stringify(hello)}`);
+
   socket.write(frame({ protocolVersion: 1, id: "native-smoke-health", type: "health" }));
   const response = await readFrame(socket);
   socket.destroy();
   if (!response?.ok || response?.result?.ready !== true) throw new Error(`engine health response was not ready: ${JSON.stringify(response)}`);
-  console.log(`Native engine IPC smoke passed (pid ${response.result.pid}, runtime ${basename(runtime)})`);
+  console.log(`Native engine IPC smoke passed (pid ${response.result.pid}, runtime ${basename(runtime)}, handshake enforced)`);
 } catch (error) {
   const detail = stderr.trim();
   throw new Error(`${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ""}`);
 } finally {
   if (!child.killed) child.kill();
+  try { rmSync(smokeHome, { recursive: true, force: true }); } catch { /* temp dir */ }
 }

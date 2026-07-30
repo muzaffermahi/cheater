@@ -2,19 +2,33 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createConnection, type Socket } from "node:net";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startDesktopEngine } from "../src/core/desktopEngine.js";
 import { command, encodeFrame, FrameDecoder } from "../src/core/desktopProtocol.js";
 import type { KittenLLM, ChatParams, ChatResult } from "../src/core/llm.js";
 
-function connect(path: string): Promise<Socket> {
+function open(path: string): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(path);
     socket.once("connect", () => resolve(socket));
     socket.once("error", reject);
   });
+}
+
+/** Every client connection must complete the engine handshake before any command is served. */
+async function connect(path: string, token: string): Promise<Socket> {
+  const socket = await open(path);
+  try {
+    const hello = await call(socket, `hello-${Math.random().toString(36).slice(2, 8)}`, "hello", { token });
+    assert.equal(hello.authenticated, true);
+    return socket;
+  } catch (error) {
+    socket.destroy();
+    throw error;
+  }
 }
 
 function call(socket: Socket, id: string, type: string, payload?: unknown): Promise<any> {
@@ -55,7 +69,7 @@ function waitForEvent(socket: Socket, type: string, predicate: (frame: any) => b
 test("desktop engine serves health and conversation commands over local IPC", async () => {
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-${process.pid}` : `${process.cwd()}/.kitten-test-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd() });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const health = await call(socket, "1", "health");
     assert.equal(health.ready, true);
@@ -148,7 +162,7 @@ test("desktop engine serves health and conversation commands over local IPC", as
 test("desktop engine exposes a redacted diagnostics bundle for the native app", async () => {
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-support-${process.pid}` : `${process.cwd()}/.kitten-support-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd(), models: { baseUrl: "fixture://support", main: "main-35b", sidecar: "sidecar-2b" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const bundle = await call(socket, "support", "support.bundle");
     assert.equal(typeof bundle.content, "string");
@@ -167,13 +181,13 @@ test("desktop engine hydrates workspace intelligence from the project cache afte
   await mkdir(join(root, "src"), { recursive: true });
   await writeFile(join(root, "src", "auth.ts"), "export function authenticate(token: string) { return Boolean(token); }\n", "utf8");
   const first = await startDesktopEngine({ socketPath: socketA, store: ":memory:", projectRoot: root });
-  const firstSocket = await connect(socketA);
+  const firstSocket = await connect(socketA, first.token);
   try {
     const indexed = await call(firstSocket, "index", "workspace.index", { root });
     assert.equal(indexed.files, 1);
   } finally { firstSocket.destroy(); await first.close(); }
   const second = await startDesktopEngine({ socketPath: socketB, store: ":memory:", projectRoot: root });
-  const secondSocket = await connect(socketB);
+  const secondSocket = await connect(socketB, second.token);
   try {
     const overview = await call(secondSocket, "overview", "workspace.overview", { root });
     assert.equal(overview.files, 1);
@@ -195,7 +209,7 @@ test("desktop submissions receive automatic sidecar orientation before the runne
     llm: { sidecar: async () => { throw new Error("fixture offline"); } } as unknown as KittenLLM,
     runner: async (ctx) => { captured = ctx.conversationContext; return { finished: true, verified: true, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: ["parser.ts"] }; },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Orientation" });
     const postflight = waitForEvent(socket, "sidecar.postflight");
@@ -232,7 +246,7 @@ test("desktop uses a configured sidecar on the shared endpoint when no second en
     },
   } as unknown as KittenLLM;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, runner: async () => ({ finished: true, verified: false, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] }), models: { baseUrl: "fixture://shared", main: "fixture-main", sidecar: "fixture-sidecar" }, llm: fixtureLlm });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Shared sidecar", projectRoot: root });
     const ready = waitForEvent(socket, "sidecar.preflight", (frame) => frame.payload?.phase === "ready");
@@ -248,7 +262,7 @@ test("desktop verification rejects unsafe commands and persists the receipt", as
   const root = await mkdtemp(join(tmpdir(), "kitten-verification-ipc-"));
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-verification-${process.pid}` : `${root}/engine.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Verification" });
     const result = await call(socket, "verify", "workspace.verify", { root, conversationId: conversation.id, runId: "run-verification", commands: ["powershell -Command whoami"] });
@@ -265,7 +279,7 @@ test("desktop sidecar gives a new conversation a durable title automatically", a
   const root = await mkdtemp(join(tmpdir(), "kitten-title-"));
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-title-${process.pid}` : `${root}/engine.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, runner: async () => ({ finished: true, verified: false, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] }) });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "New task" });
     const renamed = waitForEvent(socket, "conversation.renamed");
@@ -288,7 +302,7 @@ test("desktop submission cancellation can stop sidecar preflight before a run st
   const baseUrl = `http://127.0.0.1:${address.port}/v1`;
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-submit-cancel-${process.pid}` : `${root}/engine.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl, sidecarBaseUrl: baseUrl, main: "fixture-main", sidecar: "fixture-sidecar" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Cancellation", projectRoot: root });
     const started = waitForEvent(socket, "sidecar.preflight");
@@ -322,7 +336,7 @@ test("desktop sidecar compacts long conversation history before the main model",
       return { finished: true, verified: true, summary: "fixture completed", wallMs: 1, usage: { prompt: 1, completion: 1, reasoning: 0 }, receiptLines: [], filesChanged: [] };
     },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Long history", projectRoot: root });
     for (let index = 0; index < 8; index++) await call(socket, `seed-${index}`, "conversation.submit", { conversationId: conversation.id, text: `record durable decision ${index}`, autoSidecar: false });
@@ -339,7 +353,7 @@ test("desktop sidecar emits an actionable failure card without changing the fail
   const root = await mkdtemp(join(tmpdir(), "kitten-sidecar-failure-"));
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-sidecar-failure-${process.pid}` : `${root}/engine.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, runner: async () => { throw new Error("TypeError: parser failed at parser.ts:4"); } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Failure card", projectRoot: root });
     const failureCard = waitForEvent(socket, "sidecar.failure");
@@ -370,8 +384,8 @@ test("desktop engine streams run events and cancellation across clients", async 
       return { finished: false, verified: false, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] };
     },
   });
-  const first = await connect(socketPath);
-  const second = await connect(socketPath);
+  const first = await connect(socketPath, engine.token);
+  const second = await connect(socketPath, engine.token);
   try {
     const conversation = await call(first, "create", "conversation.create", { title: "Cancellation IPC" });
     const started = waitForEvent(second, "run.started");
@@ -397,7 +411,7 @@ test("desktop engine executes a persisted task plan through child conversations"
     projectRoot: process.cwd(),
     runner: async (ctx) => { prompts.push(ctx.task); return { finished: true, verified: true, summary: `done ${ctx.agent ?? "general"}`, wallMs: 1, usage: { prompt: 1, completion: 1, reasoning: 0 }, receiptLines: ["fixture"], filesChanged: [] }; },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Task plan" });
     await call(socket, "plan", "task.plan", { conversationId: conversation.id, nodes: [
@@ -429,7 +443,7 @@ test("desktop task plans route sidecar nodes to the configured sidecar model", a
       return { finished: true, verified: true, summary: "tier fixture", wallMs: 1, usage: { prompt: 1, completion: 1, reasoning: 0 }, receiptLines: ["fixture"], filesChanged: [] };
     },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Sidecar tier" });
     await call(socket, "plan", "task.plan", { conversationId: conversation.id, nodes: [{ id: "sidecar-tier", agent: "explore", objective: "inspect", acceptanceCriteria: ["report"], dependencies: [], allowedFiles: [], forbiddenFiles: [], modelTier: "sidecar", workspaceMode: "shared-readonly" }] });
@@ -449,7 +463,7 @@ test("desktop task-plan orientation can be cancelled before the DAG is created",
   const fixtureLlm = { models: { baseUrl: "fixture://main", sidecarBaseUrl: "fixture://sidecar", main: "main", sidecar: "side" }, chat: never, sidecar: never } as unknown as KittenLLM;
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-plan-cancel-${process.pid}` : `${process.cwd()}/.kitten-test-plan-cancel-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd(), models: { baseUrl: "fixture://main", sidecarBaseUrl: "fixture://sidecar", main: "main", sidecar: "side" }, llm: fixtureLlm });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const conversation = await call(socket, "create", "conversation.create", { title: "Plan cancellation" });
     const pending = call(socket, "plan-cancel", "task.plan-suggest", { conversationId: conversation.id, parentRunId: "plan-cancel-run", text: "inspect the project" });
@@ -467,7 +481,7 @@ test("desktop sidecar toolbox exposes validated clerical jobs with a determinist
     projectRoot: process.cwd(),
     models: { baseUrl: "http://127.0.0.1:9/v1", sidecar: "fixture-sidecar" },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const catalog = await call(socket, "catalog", "sidecar.catalog");
     assert.ok(catalog.length >= 27);
@@ -496,7 +510,7 @@ test("desktop sidecar workflows run a bounded intake pack and preserve per-step 
   await writeFile(join(root, "src", "parser.ts"), "export function parse(value: string) { return value.trim(); }\n", "utf8");
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-sidecar-workflow-${process.pid}` : `${root}/engine.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl: "http://127.0.0.1:9/v1", sidecar: "fixture-sidecar" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const catalog = await call(socket, "workflow-catalog", "sidecar.workflow.catalog");
     assert.ok(catalog.some((workflow: { id: string }) => workflow.id === "task-intake"));
@@ -520,7 +534,7 @@ test("desktop engine cancels an in-flight model download", async () => {
   const port = typeof address === "object" && address ? address.port : 0;
   const socketPath = process.platform === "win32" ? "\\\\.\\pipe\\kitten-test-download-cancel-" + process.pid : process.cwd() + "/.kitten-test-download-cancel-" + process.pid + ".sock";
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const pending = call(socket, "download", "model.download", {
       id: "cancel-download",
@@ -551,8 +565,8 @@ test("desktop task cancellation stops a running subagent plan", async () => {
       return { finished: false, verified: false, summary: "cancelled fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] };
     },
   });
-  const first = await connect(socketPath);
-  const second = await connect(socketPath);
+  const first = await connect(socketPath, engine.token);
+  const second = await connect(socketPath, engine.token);
   try {
     const conversation = await call(first, "create", "conversation.create", { title: "Task cancellation" });
     await call(first, "plan", "task.plan", { conversationId: conversation.id, nodes: [{ id: "explore-cancel", agent: "explore", objective: "inspect before cancellation", acceptanceCriteria: ["report"], dependencies: [], allowedFiles: [], forbiddenFiles: [], modelTier: "sidecar", workspaceMode: "shared-readonly" }] });
@@ -578,7 +592,7 @@ test("desktop can spawn a durable subagent directly from the native task surface
     projectRoot: process.cwd(),
     runner: async (ctx) => { childLane = ctx.lane; return { finished: true, verified: false, summary: "child fixture", wallMs: 1, usage: { prompt: 1, completion: 1, reasoning: 0 }, receiptLines: [], filesChanged: [] }; },
   });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const parent = await call(socket, "parent", "conversation.create", { title: "Direct subagent" });
     const child = await call(socket, "spawn", "task.spawn", { parentConversationId: parent.id, parentRunId: "manual-child", agent: "architect", prompt: "Map the parser boundaries and report exact paths." });
@@ -595,7 +609,7 @@ test("desktop settings update refreshes the active model runtime", async () => {
   await writeFile(join(root, ".kitten", "config.json"), JSON.stringify({ mainModel: "project-main", sidecarModel: "project-sidecar" }), "utf8");
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-settings-${process.pid}` : `${process.cwd()}/.kitten-test-settings-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const projectConversation = await call(socket, "project-conversation", "conversation.create", { title: "Project model", projectRoot: root });
     assert.equal(projectConversation.model, "project-main");
@@ -646,7 +660,7 @@ test("desktop engine starts, probes, and stops a managed local runtime", async (
   const sidecarBaseUrl = `http://127.0.0.1:${port + 1}`;
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-runtime-${process.pid}` : `${process.cwd()}/.kitten-test-runtime-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl, main: "fixture-main" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const started = await call(socket, "start", "runtime.start", { executable: process.execPath, mainModelPath: modelPath, sidecarModelPath, baseUrl, sidecarBaseUrl, mainModel: "fixture-main-live", sidecarModel: "fixture-sidecar-live", bootstrapScript: bootstrapPath });
     assert.equal(started.started, true);
@@ -685,7 +699,7 @@ test("desktop engine discovers models for native first-run setup", async () => {
   if (!address || typeof address === "string") throw new Error("fixture endpoint did not bind");
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-discovery-${process.pid}` : `${process.cwd()}/.kitten-test-discovery-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd() });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const result = await call(socket, "discover", "model.discover", { baseUrl: `http://127.0.0.1:${address.port}` });
     assert.equal(result.ok, true);
@@ -718,7 +732,7 @@ test("desktop engine exposes a bounded model responsiveness benchmark", async ()
   if (!address || typeof address === "string") throw new Error("fixture endpoint did not bind");
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-benchmark-${process.pid}` : `${process.cwd()}/.kitten-test-benchmark-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd(), models: { baseUrl: `http://127.0.0.1:${address.port}`, main: "main-35b" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const result = await call(socket, "benchmark", "model.benchmark", { samples: 2 });
     assert.equal(result.successfulSamples, 2);
@@ -750,7 +764,7 @@ test("desktop engine exposes the sandboxed coding-quality probe and persists its
   const root = await mkdtemp(join(tmpdir(), "kitten-coding-benchmark-"));
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-coding-benchmark-${process.pid}` : `${process.cwd()}/.kitten-test-coding-benchmark-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl: `http://127.0.0.1:${address.port}`, main: "main-35b", sidecar: "sidecar-2b" } });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const result = await call(socket, "coding", "model.coding-benchmark", { projectRoot: root, timeoutMs: 5_000 });
     assert.equal(result.rows.length, 2);
@@ -784,7 +798,7 @@ test("desktop engine exposes the held-out project probe and persists its receipt
   const root = await mkdtemp(join(tmpdir(), "kitten-project-benchmark-"));
   const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-project-benchmark-${process.pid}` : `${process.cwd()}/.kitten-test-project-benchmark-${process.pid}.sock`;
   const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl: "fixture://project", main: "main-35b", sidecar: "sidecar-2b" }, llm: fixtureLlm });
-  const socket = await connect(socketPath);
+  const socket = await connect(socketPath, engine.token);
   try {
     const result = await call(socket, "project", "model.project-benchmark", { projectRoot: root, timeoutMs: 8_000 });
     assert.equal(result.rows.length, 2);
@@ -795,5 +809,185 @@ test("desktop engine exposes the held-out project probe and persists its receipt
     socket.destroy();
     await engine.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+// ── Local IPC trust boundary ─────────────────────────────────────────────────────────────────────
+// The engine's socket is reachable by other processes running as this user (and on Windows the
+// default named-pipe ACL is wider still). It drives file edits, shell commands and the model
+// endpoint, so nothing may be served — including the event stream — before the handshake.
+
+test("engine refuses every command until the handshake token is presented", async () => {
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-auth-${process.pid}` : `${process.cwd()}/.kitten-test-auth-${process.pid}.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd() });
+  try {
+    const anonymous = await open(socketPath);
+    const closed = new Promise<void>((resolve) => anonymous.once("close", () => resolve()));
+    await assert.rejects(call(anonymous, "probe", "health"), /EUNAUTHORIZED|handshake required/);
+    await closed;
+    assert.equal(anonymous.destroyed, true);
+
+    const wrongToken = await open(socketPath);
+    const wrongClosed = new Promise<void>((resolve) => wrongToken.once("close", () => resolve()));
+    await assert.rejects(call(wrongToken, "hello", "hello", { token: "not-the-token" }), /EUNAUTHORIZED|token is invalid/);
+    await wrongClosed;
+
+    const authorized = await connect(socketPath, engine.token);
+    try {
+      const health = await call(authorized, "health", "health");
+      assert.equal(health.ready, true);
+    } finally { authorized.destroy(); }
+  } finally { await engine.close(); }
+});
+
+test("an unauthenticated connection receives no events and is closed on the handshake deadline", async () => {
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-auth-events-${process.pid}` : `${process.cwd()}/.kitten-test-auth-events-${process.pid}.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd(), handshakeTimeoutMs: 400 });
+  const eavesdropper = await open(socketPath);
+  const overheard: Array<Record<string, unknown>> = [];
+  const eavesdropDecoder = new FrameDecoder();
+  eavesdropper.on("data", (chunk: Buffer) => {
+    for (const parsed of eavesdropDecoder.push(chunk)) overheard.push(parsed as unknown as Record<string, unknown>);
+  });
+  const closed = new Promise<void>((resolve) => eavesdropper.once("close", () => resolve()));
+  const authorized = await connect(socketPath, engine.token);
+  try {
+    // A real conversation event fans out to authenticated clients only.
+    const conversation = await call(authorized, "create", "conversation.create", { title: "Private" });
+    await call(authorized, "rename", "conversation.rename", { id: conversation.id, title: "Still private" });
+    await closed;
+    // The only thing an unauthenticated peer may ever be told is that it is unauthenticated.
+    for (const frame of overheard) {
+      assert.equal(frame.ok, false, `unauthenticated peer received a payload frame: ${JSON.stringify(frame)}`);
+      assert.equal((frame.error as { code?: string } | undefined)?.code, "EUNAUTHORIZED");
+      assert.ok(!("eventId" in frame), "unauthenticated peer received an event");
+    }
+    assert.ok(!JSON.stringify(overheard).includes("Private"), "conversation content leaked before the handshake");
+  } finally {
+    authorized.destroy();
+    eavesdropper.destroy();
+    await engine.close();
+  }
+});
+
+test("engine publishes its socket path and token for the shell, and withdraws them on close", async () => {
+  const home = await mkdtemp(join(tmpdir(), "kitten-engine-info-"));
+  const infoPath = join(home, "engine.json");
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-info-${process.pid}` : `${home}/engine.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd(), infoPath });
+  try {
+    const info = JSON.parse(await readFile(infoPath, "utf8")) as { socketPath: string; token: string; pid: number; protocolVersion: number };
+    assert.equal(info.socketPath, socketPath);
+    assert.equal(info.token, engine.token);
+    assert.equal(info.pid, process.pid);
+    assert.equal(info.protocolVersion, 1);
+    if (process.platform !== "win32") assert.equal((await stat(infoPath)).mode & 0o777, 0o600);
+    // The published token is the one that actually opens the channel.
+    const socket = await connect(socketPath, info.token);
+    socket.destroy();
+  } finally {
+    await engine.close();
+    assert.equal(existsSync(infoPath), false, "a closed engine must not leave a live-looking info file behind");
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a test/fixture engine stays off the shared engine info file", async () => {
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-noinfo-${process.pid}` : `${process.cwd()}/.kitten-test-noinfo-${process.pid}.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd() });
+  try { assert.equal(engine.infoPath, null); } finally { await engine.close(); }
+});
+
+test("a losing second engine never rewrites the live engine's run state", async () => {
+  const home = await mkdtemp(join(tmpdir(), "kitten-engine-single-"));
+  const store = join(home, "kitten.db");
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-single-${process.pid}` : `${home}/engine.sock`;
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const engine = await startDesktopEngine({
+    socketPath, store, projectRoot: home,
+    runner: async () => { await held; return { finished: true, verified: false, summary: "held run", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] }; },
+  });
+  const socket = await connect(socketPath, engine.token);
+  try {
+    const conversation = await call(socket, "create", "conversation.create", { title: "In flight" });
+    const submitted = call(socket, "submit", "conversation.submit", { conversationId: conversation.id, text: "hold the run", autoSidecar: false });
+    await waitForEvent(socket, "run.started");
+
+    // A second launch loses the socket lock. It must fail without touching the store: recovery may
+    // not flip the live instance's in-flight run to `interrupted`.
+    await assert.rejects(startDesktopEngine({ socketPath, store, projectRoot: home }));
+    const runs = await call(socket, "runs", "conversation.runs", { id: conversation.id });
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].status, "running");
+
+    release();
+    await submitted;
+    const settled = await call(socket, "runs-after", "conversation.runs", { id: conversation.id });
+    assert.notEqual(settled[0].status, "interrupted");
+  } finally {
+    release();
+    socket.destroy();
+    await engine.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("stopping a sidecar workflow prevents its remaining steps from running", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kitten-workflow-cancel-"));
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "src", "parser.ts"), "export function parse(input: string) { return input.trim(); }\n", "utf8");
+  await writeFile(join(root, "src", "parser.test.ts"), "import { parse } from '../src/parser';\n", "utf8");
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-workflow-cancel-${process.pid}` : `${root}/engine.sock`;
+  let sidecarCalls = 0;
+  const engine = await startDesktopEngine({
+    socketPath, store: ":memory:", projectRoot: root,
+    models: { main: "main-35b", sidecar: "sidecar-2b" },
+    llm: { sidecar: async () => { sidecarCalls += 1; return { content: "{}", reasoning: "", toolCalls: [], finishReason: "stop", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 1 }; } } as unknown as KittenLLM,
+  });
+  const socket = await connect(socketPath, engine.token);
+  try {
+    // Both frames are written in order; the workflow registers itself before its first await, so the
+    // Stop lands while the workspace index is still warming — the window that used to be ignored.
+    const running = call(socket, "workflow", "sidecar.workflow", { id: "cancel-fixture", workflow: "task-intake", root, text: "fix the parser and preserve order" });
+    const cancelled = await call(socket, "cancel", "sidecar.cancel", { id: "cancel-fixture" });
+    assert.equal(cancelled, true);
+    const outcome = await running;
+    assert.equal(outcome.cancelled, true);
+    assert.ok(outcome.completedSteps < outcome.totalSteps, `expected a short-circuited pack, ran ${outcome.completedSteps}/${outcome.totalSteps}`);
+    assert.equal(sidecarCalls, 0, "no workflow step may start after Stop");
+  } finally {
+    socket.destroy();
+    await engine.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a successful command always carries a result field", async () => {
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-result-shape-${process.pid}` : `${process.cwd()}/.kitten-test-result-shape-${process.pid}.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: process.cwd() });
+  const socket = await connect(socketPath, engine.token);
+  try {
+    // A typed client that requires `result` on an ok frame must not see a success as a failure.
+    const frame = await new Promise<Record<string, unknown>>((resolve, reject) => {
+      const decoder = new FrameDecoder();
+      const onData = (chunk: Buffer): void => {
+        try {
+          for (const parsed of decoder.push(chunk)) {
+            if ((parsed as { id?: string }).id !== "missing") continue;
+            socket.off("data", onData);
+            resolve(parsed as unknown as Record<string, unknown>);
+          }
+        } catch (error) { reject(error); }
+      };
+      socket.on("data", onData);
+      socket.write(encodeFrame(command("missing", "conversation.get", { id: "conv-does-not-exist" })));
+    });
+    assert.equal(frame.ok, true);
+    assert.ok("result" in frame, "an ok frame must always include result");
+    assert.equal(frame.result, null);
+  } finally {
+    socket.destroy();
+    await engine.close();
   }
 });
