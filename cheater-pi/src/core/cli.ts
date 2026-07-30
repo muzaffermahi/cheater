@@ -98,4 +98,8 @@ async function main(argv: string[]): Promise<number> {
   return result.finished ? 0 : 1;
 }
 
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`kitten-core fatal: unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`);
+  process.exit(1);
+});
 main(process.argv.slice(2)).then((code) => process.exit(code)).catch((e) => { process.stderr.write(`kitten-core fatal: ${e?.stack ?? e}\n`); process.exit(1); });

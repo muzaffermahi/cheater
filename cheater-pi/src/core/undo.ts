@@ -131,3 +131,61 @@ export function restoreSnapshot(cwd: string, snap: RunSnapshot, files: string[])
   }
   return { ok: restored.length > 0 || deleted.length > 0, restored, deleted, skipped };
 }
+
+export function captureSnapshotAfter(cwd: string): RunSnapshot {
+  return captureSnapshot(cwd);
+}
+
+export function applySnapshot(cwd: string, snap: RunSnapshot, files: string[]): UndoResult {
+  const restored: string[] = [], deleted: string[] = [], skipped: string[] = [];
+  if (!snap.git) return { ok: false, restored, deleted, skipped: files, reason: "not a git repository — undo needs git" };
+  if (!snap.ref) return { ok: false, restored, deleted, skipped: files, reason: "no snapshot was captured for this run" };
+  for (const f of files) {
+    const inRef = git(cwd, ["cat-file", "-e", `${snap.ref}:${f}`]).ok;
+    if (inRef) {
+      const r = git(cwd, ["checkout", snap.ref, "--", f]);
+      (r.ok ? restored : skipped).push(f);
+    } else if (snap.saved && Object.prototype.hasOwnProperty.call(snap.saved, f)) {
+      try {
+        const abs = resolve(cwd, f);
+        mkdirSync(dirname(abs), { recursive: true });
+        writeFileSync(abs, Buffer.from(snap.saved[f], "base64"));
+        restored.push(f);
+      } catch { skipped.push(f); }
+    } else {
+      try { rmSync(resolve(cwd, f), { force: true }); deleted.push(f); } catch { skipped.push(f); }
+    }
+  }
+  return { ok: restored.length > 0 || deleted.length > 0, restored, deleted, skipped };
+}
+
+function currentMatchesSnapshot(cwd: string, snap: RunSnapshot, f: string): boolean {
+  if (snap.ref) {
+    const inRef = git(cwd, ["cat-file", "-e", `${snap.ref}:${f}`]).ok;
+    if (inRef) return git(cwd, ["diff", "--quiet", snap.ref, "--", f]).ok;
+  }
+  if (snap.saved && Object.prototype.hasOwnProperty.call(snap.saved, f)) {
+    try {
+      const cur = readFileSync(resolve(cwd, f)).toString("base64");
+      return cur === snap.saved[f];
+    } catch { return false; }
+  }
+  try { statSync(resolve(cwd, f)); return false; } catch { return true; }
+}
+
+export function redoSnapshot(cwd: string, preSnap: RunSnapshot, postSnap: RunSnapshot, files: string[]): UndoResult {
+  const restored: string[] = [], deleted: string[] = [], skipped: string[] = [];
+  for (const f of files) {
+    const matchesPre = currentMatchesSnapshot(cwd, preSnap, f);
+    const matchesPost = currentMatchesSnapshot(cwd, postSnap, f);
+    if (matchesPre && !matchesPost) {
+      const r = applySnapshot(cwd, postSnap, [f]);
+      (r.restored.length || r.deleted.length ? restored : skipped).push(f);
+    } else if (matchesPost) {
+      skipped.push(f);
+    } else {
+      return { ok: false, restored, deleted, skipped: [...skipped, f], reason: `file "${f}" has drifted — redo refused` };
+    }
+  }
+  return { ok: restored.length > 0, restored, deleted, skipped };
+}

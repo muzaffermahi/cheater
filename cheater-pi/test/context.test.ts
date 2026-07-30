@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ContextBuilder } from "../src/core/context.js";
+import { ContextBuilder, contextBudgetForWindow } from "../src/core/context.js";
 import { KittenApp, type Runner } from "../src/core/app.js";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
@@ -83,6 +83,23 @@ test("app injects prior-turn context into a follow-up message (same process)", a
   await app.submitMessage(conv.id, "now do the same for the parser");
   assert.match(lastContext(), /Conversation so far/);         // turn 2 sees turn 1
   assert.match(lastContext(), /slugify/);                     // the actual prior request
+});
+
+test("context budget scales with the configured local model window", () => {
+  const small = contextBudgetForWindow(4096);
+  const large = contextBudgetForWindow(32768);
+  assert.equal(small.windowTokens, 4096);
+  assert.ok(small.maxPreambleTokens < large.maxPreambleTokens);
+  assert.ok(large.maxPreambleTokens <= 8000);
+  assert.ok(large.reserveTokens >= 3000);
+});
+
+test("app appends bounded sidecar orientation to the foreground context", async () => {
+  const { app, lastContext } = capturingApp(new ConversationStore(openSqlite(":memory:")));
+  const conv = app.createConversation({ projectRoot: "/proj" });
+  await app.submitMessage(conv.id, "implement the parser", { contextPreamble: "[SIDECAR ORIENTATION]\nCandidate files: parser.ts" });
+  assert.match(lastContext(), /SIDECAR ORIENTATION/);
+  assert.match(lastContext(), /parser\.ts/);
 });
 
 test("resume after process restart still informs the model (P0 exit criterion)", async () => {

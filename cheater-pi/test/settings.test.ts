@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadKittenSettings } from "../src/core/settings.js";
+import { loadKittenSettings, saveKittenSettings } from "../src/core/settings.js";
 
 function projectWith(config: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), "kitten-cfg-"));
@@ -73,4 +73,29 @@ test("invalid JSON is a warning, not a crash", () => {
   writeFileSync(join(dir, ".kitten", "config.json"), "{ not json ");
   const s = loadKittenSettings(dir);
   assert.ok(s.warnings.some((w) => /not valid JSON/.test(w)));
+});
+
+test("app settings update writes an atomic project config without secrets", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-cfg-save-"));
+  saveKittenSettings({ baseUrl: "http://127.0.0.1:1234/v1", sidecarBaseUrl: "http://127.0.0.1:2234/v1", mainModel: "main-local", sidecarModel: "sidecar-local", approvalPolicy: "ask" }, "project", dir);
+  const loaded = loadKittenSettings(dir);
+  assert.equal(loaded.models.main, "main-local");
+  assert.equal(loaded.models.sidecar, "sidecar-local");
+  assert.equal(loaded.models.sidecarBaseUrl, "http://127.0.0.1:2234/v1");
+  assert.equal(loaded.approvalPolicy, "ask");
+});
+
+test("managed runtime paths persist without storing an API key", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-cfg-runtime-"));
+  saveKittenSettings({
+    runtimeExecutable: "C:\\models\\llama-server.exe",
+    mainModelPath: "C:\\models\\main.gguf",
+    sidecarModelPath: "C:\\models\\sidecar.gguf",
+  }, "project", dir);
+  const loaded = loadKittenSettings(dir);
+  assert.deepEqual(loaded.managedRuntime, {
+    executable: "C:\\models\\llama-server.exe",
+    mainModelPath: "C:\\models\\main.gguf",
+    sidecarModelPath: "C:\\models\\sidecar.gguf",
+  });
 });

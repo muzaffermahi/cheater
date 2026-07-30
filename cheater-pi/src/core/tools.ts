@@ -24,6 +24,11 @@ export interface ToolContext {
   filesWritten: Set<string>;
   /** Abort signal for the run — a cancellable tool (bash) kills its process tree when this fires. */
   signal?: AbortSignal;
+  /** Main-agent-only delegation hook. Subagents receive no hook and therefore cannot recurse. */
+  spawnTask?: (input: { agent: string; prompt: string; model?: string }) => Promise<{ conversationId: string; runId: string; status: string; summary: string }>;
+  /** Optional task scope. An empty allow-list means "workspace", otherwise paths must match it. */
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 export interface ToolResult {
@@ -50,6 +55,17 @@ function rel(ctx: ToolContext, p: string): string {
   return relative(ctx.cwd, p).replace(/\\/g, "/") || p;
 }
 
+function scopeError(ctx: ToolContext, p: string): string | undefined {
+  const normalized = rel(ctx, abs(ctx, p)).replace(/^\.\//, "");
+  const matches = (candidate: string): boolean => {
+    const value = candidate.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+    return normalized === value || normalized.startsWith(`${value}/`);
+  };
+  if ((ctx.forbiddenFiles ?? []).some(matches)) return `path scope denied: ${p} is forbidden for this task`;
+  if ((ctx.allowedFiles?.length ?? 0) > 0 && !ctx.allowedFiles!.some(matches)) return `path scope denied: ${p} is outside the task's allowed files`;
+  return undefined;
+}
+
 // --- read -----------------------------------------------------------------------------------
 
 export const readTool: Tool = {
@@ -69,6 +85,8 @@ export const readTool: Tool = {
   execute(args, ctx) {
     const p = String(args.path ?? "");
     if (!p) return { output: "read: missing path", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `read: ${denied}`, isError: true };
     const full = abs(ctx, p);
     if (!existsSync(full)) return { output: `read: file not found: ${p}`, isError: true };
     let text: string;
@@ -101,6 +119,8 @@ export const writeTool: Tool = {
     const p = String(args.path ?? "");
     const content = typeof args.content === "string" ? args.content : "";
     if (!p) return { output: "write: missing path", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `write: ${denied}`, isError: true };
     const full = abs(ctx, p);
     try {
       mkdirSync(dirname(full), { recursive: true });
@@ -138,6 +158,8 @@ export const editTool: Tool = {
     const search = typeof args.search === "string" ? args.search : "";
     const replace = typeof args.replace === "string" ? args.replace : "";
     if (!p || !search) return { output: "edit: need path and non-empty search", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `edit: ${denied}`, isError: true };
     const full = abs(ctx, p);
     if (!existsSync(full)) return { output: `edit: file not found: ${p} (use write to create a new file)`, isError: true };
     let text: string;
@@ -385,7 +407,35 @@ export const finishTool: Tool = {
   }
 };
 
-export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, grepTool, finishTool];
+export const taskTool: Tool = {
+  schema: {
+    name: "task",
+    description: "Delegate a bounded coding subtask to a named Kitten agent and wait for its durable report. Use explore/review/verify for read-only work; use general only when edits are explicitly required.",
+    parameters: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "agent profile: explore, review, verify, or general" },
+        prompt: { type: "string", description: "self-contained objective and acceptance criteria; do not assume the child sees this conversation" },
+        model: { type: "string", description: "optional model override" }
+      },
+      required: ["agent", "prompt"]
+    }
+  },
+  async execute(args, ctx) {
+    if (!ctx.spawnTask) return { output: "task: delegation is unavailable in this agent profile", isError: true };
+    const agent = String(args.agent ?? "").trim();
+    const prompt = String(args.prompt ?? "").trim();
+    if (!agent || !prompt) return { output: "task: agent and prompt are required", isError: true };
+    try {
+      const result = await ctx.spawnTask({ agent, prompt: prompt.slice(0, 4000), model: typeof args.model === "string" ? args.model : undefined });
+      return { output: `child ${result.conversationId} (${result.status}): ${result.summary}`.slice(0, 2000), isError: result.status === "failed" || result.status === "cancelled", meta: result };
+    } catch (error) {
+      return { output: `task failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2000), isError: true };
+    }
+  }
+};
+
+export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, grepTool, taskTool, finishTool];
 
 export function toolByName(name: string): Tool | undefined {
   return CORE_TOOLS.find((t) => t.schema.name === name);

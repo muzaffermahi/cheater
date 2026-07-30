@@ -80,6 +80,8 @@ export interface RunStarted {
   runId: string;
   request: string;
   lane: Lane;
+  model?: string;
+  agent?: string;
 }
 export interface RunStatusChanged {
   type: "run.status";
@@ -158,6 +160,7 @@ export interface CandidateCompleted {
   index: number;
   finished: boolean;
   summary: string;
+  usage?: { prompt: number; completion: number; reasoning: number };
 }
 export interface CandidateRejected {
   type: "candidate.rejected";
@@ -239,6 +242,7 @@ export interface RunCompleted {
   /** Independent execution evidence confirmed the change (finished && !verified = "checked", §4). */
   verified: boolean;
   lane: Lane;
+  model?: string;
   summary: string;
   wallMs: number;
   usage: { prompt: number; completion: number; reasoning: number };
@@ -253,6 +257,40 @@ export interface RunUndone {
   skipped: string[];
 }
 
+export interface ToolApprovalResolved {
+  type: "tool.approval_resolved";
+  runId: string;
+  callId: string;
+  allowed: boolean;
+  source: "user" | "auto-deny-cancel";
+}
+
+export interface RunRedone {
+  type: "run.redone";
+  runId: string;
+  restored: string[];
+  deleted: string[];
+  skipped: string[];
+}
+
+export interface TaskStarted {
+  type: "task.started";
+  runId: string;
+  childConversationId: string;
+  agent: string;
+  prompt: string;
+}
+
+export interface TaskCompleted {
+  type: "task.completed";
+  runId: string;
+  childConversationId: string;
+  childRunId: string;
+  status: string;
+  summary: string;
+  usage: { prompt: number; completion: number; reasoning: number };
+}
+
 /** The finish receipt: the honest audit trail of what happened (Goal §4/§9 "honest receipts"). */
 export interface ReceiptFinalized {
   type: "receipt.finalized";
@@ -260,6 +298,42 @@ export interface ReceiptFinalized {
   lines: string[];
   filesChanged: string[];
   verified: boolean;
+}
+
+/** Advisory small-model review persisted after a file-changing run. It never changes the run grade. */
+export interface SidecarPostflight {
+  type: "sidecar.postflight";
+  runId: string;
+  source: "sidecar" | "deterministic";
+  secrets: string[];
+  warnings: string[];
+  evidenceWarnings: string[];
+  recommendedTests: string[];
+  suggestedCommands: string[];
+  risk: "low" | "medium" | "high";
+  riskReasons: string[];
+  generatedTestCases: string[];
+}
+
+/** Advisory failure explanation generated after a failed run; it is never verification evidence. */
+export interface SidecarFailure {
+  type: "sidecar.failure";
+  runId: string;
+  source: "sidecar" | "deterministic";
+  severity: "error" | "warning" | "info";
+  signature: string;
+  likelyCause: string;
+  salientLines: string[];
+}
+
+/** A user-approved native verification run, persisted as bounded execution evidence. */
+export interface WorkspaceVerification {
+  type: "workspace.verification";
+  runId: string;
+  passed: boolean;
+  cancelled: boolean;
+  commands: string[];
+  results: Array<{ command: string; passed: boolean; allowed: boolean; exitCode: number | null; timedOut: boolean; durationMs: number; output: string }>;
 }
 
 export type EventPayload =
@@ -293,7 +367,14 @@ export type EventPayload =
   | RunFailed
   | RunCompleted
   | RunUndone
-  | ReceiptFinalized;
+  | RunRedone
+  | ToolApprovalResolved
+  | TaskStarted
+  | TaskCompleted
+  | ReceiptFinalized
+  | SidecarPostflight
+  | SidecarFailure
+  | WorkspaceVerification;
 
 export type EventType = EventPayload["type"];
 

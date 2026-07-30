@@ -1,0 +1,103 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Kitten.Desktop.MainWindow"
+        Width="1280" Height="820" MinWidth="900" MinHeight="600"
+        Title="Kitten" Opened="OnOpened">
+  <Grid RowDefinitions="Auto,*" ColumnDefinitions="250,*,320">
+    <Border Grid.Row="0" Grid.ColumnSpan="3" Padding="14,10" Background="#18181b">
+      <DockPanel>
+        <TextBlock Text="Kitten" FontSize="18" FontWeight="SemiBold" />
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="10">
+          <TextBlock Name="ConnectionText" Text="Starting engine..." Opacity="0.7" VerticalAlignment="Center" />
+          <Button Name="RetryEngineButton" Content="Retry engine" Click="RetryEngine" IsEnabled="False" />
+        </StackPanel>
+      </DockPanel>
+    </Border>
+    <Border Grid.Row="1" Grid.Column="0" Padding="12" Background="#111113">
+      <Grid RowDefinitions="Auto,*" RowSpacing="12">
+        <StackPanel Grid.Row="0" Spacing="8">
+          <Button Content="Open project" Click="OpenProject" />
+          <Button Content="New task" Click="NewTask" />
+          <Button Content="Workspace explorer" Click="OpenWorkspaceExplorer" />
+          <Button Content="Review changes" Click="OpenWorkspaceChanges" />
+          <Button Content="Task board" Click="OpenTaskBoard" />
+          <Button Content="Agent library" Click="OpenAgentLibrary" />
+          <Button Content="Export conversation" Click="ExportConversation" />
+          <Button Content="Export diagnostics" Click="ExportDiagnostics" />
+          <TextBlock Name="ProjectText" Text="No project selected" TextWrapping="Wrap" Opacity="0.7" />
+          <TextBlock Name="ModelText" Text="Models: checking..." TextWrapping="Wrap" Opacity="0.7" />
+        </StackPanel>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+          <StackPanel Spacing="12">
+            <TextBlock Text="Model controls" FontWeight="SemiBold" />
+            <StackPanel Spacing="6">
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Content="Check models" Click="CheckModels" />
+                <Button Grid.Column="1" Content="Validate models" Click="ValidateModels" />
+              </Grid>
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Content="Model health" Click="ModelHealth" />
+                <Button Grid.Column="1" Content="Configure" Click="ConfigureModels" />
+              </Grid>
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Content="Quick benchmark" Click="BenchmarkModels" />
+                <Button Grid.Column="1" Content="Coding probe" Click="CodingBenchmark" />
+              </Grid>
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Content="Project probe" Click="ProjectBenchmark" />
+                <Button Grid.Column="1" Content="Full bakeoff" Click="ModelBakeoff" />
+              </Grid>
+              <Grid ColumnDefinitions="*,*" ColumnSpacing="6">
+                <Button Name="CancelBakeoffButton" Content="Stop bakeoff" Click="CancelModelBakeoff" IsEnabled="False" />
+                <Button Name="ApplyBakeoffButton" Content="Apply winners" Click="ApplyModelBakeoff" IsEnabled="False" />
+              </Grid>
+              <Button Name="ViewBakeoffReportButton" Content="View last bakeoff report" Click="ViewBakeoffReport" IsEnabled="False" />
+              <Button Content="Probe capabilities" Click="ProbeCapabilities" />
+            </StackPanel>
+            <Button Content="Sidecar toolbox" Click="OpenSidecarToolbox" />
+            <TextBlock Text="Conversations" FontWeight="SemiBold" />
+            <StackPanel Orientation="Horizontal" Spacing="8">
+              <TextBox Name="ConversationSearch" Watermark="Search conversations" MinWidth="150" />
+              <Button Content="Find" Click="SearchConversations" />
+            </StackPanel>
+            <ListBox Name="ConversationList" Height="180" SelectionChanged="SelectConversation" />
+          </StackPanel>
+        </ScrollViewer>
+      </Grid>
+    </Border>
+    <Grid Grid.Row="1" Grid.Column="1" RowDefinitions="*,Auto" Margin="14">
+      <ScrollViewer Name="TranscriptScroll">
+        <TextBlock Name="Transcript" TextWrapping="Wrap" FontSize="15" LineHeight="23" />
+      </ScrollViewer>
+      <Grid Grid.Row="1" RowDefinitions="Auto,Auto,Auto" ColumnDefinitions="*,*" Margin="0,14,0,0">
+        <TextBox Name="Prompt" Grid.Row="0" Grid.ColumnSpan="2" Watermark="Describe what you want Kitten to do... (@agent objective · Ctrl+Enter to run)" AcceptsReturn="True" MinHeight="70" KeyDown="PromptKeyDown" />
+        <Button Name="PlanButton" Grid.Row="1" Grid.Column="0" Content="Plan with sidecar" Padding="14,8" Margin="0,8,4,0" Click="PlanAndRun" />
+        <Button Name="ImplementButton" Grid.Row="1" Grid.Column="1" Content="Implement bounded plan" Padding="14,8" Margin="4,8,0,0" Click="ImplementPlan" IsEnabled="False" />
+        <Button Name="RunButton" Grid.Row="2" Grid.Column="0" Content="Run" Padding="18,8" Margin="0,8,4,0" Click="Submit" />
+        <Button Name="CancelButton" Grid.Row="2" Grid.Column="1" Content="Stop" Padding="14,8" Margin="4,8,0,0" Click="CancelRun" IsEnabled="False" />
+      </Grid>
+    </Grid>
+    <Border Grid.Row="1" Grid.Column="2" Padding="12" Background="#18181b">
+      <StackPanel Spacing="12">
+        <TextBlock Text="Activity" FontWeight="SemiBold" />
+        <TextBlock Name="Activity" Text="No active run" TextWrapping="Wrap" Opacity="0.8" />
+        <TextBlock Name="ApprovalText" Text="" TextWrapping="Wrap" Margin="0,10,0,0" />
+        <Button Name="ResumeButton" Content="Resume interrupted run" Click="ResumeInterrupted" IsEnabled="False" />
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <Button Name="ApproveButton" Content="Approve" Click="ApproveAction" IsEnabled="False" />
+          <Button Name="DenyButton" Content="Deny" Click="DenyAction" IsEnabled="False" />
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,10,0,0">
+          <Button Name="UndoButton" Content="Undo last run" Click="UndoLastRun" IsEnabled="False" />
+          <Button Name="RedoButton" Content="Redo" Click="RedoLastRun" IsEnabled="False" />
+        </StackPanel>
+        <TextBlock Text="Evidence" FontWeight="SemiBold" Margin="0,16,0,0" />
+        <TextBlock Name="Evidence" Text="Verified receipts will appear here." TextWrapping="Wrap" Opacity="0.8" />
+        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,10,0,0">
+          <Button Name="RunChecksButton" Content="Run suggested checks" Click="RunSuggestedChecks" IsEnabled="False" />
+          <Button Name="CancelChecksButton" Content="Stop checks" Click="CancelSuggestedChecks" IsEnabled="False" />
+        </StackPanel>
+      </StackPanel>
+    </Border>
+  </Grid>
+</Window>

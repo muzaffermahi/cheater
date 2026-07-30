@@ -224,8 +224,23 @@ than shipped (e.g. the ascent `verdict.winner` index is 1-based, not an off-by-o
 correctly mark `failed`; the validation-ledger/computeBudget/phaseController "suspicions" were unreachable
 in the live wiring).
 
-## What was NOT done
+## What was NOT done (during the hardening pass)
 
 - No live-model or browser verification (endpoint down, Docker off) — all fixes are offline-verified.
-- A few deep subsystems remain un-hunted (`blueprint/*` web-scout/scaffold internals, `core/web/page.ts`
-  client JS, `commitlet/executor` prompt assembly, `core/tui.ts`), and the one acknowledged non-fix above.
+
+## Polish pass (post-hardening, 821 tests green)
+
+After the hardening pass, a UI polish pass addressed the remaining gaps:
+
+- `blueprint/webScout.ts` — added module-level documentation (8 trigger kinds, regex detection)
+- `commitlet/executor.ts` — added module-level documentation (7-step prompt assembly pipeline)
+- `core/web/page.ts` — Markdown overhaul (headings, lists, code blocks with copy/syntax-highlight,
+  rename modal, typing indicator, timestamps, keyboard shortcuts, favicon, conversation delete,
+  retry/regenerate, model badge, SVG icons), offline banner debounce, jump-to-bottom button
+- `core/tui.ts` — live status line with mascot/spinner/elapsed time, tab completion, history
+  persistence, multi-line messages, `/search` and `/status` commands, Ctrl+C feedback
+- All entry points — `unhandledRejection` crash handlers
+- Web server — conversation validation before `submitMessage`, `/api/status` endpoint
+- `cheater-pi/RELEASING.md` — created with release gates, tagging, and trusted-publishing procedure
+- `kitten init` command — guided first-time setup with provider-specific endpoint diagnostics
+- Doctor — endpoint failure classification (refused/auth/timeout) with actionable guidance

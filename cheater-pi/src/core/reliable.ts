@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { runAgent, type AgentRunParams, type AgentRunResult, type FinishGateState } from "./agent.js";
+import type { Tool } from "./tools.js";
 import type { KittenLLM } from "./llm.js";
 import type { ToolContext, ToolResult } from "./tools.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
@@ -33,6 +34,8 @@ export interface ReliableParams {
   cwd: string;
   llm: KittenLLM;
   model?: string;
+  /** Agent profile instructions layered ahead of the reliability contract. */
+  systemPrompt?: string;
   maxTurns?: number;
   temperature?: number;
   reasoningEffort?: "low" | "medium" | "high";
@@ -58,6 +61,10 @@ export interface ReliableParams {
   contextPreamble?: string;
   /** Stream real token deltas (forwarded to the agent loop). */
   streamDeltas?: boolean;
+  tools?: Tool[];
+  spawnTask?: AgentRunParams["spawnTask"];
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -105,6 +112,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     : `Before finishing, actually run your change once (a quick \`python -c\`/\`node -e\` check) to confirm it works — don't finish on assumption.`;
 
   const systemPrompt = [
+    params.systemPrompt,
     "You are Kitten, a precise coding agent. You have tools: read, write, edit, bash, ls, grep, finish.",
     "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
@@ -133,6 +141,10 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     commandGate: params.commandGate,
     contextPreamble: params.contextPreamble,
     streamDeltas: params.streamDeltas,
+    tools: params.tools,
+    spawnTask: params.spawnTask,
+    allowedFiles: params.allowedFiles,
+    forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
     finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
   });

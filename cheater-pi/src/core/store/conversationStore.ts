@@ -29,6 +29,10 @@ export interface ConversationRow {
   updatedAt: number;
   archived: boolean;
   lastSeq: number;
+  provider?: string | null;
+  agent?: string | null;
+  parentConversationId?: string | null;
+  parentRunId?: string | null;
 }
 
 export interface RunRow {
@@ -50,6 +54,11 @@ export interface RunRow {
   endedAt: number | null;
   /** Pre-run git snapshot for /undo (JSON of RunSnapshot), or null. */
   snapshot: string | null;
+  model: string | null;
+  agent: string | null;
+  parentRunId: string | null;
+  undone: boolean;
+  snapshotAfter: string | null;
 }
 
 export interface CreateConversationInput {
@@ -60,6 +69,10 @@ export interface CreateConversationInput {
   model: string;
   mode: Lane | "auto";
   ts: number;
+  provider?: string | null;
+  agent?: string | null;
+  parentConversationId?: string | null;
+  parentRunId?: string | null;
 }
 
 export interface ListConversationsOptions {
@@ -67,6 +80,47 @@ export interface ListConversationsOptions {
   includeArchived?: boolean;
   search?: string;
   limit?: number;
+}
+
+export type TaskNodeStatus = "queued" | "blocked" | "running" | "waiting" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted";
+
+export interface TaskNodeRow {
+  id: string;
+  conversationId: string;
+  runId: string | null;
+  parentId: string | null;
+  agent: string;
+  objective: string;
+  acceptanceCriteria: string[];
+  dependencies: string[];
+  allowedFiles: string[];
+  forbiddenFiles: string[];
+  modelTier: string;
+  workspaceMode: "shared-readonly" | "isolated-worktree";
+  status: TaskNodeStatus;
+  budget: { maxTurns: number; maxTokens: number; maxWallMs: number; maxToolCalls: number };
+  report: string;
+  evidence: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CreateTaskNodeInput {
+  id: string;
+  conversationId: string;
+  runId?: string | null;
+  parentId?: string | null;
+  agent: string;
+  objective: string;
+  acceptanceCriteria?: string[];
+  dependencies?: string[];
+  allowedFiles?: string[];
+  forbiddenFiles?: string[];
+  modelTier?: string;
+  workspaceMode?: "shared-readonly" | "isolated-worktree";
+  status?: TaskNodeStatus;
+  budget?: Partial<TaskNodeRow["budget"]>;
+  ts: number;
 }
 
 // ── Migrations ────────────────────────────────────────────────────────────────────────────────────
@@ -129,6 +183,54 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE runs ADD COLUMN snapshot TEXT;
   `,
+  // v3 — model identity, agent, parent links, undo tracking, provider.
+  `
+  ALTER TABLE runs          ADD COLUMN model TEXT;
+  ALTER TABLE runs          ADD COLUMN agent TEXT;
+  ALTER TABLE runs          ADD COLUMN parent_run_id TEXT;
+  ALTER TABLE runs          ADD COLUMN undone INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs          ADD COLUMN snapshot_after TEXT;
+  ALTER TABLE conversations ADD COLUMN provider TEXT;
+  ALTER TABLE conversations ADD COLUMN agent TEXT;
+  ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT;
+  ALTER TABLE conversations ADD COLUMN parent_run_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_conversation_id);
+  CREATE TABLE IF NOT EXISTS input_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    input TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    conversation_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_input_history_ts ON input_history(ts DESC);
+  `,
+  // v4 — durable subagent task DAG. The task table is a projection; task lifecycle events remain in
+  // the parent conversation event log so the desktop client can replay the same visible history.
+  `
+  CREATE TABLE task_nodes (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    run_id TEXT,
+    parent_id TEXT,
+    agent TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    allowed_files TEXT NOT NULL DEFAULT '[]',
+    forbidden_files TEXT NOT NULL DEFAULT '[]',
+    model_tier TEXT NOT NULL DEFAULT 'main',
+    workspace_mode TEXT NOT NULL DEFAULT 'shared-readonly',
+    status TEXT NOT NULL DEFAULT 'queued',
+    budget TEXT NOT NULL DEFAULT '{}',
+    report TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(parent_id) REFERENCES task_nodes(id) ON DELETE SET NULL
+  );
+  CREATE INDEX idx_task_nodes_conversation ON task_nodes(conversation_id, created_at);
+  CREATE INDEX idx_task_nodes_parent ON task_nodes(parent_id);
+  CREATE INDEX idx_task_nodes_status ON task_nodes(status);
+  `,
 ];
 
 function migrate(db: SqlDatabase): void {
@@ -172,11 +274,11 @@ export class ConversationStore {
   createConversation(input: CreateConversationInput): { conversation: ConversationRow; event: KittenEvent } {
     return transact(this.db, () => {
       this.db.prepare(
-        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`
       ).run(
         input.id, input.title, input.projectRoot, input.projectId, input.model, input.mode,
-        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION
+        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null
       );
       const event = this._append(input.id, {
         type: "conversation.created", title: input.title, projectRoot: input.projectRoot,
@@ -202,6 +304,11 @@ export class ConversationStore {
       `ORDER BY updated_at DESC LIMIT ?`;
     params.push(Math.max(1, Math.min(1000, opts.limit ?? 100)));
     return this.db.prepare(sqlText).all(...params).map(mapConversation);
+  }
+
+  /** Child conversations form the durable lineage tree used for subagent cancellation. */
+  listChildConversations(parentConversationId: string): ConversationRow[] {
+    return this.db.prepare("SELECT * FROM conversations WHERE parent_conversation_id = ? ORDER BY created_at ASC").all(parentConversationId).map(mapConversation);
   }
 
   renameConversation(id: string, title: string, ts: number): KittenEvent | null {
@@ -286,7 +393,7 @@ export class ConversationStore {
         break;
       case "run.started":
         ensure();
-        set("request = ?, lane = ?, status = 'running', started_at = ?", payload.request, payload.lane, ts);
+        set("request = ?, lane = ?, status = 'running', started_at = ?, model = ?", payload.request, payload.lane, ts, payload.model ?? null);
         break;
       case "run.status":
         ensure();
@@ -307,8 +414,8 @@ export class ConversationStore {
       case "run.completed":
         ensure();
         set(
-          "status = 'completed', finished = ?, verified = ?, summary = ?, usage = ?, ended_at = ?",
-          payload.finished ? 1 : 0, payload.verified ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts
+          "status = 'completed', finished = ?, verified = ?, summary = ?, usage = ?, ended_at = ?, model = ?",
+          payload.finished ? 1 : 0, payload.verified ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts, payload.model ?? null
         );
         break;
       case "run.failed":
@@ -339,11 +446,54 @@ export class ConversationStore {
     this.db.prepare("UPDATE runs SET snapshot = ? WHERE id = ?").run(snapshotJson, runId);
   }
 
+  setRunSnapshotAfter(runId: string, snapshotJson: string): void {
+    this.db.prepare("UPDATE runs SET snapshot_after = ? WHERE id = ?").run(snapshotJson, runId);
+  }
+
+  setRunUndone(runId: string, undone: boolean): void {
+    this.db.prepare("UPDATE runs SET undone = ? WHERE id = ?").run(undone ? 1 : 0, runId);
+  }
+
   listRuns(conversationId: string): RunRow[] {
     return this.db
       .prepare("SELECT * FROM runs WHERE conversation_id = ? ORDER BY started_at ASC")
       .all(conversationId)
       .map(mapRun);
+  }
+
+  createTaskNode(input: CreateTaskNodeInput): TaskNodeRow {
+    const budget = { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40, ...(input.budget ?? {}) };
+    this.db.prepare(
+      `INSERT INTO task_nodes (id, conversation_id, run_id, parent_id, agent, objective, acceptance_criteria,
+       dependencies, allowed_files, forbidden_files, model_tier, workspace_mode, status, budget, report, evidence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?)`
+    ).run(
+      input.id, input.conversationId, input.runId ?? null, input.parentId ?? null, input.agent, input.objective.slice(0, 4000),
+      JSON.stringify((input.acceptanceCriteria ?? []).slice(0, 32)), JSON.stringify((input.dependencies ?? []).slice(0, 32)),
+      JSON.stringify((input.allowedFiles ?? []).slice(0, 64)), JSON.stringify((input.forbiddenFiles ?? []).slice(0, 64)),
+      input.modelTier ?? "main", input.workspaceMode ?? "shared-readonly", input.status ?? "queued", JSON.stringify(budget), input.ts, input.ts
+    );
+    return this.getTaskNode(input.id)!;
+  }
+
+  getTaskNode(id: string): TaskNodeRow | null {
+    const row = this.db.prepare("SELECT * FROM task_nodes WHERE id = ?").get(id);
+    return row ? mapTaskNode(row) : null;
+  }
+
+  listTaskNodes(conversationId: string): TaskNodeRow[] {
+    return this.db.prepare("SELECT * FROM task_nodes WHERE conversation_id = ? ORDER BY created_at ASC").all(conversationId).map(mapTaskNode);
+  }
+
+  updateTaskNode(id: string, update: { status?: TaskNodeStatus; report?: string; evidence?: string[]; runId?: string | null; ts: number }): TaskNodeRow | null {
+    const current = this.getTaskNode(id);
+    if (!current) return null;
+    const status = update.status ?? current.status;
+    const report = update.report ?? current.report;
+    const evidence = update.evidence ?? current.evidence;
+    this.db.prepare("UPDATE task_nodes SET status = ?, report = ?, evidence = ?, run_id = ?, updated_at = ? WHERE id = ?")
+      .run(status, report.slice(0, 12000), JSON.stringify(evidence.slice(0, 64)), update.runId === undefined ? current.runId : update.runId, update.ts, id);
+    return this.getTaskNode(id);
   }
 
   /**
@@ -380,6 +530,10 @@ function mapConversation(r: Record<string, SqlValue>): ConversationRow {
     updatedAt: Number(r.updated_at),
     archived: Number(r.archived) !== 0,
     lastSeq: Number(r.last_seq),
+    provider: r.provider != null ? String(r.provider) : null,
+    agent: r.agent != null ? String(r.agent) : null,
+    parentConversationId: r.parent_conversation_id != null ? String(r.parent_conversation_id) : null,
+    parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
   };
 }
 
@@ -402,6 +556,23 @@ function mapRun(r: Record<string, SqlValue>): RunRow {
     startedAt: Number(r.started_at),
     endedAt: r.ended_at != null ? Number(r.ended_at) : null,
     snapshot: r.snapshot != null ? String(r.snapshot) : null,
+    model: r.model != null ? String(r.model) : null,
+    agent: r.agent != null ? String(r.agent) : null,
+    parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
+    undone: Number(r.undone ?? 0) !== 0,
+    snapshotAfter: r.snapshot_after != null ? String(r.snapshot_after) : null,
+  };
+}
+
+function mapTaskNode(r: Record<string, SqlValue>): TaskNodeRow {
+  return {
+    id: String(r.id), conversationId: String(r.conversation_id), runId: r.run_id == null ? null : String(r.run_id),
+    parentId: r.parent_id == null ? null : String(r.parent_id), agent: String(r.agent), objective: String(r.objective),
+    acceptanceCriteria: safeJsonArray(r.acceptance_criteria), dependencies: safeJsonArray(r.dependencies),
+    allowedFiles: safeJsonArray(r.allowed_files), forbiddenFiles: safeJsonArray(r.forbidden_files), modelTier: String(r.model_tier),
+    workspaceMode: String(r.workspace_mode) === "isolated-worktree" ? "isolated-worktree" : "shared-readonly",
+    status: String(r.status) as TaskNodeStatus, budget: safeBudget(r.budget), report: String(r.report ?? ""), evidence: safeJsonArray(r.evidence),
+    createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
   };
 }
 
@@ -420,4 +591,10 @@ function safeUsage(v: SqlValue): { prompt: number; completion: number; reasoning
     const u = JSON.parse(String(v ?? "{}"));
     return { prompt: Number(u.prompt ?? 0), completion: Number(u.completion ?? 0), reasoning: Number(u.reasoning ?? 0) };
   } catch { return { prompt: 0, completion: 0, reasoning: 0 }; }
+}
+function safeBudget(v: SqlValue): TaskNodeRow["budget"] {
+  try {
+    const b = JSON.parse(String(v ?? "{}"));
+    return { maxTurns: Number(b.maxTurns ?? 12), maxTokens: Number(b.maxTokens ?? 12000), maxWallMs: Number(b.maxWallMs ?? 900_000), maxToolCalls: Number(b.maxToolCalls ?? 40) };
+  } catch { return { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40 }; }
 }

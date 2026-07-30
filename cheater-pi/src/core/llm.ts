@@ -15,6 +15,8 @@
 
 export interface KittenModels {
   baseUrl: string;
+  /** Optional separate OpenAI-compatible endpoint for the small sidecar runtime. */
+  sidecarBaseUrl?: string;
   main: string;
   /** Optional fast clerical model. Absent on a single-model endpoint → sidecar work runs on `main`. */
   sidecar?: string;
@@ -107,10 +109,14 @@ export interface ChatResult {
   raw?: unknown;
   /** Per-token logprobs of the generated content, when requested (for self-certainty selection). */
   logprobs?: TokenLogprob[];
+  /** Number of formatting-constraint fallbacks used for this request (normally 0/undefined). */
+  formatRescues?: number;
 }
 
 export interface ChatParams {
   model?: string;
+  /** Internal endpoint override used by the sidecar; omitted for the main model. */
+  endpointBaseUrl?: string;
   messages: ChatMessage[];
   tools?: ToolSchema[];
   toolChoice?: "auto" | "none" | "required";
@@ -168,11 +174,73 @@ export interface TokenLogprob {
 const DEFAULT_MAIN_MAX_TOKENS = 4096;
 const DEFAULT_TIMEOUT_MS = 600_000;
 
+// Process-wide because project-local settings may construct separate KittenLLM instances while
+// still targeting the same LM Studio/llama.cpp endpoint.
+const GLOBAL_ENDPOINT_QUEUES = new Map<string, Promise<void>>();
+
+function endpointKey(value: string): string {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`.toLowerCase();
+  } catch {
+    return value.trim().replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+function retryableRuntimeStatus(status: number): boolean {
+  // Local runtimes commonly answer 503 while loading a large GGUF or swapping a model slot.
+  // Retry only transient gateway/load statuses; a 4xx configuration error must surface immediately.
+  return status === 408 || status === 425 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+function retryDelayMs(attempt: number, response: Response): number {
+  const retryAfter = Number(response.headers.get("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(2000, retryAfter * 1000);
+  return [250, 750][Math.min(attempt, 1)] ?? 750;
+}
+
+async function waitForRetry(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return false;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(true); }, ms);
+    const abort = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); resolve(false); };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
 export class KittenLLM {
   constructor(public readonly models: KittenModels = DEFAULT_MODELS) {}
 
-  private url(path: string): string {
-    return `${this.models.baseUrl.replace(/\/+$/, "")}${path}`;
+  // A single LM Studio/llama.cpp endpoint is commonly shared by the main and sidecar
+  // models. Serialize requests per endpoint so a clerical JSON call cannot collide with
+  // a foreground generation or trigger an avoidable context/model swap. Separate
+  // sidecarBaseUrl endpoints retain independent concurrency.
+  private async acquireEndpointLock(endpoint: string, signal: AbortSignal): Promise<(() => void) | null> {
+    const previous = GLOBAL_ENDPOINT_QUEUES.get(endpoint) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    GLOBAL_ENDPOINT_QUEUES.set(endpoint, current);
+    let abortListener: (() => void) | undefined;
+    const aborted = new Promise<boolean>((resolve) => {
+      abortListener = () => resolve(true);
+      if (signal.aborted) resolve(true);
+      else signal.addEventListener("abort", abortListener, { once: true });
+    });
+    const winner = await Promise.race([previous.then(() => false), aborted]);
+    if (abortListener) signal.removeEventListener("abort", abortListener);
+    if (winner) {
+      release();
+      if (GLOBAL_ENDPOINT_QUEUES.get(endpoint) === current) GLOBAL_ENDPOINT_QUEUES.delete(endpoint);
+      return null;
+    }
+    return () => {
+      release();
+      if (GLOBAL_ENDPOINT_QUEUES.get(endpoint) === current) GLOBAL_ENDPOINT_QUEUES.delete(endpoint);
+    };
+  }
+
+  private url(path: string, baseUrl = this.models.baseUrl): string {
+    return `${baseUrl.replace(/\/+$/, "")}${path}`;
   }
 
   /** Auth + content headers. Bearer defaults to "lm-studio" (ignored locally); a real key for cloud. */
@@ -211,6 +279,18 @@ export class KittenLLM {
     return body;
   }
 
+  /** A few OpenAI-compatible local servers reject optional structured-output fields with HTTP 400
+   * while accepting the same prompt/tools normally. Retry once without only those constraints; never
+   * weaken a safety/tool request or retry arbitrary configuration errors. */
+  private formattingFallbackBody(body: Record<string, unknown>, params: ChatParams): Record<string, unknown> | null {
+    if (!params.grammar && !params.jsonSchema) return null;
+    const fallback = { ...body };
+    let changed = false;
+    if (params.grammar && Object.prototype.hasOwnProperty.call(fallback, "grammar")) { delete fallback.grammar; changed = true; }
+    if (params.jsonSchema && Object.prototype.hasOwnProperty.call(fallback, "response_format")) { delete fallback.response_format; changed = true; }
+    return changed ? fallback : null;
+  }
+
   /** One chat completion. Never throws — a failure returns ok:false so the caller can degrade. */
   async chat(params: ChatParams): Promise<ChatResult> {
     const started = Date.now();
@@ -218,8 +298,26 @@ export class KittenLLM {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const signal = effectiveSignal(params.signal, controller.signal);
+    const release = await this.acquireEndpointLock(endpointKey(params.endpointBaseUrl ?? this.models.baseUrl), signal);
+    if (!release) { clearTimeout(timer); return failure(params.signal?.aborted ? "cancelled" : "timeout", started); }
     try {
-      const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+      let res: Response | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+        if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
+        await res.text().catch(() => "");
+        if (!await waitForRetry(retryDelayMs(attempt, res), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
+      }
+      if (!res) return failure("network: no response", started);
+      let formatRescues = 0;
+      if (!res.ok && res.status === 400) {
+        const fallbackBody = this.formattingFallbackBody(body, params);
+        if (fallbackBody) {
+          await res.text().catch(() => "");
+          res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(fallbackBody), signal });
+          if (res.ok) formatRescues = 1;
+        }
+      }
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
@@ -242,7 +340,8 @@ export class KittenLLM {
         ok: true,
         elapsedMs: Date.now() - started,
         raw: json,
-        logprobs: parseLogprobs(choice.logprobs)
+        logprobs: parseLogprobs(choice.logprobs),
+        ...(formatRescues ? { formatRescues } : {})
       };
     } catch (err) {
       const e = err as Error;
@@ -251,6 +350,7 @@ export class KittenLLM {
       return failure(reason, started);
     } finally {
       clearTimeout(timer);
+      release();
     }
   }
 
@@ -266,9 +366,27 @@ export class KittenLLM {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     const signal = effectiveSignal(params.signal, controller.signal);
+    const release = await this.acquireEndpointLock(endpointKey(params.endpointBaseUrl ?? this.models.baseUrl), signal);
+    if (!release) { clearTimeout(timer); return failure(params.signal?.aborted ? "cancelled" : "timeout", started); }
     const acc = new StreamAccumulator();
     try {
-      const res = await fetch(this.url("/chat/completions"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+      let res: Response | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+        if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
+        await res.text().catch(() => "");
+        if (!await waitForRetry(retryDelayMs(attempt, res), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
+      }
+      if (!res) return failure("network: no response", started);
+      let formatRescues = 0;
+      if (!res.ok && res.status === 400) {
+        const fallbackBody = this.formattingFallbackBody(body, params);
+        if (fallbackBody) {
+          await res.text().catch(() => "");
+          res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(fallbackBody), signal });
+          if (res.ok) formatRescues = 1;
+        }
+      }
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
@@ -306,13 +424,15 @@ export class KittenLLM {
         }
       }
       if (buf.length) processFrame(buf); // a final frame can arrive without a trailing blank line before EOF
-      return acc.finalize(started);
+      const finalized = acc.finalize(started);
+      return formatRescues ? { ...finalized, formatRescues } : finalized;
     } catch (err) {
       const e = err as Error;
       const reason = e.name === "AbortError" ? (params.signal?.aborted ? "cancelled" : "timeout") : `network: ${e.message}`;
       return failure(reason, started);
     } finally {
       clearTimeout(timer);
+      release();
     }
   }
 
@@ -338,9 +458,13 @@ export class KittenLLM {
     // A reasoning model (ornith) with thinking ON burns the whole token budget in reasoning_content and
     // returns EMPTY content, which silently killed consensus/classification on the local native engine.
     // Default thinking OFF; if a picky endpoint rejects chat_template_kwargs, retry once with it on.
-    const p = { ...params, model: params.model ?? this.models.sidecar ?? this.models.main, maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000, disableThinking: params.disableThinking ?? true };
+    const p = { ...params, model: params.model ?? this.models.sidecar ?? this.models.main, endpointBaseUrl: params.endpointBaseUrl ?? (this.models.sidecarBaseUrl?.trim() || undefined), maxTokens: params.maxTokens ?? 512, timeoutMs: params.timeoutMs ?? 60_000, disableThinking: params.disableThinking ?? true };
     const r = await this.chat(p);
-    if (!r.ok && p.disableThinking) return this.chat({ ...p, disableThinking: false });
+    // Only retry when the endpoint explicitly rejected the thinking-control field. Retrying
+    // timeouts/network failures doubles latency and made a down 2B endpoint hold an entire
+    // benchmark battery open for minutes with no new information.
+    const retryWithoutThinking = !r.ok && p.disableThinking && !!r.error && /^HTTP 4(?:00|22)\b/i.test(r.error);
+    if (retryWithoutThinking) return this.chat({ ...p, disableThinking: false });
     return r;
   }
 
@@ -440,6 +564,25 @@ export class KittenLLM {
   async ping(model: string): Promise<boolean> {
     const r = await this.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 64, timeoutMs: 20_000 });
     return r.ok;
+  }
+
+  /** List models from the endpoint. Returns null on any failure (never throws). */
+  async listModels(): Promise<string[] | null> {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 4000);
+      const res = await fetch(`${this.models.baseUrl.replace(/\/+$/, "")}/models`, {
+        headers: { authorization: `Bearer ${this.models.apiKey ?? "lm-studio"}` },
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (!res.ok) return null;
+      const j = await res.json() as { data?: Array<{ id?: string }> };
+      const list = (j.data ?? []).map((m) => String(m.id ?? "")).filter(Boolean);
+      return list.length ? list : null;
+    } catch {
+      return null;
+    }
   }
 }
 

@@ -8,13 +8,20 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { DEFAULT_MODELS, type KittenModels } from "./llm.js";
 
 export type ApprovalPolicy = "ask" | "auto-allow" | "auto-deny";
 
+export interface ManagedRuntimeSettings {
+  executable?: string;
+  mainModelPath?: string;
+  sidecarModelPath?: string;
+}
+
 export interface KittenSettings {
   models: KittenModels;
+  managedRuntime: ManagedRuntimeSettings;
   approvalPolicy: ApprovalPolicy;
   contextWindowTokens: number;
   /** Config files that were merged (for `kitten doctor` transparency). */
@@ -23,14 +30,29 @@ export interface KittenSettings {
   warnings: string[];
 }
 
+export interface SettingsUpdate {
+  baseUrl?: string;
+  sidecarBaseUrl?: string;
+  mainModel?: string;
+  sidecarModel?: string;
+  embedModel?: string;
+  approvalPolicy?: ApprovalPolicy;
+  contextWindowTokens?: number;
+  runtimeExecutable?: string;
+  mainModelPath?: string;
+  sidecarModelPath?: string;
+}
+
 const KNOWN_KEYS = new Set([
-  "baseUrl", "mainModel", "sidecarModel", "embedModel", "apiKey",
+  "baseUrl", "sidecarBaseUrl", "mainModel", "sidecarModel", "embedModel", "apiKey",
   "approvalPolicy", "contextWindowTokens",
+  "runtimeExecutable", "mainModelPath", "sidecarModelPath",
 ]);
 
 interface RawConfig {
-  baseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
+  baseUrl?: string; sidecarBaseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
   approvalPolicy?: string; contextWindowTokens?: number;
+  runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
 }
 
 function readConfig(path: string, warnings: string[]): RawConfig | null {
@@ -86,22 +108,33 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
   }
   const env = {
     baseUrl: envStr("KITTEN_BASE_URL"),
+    sidecarBaseUrl: envStr("KITTEN_SIDECAR_BASE_URL"),
     mainModel: envStr("KITTEN_MAIN_MODEL"),
     sidecarModel: envStr("KITTEN_SIDECAR_MODEL"),
     embedModel: envStr("KITTEN_EMBED_MODEL"),
     apiKey: envStr("KITTEN_API_KEY"),
     approvalPolicy: envStr("KITTEN_APPROVAL_POLICY"),
     contextWindowTokens: envContextTokens,
+    runtimeExecutable: undefined,
+    mainModelPath: undefined,
+    sidecarModelPath: undefined,
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
 
   const models: KittenModels = {
     baseUrl: pick("baseUrl") ?? DEFAULT_MODELS.baseUrl,
+    sidecarBaseUrl: (pick("sidecarBaseUrl") ?? "").trim() || undefined,
     main: pick("mainModel") ?? DEFAULT_MODELS.main,
     sidecar: pick("sidecarModel") ?? DEFAULT_MODELS.sidecar,
     embed: pick("embedModel") ?? DEFAULT_MODELS.embed,
     apiKey: pick("apiKey") ?? DEFAULT_MODELS.apiKey,
+  };
+
+  const managedRuntime: ManagedRuntimeSettings = {
+    executable: pick("runtimeExecutable"),
+    mainModelPath: pick("mainModelPath"),
+    sidecarModelPath: pick("sidecarModelPath"),
   };
 
   const rawPolicy = pick("approvalPolicy");
@@ -110,5 +143,23 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
 
   const contextWindowTokens = Number(pick("contextWindowTokens")) > 0 ? Number(pick("contextWindowTokens")) : 16384;
 
-  return { models, approvalPolicy, contextWindowTokens, sources, warnings };
+  return { models, managedRuntime, approvalPolicy, contextWindowTokens, sources, warnings };
+}
+
+/** Persist non-secret app settings atomically. API keys remain environment/config-file only. */
+export function saveKittenSettings(update: SettingsUpdate, scope: "user" | "project" = "user", cwd = process.cwd()): string {
+  const path = scope === "project" ? join(cwd, ".kitten", "config.json") : join(homedir(), ".kitten", "config.json");
+  mkdirSync(join(path, ".."), { recursive: true });
+  let current: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) current = parsed as Record<string, unknown>;
+    } catch { /* overwrite malformed config with the explicit app update */ }
+  }
+  for (const [key, value] of Object.entries(update)) if (value !== undefined) current[key] = value;
+  const temp = `${path}.tmp-${process.pid}`;
+  writeFileSync(temp, `${JSON.stringify(current, null, 2)}\n`, "utf8");
+  renameSync(temp, path);
+  return path;
 }

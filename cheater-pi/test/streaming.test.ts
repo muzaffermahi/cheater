@@ -195,3 +195,30 @@ test("chatStream aborts as 'cancelled', not a generic network error", async () =
   assert.equal(r.ok, false);
   assert.equal(r.error, "cancelled");
 });
+
+test("sidecar calls use a separate configured endpoint when available", async () => {
+  let mainCalls = 0;
+  let sidecarCalls = 0;
+  const response = JSON.stringify({ choices: [{ message: { content: "{\"ok\":true}" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } });
+  const main = createServer((_req, res) => { mainCalls += 1; res.writeHead(200, { "content-type": "application/json" }); res.end(response); });
+  const sidecar = createServer((_req, res) => { sidecarCalls += 1; res.writeHead(200, { "content-type": "application/json" }); res.end(response); });
+  await Promise.all([
+    new Promise<void>((resolve) => main.listen(0, "127.0.0.1", () => resolve())),
+    new Promise<void>((resolve) => sidecar.listen(0, "127.0.0.1", () => resolve())),
+  ]);
+  const mainAddress = main.address();
+  const sidecarAddress = sidecar.address();
+  if (!mainAddress || typeof mainAddress === "string" || !sidecarAddress || typeof sidecarAddress === "string") throw new Error("endpoint fixtures did not bind");
+  const llm = new KittenLLM({
+    baseUrl: `http://127.0.0.1:${mainAddress.port}/v1`,
+    sidecarBaseUrl: `http://127.0.0.1:${sidecarAddress.port}/v1`,
+    main: "main-model",
+    sidecar: "sidecar-model",
+  });
+  const result = await llm.sidecar({ messages: [{ role: "user", content: "classify" }] });
+  main.close();
+  sidecar.close();
+  assert.equal(result.ok, true);
+  assert.equal(sidecarCalls, 1);
+  assert.equal(mainCalls, 0);
+});

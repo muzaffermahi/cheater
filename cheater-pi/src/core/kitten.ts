@@ -13,6 +13,7 @@
 // replayable. This is the entry that proves the Phase-A spine end to end from a real command.
 
 import { resolve } from "node:path";
+import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
@@ -22,7 +23,11 @@ import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { loadKittenSettings } from "./settings.js";
 import { runRepl } from "./repl.js";
 import { runTui } from "./tui.js";
-import { runWeb } from "./web.js";
+import { runWeb, runServe } from "./web.js";
+import { VERSION } from "../config.js";
+import { runAttach } from "./tui.js";
+import { gatherSupportInfo } from "./support.js";
+import { launchApp, installLauncher } from "./app-launch.js";
 import type { KittenEvent, Lane } from "./events.js";
 import type { ConversationRow } from "./store/conversationStore.js";
 
@@ -37,12 +42,19 @@ const HELP = `${bold("Kitten")} — a reliable local-first coding agent
 
 Usage:
   kitten                     open the interactive session
+  kitten init                first-time setup (check Node, endpoint, model)
   kitten run "<task>"        run one task (persisted + resumable)
   kitten resume [id]         replay a stored conversation
   kitten conversations|ls    list stored conversations
   kitten undo [id]           roll back the last file-changing run (git-backed)
   kitten doctor              check the runtime + endpoint
-  kitten web                 local web UI (later preview)
+  kitten web                 local web UI
+  kitten serve               daemon mode (starts background server)
+  kitten attach              connect TUI to a running daemon
+  kitten support             diagnostic bundle (copy-paste for support)
+  kitten export [id]         export a conversation as Markdown
+  kitten completions <shell>  generate shell completions (bash|zsh|fish|powershell)
+  kitten app [--cwd DIR]    native desktop app (no browser fallback)
   kitten help
 
 run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
@@ -127,6 +139,10 @@ async function cmdRun(rest: string[]): Promise<number> {
   if (continueId) {
     const existing = store.getConversation(continueId);
     if (!existing) { process.stderr.write(`kitten run: no conversation ${continueId}\n`); store.close(); return 1; }
+    if (model && existing.model && model !== existing.model) {
+      process.stderr.write(`kitten run: conversation ${continueId} already runs model ${existing.model}; resume uses the recorded model. Start a new conversation to use --model.\n`);
+      store.close(); return 2;
+    }
     conv = existing;
   } else {
     conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
@@ -219,18 +235,51 @@ function finishUndo(store: ConversationStore, conversationId: string): number {
   return 0;
 }
 
-async function endpointModels(models = DEFAULT_MODELS): Promise<{ reachable: boolean; models: string[] }> {
+interface EndpointDiagnostics {
+  reachable: boolean;
+  models: string[];
+  errorKind: "none" | "refused" | "timeout" | "not_found" | "auth" | "unknown";
+  errorDetail: string;
+  /** Headers that help identify the provider (via response _and_ via error body probe). */
+  providerHint: string;
+}
+
+async function diagnoseEndpoint(models = DEFAULT_MODELS): Promise<EndpointDiagnostics> {
+  const base = { reachable: false, models: [] as string[], errorKind: "unknown" as const, errorDetail: "", providerHint: "" };
   try {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 3000);
+    const t = setTimeout(() => ctrl.abort(), 4000);
     const res = await fetch(`${models.baseUrl.replace(/\/+$/, "")}/models`, {
       headers: { authorization: `Bearer ${models.apiKey ?? "lm-studio"}` }, signal: ctrl.signal,
     });
     clearTimeout(t);
-    if (!res.ok) return { reachable: true, models: [] };
-    const j = await res.json() as { data?: Array<{ id?: string }> };
-    return { reachable: true, models: (j.data ?? []).map((m) => String(m.id ?? "")).filter(Boolean) };
-  } catch { return { reachable: false, models: [] }; }
+    if (res.ok) {
+      const j = await res.json() as { data?: Array<{ id?: string }> };
+      const list = (j.data ?? []).map((m) => String(m.id ?? "")).filter(Boolean);
+      const xLlamaCpp = res.headers.get("x-llama-cpp") ?? "";
+      const provider = xLlamaCpp ? `llama.cpp ${xLlamaCpp}` : "";
+      return { reachable: true, models: list, errorKind: "none", errorDetail: "", providerHint: provider };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { ...base, reachable: true, errorKind: "auth", errorDetail: `HTTP ${res.status} (check KITTEN_API_KEY)` };
+    }
+    if (res.status === 404) {
+      return { ...base, reachable: true, errorKind: "not_found", errorDetail: "endpoint responded but /models returned 404 (not fatal — some providers omit it)" };
+    }
+    return { ...base, reachable: true, errorKind: "unknown", errorDetail: `HTTP ${res.status} ${res.statusText}` };
+  } catch (e) {
+    const msg = (e as Error).message ?? String(e);
+    if (msg.includes("ECONNREFUSED") || msg.includes("Connection refused")) {
+      return { ...base, errorKind: "refused", errorDetail: "connection refused — is the server running on this port?" };
+    }
+    if (msg.includes("ETIMEDOUT") || msg.includes("timeout") || msg.includes("AbortError") || msg.includes("aborted")) {
+      return { ...base, errorKind: "timeout", errorDetail: "timeout — server did not respond in 4s" };
+    }
+    if (msg.includes("ENOTFOUND") || msg.includes("EAI_AGAIN") || msg.includes("getaddrinfo")) {
+      return { ...base, errorKind: "refused", errorDetail: "host not found — check KITTEN_BASE_URL" };
+    }
+    return { ...base, errorKind: "unknown", errorDetail: msg };
+  }
 }
 
 async function cmdDoctor(): Promise<number> {
@@ -263,27 +312,64 @@ async function cmdDoctor(): Promise<number> {
   // Endpoint + model + engine.
   const models = tierSidecar(settings.models);
   const llm = new KittenLLM(models);
-  const ep = await endpointModels(models);
+  const ep = await diagnoseEndpoint(models);
   if (!ep.reachable) {
     bad++;
-    process.stdout.write(`${red("✗")} endpoint unreachable at ${models.baseUrl}  (start LM Studio / llama.cpp, or set KITTEN_BASE_URL)\n`);
+    process.stdout.write(`${red("✗")} endpoint unreachable at ${models.baseUrl}\n`);
+    process.stdout.write(dim(`    ${ep.errorDetail || "unknown error"}\n`));
+    if (ep.errorKind === "refused") {
+      process.stdout.write(dim("    → start LM Studio with a loaded model, or launch: llama-server -m MODEL.gguf --port 1234\n"));
+      process.stdout.write(dim("    → then set: export KITTEN_BASE_URL=http://localhost:1234/v1\n"));
+    } else if (ep.errorKind === "timeout") {
+      process.stdout.write(dim("    → check the port and that no firewall is blocking localhost\n"));
+    }
   } else {
-    process.stdout.write(`${green("✓")} endpoint reachable at ${models.baseUrl}\n`);
+    const providerLine = ep.providerHint ? `  (${ep.providerHint})` : "";
+    if (ep.errorKind === "auth") {
+      bad++;
+      process.stdout.write(`${red("✗")} endpoint auth failed at ${models.baseUrl}\n`);
+      process.stdout.write(dim(`    ${ep.errorDetail}\n`));
+      process.stdout.write(dim("    → set KITTEN_API_KEY (LM Studio default is \"lm-studio\"; llama.cpp has no default key)\n"));
+    } else if (ep.errorKind === "not_found") {
+      process.stdout.write(`${yellow("○")} ${ep.errorDetail}${providerLine}\n`);
+    } else if (!ep.reachable) {
+      bad++;
+      process.stdout.write(`${red("✗")} endpoint at ${models.baseUrl}: ${ep.errorDetail}\n`);
+      process.stdout.write(dim("    → set KITTEN_BASE_URL to your local server, e.g. http://localhost:1234/v1\n"));
+    } else {
+      process.stdout.write(`${green("✓")} endpoint reachable at ${models.baseUrl}${providerLine}\n`);
+    }
     // Ping is authoritative: a llama.cpp single-model server advertises the .gguf path in /v1/models but
     // accepts ANY model id and returns the loaded model — so an id-list mismatch is NOT "model missing".
-    const responds = await llm.ping(models.main);
-    if (responds) {
-      const engine = await llm.detectEngine();
-      const advertised = ep.models.length === 0 || ep.models.includes(models.main);
-      const note = advertised ? "" : "  (server advertises a different id but accepts this one)";
-      process.stdout.write(`${green("✓")} model '${models.main}' responds${note}  (engine: ${engine}${engine === "llamacpp" ? " — grammar/min-p/logprobs available" : ""})\n`);
-    } else if (ep.models.length && !ep.models.includes(models.main)) {
-      bad++;
-      process.stdout.write(`${red("✗")} model '${models.main}' not loaded and no probe response  (available: ${ep.models.slice(0, 4).map((m) => m.split(/[\\/]/).pop()).join(", ") || "none"}; set KITTEN_MAIN_MODEL)\n`);
-    } else {
-      bad++;
-      process.stdout.write(`${red("✗")} model '${models.main}' did not respond to a probe\n`);
+    if (ep.reachable && ep.errorKind !== "auth") {
+      const responds = await llm.ping(models.main);
+      if (responds) {
+        const engine = await llm.detectEngine();
+        const advertised = ep.models.length === 0 || ep.models.includes(models.main);
+        const note = advertised ? "" : "  (server advertises a different id but accepts this one)";
+        process.stdout.write(`${green("✓")} model '${models.main}' responds${note}\n`);
+        const engineLabel = engine === "llamacpp" ? "llama.cpp (native — grammar/min-p/logprobs/cache-prompt available)" : "OpenAI-compatible proxy";
+        process.stdout.write(dim(`    engine: ${engineLabel}\n`));
+        if (engine === "llamacpp") {
+          process.stdout.write(dim("    → streaming, constraint bans, and prompt-cache reuse are available\n"));
+        }
+        if (!advertised && ep.models.length) {
+          process.stdout.write(dim(`    (advertised: ${ep.models.slice(0, 4).map((m) => m.split(/[\\/]/).pop()).join(", ")})\n`));
+        }
+      } else if (ep.models.length && !ep.models.includes(models.main)) {
+        bad++;
+        process.stdout.write(`${red("✗")} model '${models.main}' not loaded and probe failed\n`);
+        process.stdout.write(dim(`    available: ${ep.models.slice(0, 5).map((m) => m.split(/[\\/]/).pop()).join(", ") || "none"}\n`));
+        process.stdout.write(dim(`    → set KITTEN_MAIN_MODEL to an available model name (e.g. export KITTEN_MAIN_MODEL="${ep.models[0]?.split(/[\\/]/).pop() ?? "ornith"}")\n`));
+      } else {
+        bad++;
+        process.stdout.write(`${red("✗")} model '${models.main}' did not respond — verify the model is loaded\n`);
+      }
     }
+  }
+  // Show the resolved model name if set, otherwise default.
+  if (!settings.models.main || settings.models.main === DEFAULT_MODELS.main) {
+    process.stdout.write(dim("○ no KITTEN_MAIN_MODEL set — using default (set it to your loaded model name)\n"));
   }
 
   // Git (affects /undo).
@@ -294,6 +380,89 @@ async function cmdDoctor(): Promise<number> {
   return bad ? 1 : 0;
 }
 
+async function cmdInit(): Promise<number> {
+  process.stdout.write(bold("Kitten") + dim(" — first-time setup") + "\n\n");
+  process.stdout.write(dim("Checks Node, storage, endpoint, and model. ")
+    + "On a clean machine, export two env vars first:\n\n"
+    + dim("  export KITTEN_BASE_URL=http://localhost:1234/v1\n")
+    + dim("  export KITTEN_MAIN_MODEL=ornith-1.0-35b\n\n"));
+  const code = await cmdDoctor();
+  process.stdout.write("\n" + dim("To run your first task:") + "\n");
+  process.stdout.write(dim("  kitten run \"write a hello.py that prints a greeting\"") + "\n");
+  process.stdout.write(dim("Or open the interactive session: kitten") + "\n");
+  return code;
+}
+
+function cmdExport(rest: string[]): number {
+  const id = rest.find((a) => !a.startsWith("--"));
+  const store = ConversationStore.open(storePath());
+  if (!id) {
+    const convs = store.listConversations({ limit: 10 });
+    if (!convs.length) { process.stdout.write("no conversations to export\n"); store.close(); return 0; }
+    process.stdout.write("export one of:\n");
+    for (const c of convs) process.stdout.write(`  ${c.id}  ${c.title}\n`);
+    store.close();
+    return 0;
+  }
+  const conv = store.getConversation(id);
+  if (!conv) { process.stderr.write(`kitten export: no conversation ${id}\n`); store.close(); return 1; }
+  const events = store.readEvents(id);
+  const runs = store.listRuns(id);
+  const lines: string[] = [`# ${conv.title}`, `_kitten conversation ${id} · model: ${conv.model}_\n`];
+  for (const e of events) {
+    if (e.type === "user.message") lines.push(`\n## You — ${new Date(e.ts).toLocaleTimeString()}\n${e.text}`);
+    if (e.type === "assistant.final") lines.push(`\n## Kitten — ${new Date(e.ts).toLocaleTimeString()}\n${e.text}`);
+  }
+  const markdown = lines.join("\n");
+  const slug = conv.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 32);
+  const outPath = resolve(process.cwd(), `${slug}-${id.slice(-8)}.md`);
+  writeFileSync(outPath, markdown, "utf8");
+  process.stdout.write(`exported to ${outPath}\n`);
+  store.close();
+  return 0;
+}
+
+function cmdCompletions(rest: string[]): number {
+  const shell = rest[0] || "bash";
+  const allCommands = ["run", "resume", "conversations", "ls", "undo", "doctor", "init", "web", "serve", "attach", "help", "support", "export", "completions", "app", "repl"];
+  const flags = ["--cwd", "--model", "--lane", "--k", "--json", "--dangerous", "--yes", "--conversation", "-c", "--port", "--no-open", "--replace", "--print-connection", "--url", "--token"];
+  switch (shell) {
+    case "bash":
+      process.stdout.write(`# kitten bash completion\ncomplete -W "${allCommands.join(" ")}" kitten\n`);
+      break;
+    case "zsh":
+      process.stdout.write(`#compdef kitten\n_arguments "1: :(${allCommands.join(" ")})" "*: :(${flags.join(" ")})"\n`);
+      break;
+    case "fish":
+      process.stdout.write(`complete -c kitten -f -a "${allCommands.join(" ")}"\n`);
+      for (const f of flags) process.stdout.write(`complete -c kitten -l "${f.replace(/^--/, "")}"\n`);
+      break;
+    case "powershell":
+      process.stdout.write(`Register-ArgumentCompleter -Native -CommandName kitten -ScriptBlock {
+  param(\$wordToComplete, \$commandAst, \$cursorPosition)
+  ${allCommands.map((c) => `"${c}"`).join("; ")} | Where-Object { \$_ -like \$wordToComplete + '*' } | ForEach-Object { [System.Management.Automation.CompletionResult]::new(\$_) }
+}\n`);
+      break;
+    default:
+      process.stderr.write(`kitten completions: unknown shell '${shell}' (use bash|zsh|fish|powershell)\n`);
+      return 1;
+  }
+  return 0;
+}
+
+async function cmdApp(rest: string[]): Promise<number> {
+  const install = rest.includes("--install");
+  const dryRun = rest.includes("--dry-run");
+  const cwdFlag = rest.indexOf("--cwd");
+  const cwd = cwdFlag >= 0 ? rest[cwdFlag + 1] : undefined;
+  if (install) {
+    await installLauncher({ install: true, dryRun });
+    return 0;
+  }
+  await launchApp({ cwd });
+  return 0;
+}
+
 async function main(argv: string[]): Promise<number> {
   const [cmd, ...rest] = argv;
   switch (cmd) {
@@ -302,9 +471,17 @@ async function main(argv: string[]): Promise<number> {
     case "conversations": case "ls": return cmdConversations(rest);
     case "undo": return cmdUndo(rest);
     case "doctor": return await cmdDoctor();
+    case "init": return await cmdInit();
     case "web": await runWeb(rest); return 0;
+    case "serve": await runServe(rest); return 0;
+    case "attach": await runAttach(rest); return 0;
+    case "support": process.stdout.write((await gatherSupportInfo()) + "\n"); return 0;
+    case "export": return cmdExport(rest);
+    case "completions": return cmdCompletions(rest);
+    case "app": return await cmdApp(rest);
     case "repl": await runRepl(rest); return 0; // the minimal readline REPL (compatibility)
     case "help": case "--help": case "-h": process.stdout.write(HELP); return 0;
+    case "version": case "--version": case "-v": process.stdout.write(VERSION + "\n"); return 0;
     case undefined: await runTui([]); return 0; // bare `kitten` → the full TUI
     default:
       // Unknown leading token → treat the whole argv as a one-shot task (back-compat with `kitten "<task>"`).
@@ -312,6 +489,10 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
+process.on("unhandledRejection", (reason) => {
+  process.stderr.write(`kitten fatal: unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}\n`);
+  process.exit(1);
+});
 main(process.argv.slice(2)).then((code) => process.exit(code)).catch((e) => {
   process.stderr.write(`kitten fatal: ${e?.stack ?? e}\n`);
   process.exit(1);

@@ -35,8 +35,18 @@ export interface ContextBudget {
 export const DEFAULT_CONTEXT_BUDGET: ContextBudget = {
   windowTokens: 16384,
   reserveTokens: 8000,
-  maxPreambleTokens: 1800,
+  maxPreambleTokens: 5600,
 };
+
+/** Derive a safe history budget from the configured model context window. Larger local models can
+ * use more durable context without starving the current task; small windows keep the old compact
+ * floor so prompts do not crowd out tool results. */
+export function contextBudgetForWindow(windowTokens: number): ContextBudget {
+  const window = Math.max(4096, Math.min(131072, Math.floor(Number.isFinite(windowTokens) ? windowTokens : DEFAULT_CONTEXT_BUDGET.windowTokens)));
+  const reserveTokens = Math.min(8000, Math.max(3000, Math.floor(window * 0.45)));
+  const maxPreambleTokens = Math.min(8000, Math.max(1800, Math.floor(window * 0.35)));
+  return { windowTokens: window, reserveTokens, maxPreambleTokens };
+}
 
 const approxTokens = (s: string): number => Math.ceil(s.length / 4);
 
@@ -53,8 +63,12 @@ interface TurnDigest {
 export class ContextBuilder {
   constructor(
     private readonly store: ConversationStore,
-    private readonly budget: ContextBudget = DEFAULT_CONTEXT_BUDGET,
+    private budget: ContextBudget = DEFAULT_CONTEXT_BUDGET,
   ) {}
+
+  setWindowTokens(windowTokens: number): void {
+    this.budget = contextBudgetForWindow(windowTokens);
+  }
 
   /**
    * Build the model-facing context for the NEXT message in `conversationId`. `currentUserText` is the

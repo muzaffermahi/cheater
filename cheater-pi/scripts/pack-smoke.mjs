@@ -41,6 +41,12 @@ try {
   const help = run(bin, ["help"], { cwd: proj, env });
   if (!/Usage:/.test(help) || !/kitten run/.test(help)) fail("help output missing");
 
+  log("• kitten init …");
+  let init = "";
+  try { init = run(bin, ["init"], { cwd: proj, env }); } catch (e) { init = e.stdout ?? ""; }
+  if (!/first-time setup/.test(init)) fail("init did not show setup banner");
+  if (!/store writable at/.test(init)) fail("init did not report the store");
+
   log("• kitten doctor …");
   // doctor exits nonzero when the (deliberately dead) endpoint is unreachable — that's expected here;
   // we assert on its OUTPUT, not its exit code.

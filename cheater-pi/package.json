@@ -1,11 +1,11 @@
 {
   "name": "@cheater/cheater-pi",
   "version": "0.7.0",
-  "description": "Kitten — a reliable local-first coding agent (terminal + web UI) for local models, with durable conversations and an adaptive reliability engine.",
+  "description": "Kitten — a reliable native desktop coding agent for local models, with durable conversations, sidecar orchestration, and an adaptive reliability engine.",
   "type": "module",
   "bin": {
     "kitten": "./dist/src/core/kitten.js",
-    "cheater": "./dist/src/index.js"
+    "cheater": "./dist/src/core/cheaterAlias.js"
   },
   "keywords": [
     "kitten",
@@ -27,50 +27,54 @@
     "url": "https://github.com/muzaffermahi/cheater/issues"
   },
   "files": [
-    "dist",
-    "src",
-    "prompts",
-    "skills",
-    "themes",
+    "dist/src/core",
+    "dist/src/config.js",
+    "dist/src/config.d.ts",
+    "dist/src/autopilot/classifier.js",
+    "dist/src/autopilot/classifier.d.ts",
+    "dist/src/autopilot/types.js",
+    "dist/src/autopilot/types.d.ts",
+    "dist/src/blueprint/config.js",
+    "dist/src/blueprint/config.d.ts",
+    "dist/src/commitlet/config.js",
+    "dist/src/commitlet/config.d.ts",
+    "dist/src/reliability",
+    "dist/src/runstate",
+    "dist/src/runtime",
+    "dist/src/ui",
+    "dist/src/types.js",
+    "dist/src/types.d.ts",
+    "README.md",
     "LICENSE",
-    "README.md"
+    "scripts/pack-smoke.mjs",
+    "scripts/cleanroom-smoke.mjs",
+    "scripts/zero-dep-gate.mjs",
+    "scripts/version-check.mjs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "prepack": "npm run build",
+    "desktop-engine": "npm run build && node dist/src/core/desktopEngine.js",
+    "package-desktop": "npm run build && node scripts/package-desktop.mjs",
+    "native-engine-smoke": "node scripts/native-engine-smoke.mjs",
+    "package-desktop-release": "powershell -ExecutionPolicy Bypass -File scripts/package-desktop-release.ps1",
+    "zero-dep-gate": "node scripts/zero-dep-gate.mjs",
+    "version-check": "node scripts/version-check.mjs",
+    "cleanroom-smoke": "node scripts/cleanroom-smoke.mjs",
+    "prepack": "npm run build && npm run zero-dep-gate",
     "smoke": "node scripts/pack-smoke.mjs",
     "kitten": "node dist/src/core/kitten.js"
   },
   "engines": {
     "node": ">=22.5.0"
   },
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.2",
-    "@earendil-works/pi-tui": "^0.80.2"
-  },
-  "peerDependencies": {
-    "typebox": "*"
-  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-tui": "^0.80.2",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.0",
     "typebox": "^1.3.1"
-  },
-  "pi": {
-    "extensions": [
-      "./src/extension.ts"
-    ],
-    "skills": [
-      "./skills"
-    ],
-    "prompts": [
-      "./prompts"
-    ],
-    "themes": [
-      "./themes"
-    ]
   }
 }

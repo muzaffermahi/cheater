@@ -72,6 +72,8 @@ export interface AscentConfig {
   /** Measurement hook (D1): awaited with all candidate workspaces + the verdict BEFORE cleanup, so a
    *  rig can oracle-score every candidate (pass@k) not just the winner. */
   onVerified?: (ctx: { attempts: BurstAttempt[]; verdict: { winner: number | null; slate: Array<{ index: number }> } }) => void | Promise<void>;
+  /** Durable candidate cards for the desktop/app event stream. */
+  onCandidate?: (event: { phase: "started" | "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
 }
 
 export interface AscentParams {
@@ -87,6 +89,8 @@ export interface AscentParams {
   contextPreamble?: string;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
+  /** Effective model ID for this run. Passed through to cloudBurstGenerate per-call ChatParams. */
+  model?: string;
 }
 
 export interface AscentResult {
@@ -100,6 +104,7 @@ export interface AscentResult {
   rounds: number;
   receipts: string[];
   usage: { prompt: number; completion: number; reasoning: number };
+  formatRescues?: number;
   wallMs: number;
 }
 
@@ -261,7 +266,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
     if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
     const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
+      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
         decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
@@ -274,6 +279,9 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     const indexBase = allAttempts.length;
     attempts.forEach((a, j) => { a.index = indexBase + j + 1; });
     allAttempts = allAttempts.concat(attempts);
+    for (const attempt of attempts) {
+      try { await config.onCandidate?.({ phase: "started", attempt }); } catch { /* telemetry-free UI hook */ }
+    }
 
     // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
     // not enough — a candidate can pass its own finish gate yet be wrong on the worked examples, and
@@ -332,6 +340,21 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const verdict = await verifier.verify(candidates);
   receipts.push(...verifierReceiptLines(verdict));
 
+  for (const attempt of allAttempts) {
+    const signal = verdict.slate.find((entry) => entry.index === attempt.index);
+    const participated = survivorsByIndex.has(attempt.index);
+    try {
+      await config.onCandidate?.({
+        phase: participated ? "completed" : "rejected",
+        attempt,
+        reason: participated ? undefined : "removed by cascade before verification",
+      });
+      if (participated && signal && !signal.executionEligible) {
+        await config.onCandidate?.({ phase: "rejected", attempt, reason: signal.receipt.slice(-2).join("; ") || "failed execution eligibility" });
+      }
+    } catch { /* candidate cards are advisory and never change the grade */ }
+  }
+
   const winnerAttempt = verdict.winner ? survivorsByIndex.get(verdict.winner) ?? null : null;
   if (winnerAttempt) adoptWorkspace(params.cwd, winnerAttempt.workspace);
 
@@ -351,6 +374,8 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
 
   receipts.push(...governor.receiptLines());
   const usage = allAttempts.reduce((u, a) => ({ prompt: u.prompt + a.result.usage.prompt, completion: u.completion + a.result.usage.completion, reasoning: u.reasoning + a.result.usage.reasoning }), { prompt: 0, completion: 0, reasoning: 0 });
+  const formatRescues = allAttempts.reduce((total, attempt) => total + (attempt.result.formatRescues ?? 0), 0);
+  if (formatRescues > 0) receipts.push(`format rescues: ${formatRescues} optional structured-output constraint(s) removed after endpoint rejection`);
 
   const result: AscentResult = {
     finished: !!winnerAttempt && verdict.winnerHasExecutionReceipt,
@@ -358,7 +383,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     winner: verdict.winner,
     selector: verdict.selector,
     winnerHasExecutionReceipt: verdict.winnerHasExecutionReceipt,
-    family, samples, rounds: round, receipts, usage, wallMs: Date.now() - started
+    family, samples, rounds: round, receipts, usage, ...(formatRescues ? { formatRescues } : {}), wallMs: Date.now() - started
   };
 
   // Measurement hook (D1): let a rig oracle-score every candidate workspace before they're removed.

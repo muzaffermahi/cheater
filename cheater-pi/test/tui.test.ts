@@ -25,7 +25,7 @@ test("TUI renders the header + mascot and handles slash commands", () => {
   assert.match(out, /Kitten/);
   assert.match(out, /reliable local-first coding agent/);
   assert.match(out, /Commands:/);         // /help dispatched
-  assert.match(out, /conversation conv_/); // a conversation was created + persisted
+  assert.match(out, /type a task or \/help/); // no conversation created at startup
 });
 
 test("TUI routes a question to the answer lane without a model", () => {
@@ -36,5 +36,5 @@ test("TUI routes a question to the answer lane without a model", () => {
 
 test("TUI /conversations lists the persisted session", () => {
   const out = runTui("/conversations\n/exit\n").replace(/\x1b\[[0-9;]*m/g, "");
-  assert.match(out, /conv_/);
+  assert.match(out, /no conversations yet/);
 });

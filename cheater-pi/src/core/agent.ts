@@ -77,6 +77,10 @@ export interface AgentRunParams {
    *  consensus, repair) supplies the correctness, not the model's CoT. Thinking is auto-RE-ENABLED once
    *  the finish gate rejects a "done" (repair genuinely needs reasoning). Native `--jinja` server only. */
   disableThinking?: boolean;
+  /** Main-agent delegation hook; omitted for isolated/read-only workers. */
+  spawnTask?: ToolContext["spawnTask"];
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 export interface AgentRunResult {
@@ -90,6 +94,8 @@ export interface AgentRunResult {
   filesWritten: string[];
   events: AgentEvent[];
   usage: { prompt: number; completion: number; reasoning: number };
+  /** Number of times the endpoint rejected structured output and the client used a bounded fallback. */
+  formatRescues?: number;
   wallMs: number;
   stopReason: "finish" | "max_turns" | "error" | "stalled" | "aborted";
   /** P1: self-certainty aggregated over the trajectory (0.5 if not captured). Verifier tiebreaker. */
@@ -116,7 +122,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const tools = params.tools ?? CORE_TOOLS;
   const events: AgentEvent[] = [];
   const emit = (e: AgentEvent): void => { events.push(e); params.onEvent?.(e); };
-  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal };
+  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal, spawnTask: params.spawnTask, allowedFiles: params.allowedFiles, forbiddenFiles: params.forbiddenFiles };
   resetNounGate();
 
   // Ground the model in its real environment. Without this, a small model invents a cwd (observed
@@ -134,6 +140,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;
   const usage = { prompt: 0, completion: 0, reasoning: 0 };
   let toolCalls = 0;
+  let formatRescues = 0;
   let finished = false;
   let summary = "";
   let stopReason: AgentRunResult["stopReason"] = "max_turns";
@@ -190,6 +197,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       result = await llm.chat(chatParams);
     }
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;
+    formatRescues += result.formatRescues ?? 0;
     if (params.captureConfidence && result.logprobs?.length) logprobChunks.push(result.logprobs);
 
     if (!result.ok) {
@@ -312,6 +320,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
     filesWritten: [...ctx.filesWritten],
     events,
     usage,
+    ...(formatRescues ? { formatRescues } : {}),
     wallMs: Date.now() - started,
     stopReason,
     confidence: params.captureConfidence ? aggregateSelfCertainty(logprobChunks) : undefined

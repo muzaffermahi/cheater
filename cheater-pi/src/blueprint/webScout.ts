@@ -1,3 +1,25 @@
+// Web-scout search-trigger detection.
+//
+// Analysing a task's text, failure signals, known libraries, and manifest dependencies to decide
+// whether the harness should augment a worker's context with a web search. A trigger is a
+// structured signal (kind + reason + evidence weight) consumed by the web-augment pipeline
+// (core/webAugment.ts) — it gates a real DuckDuckGo-lite lookup, filters results to the
+// allow-listed domains, fetches the page text, and injects a bounded number of receipts into
+// the worker capsule. Every trigger is advisory and offline-safe: when the web augment is down,
+// the trigger is a no-op.
+//
+// Trigger kinds (by weight, highest first):
+//   1. exact_error           — an error string in the failure signal or user goal
+//   2. insufficient_local_evidence — repair rounds with no remaining local evidence
+//   3. unknown_package        — the goal mentions an unrecognised import/attribute/name
+//   4. version_sensitive      — version/upgrade/migration/deprecation keywords
+//   5. framework_uncertainty   — "how to / best practice / which one" questions
+//   6. external_test_failure  — a failure with only remote context (task type, no local signals)
+//   7. user_requested_search   — explicit "search the web / look it up" instructions
+//   8. repeated_failed_verification — 2+ local passes failed on the same boundary
+//
+// The detection is pure regex + local data — zero model cost, zero network calls.
+
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
