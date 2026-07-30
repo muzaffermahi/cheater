@@ -11,13 +11,28 @@ namespace Kitten.Desktop;
 
 public partial class MainWindow : Window
 {
-    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId)
+    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId, long UpdatedAt)
     {
         public override string ToString()
         {
             var branch = string.IsNullOrWhiteSpace(ParentConversationId) ? "" : "↳ ";
             var role = string.IsNullOrWhiteSpace(Agent) || string.Equals(Agent, "general", StringComparison.OrdinalIgnoreCase) ? "" : $"[{Agent}] ";
             return $"{branch}{role}{Title}";
+        }
+
+        /// <summary>Recency, because several sessions in one project often share the same opening line.</summary>
+        public string Age
+        {
+            get
+            {
+                if (UpdatedAt <= 0) return "";
+                var elapsed = DateTimeOffset.UtcNow - DateTimeOffset.FromUnixTimeMilliseconds(UpdatedAt);
+                if (elapsed < TimeSpan.Zero) return "now";
+                if (elapsed.TotalMinutes < 1) return "now";
+                if (elapsed.TotalHours < 1) return $"{(int)elapsed.TotalMinutes}m";
+                if (elapsed.TotalDays < 1) return $"{(int)elapsed.TotalHours}h";
+                return elapsed.TotalDays < 7 ? $"{(int)elapsed.TotalDays}d" : DateTimeOffset.FromUnixTimeMilliseconds(UpdatedAt).ToLocalTime().ToString("d MMM");
+            }
         }
     }
 
@@ -87,14 +102,14 @@ public partial class MainWindow : Window
             if (_engine is null) throw last ?? new InvalidOperationException("the local engine did not connect");
             _engine.EventReceived += OnEngineEvent;
             _engine.Disconnected += OnEngineDisconnected;
-            ConnectionText.Text = "Engine connected";
+            SetEngineState(EngineState.Connected, "Engine connected");
             RetryEngineButton.IsEnabled = false;
             await RefreshModelStatusAsync();
             await RefreshConversationsAsync();
         }
         catch (Exception ex)
         {
-            ConnectionText.Text = $"Engine unavailable: {ex.Message}";
+            SetEngineState(EngineState.Failed, $"Engine unavailable: {ex.Message}");
             Activity.Text = "Install a complete Kitten package or repair the local engine.";
             RetryEngineButton.IsEnabled = true;
         }
@@ -122,7 +137,8 @@ public partial class MainWindow : Window
                 item.TryGetProperty("title", out var title) ? title.GetString() ?? "Untitled" : "Untitled",
                 item.TryGetProperty("projectRoot", out var root) ? root.GetString() ?? "" : "",
                 item.TryGetProperty("agent", out var agent) ? agent.GetString() ?? "general" : "general",
-                item.TryGetProperty("parentConversationId", out var parent) && parent.ValueKind == JsonValueKind.String ? parent.GetString() : null));
+                item.TryGetProperty("parentConversationId", out var parent) && parent.ValueKind == JsonValueKind.String ? parent.GetString() : null,
+                item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0));
         }
         ConversationList.ItemsSource = null;
         ConversationList.ItemsSource = _conversationItems;
@@ -131,7 +147,7 @@ public partial class MainWindow : Window
         else
         {
             _conversationId = null;
-            ProjectText.Text = "No project selected";
+            SetProject(null);
             _transcript.ShowSystem("Welcome to Kitten.\n\nOpen a project to start a durable coding task. Kitten will inspect the workspace, use the sidecar for bounded planning, and keep the main model focused on implementation.\n\nYou can configure a local endpoint or managed llama.cpp runtime from Configure in the Model controls.");
             Evidence.Text = "Open a project to begin.";
             Activity.Text = "Ready — open a project to start.";
@@ -151,16 +167,22 @@ public partial class MainWindow : Window
             var main = models.TryGetProperty("main", out var mainValue) ? mainValue.GetString() : "unknown";
             var sidecar = models.TryGetProperty("sidecar", out var sidecarValue) ? sidecarValue.GetString() : "none";
             var sidecarEndpoint = models.TryGetProperty("sidecarBaseUrl", out var sidecarEndpointValue) && sidecarEndpointValue.ValueKind == JsonValueKind.String ? sidecarEndpointValue.GetString() : null;
-            ModelText.Text = $"Main: {main}\nSidecar: {sidecar}" + (string.IsNullOrWhiteSpace(sidecarEndpoint) ? "" : $"\nSidecar endpoint: {sidecarEndpoint}");
+            // The status line is one line. Everything else that used to be crammed into it — history
+            // budget, hardware guidance, bakeoff winners, runtime state — is detail on hover, because a
+            // five-line block wedged into a 24px strip is unreadable and pushed the layout around.
+            var line = new List<string> { main ?? "unknown", $"sidecar {(string.IsNullOrWhiteSpace(sidecar) ? "none" : sidecar)}" };
+            var detail = new List<string> { $"Main model: {main}", $"Sidecar model: {(string.IsNullOrWhiteSpace(sidecar) ? "none" : sidecar)}" };
+            if (!string.IsNullOrWhiteSpace(sidecarEndpoint)) detail.Add($"Sidecar endpoint: {sidecarEndpoint}");
             if (value.TryGetProperty("contextWindowTokens", out var contextValue) && contextValue.ValueKind == JsonValueKind.Number)
             {
                 var contextTokens = contextValue.GetInt32();
                 var historyBudget = Math.Min(8000, Math.Max(1800, (int)(contextTokens * 0.35)));
-                ModelText.Text += $"\nHistory budget: ~{historyBudget:n0} / {contextTokens:n0} context tokens";
+                line.Add($"{contextTokens / 1000}k ctx");
+                detail.Add($"History budget: ~{historyBudget:n0} of {contextTokens:n0} context tokens");
             }
             var recommendation = await _engine.CallAsync("model.recommend");
             if (recommendation is { } guidance && guidance.ValueKind == JsonValueKind.Object && guidance.TryGetProperty("summary", out var summary))
-                ModelText.Text += $"\n{summary.GetString()}";
+                detail.Add(summary.GetString() ?? "");
             if (recommendation is { } bakeoffGuidance && bakeoffGuidance.ValueKind == JsonValueKind.Object && bakeoffGuidance.TryGetProperty("latestBakeoff", out var latestBakeoff) && latestBakeoff.ValueKind == JsonValueKind.Object && latestBakeoff.TryGetProperty("recommendations", out var latestRecommendations) && latestRecommendations.ValueKind == JsonValueKind.Array && latestRecommendations.GetArrayLength() > 0)
             {
                 var winners = latestRecommendations.EnumerateArray().Select(item =>
@@ -170,14 +192,17 @@ public partial class MainWindow : Window
                     var score = item.TryGetProperty("qualityScore", out var scoreValue) && scoreValue.ValueKind == JsonValueKind.Number ? $" {scoreValue.GetDouble():P0}" : "";
                     return $"{role}={model}{score}";
                 });
-                ModelText.Text += $"\nLast bakeoff: {string.Join(", ", winners)}";
+                detail.Add($"Last bakeoff: {string.Join(", ", winners)}");
             }
             var runtime = await _engine.CallAsync("runtime.status");
             if (runtime is { } runtimeValue && runtimeValue.ValueKind == JsonValueKind.Object && runtimeValue.TryGetProperty("running", out var running))
-                ModelText.Text += $"\nManaged runtime: {(running.GetBoolean() ? "running" : "stopped")}";
+                detail.Add($"Managed runtime: {(running.GetBoolean() ? "running" : "stopped")}");
             var probe = await _engine.CallAsync("model.probe", new { projectRoot });
-            if (probe is { } probeValue && probeValue.ValueKind == JsonValueKind.Object && probeValue.TryGetProperty("reachable", out var reachable) && !reachable.GetBoolean())
-                ModelText.Text += "\nEndpoint offline — click Configure to connect a local runtime.";
+            var offline = probe is { } probeValue && probeValue.ValueKind == JsonValueKind.Object && probeValue.TryGetProperty("reachable", out var reachable) && !reachable.GetBoolean();
+            // An unreachable endpoint is the one model fact that has to be visible without hovering.
+            if (offline) line.Add("endpoint offline — open Model settings");
+            ModelText.Text = string.Join("  ·  ", line);
+            ToolTip.SetTip(ModelText, string.Join("\n", detail.Where(entry => !string.IsNullOrWhiteSpace(entry))));
         }
         catch (Exception ex) { ModelText.Text = $"Models unavailable: {ex.Message}"; }
     }
@@ -194,6 +219,7 @@ public partial class MainWindow : Window
                 : null;
             _lastBakeoffReportPath = path;
             ViewBakeoffReportButton.IsEnabled = !string.IsNullOrWhiteSpace(path);
+            ShowBakeoffSection(!string.IsNullOrWhiteSpace(path));
         }
         catch { /* report history is advisory and must never block project activation */ }
     }
@@ -307,6 +333,7 @@ public partial class MainWindow : Window
         if (_activeBakeoffId is not null) return;
         _activeBakeoffId = $"model-bakeoff-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
         CancelBakeoffButton.IsEnabled = true;
+        ShowBakeoffSection(true);
         try
         {
             Activity.Text = "Running full local-model bakeoff (coding + held-out project tasks; up to 90 seconds per request)...";
@@ -1548,7 +1575,7 @@ public partial class MainWindow : Window
             _activeVerificationId = null;
             RunChecksButton.IsEnabled = false;
             CancelChecksButton.IsEnabled = false;
-            ProjectText.Text = item.ProjectRoot;
+            SetProject(item.ProjectRoot);
             _activeRunId = null;
             _lastCompletedRunId = null;
             UndoButton.IsEnabled = false;
@@ -1590,6 +1617,8 @@ public partial class MainWindow : Window
         if (events is null || events.Value.ValueKind != JsonValueKind.Array) return;
         var text = new StringBuilder();
         var streamedRuns = new HashSet<string>();
+        var replayedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? historicReceipt = null;
         string? historicPostflight = null;
         string? historicVerificationOutputText = null;
         foreach (var frame in events.Value.EnumerateArray())
@@ -1612,8 +1641,28 @@ public partial class MainWindow : Window
                     if (!streamedRuns.Contains(runId)) { text.Append("Kitten: "); streamedRuns.Add(runId); }
                     if (frame.TryGetProperty("text", out var delta)) text.Append(delta.GetString() ?? "");
                     break;
+                case "tool.completed":
+                    // Replayed history has to show the work, not just the conclusion.
+                    text.Append(TranscriptView.ToolLine(
+                        frame.TryGetProperty("name", out var toolName) ? toolName.GetString() ?? "tool" : "tool",
+                        frame.TryGetProperty("target", out var toolTarget) ? toolTarget.GetString() ?? "" : "",
+                        !frame.TryGetProperty("ok", out var toolOk) || toolOk.ValueKind != JsonValueKind.False,
+                        frame.TryGetProperty("durationMs", out var toolMs) && toolMs.ValueKind == JsonValueKind.Number ? toolMs.GetInt64() : 0,
+                        frame.TryGetProperty("output", out var toolOutput) ? toolOutput.GetString() ?? "" : ""));
+                    break;
                 case "file.changed":
-                    if (frame.TryGetProperty("path", out var path)) text.Append($"Changed {path.GetString()}\n");
+                    // Changed files belong to the CHANGES panel; appending them to the transcript text
+                    // merged them into whichever card was open (the user's own message, typically).
+                    if (frame.TryGetProperty("path", out var path)) replayedFiles.Add(path.GetString() ?? "");
+                    break;
+                case "receipt.finalized":
+                    // A replayed session has receipts; the panel used to claim they would "appear after a
+                    // run" while the evidence for that very run sat unread in the event log.
+                    if (frame.TryGetProperty("lines", out var replayReceipt) && replayReceipt.ValueKind == JsonValueKind.Array)
+                    {
+                        var lines = replayReceipt.EnumerateArray().Where(line => line.ValueKind == JsonValueKind.String).Select(line => line.GetString() ?? "").Where(line => line.Length > 0).ToArray();
+                        if (lines.Length > 0) historicReceipt = string.Join("\n", lines);
+                    }
                     break;
                 case "run.completed":
                     var historicVerified = frame.TryGetProperty("verified", out var historicVerifiedValue) && historicVerifiedValue.ValueKind == JsonValueKind.True;
@@ -1622,7 +1671,7 @@ public partial class MainWindow : Window
                     var historicSummary = frame.TryGetProperty("summary", out var historicSummaryValue) ? historicSummaryValue.GetString() : "";
                     var historicWall = frame.TryGetProperty("wallMs", out var historicWallValue) && historicWallValue.ValueKind == JsonValueKind.Number ? frame.GetProperty("wallMs").GetInt64() : 0;
                     _lastCompletedRunId = runId;
-                    text.Append($"Outcome: {historicGrade} · {historicWall} ms\n{historicSummary}\n\n");
+                    text.Append($"Outcome: {historicGrade} · {Duration(historicWall)}\n{historicSummary}\n\n");
                     break;
                 case "run.failed":
                     text.Append($"Outcome: failed — {(frame.TryGetProperty("error", out var historicError) ? historicError.GetString() : "unknown error")}\n\n");
@@ -1673,8 +1722,12 @@ public partial class MainWindow : Window
             }
         }
         _transcript.Replay(text.ToString());
+        // A replayed session reports the files that session touched, instead of claiming "no changes".
+        SetChangesSummary(replayedFiles.Count, 0, 0);
         if (historicPostflight is not null && !string.IsNullOrWhiteSpace(historicVerificationOutputText)) historicPostflight += $"\n\n{historicVerificationOutputText}";
-        if (historicPostflight is not null) Evidence.Text = historicPostflight;
+        // The run's own receipt is the primary evidence; a sidecar postflight review adds to it.
+        var evidence = string.Join("\n\n", new[] { historicReceipt, historicPostflight }.Where(entry => !string.IsNullOrWhiteSpace(entry)));
+        if (!string.IsNullOrWhiteSpace(evidence)) Evidence.Text = evidence;
         _assistantStreamed = false;
     }
 
@@ -1704,7 +1757,7 @@ public partial class MainWindow : Window
         {
             var lost = _engine;
             _engine = null;
-            ConnectionText.Text = "Engine disconnected";
+            SetEngineState(EngineState.Failed, "Engine disconnected");
             Activity.Text = $"The local engine stopped; no new work will start. Click Retry engine to reconnect.{(error is null ? "" : $" ({error.Message})")}";
             RetryEngineButton.IsEnabled = true;
             _ = lost?.DisposeAsync();
@@ -1832,13 +1885,23 @@ public partial class MainWindow : Window
                         foreach (var file in receiptFiles.EnumerateArray()) if (file.ValueKind == JsonValueKind.String) _activeRunFiles.Add(file.GetString() ?? "");
                     break;
                 case "tool.started": Activity.Text = payload.TryGetProperty("name", out var tool) ? $"Using {tool.GetString()}" : "Running tool"; break;
+                case "tool.completed":
+                    // The step lands in the transcript the moment it finishes, so the conversation shows
+                    // the actual work — which files were read, what was edited, which command ran.
+                    _transcript.AddTool(
+                        payload.TryGetProperty("name", out var doneName) ? doneName.GetString() ?? "tool" : "tool",
+                        payload.TryGetProperty("target", out var doneTarget) ? doneTarget.GetString() ?? "" : "",
+                        !payload.TryGetProperty("ok", out var doneOk) || doneOk.ValueKind != JsonValueKind.False,
+                        payload.TryGetProperty("durationMs", out var doneMs) && doneMs.ValueKind == JsonValueKind.Number ? doneMs.GetInt64() : 0,
+                        payload.TryGetProperty("output", out var doneOutput) ? doneOutput.GetString() ?? "" : "");
+                    break;
                 case "task.started": Activity.Text = payload.TryGetProperty("agent", out var taskAgent) ? $"Sidecar subagent started: {taskAgent.GetString()}" : "Subagent started"; break;
                 case "task.completed": Activity.Text = payload.TryGetProperty("status", out var taskStatus) ? $"Subagent completed: {taskStatus.GetString()}" : "Subagent completed"; break;
                 case "task.blocked": Activity.Text = payload.TryGetProperty("report", out var taskReport) ? $"Subagent blocked: {taskReport.GetString()}" : "Subagent blocked"; break;
                 case "tool.approval_required":
                     _approvalRunId = runId;
                     _approvalCallId = payload.TryGetProperty("callId", out var call) ? call.GetString() : null;
-                    ApprovalText.Text = $"Approval needed: {(payload.TryGetProperty("name", out var name) ? name.GetString() : "action")}\n{(payload.TryGetProperty("reason", out var reason) ? reason.GetString() : "")}";
+                    ShowApproval($"Approval needed: {(payload.TryGetProperty("name", out var name) ? name.GetString() : "action")}\n{(payload.TryGetProperty("reason", out var reason) ? reason.GetString() : "")}");
                     ApproveButton.IsEnabled = true;
                     DenyButton.IsEnabled = true;
                     Activity.Text = "Waiting for your approval";
@@ -1853,13 +1916,15 @@ public partial class MainWindow : Window
                     var summary = payload.TryGetProperty("summary", out var summaryValue) ? summaryValue.GetString() : "";
                     var wallMs = payload.TryGetProperty("wallMs", out var wallValue) && wallValue.ValueKind == JsonValueKind.Number ? wallValue.GetInt64() : 0;
                     var grade = verified ? "✓ verified" : finished ? "~ checked" : "• unverified";
-                    Activity.Text = $"Run complete · {grade} · {_activeRunFiles.Count} file(s) · {wallMs} ms";
+                    Activity.Text = $"Run complete · {grade} · {_activeRunFiles.Count} file(s) · {Duration(wallMs)}";
                     var usage = payload.TryGetProperty("usage", out var usageValue) && usageValue.ValueKind == JsonValueKind.Object
                         ? "Usage: " + ReadLong(usageValue, "prompt") + " prompt + " + ReadLong(usageValue, "completion") + " completion tokens"
                         : "Usage: unavailable";
                     var completionTokens = payload.TryGetProperty("usage", out var speedUsage) && speedUsage.ValueKind == JsonValueKind.Object ? ReadLong(speedUsage, "completion") : 0;
                     var speed = wallMs > 0 && completionTokens > 0 ? $" · {completionTokens / (wallMs / 1000.0):0.0} tok/s" : "";
                     Evidence.Text = $"{grade}\n{summary}\nFiles: {_activeRunFiles.Count} ( +{_activeRunAdded} / -{_activeRunRemoved} lines )\n{usage}{speed}";
+                    SetChangesSummary(_activeRunFiles.Count, _activeRunAdded, _activeRunRemoved);
+                    SetComposerHint($"{grade} · {Duration(wallMs)}{speed}");
                     _lastCompletedRunId = runId;
                     _activeRunId = null;
                     _canResumeInterrupted = false;
@@ -2233,7 +2298,7 @@ public partial class MainWindow : Window
     {
         _approvalRunId = null;
         _approvalCallId = null;
-        ApprovalText.Text = "";
+        ShowApproval("");
         ApproveButton.IsEnabled = false;
         DenyButton.IsEnabled = false;
     }

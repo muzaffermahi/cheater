@@ -897,8 +897,11 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         if (p.allowMismatch !== true && tierError) throw new Error(`${tierError}; pass an explicit override only for diagnostics`);
         const endpoint = role === "sidecar" && active.models.sidecarBaseUrl ? active.models.sidecarBaseUrl : active.models.baseUrl;
         const client = endpoint === active.models.baseUrl ? active.llm : new KittenLLM({ ...active.models, baseUrl: endpoint, main: model, sidecar: model });
-        const validation = await validateModel(client, model, typeof p.provider === "string" && p.provider.trim() ? p.provider.trim() : "local", undefined, { probeAdvertised: true, timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : 5000 });
-        if (!validation.valid || !validation.verified) throw new Error(validation.error ?? `model '${model}' did not respond`);
+        const validation = await validateModel(client, model, typeof p.provider === "string" && p.provider.trim() ? p.provider.trim() : "local", undefined, { probeAdvertised: true, timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : 45_000 });
+        // A wrong name is refused. A right name whose weights are still loading is accepted with an
+        // honest warning: a cold 35B cannot answer inside a selection dialog, and refusing to save it
+        // left the user unable to configure the model they actually have.
+        if (!validation.valid) throw new Error(validation.error ?? `model '${model}' is not served by this endpoint`);
         const scope = p.scope === "user" ? "user" : "project";
         saveKittenSettings(role === "sidecar" ? { sidecarModel: model } : { mainModel: model }, scope, projectRoot);
         // Keep the already-running engine honest for the current session. This is an explicit user
@@ -907,7 +910,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         else runtime.models.main = model;
         runtime.llm = new KittenLLM(runtime.models);
         if (role === "sidecar") app.setSidecarModel(model); else app.setDefaultModel(model);
-        result = { selected: true, role, model, endpoint, scope };
+        result = { selected: true, role, model, endpoint, scope, verified: validation.verified === true, ...(validation.verified ? {} : { warning: validation.error ?? `model '${model}' has not answered yet` }) };
         break;
       }
       case "model.benchmark": {

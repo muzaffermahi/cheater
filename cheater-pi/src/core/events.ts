@@ -143,6 +143,11 @@ export interface ToolCompleted {
   runId: string;
   callId: string;
   name: string;
+  /**
+   * What the call acted on — a path, a command, a pattern. Optional because stored events predate it.
+   * Without it a UI can only say "read", which tells the user nothing about what was read.
+   */
+  target?: string;
   ok: boolean;
   durationMs: number;
   /** Bounded final output. */

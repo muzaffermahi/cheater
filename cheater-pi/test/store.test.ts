@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ConversationStore } from "../src/core/store/conversationStore.js";
+import { ConversationStore, pendingRepairs } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 
 function memStore(): ConversationStore {
@@ -139,4 +139,55 @@ test("data survives close + reopen (durability across process restart)", () => {
   assert.deepEqual(evs.map((e) => e.type), ["conversation.created", "user.message"]);
   assert.equal(s2.getConversation("persist")!.title, "Fix the parser");
   s2.close();
+});
+
+// A store on a real machine can carry a `user_version` this code line never wrote — an older or forked
+// Kitten numbered its migrations differently. The stamp then says "current" while the columns this line
+// needs are absent, and the observed result was that every new conversation failed with
+// "table conversations has no column named provider": the app was dead on the store it had been using.
+test("a store stamped by a foreign migration line is reconciled instead of failing every write", () => {
+  const db = openSqlite(":memory:");
+  // A v1-era schema, stamped far ahead of this line's migration count.
+  db.exec(`
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, project_root TEXT NOT NULL, project_id TEXT NOT NULL,
+      model TEXT NOT NULL, mode TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+      search_text TEXT NOT NULL DEFAULT '', schema_version INTEGER NOT NULL
+    );
+    CREATE TABLE events (
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+      ts INTEGER NOT NULL, type TEXT NOT NULL, run_id TEXT, payload TEXT NOT NULL,
+      schema_version INTEGER NOT NULL, PRIMARY KEY (conversation_id, seq)
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      request TEXT NOT NULL DEFAULT '', lane TEXT, reasons TEXT NOT NULL DEFAULT '[]',
+      k INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL, finished INTEGER NOT NULL DEFAULT 0,
+      winner INTEGER, summary TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0,
+      files_changed TEXT NOT NULL DEFAULT '[]', usage TEXT NOT NULL DEFAULT '{}', error TEXT,
+      started_at INTEGER NOT NULL, ended_at INTEGER, schema_version INTEGER NOT NULL, snapshot TEXT,
+      redo_snapshot TEXT, model TEXT
+    );
+    PRAGMA user_version = 99;
+  `);
+
+  const missing = pendingRepairs(db);
+  assert.ok(missing.some((repair) => repair.label === "added conversations.provider"), `expected drift to be detected, saw: ${missing.map((r) => r.label).join(", ")}`);
+
+  const store = new ConversationStore(db);
+  assert.equal(pendingRepairs(db).length, 0, "opening the store must leave no drift behind");
+
+  // The failure this guards against was on the very first write, so exercise the real paths.
+  store.createConversation({ id: "drift-1", title: "Recovered", projectRoot: "/proj", projectId: "/proj", model: "ornith", mode: "auto", ts: 1000 });
+  const conversation = store.getConversation("drift-1");
+  assert.equal(conversation?.title, "Recovered");
+  assert.equal(store.listConversations({}).length, 1);
+
+  // A foreign stamp is left alone: this line must not claim a newer store is older than it is.
+  const version = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  assert.equal(version.user_version, 99);
+
+  // Repair is idempotent — a second open is a no-op rather than a duplicate-column error.
+  assert.doesNotThrow(() => new ConversationStore(db));
 });

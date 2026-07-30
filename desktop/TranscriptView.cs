@@ -26,6 +26,12 @@ public sealed class TranscriptView
     private string _streamingText = "";
 
     private static readonly FontFamily Mono = new("Cascadia Mono,Consolas,Menlo,monospace");
+    private static readonly IBrush Text = new SolidColorBrush(Color.Parse("#e8e8ec"));
+    private static readonly IBrush Muted = new SolidColorBrush(Color.Parse("#9a9aa4"));
+    private static readonly IBrush Faint = new SolidColorBrush(Color.Parse("#6a6a74"));
+    private static readonly IBrush Ok = new SolidColorBrush(Color.Parse("#6ee7a8"));
+    private static readonly IBrush Err = new SolidColorBrush(Color.Parse("#f4837f"));
+    private static readonly IBrush ToolBackground = new SolidColorBrush(Color.Parse("#101014"));
 
     public TranscriptView(Panel host, ScrollViewer scroll)
     {
@@ -33,7 +39,60 @@ public sealed class TranscriptView
         _scroll = scroll;
     }
 
-    public enum Role { User, Assistant, Note, System }
+    public enum Role { User, Assistant, Note, Tool, System }
+
+    /// <summary>
+    /// One tool call, rendered as a compact step rather than a card. Seeing which files the agent read,
+    /// what it edited and which command it ran is the main thing a coding agent has to show; before
+    /// this, tool activity only ever appeared as a transient "Using bash" status and was dropped
+    /// entirely from replayed history.
+    /// </summary>
+    public void AddTool(string name, bool ok, long durationMs, string output) => AddTool(name, "", ok, durationMs, output);
+
+    public void AddTool(string name, string target, bool ok, long durationMs, string output)
+    {
+        // Tools run inside a turn, so close the prose card first: the reader then sees what the model
+        // said, what it then did, and what it said next, in the order it happened.
+        if (IsStreaming) CompleteAssistant();
+        var step = new StackPanel { Spacing = 3 };
+        var head = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+        head.Children.Add(new TextBlock { Text = ok ? "✓" : "✗", Foreground = ok ? Ok : Err, FontSize = 12, VerticalAlignment = VerticalAlignment.Center });
+        head.Children.Add(new TextBlock { Text = name, FontFamily = Mono, FontSize = 12.5, Foreground = Text, VerticalAlignment = VerticalAlignment.Center });
+        var detailText = FirstLines(output, 2);
+        // A shell tool's output already opens with `$ <command>`, so repeating the command as the target
+        // would print it twice.
+        if (detailText.StartsWith("$ ", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(target) && detailText.Contains(target.TrimEnd('…'), StringComparison.Ordinal)) target = "";
+        if (!string.IsNullOrWhiteSpace(target))
+        {
+            head.Children.Add(new TextBlock { Text = target.Length > 90 ? target.Substring(0, 90) + "…" : target, FontFamily = Mono, FontSize = 12, Foreground = Muted, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis });
+        }
+        if (durationMs > 0) head.Children.Add(new TextBlock { Text = durationMs >= 1000 ? $"{durationMs / 1000.0:0.0}s" : $"{durationMs}ms", FontSize = 11.5, Foreground = Faint, VerticalAlignment = VerticalAlignment.Center });
+        step.Children.Add(head);
+        if (detailText.Length > 0) step.Children.Add(new SelectableTextBlock { Text = detailText, FontFamily = Mono, FontSize = 11.5, Foreground = Muted, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(20, 0, 0, 0) });
+        _host.Children.Add(new Border { Child = step, Padding = new Thickness(12, 6), Margin = new Thickness(0, 0, 0, 6), CornerRadius = new CornerRadius(6), Background = ToolBackground });
+        ScrollToEnd();
+    }
+
+    /// <summary>
+    /// The first lines of a tool's output that actually say something. Tool output often opens by
+    /// restating the call ("edited stats.py", "now reads:"), which would consume the whole preview and
+    /// tell the reader nothing they cannot see in the step header.
+    /// </summary>
+    private static string FirstLines(string text, int count)
+    {
+        var lines = (text ?? "").Replace("\r\n", "\n").Split('\n').Select(line => line.TrimEnd()).Where(line => line.Length > 0).ToList();
+        while (lines.Count > 0 && IsRestatement(lines[0])) lines.RemoveAt(0);
+        return string.Join("\n", lines.Take(count).Select(line => line.Length > 160 ? line.Substring(0, 160) + "…" : line));
+    }
+
+    private static bool IsRestatement(string line)
+    {
+        var value = line.Trim();
+        return value.EndsWith("now reads:", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("edited ", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("wrote ", StringComparison.OrdinalIgnoreCase)
+            || value.StartsWith("created ", StringComparison.OrdinalIgnoreCase);
+    }
 
     public void Clear()
     {
@@ -105,13 +164,13 @@ public sealed class TranscriptView
         var body = new System.Text.StringBuilder();
         void Flush()
         {
-            var text = body.ToString().Trim('\n');
+            var text = body.ToString().Replace("\r", "").Trim('\n').TrimEnd();
             if (!string.IsNullOrWhiteSpace(text) || header is not null) Add(role, header, text);
             body.Clear();
         }
         var started = false;
         var inCode = false;
-        foreach (var line in transcript.Replace("\r\n", "\n").Split('\n'))
+        foreach (var line in transcript.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n'))
         {
             if (line.TrimStart().StartsWith("```", StringComparison.Ordinal)) inCode = !inCode;
             var marker = inCode ? null : MarkerFor(line);
@@ -122,10 +181,10 @@ public sealed class TranscriptView
                 role = marker.Value.role;
                 header = marker.Value.header;
                 var remainder = line.Substring(marker.Value.consumed).TrimStart();
-                if (remainder.Length > 0) body.AppendLine(remainder);
+                if (remainder.Length > 0) body.Append(remainder).Append('\n');
                 continue;
             }
-            body.AppendLine(line);
+            body.Append(line).Append('\n');
         }
         if (started || body.Length > 0) Flush();
         ScrollToEnd();
@@ -137,14 +196,40 @@ public sealed class TranscriptView
         if (line.StartsWith("You: ", StringComparison.Ordinal)) return (Role.User, "You", 5);
         if (line.StartsWith("Kitten: ", StringComparison.Ordinal)) return (Role.Assistant, "Kitten", 8);
         if (line.StartsWith("Outcome: ", StringComparison.Ordinal)) return (Role.Note, "Outcome", 9);
-        foreach (var prefix in new[] { "Sidecar postflight", "Sidecar failure card", "Sidecar plan for:", "Native verification", "Bounded implementation results", "Tool ", "Approval " })
+        if (line.StartsWith(ToolMarker, StringComparison.Ordinal)) return (Role.Tool, "", ToolMarker.Length);
+        foreach (var prefix in new[] { "Sidecar postflight", "Sidecar failure card", "Sidecar plan for:", "Native verification", "Bounded implementation results", "Approval " })
         {
             if (line.StartsWith(prefix, StringComparison.Ordinal)) return (Role.Note, prefix.TrimEnd(':', ' '), 0);
         }
         return null;
     }
 
-    private void Add(Role role, string? header, string text) => CreateCard(role, header, text);
+    /// <summary>Replay writes tool steps with this prefix so they can be rebuilt as steps, not prose.</summary>
+    public const string ToolMarker = "⚙ ";
+
+    public static string ToolLine(string name, string target, bool ok, long durationMs, string output)
+    {
+        var head = $"{ToolMarker}{name}\t{target}\t{(ok ? "ok" : "failed")}\t{durationMs}";
+        var detail = FirstLines(output, 2).Replace("\n", " ⏎ ");
+        return detail.Length > 0 ? $"{head}\t{detail}\n" : $"{head}\n";
+    }
+
+    private void Add(Role role, string? header, string text)
+    {
+        if (role == Role.Tool) { AddEncodedTool(text); return; }
+        CreateCard(role, header, text);
+    }
+
+    private void AddEncodedTool(string encoded)
+    {
+        var parts = encoded.Split('\t');
+        var name = parts.Length > 0 && parts[0].Trim().Length > 0 ? parts[0].Trim() : "tool";
+        var target = parts.Length > 1 ? parts[1].Trim() : "";
+        var ok = parts.Length < 3 || parts[2].Trim().Equals("ok", StringComparison.OrdinalIgnoreCase);
+        var durationMs = parts.Length > 3 && long.TryParse(parts[3].Trim(), out var value) ? value : 0;
+        var detail = parts.Length > 4 ? parts[4].Replace(" ⏎ ", "\n") : "";
+        AddTool(name, target, ok, durationMs, detail);
+    }
 
     private (Panel body, SelectableTextBlock? first) CreateCard(Role role, string? header, string text)
     {
@@ -194,7 +279,10 @@ public sealed class TranscriptView
     /// <summary>Split a message into prose paragraphs and fenced code blocks.</summary>
     private static IEnumerable<Control> RenderBody(string text)
     {
-        var normalized = text.Replace("\r\n", "\n");
+        // Strip carriage returns, not just newlines. A lone '\r' left by StringBuilder.AppendLine
+        // survived a Trim('\n') and rendered as blank lines, which is what put unexplained dead space
+        // at the bottom of every card.
+        var normalized = text.Replace("\r\n", "\n").Replace("\r", "\n").Trim('\n');
         var blocks = new List<Control>();
         var buffer = new System.Text.StringBuilder();
         var code = new System.Text.StringBuilder();
@@ -230,8 +318,11 @@ public sealed class TranscriptView
             var remainder = buffer.ToString().Trim('\n');
             if (remainder.Length > 0) blocks.Add(Paragraph(remainder));
         }
-        if (blocks.Count == 0) blocks.Add(Paragraph(normalized.Trim('\n')));
-        return blocks;
+        // Never emit an empty paragraph: a blank trailing block reads as unexplained dead space inside
+        // the card, which is exactly what made the first cut of these cards look broken.
+        var kept = blocks.Where(block => block is not SelectableTextBlock text || !string.IsNullOrWhiteSpace(text.Text)).ToList();
+        if (kept.Count == 0 && normalized.Trim('\n').Length > 0) kept.Add(Paragraph(normalized.Trim('\n')));
+        return kept;
     }
 
     private static SelectableTextBlock Paragraph(string text) => new()

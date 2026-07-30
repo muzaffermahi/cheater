@@ -233,8 +233,119 @@ const MIGRATIONS: string[] = [
   `,
 ];
 
+/**
+ * The additive safety net under the migration list.
+ *
+ * `user_version` is only a claim, and a store on a real machine may carry a stamp this code line never
+ * wrote — an older or forked Kitten whose migration list was numbered differently. A store found at
+ * `user_version` 6 with only four migrations here took the "already current" fast path while missing
+ * every column v3 adds, so **every** new conversation failed with "table conversations has no column
+ * named provider": the app was unusable on the very store it had been using.
+ *
+ * So the schema itself is checked, never just the number. Everything here is additive and idempotent —
+ * missing tables and columns are created, nothing is dropped, renamed or rewritten — which makes it
+ * safe to run on every open regardless of which line stamped the file.
+ */
+const REPAIR_TABLES: ReadonlyArray<{ table: string; ddl: string }> = [
+  {
+    table: "input_history",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS input_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      input TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      conversation_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_input_history_ts ON input_history(ts DESC);
+    `,
+  },
+  {
+    table: "task_nodes",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS task_nodes (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      run_id TEXT,
+      parent_id TEXT,
+      agent TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      dependencies TEXT NOT NULL DEFAULT '[]',
+      allowed_files TEXT NOT NULL DEFAULT '[]',
+      forbidden_files TEXT NOT NULL DEFAULT '[]',
+      model_tier TEXT NOT NULL DEFAULT 'main',
+      workspace_mode TEXT NOT NULL DEFAULT 'shared-readonly',
+      status TEXT NOT NULL DEFAULT 'queued',
+      budget TEXT NOT NULL DEFAULT '{}',
+      report TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(parent_id) REFERENCES task_nodes(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_conversation ON task_nodes(conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_parent ON task_nodes(parent_id);
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_status ON task_nodes(status);
+    `,
+  },
+];
+
+/** Every column this code line reads or writes beyond the v1 tables. */
+const REPAIR_COLUMNS: ReadonlyArray<{ table: string; column: string; type: string }> = [
+  { table: "runs", column: "snapshot", type: "TEXT" },
+  { table: "runs", column: "model", type: "TEXT" },
+  { table: "runs", column: "agent", type: "TEXT" },
+  { table: "runs", column: "parent_run_id", type: "TEXT" },
+  { table: "runs", column: "undone", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "runs", column: "snapshot_after", type: "TEXT" },
+  { table: "conversations", column: "provider", type: "TEXT" },
+  { table: "conversations", column: "agent", type: "TEXT" },
+  { table: "conversations", column: "parent_conversation_id", type: "TEXT" },
+  { table: "conversations", column: "parent_run_id", type: "TEXT" },
+];
+
+function tableNames(db: SqlDatabase): Set<string> {
+  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+function columnNames(db: SqlDatabase, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+/** What this store is missing, as executable additive statements. Read-only: takes no write lock. */
+export function pendingRepairs(db: SqlDatabase): Array<{ label: string; sql: string }> {
+  const pending: Array<{ label: string; sql: string }> = [];
+  const tables = tableNames(db);
+  if (!tables.has("conversations")) return pending; // an empty file: the migrations own it
+  for (const { table, ddl } of REPAIR_TABLES) {
+    if (!tables.has(table)) pending.push({ label: `created table ${table}`, sql: ddl });
+  }
+  for (const { table, column, type } of REPAIR_COLUMNS) {
+    if (!tables.has(table) || columnNames(db, table).has(column)) continue;
+    pending.push({ label: `added ${table}.${column}`, sql: `ALTER TABLE ${table} ADD COLUMN ${column} ${type}` });
+  }
+  return pending;
+}
+
+/** Apply the additive repairs. Returns what it did, so a caller can surface the reconciliation. */
+export function reconcileSchema(db: SqlDatabase): string[] {
+  const pending = pendingRepairs(db);
+  for (const repair of pending) db.exec(repair.sql);
+  return pending.map((repair) => repair.label);
+}
+
 function migrate(db: SqlDatabase): void {
-  if (userVersion(db) >= MIGRATIONS.length) return; // fast path: already current, no write lock needed
+  if (userVersion(db) >= MIGRATIONS.length) {
+    // The stamp says current — verify it, because a foreign stamp is exactly how a store ends up
+    // "current" without the columns. The check is read-only, so the common case still takes no write
+    // lock; only an actually-drifted store is repaired, additively, under a transaction.
+    if (!pendingRepairs(db).length) return;
+    const repaired = transact(db, () => reconcileSchema(db));
+    if (repaired.length) process.emitWarning(`kitten store schema reconciled: ${repaired.join(", ")}`);
+    return;
+  }
   // Read the version, apply migrations, AND bump the version all inside ONE BEGIN IMMEDIATE. This store
   // is explicitly opened by two processes (a TUI and a web client on the same file), so a concurrent
   // first-open must not double-migrate: BEGIN IMMEDIATE serializes them, and the loser re-reads the
@@ -243,9 +354,12 @@ function migrate(db: SqlDatabase): void {
   // it can never leave committed tables with a stale user_version.
   transact(db, () => {
     const from = userVersion(db);
-    if (from >= MIGRATIONS.length) return; // another process migrated while we waited for the write lock
+    if (from >= MIGRATIONS.length) { reconcileSchema(db); return; } // another process migrated while we waited
     for (let v = from; v < MIGRATIONS.length; v++) db.exec(MIGRATIONS[v]);
     setUserVersion(db, MIGRATIONS.length);
+    // A partially-migrated store from another line can leave this list with nothing to do for a
+    // version it never actually applied; reconcile before anyone reads or writes a row.
+    reconcileSchema(db);
   });
 }
 

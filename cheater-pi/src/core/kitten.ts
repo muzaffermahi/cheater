@@ -342,7 +342,8 @@ async function cmdDoctor(): Promise<number> {
     // Ping is authoritative: a llama.cpp single-model server advertises the .gguf path in /v1/models but
     // accepts ANY model id and returns the loaded model — so an id-list mismatch is NOT "model missing".
     if (ep.reachable && ep.errorKind !== "auth") {
-      const responds = await llm.ping(models.main);
+      const probe = await llm.pingDetailed(models.main);
+      const responds = probe.ok;
       if (responds) {
         const engine = await llm.detectEngine();
         const advertised = ep.models.length === 0 || ep.models.includes(models.main);
@@ -361,9 +362,13 @@ async function cmdDoctor(): Promise<number> {
         process.stdout.write(`${red("✗")} model '${models.main}' not loaded and probe failed\n`);
         process.stdout.write(dim(`    available: ${ep.models.slice(0, 5).map((m) => m.split(/[\\/]/).pop()).join(", ") || "none"}\n`));
         process.stdout.write(dim(`    → set KITTEN_MAIN_MODEL to an available model name (e.g. export KITTEN_MAIN_MODEL="${ep.models[0]?.split(/[\\/]/).pop() ?? "ornith"}")\n`));
+      } else if (probe.loading) {
+        // Not an error: the endpoint accepted the request and is still bringing the weights up.
+        process.stdout.write(`${yellow("○")} model '${models.main}' is loading — no answer within ${Math.round(probe.elapsedMs / 1000)}s\n`);
+        process.stdout.write(dim("    → a large local model often needs a minute on first use; re-run doctor once it has warmed up\n"));
       } else {
         bad++;
-        process.stdout.write(`${red("✗")} model '${models.main}' did not respond — verify the model is loaded\n`);
+        process.stdout.write(`${red("✗")} model '${models.main}' did not respond — ${probe.error ?? "no completion"}\n`);
       }
     }
   }

@@ -1,8 +1,163 @@
 <Application xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             x:Class="Kitten.Desktop.App">
+             x:Class="Kitten.Desktop.App"
+             RequestedThemeVariant="Dark">
+
+  <!-- One set of tokens for the whole app. Every surface, border and state colour comes from here so
+       the window cannot drift into a patchwork of hand-picked hex values. -->
+  <Application.Resources>
+    <SolidColorBrush x:Key="BaseBrush" Color="#0c0c0e" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="#131317" />
+    <SolidColorBrush x:Key="Surface2Brush" Color="#1b1b21" />
+    <SolidColorBrush x:Key="Surface3Brush" Color="#23232b" />
+    <SolidColorBrush x:Key="BorderBrush2" Color="#26262e" />
+    <SolidColorBrush x:Key="BorderStrongBrush" Color="#35353f" />
+    <SolidColorBrush x:Key="TextBrush" Color="#e8e8ec" />
+    <SolidColorBrush x:Key="MutedBrush" Color="#9a9aa4" />
+    <SolidColorBrush x:Key="FaintBrush" Color="#6a6a74" />
+    <SolidColorBrush x:Key="AccentBrush" Color="#e0a15c" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#3a2c1c" />
+    <SolidColorBrush x:Key="OkBrush" Color="#6ee7a8" />
+    <SolidColorBrush x:Key="WarnBrush" Color="#f5c451" />
+    <SolidColorBrush x:Key="ErrBrush" Color="#f4837f" />
+  </Application.Resources>
+
   <Application.Styles>
     <FluentTheme />
+
+    <Style Selector="Window">
+      <Setter Property="Background" Value="{DynamicResource BaseBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource ContentControlThemeFontFamily}" />
+      <Setter Property="TransparencyLevelHint" Value="None" />
+    </Style>
+
+    <Style Selector="TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="FontSize" Value="13" />
+    </Style>
+    <Style Selector="SelectableTextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+
+    <!-- A section label: small, quiet, uppercase. These carry the structure so the window needs far
+         fewer boxes and separators to read as organised. -->
+    <Style Selector="TextBlock.label">
+      <Setter Property="Foreground" Value="{DynamicResource FaintBrush}" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Margin" Value="0,0,0,2" />
+    </Style>
+    <Style Selector="TextBlock.muted">
+      <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+    </Style>
+    <Style Selector="TextBlock.body">
+      <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="LineHeight" Value="19" />
+    </Style>
+
+    <!-- Default button: quiet surface, one accent for the primary action only. -->
+    <Style Selector="Button">
+      <Setter Property="Background" Value="{DynamicResource Surface2Brush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush2}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Padding" Value="11,6" />
+      <Setter Property="FontSize" Value="12.5" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+    <Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface3Brush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderStrongBrush}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+    <Style Selector="Button:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface2Brush}" />
+    </Style>
+    <Style Selector="Button:disabled /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush2}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource FaintBrush}" />
+    </Style>
+
+    <Style Selector="Button.primary">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Foreground" Value="#1a1206" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+      <Setter Property="Padding" Value="16,7" />
+    </Style>
+    <Style Selector="Button.primary:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#f0b26b" />
+      <Setter Property="BorderBrush" Value="#f0b26b" />
+      <Setter Property="TextBlock.Foreground" Value="#1a1206" />
+    </Style>
+
+    <!-- Ghost: for anything that should be reachable but never compete for attention. -->
+    <Style Selector="Button.ghost">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+      <Setter Property="Padding" Value="7,4" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="HorizontalContentAlignment" Value="Left" />
+    </Style>
+    <Style Selector="Button.ghost:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface2Brush}" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+
+    <Style Selector="Button.tiny">
+      <Setter Property="Padding" Value="8,3" />
+      <Setter Property="FontSize" Value="11.5" />
+    </Style>
+
+    <Style Selector="TextBox">
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush2}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="10,8" />
+      <Setter Property="FontSize" Value="13.5" />
+      <Setter Property="SelectionBrush" Value="{DynamicResource AccentSoftBrush}" />
+    </Style>
+    <Style Selector="TextBox:focus /template/ Border#PART_BorderElement">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+    </Style>
+    <Style Selector="TextBox:pointerover /template/ Border#PART_BorderElement">
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderStrongBrush}" />
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+    </Style>
+
+    <Style Selector="ListBox">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+    </Style>
+    <Style Selector="ListBoxItem">
+      <Setter Property="Padding" Value="9,7" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Margin" Value="0,1" />
+      <Setter Property="FontSize" Value="12.5" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+    <Style Selector="ListBoxItem:pointerover /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface2Brush}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+    <Style Selector="ListBoxItem:selected /template/ ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface3Brush}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+
+    <Style Selector="ScrollViewer">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
   </Application.Styles>
 </Application>
-

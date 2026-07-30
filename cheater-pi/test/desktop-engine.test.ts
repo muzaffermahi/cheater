@@ -710,7 +710,10 @@ test("desktop engine discovers models for native first-run setup", async () => {
     const probed = await call(socket, "validate-probed", "model.validate", { baseUrl: `http://127.0.0.1:${address.port}`, model: "main-35b", probe: true, timeoutMs: 1000 });
     assert.equal(probed.valid, true);
     assert.equal(probed.verified, false);
-    assert.match(probed.error, /advertised but not responding/);
+    // Advertised but erroring: reported unverified with the endpoint's own reason, and not as "loading"
+    // — that state is reserved for a deadline elapsing, which is what a cold local model actually does.
+    assert.match(probed.error, /advertised but did not respond/);
+    assert.notEqual(probed.loading, true);
     const invalid = await call(socket, "invalid", "model.validate", { baseUrl: `http://127.0.0.1:${address.port}`, model: "missing-model" });
     assert.equal(invalid.valid, false);
   } finally {
@@ -989,5 +992,45 @@ test("a successful command always carries a result field", async () => {
   } finally {
     socket.destroy();
     await engine.close();
+  }
+});
+
+// A local runtime JIT-loads weights on first use, and a 35B needs tens of seconds. The probe used to
+// run with a 5s deadline and report "advertised but not responding (it may be unloaded)", and
+// model.select refused to save on that — so the user could not configure the model they actually had.
+test("a model whose weights are still loading can still be selected, with an honest warning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kitten-loading-model-"));
+  const slow = createServer((request, response) => {
+    if (request.url?.includes("/models")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ data: [{ id: "main-35b" }] }));
+      return;
+    }
+    // A completion request that never answers: exactly how a cold local model behaves.
+    response.writeHead(200, { "content-type": "application/json" });
+  });
+  await new Promise<void>((resolve) => slow.listen(0, "127.0.0.1", () => resolve()));
+  const address = slow.address() as { port: number };
+  const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\kitten-test-loading-${process.pid}` : `${root}/engine.sock`;
+  const engine = await startDesktopEngine({ socketPath, store: ":memory:", projectRoot: root, models: { baseUrl: `http://127.0.0.1:${address.port}`, main: "main-35b" } });
+  const socket = await connect(socketPath, engine.token);
+  try {
+    const validated = await call(socket, "validate-loading", "model.validate", { model: "main-35b", probe: true, timeoutMs: 600 });
+    assert.equal(validated.valid, true, "an advertised model is a valid choice even before it answers");
+    assert.equal(validated.verified, false);
+    assert.equal(validated.loading, true);
+    assert.match(validated.error, /loading/);
+
+    // The name is right, so selection saves it and says plainly that it has not answered yet.
+    const selected = await call(socket, "select-loading", "model.select", { role: "main", model: "main-35b", timeoutMs: 600, scope: "project" });
+    assert.equal(selected.selected, true);
+    assert.equal(selected.verified, false);
+    assert.match(selected.warning, /loading/);
+    // (A name the endpoint does not serve is refused — covered by the discovery test above.)
+  } finally {
+    socket.destroy();
+    await engine.close();
+    await new Promise<void>((resolve) => slow.close(() => resolve()));
+    await rm(root, { recursive: true, force: true });
   }
 });

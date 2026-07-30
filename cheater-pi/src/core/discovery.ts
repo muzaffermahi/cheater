@@ -64,10 +64,41 @@ async function listModels(llm: KittenLLM): Promise<string[] | null> {
   }
 }
 
+export interface ModelProbe {
+  /** The model produced a completion. */
+  alive: boolean;
+  /** The probe deadline elapsed. On a local runtime this usually means "still loading", not "broken". */
+  timedOut: boolean;
+  elapsedMs: number;
+  /** It answered, but spent the whole budget thinking. Proof of life, not proof of usefulness. */
+  reasonedOnly: boolean;
+  error?: string;
+}
+
+/**
+ * A local runtime JIT-loads weights on the first request, and a 35B takes tens of seconds to become
+ * ready — so the deadline here is generous and a timeout is reported as its own state rather than as
+ * a dead model. The token budget also has to clear the reasoning tax: a reasoning model counts its
+ * `reasoning_content` against `max_tokens`, so a 16-token probe returns empty content by construction
+ * (llm.ts documents this hazard) and must not be read as failure.
+ */
+export async function probeModel(llm: KittenLLM, model: string, timeoutMs = 45_000): Promise<ModelProbe> {
+  const started = Date.now();
+  const result = await llm.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 64, timeoutMs });
+  const elapsedMs = Date.now() - started;
+  const timedOut = !result.ok && /^timeout$/i.test(result.error ?? "");
+  return {
+    alive: result.ok,
+    timedOut,
+    elapsedMs,
+    reasonedOnly: result.ok && !result.content.trim() && result.reasoning.trim().length > 0,
+    ...(result.ok ? {} : { error: result.error ?? "no completion" }),
+  };
+}
+
 /** Probe model with a minimal chat. Returns true if the model responds. */
-export async function pingModel(llm: KittenLLM, model: string, timeoutMs = 20_000): Promise<boolean> {
-  const result = await llm.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 16, timeoutMs });
-  return result.ok;
+export async function pingModel(llm: KittenLLM, model: string, timeoutMs = 45_000): Promise<boolean> {
+  return (await probeModel(llm, model, timeoutMs)).alive;
 }
 
 /** Validate a requested model name against discovery results from a provider. */
@@ -77,7 +108,7 @@ export async function validateModel(
   provider: string,
   discoveredModels?: ModelInfo[],
   options: { probeAdvertised?: boolean; timeoutMs?: number } = {},
-): Promise<{ valid: boolean; verified: boolean; error?: string; suggestion?: string }> {
+): Promise<{ valid: boolean; verified: boolean; error?: string; suggestion?: string; loading?: boolean }> {
   if (!model) return { valid: false, verified: false, error: "model name is empty" };
 
   const list = discoveredModels?.map((m) => m.id) ?? (await listModels(llm));
@@ -85,10 +116,14 @@ export async function validateModel(
   if (list && list.length > 0) {
     if (list.includes(model)) {
       if (!options.probeAdvertised) return { valid: true, verified: true };
-      const responds = await pingModel(llm, model, options.timeoutMs ?? 10_000);
-      return responds
-        ? { valid: true, verified: true }
-        : { valid: true, verified: false, error: `model '${model}' is advertised but not responding (it may be unloaded)` };
+      const probe = await probeModel(llm, model, options.timeoutMs ?? 45_000);
+      if (probe.alive) return { valid: true, verified: true };
+      // The endpoint advertises it, so the name is right. A deadline that elapsed on a local runtime
+      // means the weights are still loading — a real state to report, not a reason to reject the model.
+      if (probe.timedOut) {
+        return { valid: true, verified: false, loading: true, error: `model '${model}' is loading — it did not answer within ${Math.round(probe.elapsedMs / 1000)}s. Large local models often need a minute on first use.` };
+      }
+      return { valid: true, verified: false, error: `model '${model}' is advertised but did not respond (${probe.error ?? "unknown error"})` };
     }
     // Check cross-provider
     if (discoveredModels) {

@@ -92,7 +92,12 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
         const name = e.detail.split("(")[0].trim() || "tool";
         const ok = !(e.data && (e.data as { error?: boolean }).error);
         const output = e.data && typeof (e.data as { output?: string }).output === "string" ? String((e.data as { output?: string }).output) : "";
-        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: `${ctx.runId}:t${toolN++}`, name, ok, durationMs: 0, output });
+        // The agent already renders `name(brief args) -> ok`; carry the argument through as `target` so a
+        // client can say "read src/parser.ts" instead of just "read".
+        const open = e.detail.indexOf("(");
+        const close = e.detail.lastIndexOf(")");
+        const target = open >= 0 && close > open ? e.detail.slice(open + 1, close).trim() : "";
+        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: `${ctx.runId}:t${toolN++}`, name, ...(target ? { target } : {}), ok, durationMs: 0, output });
         break;
       }
       case "gate_block":

@@ -208,6 +208,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       // One retry on a transient error, then stop.
       if (turn < maxTurns && /timeout|network/.test(result.error ?? "")) continue;
       stopReason = "error";
+      // Carry the reason out with the run. The summary is what every client shows, and it fell back to
+      // the bare word "error" — a dead run with no diagnosis anywhere the user can see it.
+      summary = `model call failed: ${result.error ?? "unknown error"}`;
       break;
     }
     emit({ turn, kind: "assistant", detail: (result.content || "(tool call)").slice(0, 400), data: { reasoningChars: result.reasoning.length, toolCalls: result.toolCalls.map((t) => t.name) } });

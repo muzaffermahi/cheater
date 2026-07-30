@@ -562,8 +562,18 @@ export class KittenLLM {
 
   /** Cheap capability + liveness probe: is the given model answering? */
   async ping(model: string): Promise<boolean> {
-    const r = await this.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 64, timeoutMs: 20_000 });
-    return r.ok;
+    return (await this.pingDetailed(model)).ok;
+  }
+
+  /**
+   * Proof of life with the reason attached. A local runtime JIT-loads weights on first use and a 35B
+   * needs tens of seconds, so a timeout here means "loading", not "missing" — the caller has to be able
+   * to say which, instead of telling the user to load a model that is already loading.
+   */
+  async pingDetailed(model: string, timeoutMs = 45_000): Promise<{ ok: boolean; loading: boolean; elapsedMs: number; error?: string }> {
+    const started = Date.now();
+    const r = await this.chat({ model, messages: [{ role: "user", content: "Reply: OK" }], maxTokens: 64, timeoutMs });
+    return { ok: r.ok, loading: !r.ok && r.error === "timeout", elapsedMs: Date.now() - started, ...(r.ok ? {} : { error: r.error ?? "no completion" }) };
   }
 
   /** List models from the endpoint. Returns null on any failure (never throws). */
