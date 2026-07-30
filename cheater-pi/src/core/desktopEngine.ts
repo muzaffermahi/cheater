@@ -1199,6 +1199,19 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         result = getWorkspaceIndex(root, indexes).overview();
         break;
       }
+      case "workspace.files": {
+        // Listing the project is not a search. The file browser opened onto an empty pane because the
+        // only way to see anything was to type a query first.
+        const root = String(p.root ?? opts.projectRoot ?? process.cwd());
+        const index = getWorkspaceIndex(root, indexes);
+        if (!index.overview().files) { await index.refresh(root); persistWorkspaceIndex(root, index); }
+        const limit = Math.max(1, Math.min(2000, Number(p.limit ?? 400)));
+        result = index.list()
+          .sort((a, b) => a.path.localeCompare(b.path))
+          .slice(0, limit)
+          .map((record) => ({ path: record.path, language: record.language, isTest: record.isTest, symbols: record.symbols.slice(0, 8), bytes: record.bytes }));
+        break;
+      }
       case "workspace.search": {
         const root = String(p.root ?? opts.projectRoot ?? process.cwd());
         const index = getWorkspaceIndex(root, indexes);

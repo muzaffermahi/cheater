@@ -41,7 +41,7 @@ export function inspectWorkspaceChanges(root: string, options: { maxBytes?: numb
   }
   const branchResult = runGit(resolved, ["branch", "--show-current"]);
   const statusResult = runGit(resolved, ["status", "--porcelain=v1", "--untracked-files=normal"]);
-  const files = parseStatus(statusResult.stdout).slice(0, maxFiles);
+  const files = parseStatus(statusResult.stdout).filter((file) => !isGeneratedChangePath(file.path)).slice(0, maxFiles);
   let used = 0;
   let truncated = false;
   const diffResult = runGit(resolved, ["diff", "--no-ext-diff", "--no-color", "--unified=3", "HEAD", "--"], maxBytes);
@@ -73,6 +73,18 @@ function runGit(cwd: string, args: string[], maxBuffer = DEFAULT_MAX_BYTES): { s
     const result = spawnSync("git", args, { cwd, encoding: "utf8", windowsHide: true, timeout: 8_000, maxBuffer: Math.max(maxBuffer, 32_000) });
     return { status: result.status, stdout: result.stdout ?? "" };
   } catch { return { status: null, stdout: "" }; }
+}
+
+/**
+ * Kitten's own state and the language toolchains' caches are not the user's changes. Listing
+ * `.cheater/` (Kitten's private cache) and `__pycache__/` next to a real edit makes the review panel
+ * look like the agent touched things it never touched.
+ */
+const GENERATED_PATHS = /(?:^|\/)(?:\.cheater|\.kitten|__pycache__|node_modules|\.pytest_cache|\.mypy_cache|\.ruff_cache|\.venv|dist|build|target|\.next|\.turbo|coverage|\.gradle|\.idea|\.vs)(?:\/|$)/i;
+
+export function isGeneratedChangePath(path: string): boolean {
+  const normalized = path.replaceAll("\\", "/");
+  return GENERATED_PATHS.test(normalized) || /(?:^|\/)(?:\.DS_Store|Thumbs\.db)$/i.test(normalized) || /\.(?:pyc|pyo|log|tmp)$/i.test(normalized);
 }
 
 function parseStatus(text: string): WorkspaceChangeFile[] {

@@ -603,7 +603,7 @@ public partial class MainWindow : Window
         }
         var query = new TextBox { Watermark = "Search files, symbols, or imports...", MinWidth = 500 };
         var results = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.Wrap, MinHeight = 180, FontFamily = "Consolas" };
-        var context = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.Wrap, MinHeight = 280, FontFamily = "Consolas" };
+        var context = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.Wrap, MinHeight = 280, FontFamily = "Consolas", Text = "Search to preview the bounded context Kitten would hand a model for that query." };
         var status = new TextBlock { Text = "Indexing is local, bounded, and skips dependency/build directories.", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 };
         var index = new Button { Content = "Refresh index" };
         var search = new Button { Content = "Search" };
@@ -620,8 +620,7 @@ public partial class MainWindow : Window
                 Spacing = 12,
                 Children =
                 {
-                    new TextBlock { Text = root, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 },
-                    new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { query, index, search } },
+                    PathRow(query, index, search),
                     status,
                     new TextBlock { Text = "Matching files", FontWeight = Avalonia.Media.FontWeight.Bold },
                     results,
@@ -635,11 +634,24 @@ public partial class MainWindow : Window
         async Task RefreshIndexAsync()
         {
             index.IsEnabled = false;
-            status.Text = "Indexing the project...";
+            status.Text = "Indexing the project…";
             try
             {
                 var overview = await engine.CallAsync("workspace.index", new { root });
-                status.Text = overview is { } value ? $"Indexed {value.GetProperty("files").GetInt32()} files." : "Index complete.";
+                if (overview is { } value && value.ValueKind == JsonValueKind.Object)
+                {
+                    var fileCount = value.TryGetProperty("files", out var filesValue) && filesValue.ValueKind == JsonValueKind.Number ? filesValue.GetInt32() : 0;
+                    var testCount = value.TryGetProperty("tests", out var testsValue) && testsValue.ValueKind == JsonValueKind.Number ? testsValue.GetInt32() : 0;
+                    var languages = value.TryGetProperty("languages", out var languagesValue) && languagesValue.ValueKind == JsonValueKind.Object
+                        ? string.Join(", ", languagesValue.EnumerateObject().OrderByDescending(entry => entry.Value.ValueKind == JsonValueKind.Number ? entry.Value.GetInt32() : 0).Take(4).Select(entry => $"{entry.Name} {entry.Value}"))
+                        : "";
+                    status.Text = $"{fileCount} {(fileCount == 1 ? "file" : "files")} indexed · {testCount} test {(testCount == 1 ? "file" : "files")}{(languages.Length > 0 ? $" · {languages}" : "")}";
+                }
+                else status.Text = "Index complete.";
+                // Show the project immediately. Opening onto two empty boxes gives the user nothing to
+                // act on and no clue that a button has to be pressed first.
+                var listed = await engine.CallAsync("workspace.files", new { root, limit = 400 });
+                results.Text = DescribeSearchHits(listed);
             }
             catch (Exception ex) { status.Text = $"Index failed: {ex.Message}"; }
             finally { index.IsEnabled = true; }
@@ -652,7 +664,7 @@ public partial class MainWindow : Window
             try
             {
                 var hits = await engine.CallAsync("workspace.search", new { root, query = query.Text, limit = 20 });
-                results.Text = hits is { } value ? JsonSerializer.Serialize(value, new JsonSerializerOptions { WriteIndented = true }) : "No matches.";
+                results.Text = DescribeSearchHits(hits);
                 var bounded = await engine.CallAsync("workspace.context", new { root, query = query.Text, maxChars = 16000 });
                 context.Text = bounded is { } contextValue && contextValue.ValueKind == JsonValueKind.String ? contextValue.GetString() : "No bounded context.";
                 status.Text = "Search complete. Context is intentionally bounded before it reaches a model.";
@@ -660,7 +672,9 @@ public partial class MainWindow : Window
             catch (Exception ex) { status.Text = $"Search failed: {ex.Message}"; }
             finally { search.IsEnabled = true; }
         };
-        await dialog.ShowDialog(this);
+        var explorerTask = dialog.ShowDialog(this);
+        await RefreshIndexAsync();
+        await explorerTask;
     }
 
     private async void OpenAgentLibrary(object? sender, RoutedEventArgs e)
@@ -678,19 +692,39 @@ public partial class MainWindow : Window
             Width = 900,
             Height = 680,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Content = new StackPanel
+            // The definition list is long, so the actions dock instead of scrolling out of reach.
+            Content = new DockPanel
             {
-                Margin = new Avalonia.Thickness(24),
-                Spacing = 12,
+                LastChildFill = true,
                 Children =
                 {
-                    new TextBlock { Text = "Agents are bounded roles, not hidden magic: each definition declares its model tier, step budget, edit/bash/task permissions, and whether it may spawn children.", TextWrapping = Avalonia.Media.TextWrapping.Wrap },
-                    status,
-                    definitions,
-                    new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { create, spawn, refresh, close } },
+                    new Border
+                    {
+                        [DockPanel.DockProperty] = Dock.Bottom,
+                        Padding = new Avalonia.Thickness(24, 12),
+                        BorderThickness = new Avalonia.Thickness(0, 1, 0, 0),
+                        BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#26262e")),
+                        Child = ButtonRow(spawn, create, refresh, close),
+                    },
+                    new ScrollViewer
+                    {
+                        VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+                        Content = new StackPanel
+                        {
+                            Margin = new Avalonia.Thickness(24),
+                            Spacing = 12,
+                            Children =
+                            {
+                                new TextBlock { Text = "Agents are bounded roles, not hidden magic: each definition declares its model tier, step budget, edit/bash/task permissions, and whether it may spawn children.", TextWrapping = Avalonia.Media.TextWrapping.Wrap },
+                                status,
+                                definitions,
+                            },
+                        },
+                    },
                 },
             },
         };
+        spawn.Classes.Add("primary");
         close.Click += (_, _) => dialog.Close();
         async Task RefreshAsync()
         {
@@ -989,7 +1023,8 @@ public partial class MainWindow : Window
             try
             {
                 var result = await engine.CallAsync("task.list", new { conversationId = _conversationId });
-                nodes.Text = result is { } value ? JsonSerializer.Serialize(value, new JsonSerializerOptions { WriteIndented = true }) : "No task nodes have been planned.";
+                // Never show the user a JSON literal. An empty plan printed "[]", which is not an answer.
+                nodes.Text = DescribeTaskNodes(result);
                 status.Text = _activeTaskId is null ? "No active plan." : "Plan running; updates are durable and survive reconnects.";
                 cancel.IsEnabled = _activeTaskId is not null;
             }
@@ -1012,9 +1047,17 @@ public partial class MainWindow : Window
             Activity.Text = "Open a project before reviewing changes.";
             return;
         }
-        var status = new TextBlock { Text = "Loading read-only Git status and bounded diff...", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 };
-        var files = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.Wrap, MinHeight = 120, FontFamily = "Consolas" };
-        var diff = new TextBox { IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.NoWrap, MinHeight = 360, FontFamily = "Consolas" };
+        var status = new TextBlock { Text = "Reading local changes…", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Classes = { "body" } };
+        // Sized to its content: a fixed 120px box around a single changed file is mostly empty space.
+        var files = new SelectableTextBlock { FontFamily = new Avalonia.Media.FontFamily("Cascadia Mono,Consolas,monospace"), FontSize = 12, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
+        var diffBody = DiffBody();
+        var diff = new ScrollViewer
+        {
+            Content = diffBody,
+            MinHeight = 380,
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+        };
         var refresh = new Button { Content = "Refresh" };
         var close = new Button { Content = "Close" };
         var dialog = new Window
@@ -1029,13 +1072,12 @@ public partial class MainWindow : Window
                 Spacing = 10,
                 Children =
                 {
-                    new TextBlock { Text = root, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 },
                     status,
-                    new TextBlock { Text = "Changed files", FontWeight = Avalonia.Media.FontWeight.Bold },
+                    Section("Changed files"),
                     files,
-                    new TextBlock { Text = "Diff (tracked changes; untracked files are listed above)", FontWeight = Avalonia.Media.FontWeight.Bold },
+                    Section("Diff"),
                     diff,
-                    new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { refresh, close } },
+                    ButtonRow(refresh, close),
                 },
             },
         };
@@ -1051,7 +1093,12 @@ public partial class MainWindow : Window
                 var branch = value.TryGetProperty("branch", out var branchValue) && branchValue.ValueKind == JsonValueKind.String ? branchValue.GetString() : null;
                 var isGit = value.TryGetProperty("isGit", out var gitValue) && gitValue.GetBoolean();
                 var truncated = value.TryGetProperty("truncated", out var truncatedValue) && truncatedValue.GetBoolean();
-                status.Text = !isGit ? "This project is not a Git repository." : $"Branch: {branch ?? "(detached)"}. Read-only inspection; {(truncated ? "output was bounded." : "output is complete.")}";
+                // Name the project, not its full path; say plainly whether this is the whole picture.
+                var projectName = Path.GetFileName(root!.TrimEnd('\\', '/'));
+                status.Text = !isGit
+                    ? $"{projectName} is not a Git repository, so there is nothing to diff."
+                    : $"{projectName} · {branch ?? "detached HEAD"} · read-only{(truncated ? " · output bounded" : "")}";
+                ToolTip.SetTip(status, root);
                 var changedText = value.TryGetProperty("files", out var fileValue) && fileValue.ValueKind == JsonValueKind.Array
                     ? string.Join("\n", fileValue.EnumerateArray().Select(item =>
                     {
@@ -1071,7 +1118,7 @@ public partial class MainWindow : Window
                     changedText += string.Join("\n", previews);
                 }
                 files.Text = changedText;
-                diff.Text = value.TryGetProperty("diff", out var diffValue) && diffValue.ValueKind == JsonValueKind.String ? diffValue.GetString() : "No tracked diff.";
+                SetDiff(diffBody, value.TryGetProperty("diff", out var diffValue) && diffValue.ValueKind == JsonValueKind.String ? diffValue.GetString() ?? "" : "");
             }
             catch (Exception ex) { status.Text = $"Change inspection failed: {ex.Message}"; }
             finally { refresh.IsEnabled = true; }
@@ -1295,32 +1342,70 @@ public partial class MainWindow : Window
         catch { }
         var save = new Button { Content = "Save for this project" };
         var cancel = new Button { Content = "Cancel" };
+        // Every field is labelled and every button row wraps. Fixed-width inputs beside non-wrapping
+        // button rows overflowed the window: the description, the last button in each row and the Save
+        // row were all clipped off the edge, and the two model fields showed bare values with no idea
+        // which was which once a watermark had been replaced.
+        save.Classes.Add("primary");
+        foreach (var input in new[] { endpoint, sidecarEndpoint, main, sidecar, runtimeExecutable, mainModelPath, sidecarModelPath }) input.MinWidth = 260;
+        // Each field now carries a label, so a watermark that repeats it is just noise. Keep watermarks
+        // only where they add an example.
+        endpoint.Watermark = "http://localhost:1234/v1";
+        sidecarEndpoint.Watermark = "";
+        main.Watermark = "";
+        sidecar.Watermark = "";
+        runtimeExecutable.Watermark = "";
+        mainModelPath.Watermark = "";
+        sidecarModelPath.Watermark = "";
         var dialog = new Window
         {
             Title = "Kitten model setup",
-            Width = 720,
-            Height = 560,
+            Width = 780,
+            Height = 720,
+            MinWidth = 560,
+            MinHeight = 420,
             WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            Content = new ScrollViewer
+            // Save and Cancel are docked, not scrolled: the primary action must never be below the fold.
+            Content = new DockPanel
             {
-                Content = new StackPanel
+                LastChildFill = true,
+                Children =
                 {
-                    Margin = new Avalonia.Thickness(24),
-                    Spacing = 12,
-                    Children =
+                    new Border
                     {
-                        new TextBlock { Text = "Choose the local endpoint and model tiers. Kitten will use the sidecar for clerical work and keep the main model for coding." },
-                        endpoint,
-                        sidecarEndpoint,
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { findLocal, discover, importCatalog, downloadCatalog, cancelDownload } },
-                        discoverStatus, main, sidecar,
-                        new TextBlock { Text = "Managed local runtime (no terminal required)", FontWeight = Avalonia.Media.FontWeight.Bold },
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { runtimeExecutable, browseRuntime, findRuntime } },
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { mainModelPath, browseMainModel } },
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { sidecarModelPath, browseSidecarModel } },
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { startRuntime, stopRuntime } },
-                        runtimeStatus,
-                        new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal, Spacing = 8, Children = { save, cancel } },
+                        [DockPanel.DockProperty] = Dock.Bottom,
+                        Padding = new Avalonia.Thickness(24, 12),
+                        BorderThickness = new Avalonia.Thickness(0, 1, 0, 0),
+                        BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#26262e")),
+                        Child = ButtonRow(save, cancel),
+                    },
+                    new ScrollViewer
+                    {
+                        VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+                        Content = new StackPanel
+                        {
+                            Margin = new Avalonia.Thickness(24),
+                            Spacing = 14,
+                            Children =
+                            {
+                        Section("Endpoint"),
+                        Hint("Kitten talks to an OpenAI-compatible local server. The sidecar handles clerical work so the main model stays on the code."),
+                        Field("Main endpoint", endpoint),
+                        Field("Sidecar endpoint (optional — defaults to the main endpoint)", sidecarEndpoint),
+                        ButtonRow(findLocal, discover, importCatalog, downloadCatalog, cancelDownload),
+                        discoverStatus,
+                        Section("Models"),
+                        Field("Main model (35B–200B)", main),
+                        Field("Sidecar model (2B–9B)", sidecar),
+                        Section("Managed local runtime"),
+                        Hint("Optional. Point Kitten at a llama.cpp server and it starts and stops it for you — no terminal."),
+                        Field("Runtime executable (for example llama-server.exe)", PathRow(runtimeExecutable, browseRuntime, findRuntime)),
+                        Field("Main model file (.gguf)", PathRow(mainModelPath, browseMainModel)),
+                        Field("Sidecar model file (.gguf, optional)", PathRow(sidecarModelPath, browseSidecarModel)),
+                                ButtonRow(startRuntime, stopRuntime),
+                                runtimeStatus,
+                            },
+                        },
                     },
                 },
             },

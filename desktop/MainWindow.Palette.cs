@@ -1,6 +1,9 @@
+using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Documents;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Layout;
 using Avalonia.Media;
 
 namespace Kitten.Desktop;
@@ -70,6 +73,22 @@ public partial class MainWindow
 
     /// <summary>Used by `--snapshot --palette` so the palette can be reviewed like any other surface.</summary>
     internal void OpenPaletteForSnapshot() => OpenPalette();
+
+    /// <summary>Open one secondary surface by name for `--snapshot --view <name>`, so every screen the
+    /// app can show is reviewable without a human driving the mouse.</summary>
+    internal void OpenViewForSnapshot(string view)
+    {
+        if (_paletteCommands.Count == 0) BuildPalette();
+        var wanted = view.Replace('-', ' ').Trim();
+        var command = _paletteCommands.FirstOrDefault(entry => entry.Title.StartsWith(wanted, StringComparison.OrdinalIgnoreCase))
+            ?? _paletteCommands.FirstOrDefault(entry => entry.Title.Contains(wanted, StringComparison.OrdinalIgnoreCase));
+        if (command is null)
+        {
+            Console.Error.WriteLine($"unknown snapshot view '{view}'. Available: {string.Join(", ", _paletteCommands.Select(entry => entry.Title))}");
+            return;
+        }
+        command.Invoke();
+    }
 
     private void OpenPalette()
     {
@@ -151,6 +170,141 @@ public partial class MainWindow
 
     // ── Status surfaces ──────────────────────────────────────────────────────────────────────────
     // Small helpers so state is reported in one place instead of each handler poking at controls.
+
+    // ── Dialog building blocks ───────────────────────────────────────────────────────────────────
+    // Secondary surfaces are built in code, so they need shared pieces or every one drifts into its own
+    // layout — unlabelled inputs, button rows that overflow the window, no visible structure.
+
+    /// <summary>A small-caps section heading, matching the inspector's labels.</summary>
+    internal static Control Section(string title) => new TextBlock { Text = title.ToUpperInvariant(), Classes = { "label" }, Margin = new Thickness(0, 6, 0, 0) };
+
+    internal static Control Hint(string text) => new TextBlock { Text = text, Classes = { "body" }, TextWrapping = TextWrapping.Wrap };
+
+    /// <summary>A labelled field. A watermark is not a label: it disappears as soon as there is a value.</summary>
+    internal static Control Field(string label, Control input) => new StackPanel
+    {
+        Spacing = 4,
+        Children = { new TextBlock { Text = label, FontSize = 11.5, Opacity = 0.75, TextWrapping = TextWrapping.Wrap }, input },
+    };
+
+    /// <summary>Buttons that wrap instead of running off the edge of the window.</summary>
+    internal static Control ButtonRow(params Control[] buttons)
+    {
+        var panel = new WrapPanel { Orientation = Orientation.Horizontal, ItemSpacing = 8, LineSpacing = 8 };
+        foreach (var button in buttons) panel.Children.Add(button);
+        return panel;
+    }
+
+    /// <summary>A path input that takes the free space, with its browse buttons pinned to the right.</summary>
+    internal static Control PathRow(Control input, params Control[] buttons)
+    {
+        var grid = new Grid { ColumnDefinitions = new ColumnDefinitions("*,Auto"), ColumnSpacing = 8 };
+        grid.Children.Add(input);
+        var side = new WrapPanel { Orientation = Orientation.Horizontal, ItemSpacing = 8, LineSpacing = 8 };
+        foreach (var button in buttons) side.Children.Add(button);
+        Grid.SetColumn(side, 1);
+        grid.Children.Add(side);
+        return grid;
+    }
+
+    /// <summary>
+    /// A diff has to be coloured to be readable — scanning a monochrome wall of +/- lines for what
+    /// changed is exactly the work the view is supposed to do for you. One control with a run per line
+    /// keeps it selectable and cheap even for a bounded 240 KB diff.
+    /// </summary>
+    internal static SelectableTextBlock DiffBody() => new()
+    {
+        FontFamily = new FontFamily("Cascadia Mono,Consolas,Menlo,monospace"),
+        FontSize = 12,
+        TextWrapping = TextWrapping.NoWrap,
+    };
+
+    internal static void SetDiff(SelectableTextBlock target, string diff)
+    {
+        var added = new SolidColorBrush(Color.Parse("#7ee2a8"));
+        var removed = new SolidColorBrush(Color.Parse("#f4837f"));
+        var hunk = new SolidColorBrush(Color.Parse("#7dd3fc"));
+        var meta = new SolidColorBrush(Color.Parse("#6a6a74"));
+        var body = new SolidColorBrush(Color.Parse("#c9c9d1"));
+        target.Inlines?.Clear();
+        if (string.IsNullOrWhiteSpace(diff))
+        {
+            target.Inlines?.Add(new Run("No tracked diff.") { Foreground = meta });
+            return;
+        }
+        foreach (var line in diff.Replace("\r\n", "\n").Split('\n'))
+        {
+            var brush = body;
+            if (line.StartsWith("@@", StringComparison.Ordinal)) brush = hunk;
+            else if (line.StartsWith("+++", StringComparison.Ordinal) || line.StartsWith("---", StringComparison.Ordinal)
+                || line.StartsWith("diff ", StringComparison.Ordinal) || line.StartsWith("index ", StringComparison.Ordinal)
+                || line.StartsWith("new file", StringComparison.Ordinal) || line.StartsWith("deleted file", StringComparison.Ordinal)
+                || line.StartsWith("similarity", StringComparison.Ordinal) || line.StartsWith("rename ", StringComparison.Ordinal)) brush = meta;
+            else if (line.StartsWith("+", StringComparison.Ordinal)) brush = added;
+            else if (line.StartsWith("-", StringComparison.Ordinal)) brush = removed;
+            target.Inlines?.Add(new Run(line + "\n") { Foreground = brush });
+        }
+    }
+
+    /// <summary>
+    /// Render the durable subagent DAG as readable rows. This used to serialise the raw array, so an
+    /// empty plan showed the user the two characters "[]".
+    /// </summary>
+    internal static string DescribeTaskNodes(System.Text.Json.JsonElement? result)
+    {
+        if (result is not { } value || value.ValueKind != System.Text.Json.JsonValueKind.Array || value.GetArrayLength() == 0)
+        {
+            return "No subagent tasks in this session yet.\n\nUse \"Plan with sidecar\" on a task, or @agent in the composer, to create one.";
+        }
+        var lines = new List<string>();
+        foreach (var node in value.EnumerateArray())
+        {
+            string Read(string name) => node.TryGetProperty(name, out var found) && found.ValueKind == System.Text.Json.JsonValueKind.String ? found.GetString() ?? "" : "";
+            string[] ReadList(string name) => node.TryGetProperty(name, out var found) && found.ValueKind == System.Text.Json.JsonValueKind.Array
+                ? found.EnumerateArray().Where(item => item.ValueKind == System.Text.Json.JsonValueKind.String).Select(item => item.GetString() ?? "").Where(item => item.Length > 0).ToArray()
+                : Array.Empty<string>();
+
+            var status = Read("status");
+            var mark = status switch { "completed" => "✓", "failed" => "✗", "running" => "▶", "cancelled" => "⊘", "blocked" => "…", _ => "•" };
+            lines.Add($"{mark} {Read("agent")}  ·  {status}  ·  {Read("modelTier")} tier  ·  {Read("workspaceMode")}");
+            var objective = Read("objective").Replace("\r", "").Split('\n').FirstOrDefault() ?? "";
+            if (objective.Length > 0) lines.Add($"    {(objective.Length > 150 ? objective.Substring(0, 150) + "…" : objective)}");
+            var dependencies = ReadList("dependencies");
+            if (dependencies.Length > 0) lines.Add($"    after: {string.Join(", ", dependencies)}");
+            var allowed = ReadList("allowedFiles");
+            if (allowed.Length > 0) lines.Add($"    files: {string.Join(", ", allowed.Take(6))}{(allowed.Length > 6 ? $" (+{allowed.Length - 6})" : "")}");
+            var report = Read("report").Replace("\r", "").Split('\n').FirstOrDefault() ?? "";
+            if (report.Length > 0) lines.Add($"    report: {(report.Length > 150 ? report.Substring(0, 150) + "…" : report)}");
+            lines.Add("");
+        }
+        return string.Join("\n", lines).TrimEnd();
+    }
+
+    /// <summary>Search hits as readable rows. This surface used to print the raw JSON array.</summary>
+    internal static string DescribeSearchHits(System.Text.Json.JsonElement? result)
+    {
+        if (result is not { } value || value.ValueKind != System.Text.Json.JsonValueKind.Array || value.GetArrayLength() == 0) return "No matches.";
+        var lines = new List<string>();
+        foreach (var hit in value.EnumerateArray())
+        {
+            var path = hit.TryGetProperty("path", out var pathValue) ? pathValue.GetString() ?? "?" : "?";
+            var symbols = hit.TryGetProperty("symbols", out var symbolsValue) && symbolsValue.ValueKind == System.Text.Json.JsonValueKind.Array
+                ? symbolsValue.EnumerateArray().Where(item => item.ValueKind == System.Text.Json.JsonValueKind.String).Select(item => item.GetString() ?? "").Where(item => item.Length > 0).Take(8).ToArray()
+                : Array.Empty<string>();
+            lines.Add(path);
+            if (symbols.Length > 0) lines.Add($"    {string.Join(", ", symbols)}");
+            if (hit.TryGetProperty("lines", out var previewValue) && previewValue.ValueKind == System.Text.Json.JsonValueKind.Array)
+            {
+                foreach (var preview in previewValue.EnumerateArray().Take(2))
+                {
+                    var text = preview.ValueKind == System.Text.Json.JsonValueKind.String ? preview.GetString() ?? "" : preview.ToString();
+                    text = text.Replace("\r", "").Replace("\n", " ").Trim();
+                    if (text.Length > 0) lines.Add($"    {(text.Length > 140 ? text.Substring(0, 140) + "…" : text)}");
+                }
+            }
+        }
+        return string.Join("\n", lines);
+    }
 
     private enum EngineState { Starting, Connected, Failed }
 

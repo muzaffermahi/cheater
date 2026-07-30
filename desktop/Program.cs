@@ -18,7 +18,7 @@ internal static class Program
         if (snapshot is not null)
         {
             var delay = ArgValue(args, "--delay") is { } raw && int.TryParse(raw, out var ms) ? ms : 2500;
-            RunSnapshot(snapshot, delay, HasFlag(args, "--palette"));
+            RunSnapshot(snapshot, delay, HasFlag(args, "--palette"), ArgValue(args, "--view"));
             return;
         }
 
@@ -35,7 +35,7 @@ internal static class Program
 
     private static bool HasFlag(string[] args, string name) => Array.IndexOf(args, name) >= 0;
 
-    private static void RunSnapshot(string path, int delayMs, bool withPalette)
+    private static void RunSnapshot(string path, int delayMs, bool withPalette, string? view)
     {
         BuildAvaloniaApp().Start((_, _) =>
         {
@@ -46,14 +46,20 @@ internal static class Program
                 try
                 {
                     if (withPalette) window.OpenPaletteForSnapshot();
-                    // A second beat lets the palette's own layout settle before the frame is captured.
+                    if (view is not null) window.OpenViewForSnapshot(view);
+                    // A second beat lets the opened surface finish its own layout and first data load.
                     DispatcherTimer.RunOnce(() =>
                     {
-                        try { Capture(window, path); }
+                        try
+                        {
+                            // A secondary surface opens as an owned window, so capture that instead.
+                            var target = window.OwnedWindows.LastOrDefault() ?? window;
+                            Capture(target, path);
+                        }
                         catch (Exception error) { Console.Error.WriteLine($"snapshot failed: {error.Message}"); }
                         window.Close();
                         Dispatcher.UIThread.InvokeShutdown();
-                    }, TimeSpan.FromMilliseconds(withPalette ? 400 : 1));
+                    }, TimeSpan.FromMilliseconds(view is not null ? 2500 : withPalette ? 400 : 1));
                 }
                 catch (Exception error)
                 {

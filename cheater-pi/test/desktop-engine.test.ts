@@ -189,6 +189,11 @@ test("desktop engine hydrates workspace intelligence from the project cache afte
   const second = await startDesktopEngine({ socketPath: socketB, store: ":memory:", projectRoot: root });
   const secondSocket = await connect(socketB, second.token);
   try {
+    // Listing the project must not require a query: the file browser opens on this.
+    const listed = await call(secondSocket, "files", "workspace.files", { root });
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].path, "src/auth.ts");
+    assert.ok(listed[0].symbols.includes("authenticate"));
     const overview = await call(secondSocket, "overview", "workspace.overview", { root });
     assert.equal(overview.files, 1);
     const hits = await call(secondSocket, "search", "workspace.search", { root, query: "authenticate" });
