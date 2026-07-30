@@ -98,22 +98,42 @@ engine fails the release rather than shipping. `.github/workflows/desktop.yml` r
 gate for the C# shell (`-warnaserror`) plus the bundle + IPC smoke, because no Node test can catch a
 break in the native shell.
 
-## Native workbench (in progress)
+## Native workbench
 
-The transcript is no longer one concatenated `TextBlock`: `desktop/TranscriptView.cs` renders each turn
-as a card (role header, prose/fenced-code split, monospaced scrollable code, per-block selection),
-streams into the open card, labels harness output as harness output, and only follows the tail when the
-user is already at the bottom. Local gate: `dotnet build desktop/Kitten.Desktop.csproj -c Release
--warnaserror` plus a launch smoke; the SDK lives repo-locally in `.dotnet/` (gitignored).
+The app is the product, so it was rebuilt and then reviewed by rendering it, not by trusting that it
+compiled. `Kitten.Desktop.exe --snapshot <png> [--palette] [--view <name>] [--task "<prompt>"]` lays the
+real window out against the real engine, writes a PNG and exits — every screen, including a live run in
+flight, is reviewable without a human at the mouse (and pinnable in CI).
 
-Still outstanding against the plan's Milestone 3 gate: inline native diff review, a subagent tree, an
-activity drawer of process cards, a first-run wizard, and collapsing the 22-button left rail into one
-Settings/Models screen. `MainWindow.axaml.cs` remains ~2250 lines of code-behind with modal dialogs
-built inline.
+**Shell.** Three regions and a status line: sessions, the conversation, what the run produced.
+Everything else — models, runtimes, benchmarks, agents, workspace tools, exports — sits behind Ctrl+K
+in one searchable command palette, replacing the twenty-two-button left rail. `App.axaml` carries the
+design tokens (surfaces, borders, text, one accent, ok/warn/error) and control styles, so surfaces stop
+drifting into hand-picked hex. Approvals appear next to the conversation that raised them and are
+hidden otherwise. The transcript is bottom-anchored, like a conversation.
+
+**The transcript** renders each turn as a card (prose/fenced-code split, monospaced scrollable code,
+per-block selection) and each tool call as a compact step — `read stats.py`, `edit stats.py`,
+`bash python -c …` with duration and output preview. `tool.completed` carries a `target` for this. A
+card opens as "thinking…" because a local 35B needs half a minute before its first token; a turn that
+only called tools leaves no empty card behind. Kitten's own notes are labelled as harness output.
+
+**Honest state.** Every panel describes the current run: EVIDENCE shows that run's receipt (replayed
+sessions included), CHANGES the files it touched, and stopped/interrupted runs say so in the history
+instead of leaving a prompt with no answer. Durations read "1m 53s". The status line is one line, with
+the detail on hover.
+
+**Secondary surfaces** were each rendered and repaired: model settings no longer clips its fields and
+docks Save; change review filters Kitten's own `.cheater/` cache and colours the diff; the task board
+describes the DAG instead of printing `[]`; the file browser lists the project on open via
+`workspace.files`; the agent library docks its actions.
+
+Still open: an inline diff in the inspector (it is a separate window today), a subagent tree view, and
+a guided first-run wizard.
 
 ## Tests
 
-Core and desktop-engine tests: **924 green** (912 before the sweep; +12 regression tests).
+Core and desktop-engine tests: **928 green** (912 at the start of this pass).
 
 The native Agent library includes seven additional sidecar specialists (`architect`, `security`,
 `debug`, `test`, `release`, `docs`, and `performance`) with bounded permissions and durable
