@@ -130,6 +130,12 @@ export interface ChatParams {
   timeoutMs?: number;
   /** LM Studio / Qwen reasoning-effort hint (best-effort; ignored by models that lack it). */
   reasoningEffort?: "low" | "medium" | "high";
+  /**
+   * Hard cap on thinking tokens for this call (llama.cpp `reasoning_budget`). Unlike the effort hint
+   * this is a real bound: 0 disables reasoning outright. Set it from task hardness — thinking is worth
+   * paying for on a hard task and is the dominant latency cost on an easy one.
+   */
+  reasoningBudget?: number;
   signal?: AbortSignal;
 
   // ── Owned-inference decode controls (Pi/opencode cannot send these). Each is optional and only
@@ -266,7 +272,15 @@ export class KittenLLM {
       body.response_format = { type: "json_schema", json_schema: { name: params.jsonSchema.name, strict: true, schema: params.jsonSchema.schema } };
     }
     if (params.logprobs) { body.logprobs = true; if (params.topLogprobs) body.top_logprobs = params.topLogprobs; }
+    // `reasoning_effort` is sent for endpoints that honour it, but it is NOT a reliable control: on
+    // llama.cpp only "none" dependably disables reasoning, and the graded values may do nothing at all.
+    // So the effort hint never stands alone — `reasoningBudget` below is the mechanism that actually
+    // bounds the thinking tax, and callers that care about latency must set it.
     if (params.reasoningEffort) body.reasoning_effort = params.reasoningEffort;
+    if (params.reasoningBudget !== undefined && params.reasoningBudget >= 0) {
+      body.reasoning_budget = Math.floor(params.reasoningBudget);
+      if (params.reasoningBudget === 0) body.reasoning_effort = "none";
+    }
     if (params.topP !== undefined) body.top_p = params.topP;
     if (params.topK !== undefined) body.top_k = params.topK;
     if (params.minP !== undefined) body.min_p = params.minP;

@@ -103,6 +103,9 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
         extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime,
         contextPreamble: params.contextPreamble,
         captureConfidence: params.captureConfidence,
+        // Self-certainty only decides between candidates, and per-token probabilities cost real decode
+        // throughput — so a single-plan round does not pay for them.
+        candidateCount: plans.length,
         decode: { ...params.decode, ...plan.decode },
         banForbidden: params.banForbidden,
         disableThinking: params.disableThinking,

@@ -4,6 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAgent } from "../src/core/agent.js";
+import type { KittenLLM, ChatParams, ChatResult } from "../src/core/llm.js";
 import { KittenApp, type Runner } from "../src/core/app.js";
 import { defaultRunner } from "../src/core/runner.js";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
@@ -138,4 +139,37 @@ test("an answer-lane model error is recorded as failed, not completed", async ()
   const events = kapp.getEvents(conv.id);
   assert.ok(events.some((e) => e.type === "run.failed"), "a model error must terminate as run.failed");
   assert.ok(!events.some((e) => e.type === "run.completed"), "must NOT be recorded as a completed run");
+});
+
+// Per-token probabilities are not free — llama.cpp reports roughly a 3x generation slowdown with
+// n_probs > 0 — and self-certainty is only ever read to break a tie between candidates. A single
+// candidate has nothing to tie with, so it must not pay the tax.
+test("logprobs are requested only when a run has candidates to be compared against", async () => {
+  const seen: Array<{ logprobs?: boolean; topLogprobs?: number }> = [];
+  const llm = {
+    models: { baseUrl: "fixture://logprob", main: "main-35b" },
+    chat: async (params: ChatParams) => {
+      seen.push({ logprobs: (params as { logprobs?: boolean }).logprobs, topLogprobs: (params as { topLogprobs?: number }).topLogprobs });
+      return { content: "done", reasoning: "", toolCalls: [], finishReason: "stop", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 1 } as ChatResult;
+    },
+  } as unknown as KittenLLM;
+
+  const base = { task: "say done", cwd: process.cwd(), llm, maxTurns: 1, captureConfidence: true };
+
+  await runAgent({ ...base });
+  assert.equal(seen[0].logprobs, false, "an ordinary single run must not pay the logprob tax");
+  assert.equal(seen[0].topLogprobs, undefined);
+
+  seen.length = 0;
+  await runAgent({ ...base, candidateCount: 1 });
+  assert.equal(seen[0].logprobs, false, "one candidate has nothing to be compared against");
+
+  seen.length = 0;
+  await runAgent({ ...base, candidateCount: 3 });
+  assert.equal(seen[0].logprobs, true, "best-of-N still gets its selection signal");
+  assert.equal(seen[0].topLogprobs, 5);
+
+  seen.length = 0;
+  await runAgent({ ...base, captureConfidence: false, candidateCount: 3 });
+  assert.equal(seen[0].logprobs, false, "the lever still turns it off entirely");
 });

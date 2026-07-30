@@ -44,6 +44,9 @@ export interface AgentRunParams {
   /** Owned-engine lever: cap ornith's reasoning depth per turn (it reasons ~130 tok even for a
    *  trivial tool call). "low" trims the reasoning tax for speed; omit for the model default. */
   reasoningEffort?: "low" | "medium" | "high";
+  /** Hard cap on thinking tokens per turn (llama.cpp `reasoning_budget`); 0 disables reasoning. Set
+   *  from task hardness by the caller — see runReliableAgent. */
+  reasoningBudget?: number;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
   /** Reliability hook: after a tool runs, return extra feedback to append to the tool result the
@@ -63,6 +66,8 @@ export interface AgentRunParams {
   /** P1: request per-token logprobs and aggregate self-certainty across the trajectory (owned-engine
    *  selection signal). Opt-in — adds response size, so only the ascent best-of-N path enables it. */
   captureConfidence?: boolean;
+  /** How many candidates this run competes against. Self-certainty is only captured above 1. */
+  candidateCount?: number;
   /** Owned-inference per-sample decode controls (P2 ban, P5 sampler diversity) applied to every turn. */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
   /** Model-facing conversation context (prior turns + current repo truth), injected as a system block
@@ -157,6 +162,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const bashOk: string[] = [];
   const bashAll: string[] = [];
   const logprobChunks: (TokenLogprob[] | undefined)[] = [];
+  // Self-certainty is a tiebreaker between candidates, so it is only worth its cost when there is
+  // something to tie with. `candidateCount` is 1 for every ordinary run.
+  const captureLogprobs = Boolean(params.captureConfidence) && (params.candidateCount ?? 1) > 1;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
@@ -168,8 +176,16 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       maxTokens: params.maxTokens,
       temperature: params.temperature,
       reasoningEffort: params.reasoningEffort,
-      logprobs: params.captureConfidence,
-      topLogprobs: params.captureConfidence ? 5 : undefined,
+      // The harness decides how long the model may think, because the model consistently over-spends
+      // it. `reasoning_effort` alone is not a reliable control (only "none" dependably bites), so the
+      // budget travels with it and is the thing that actually bounds the tax.
+      reasoningBudget: params.reasoningBudget,
+      // Per-token probabilities are NOT free: llama.cpp reports roughly a 3x generation slowdown with
+      // n_probs > 0, and self-certainty is only ever consulted to break a tie between candidates. So
+      // capture them only when more than one candidate will exist — a single-candidate run has nothing
+      // to compare against and was paying the tax for a number nobody read.
+      logprobs: captureLogprobs,
+      topLogprobs: captureLogprobs ? 5 : undefined,
       logitBias: params.decode?.logitBias,
       topP: params.decode?.topP,
       topK: params.decode?.topK,

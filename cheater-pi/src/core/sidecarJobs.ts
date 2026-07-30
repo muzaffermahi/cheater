@@ -2,6 +2,7 @@
 // small model is absent, busy, malformed, or slower than the foreground task.
 
 import type { KittenLLM } from "./llm.js";
+import { enumGrammar } from "./grammar.js";
 import type { WorkspaceIndex } from "./workspaceIndex.js";
 import { SidecarControlPlane, type SidecarPriority, type SidecarTier, type SidecarResult } from "./sidecarControlPlane.js";
 
@@ -253,6 +254,17 @@ function boundedString(value: unknown, max = 4000): string | null {
 }
 
 /** Validate sidecar output against the request's candidate set; invalid output falls back deterministically. */
+/**
+ * Jobs whose entire answer is one label from a closed set. These are the calls worth constraining: the
+ * set is small, the answer is a single token, and any prose the model adds is pure latency.
+ */
+export function closedSetLabels(type: SidecarJobType): string[] | null {
+  switch (type) {
+    case "classify_task": return ["question", "bug", "feature", "refactor", "general"];
+    default: return null;
+  }
+}
+
 export function validateSidecarValue(input: SidecarJobInput, value: unknown): unknown | null {
   if (value && typeof value === "object" && !Array.isArray(value) && "value" in value) value = (value as { value: unknown }).value;
   switch (input.type) {
@@ -379,9 +391,28 @@ export async function runCatalogJob(scheduler: SidecarControlPlane, llm: KittenL
   return scheduler.enqueue({ id: input.id, type: input.type, tier: defaults.tier, priority: defaults.priority, premise: input.premise, deadlineMs: input.deadlineMs,
     run: async (signal) => {
       if (!llm) return deterministicSidecar(input, index);
-      const prompt = `Return a concise JSON object for sidecar job ${input.type}. Do not invent files or evidence.\n${JSON.stringify(input).slice(0, 12000)}`;
-      const response = await llm.sidecar({ messages: [{ role: "user", content: prompt }], maxTokens: 512, disableThinking: true, signal });
+      // A closed-set answer is decoded under a grammar, so an out-of-set label cannot be produced at
+      // all. That removes the parse-then-retry turn instead of making it rarer, and it is the single
+      // cheapest use of owning the decoder. Endpoints without grammar support ignore the field and the
+      // existing validator + deterministic floor still catch anything malformed.
+      const closedSet = closedSetLabels(input.type);
+      const prompt = closedSet
+        ? `Answer with exactly one label for sidecar job ${input.type}, and nothing else. Allowed: ${closedSet.join(", ")}.\n${JSON.stringify(input).slice(0, 12000)}`
+        : `Return a concise JSON object for sidecar job ${input.type}. Do not invent files or evidence.\n${JSON.stringify(input).slice(0, 12000)}`;
+      const response = await llm.sidecar({
+        messages: [{ role: "user", content: prompt }],
+        maxTokens: closedSet ? 8 : 512,
+        disableThinking: true,
+        ...(closedSet ? { grammar: enumGrammar(closedSet) } : {}),
+        signal,
+      });
       if (!response.ok || !response.content.trim()) throw new Error(response.error ?? "sidecar returned no content");
+      if (closedSet) {
+        const label = response.content.trim().toLowerCase();
+        const value = validateSidecarValue(input, label);
+        if (value === null) throw new Error("sidecar returned an out-of-set label");
+        return { type: input.type, value, confidence: "medium", notes: ["sidecar model", "grammar-constrained label"] };
+      }
       const parsed = extractSidecarJson(response.content);
       const value = parsed === null ? null : validateSidecarValue(input, parsed);
       if (value === null) throw new Error("sidecar returned malformed or out-of-scope JSON");

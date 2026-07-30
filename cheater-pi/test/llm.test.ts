@@ -88,3 +88,42 @@ test("chat rescues a server that rejects optional structured-output constraints"
   assert.equal(calls, 2);
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
+
+// `reasoning_effort` is not a reliable control: on llama.cpp only "none" dependably disables thinking,
+// so a harness that sends "low" and believes it has cut the reasoning tax may have changed nothing.
+// `reasoning_budget` is the mechanism that actually bites, and it must travel with the hint.
+test("a reasoning budget reaches the endpoint as a real bound, not just an effort hint", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const server = createServer((request, response) => {
+    let raw = "";
+    request.on("data", (chunk) => { raw += String(chunk); });
+    request.on("end", () => {
+      try { bodies.push(JSON.parse(raw)); } catch { bodies.push({}); }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const port = (server.address() as { port: number }).port;
+  const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${port}/v1`, main: "main-35b" });
+  try {
+    await llm.chat({ messages: [{ role: "user", content: "hi" }], reasoningEffort: "low" });
+    assert.equal(bodies[0].reasoning_effort, "low");
+    assert.equal(bodies[0].reasoning_budget, undefined, "an effort hint alone must not imply a bound");
+
+    await llm.chat({ messages: [{ role: "user", content: "hi" }], reasoningEffort: "low", reasoningBudget: 256 });
+    assert.equal(bodies[1].reasoning_budget, 256);
+    assert.equal(bodies[1].reasoning_effort, "low");
+
+    // Zero is the one value dependable across endpoints, so it is stated both ways.
+    await llm.chat({ messages: [{ role: "user", content: "hi" }], reasoningBudget: 0 });
+    assert.equal(bodies[2].reasoning_budget, 0);
+    assert.equal(bodies[2].reasoning_effort, "none");
+
+    // A negative budget is a caller bug, not an instruction to disable reasoning.
+    await llm.chat({ messages: [{ role: "user", content: "hi" }], reasoningBudget: -5 });
+    assert.equal(bodies[3].reasoning_budget, undefined);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});

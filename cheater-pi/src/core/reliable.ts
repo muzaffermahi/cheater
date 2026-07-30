@@ -49,6 +49,10 @@ export interface ReliableParams {
   experiencePrime?: string;
   /** P1: capture per-token logprobs → self-certainty (owned-engine selection signal). */
   captureConfidence?: boolean;
+  /** Candidates in this round; self-certainty is only captured when there is something to compare. */
+  candidateCount?: number;
+  /** Hard cap on thinking tokens per turn; forwarded to the agent loop. */
+  reasoningBudget?: number;
   /** P2/P5: owned-inference per-sample decode controls (forbidden-token ban, sampler diversity). */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
   /** P2: run the finish-gate forbidden-construct source scan (engine-agnostic fallback for the ban). */
@@ -136,6 +140,8 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     onEvent: params.onEvent,
     signal: params.signal,
     captureConfidence: params.captureConfidence,
+    candidateCount: params.candidateCount,
+    reasoningBudget: params.reasoningBudget,
     decode: params.decode,
     disableThinking: params.disableThinking,
     commandGate: params.commandGate,
