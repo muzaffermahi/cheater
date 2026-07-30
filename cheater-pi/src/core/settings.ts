@@ -70,6 +70,11 @@ function readConfig(path: string, warnings: string[]): RawConfig | null {
 }
 
 function userConfigPath(): string {
+  // KITTEN_HOME is the documented Kitten home (paths.ts), so user settings live inside it too.
+  // Honouring it here also makes the suite hermetic: without this, a developer's own ~/.kitten config
+  // silently changes what tests observe — which is exactly how a green suite starts lying.
+  const override = process.env.KITTEN_HOME?.trim();
+  if (override) return join(override, "config.json");
   // Prefer ~/.kitten/config.json; fall back to the XDG-style ~/.config/kitten/config.json if present.
   const home = join(homedir(), ".kitten", "config.json");
   if (existsSync(home)) return home;
@@ -148,7 +153,8 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
 
 /** Persist non-secret app settings atomically. API keys remain environment/config-file only. */
 export function saveKittenSettings(update: SettingsUpdate, scope: "user" | "project" = "user", cwd = process.cwd()): string {
-  const path = scope === "project" ? join(cwd, ".kitten", "config.json") : join(homedir(), ".kitten", "config.json");
+  // Write where a read would look, or a saved setting becomes invisible to the next load.
+  const path = scope === "project" ? join(cwd, ".kitten", "config.json") : userConfigPath();
   mkdirSync(join(path, ".."), { recursive: true });
   let current: Record<string, unknown> = {};
   if (existsSync(path)) {

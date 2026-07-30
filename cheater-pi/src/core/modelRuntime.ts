@@ -3,7 +3,7 @@
 // files, and produce a safe launch plan without opening a terminal or mutating user configuration.
 
 import { createHash } from "node:crypto";
-import { existsSync, statSync, readFileSync } from "node:fs";
+import { existsSync, statSync, readFileSync, mkdirSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { cpus, totalmem } from "node:os";
@@ -208,7 +208,8 @@ export function buildLaunchPlan(input: {
   // The expert tensors are the bulk of a MoE and the part that does not fit. Pushing them to CPU keeps
   // attention and the dense path resident instead of letting the driver thrash.
   if (backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8) {
-    args.push("--cpu-moe");
+    // llama.cpp itself warns that CPU tensor overrides with mmap enabled are slower, so take its advice.
+    args.push("--cpu-moe", "--no-mmap");
     warnings.push(`The model is ${(modelBytes / 1e9).toFixed(1)} GB against ${(vramBytes / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth.`);
   }
 
@@ -216,7 +217,13 @@ export function buildLaunchPlan(input: {
   // a similarity threshold so a near-identical prompt lands on the warm slot, a prompt-cache pool, and
   // a disk path so a reopened conversation can restore instead of re-paying a 16k prefill.
   args.push("--slot-prompt-similarity", "0.25");
-  if (input.slotSavePath) args.push("--slot-save-path", input.slotSavePath);
+  if (input.slotSavePath) {
+    // The server will not start if this directory does not exist, and because the managed spawn
+    // discards stderr the only symptom was "the runtime never became reachable" — a silent failure
+    // with no reason anywhere. Create it here so the flag is always safe to pass.
+    try { mkdirSync(input.slotSavePath, { recursive: true }); args.push("--slot-save-path", input.slotSavePath); }
+    catch { warnings.push(`KV slots cannot be persisted: ${input.slotSavePath} is not writable. Resume will re-prefill instead of restoring.`); }
+  }
   if (input.promptCacheMiB && input.promptCacheMiB > 0) args.push("--cache-ram", String(Math.floor(input.promptCacheMiB)));
 
   if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
@@ -224,10 +231,17 @@ export function buildLaunchPlan(input: {
 }
 
 /** Spawn a managed runtime without inheriting a console window or arbitrary environment secrets. */
-export function spawnManagedRuntime(executable: string, args: string[], cwd: string): { process: ReturnType<typeof spawn>; stop: () => void } {
+export function spawnManagedRuntime(executable: string, args: string[], cwd: string): { process: ReturnType<typeof spawn>; stop: () => void; stderr: () => string } {
   // The native app has no console surface. Ignoring output also prevents a verbose server from
   // filling an undrained pipe and stalling inference after a long session.
-  const child = spawn(executable, args, { cwd, windowsHide: true, stdio: ["ignore", "ignore", "ignore"], detached: process.platform !== "win32", env: { PATH: process.env.PATH ?? "" } });
+  // stderr is captured, not discarded. Throwing it away meant a runtime that refused to start — a
+  // missing slot directory, a bad flag, an out-of-memory — surfaced only as "did not become
+  // reachable", with the actual reason printed into nowhere. The buffer stays bounded so a chatty
+  // server can never fill an undrained pipe and stall inference.
+  const child = spawn(executable, args, { cwd, windowsHide: true, stdio: ["ignore", "ignore", "pipe"], detached: process.platform !== "win32", env: { PATH: process.env.PATH ?? "" } });
+  let stderr = "";
+  child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + String(chunk)).slice(-8000); });
+  child.stderr?.on("error", () => { /* the runtime is what matters, not our reader */ });
   const stop = (): void => { if (child.pid && process.platform === "win32") { try { spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" }); } catch {} } else child.kill("SIGTERM"); };
-  return { process: child, stop };
+  return { process: child, stop, stderr: () => stderr };
 }

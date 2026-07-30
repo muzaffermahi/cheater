@@ -1,4 +1,10 @@
 import test from "node:test";
+
+// The suite must not observe the developer's own ~/.kitten config: a real configured runtime on the
+// machine silently changes what these tests see. KITTEN_HOME points settings and store at a scratch
+// home for the whole file.
+process.env.KITTEN_HOME = process.env.KITTEN_HOME ?? join(tmpdir(), `kitten-test-home-${process.pid}`);
+
 import assert from "node:assert/strict";
 import { createConnection, type Socket } from "node:net";
 import { createServer } from "node:http";

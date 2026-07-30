@@ -287,7 +287,12 @@ async function launchManagedRuntime(request: ManagedRuntimeLaunchRequest, holder
   const sidecarProbe = sidecarBaseUrl ? await waitForEndpoint(sidecarBaseUrl, request.probeTimeoutMs ?? 15_000) : undefined;
   if (!probe.reachable || (sidecarProbe && !sidecarProbe.reachable)) {
     await stopManagedRuntime(holder);
-    throw new Error(`managed runtime did not become reachable: ${probe.reachable ? (sidecarProbe?.error ?? "sidecar endpoint probe failed") : (probe.error ?? "endpoint probe failed")}`);
+    // The runtime almost always says why it refused to start — a missing directory, a rejected flag,
+    // out of memory. Report its own last words instead of only our timeout.
+    const said = [mainProcess?.stderr(), sidecarProcess?.stderr()].filter((text): text is string => Boolean(text && text.trim()));
+    const detail = probe.reachable ? (sidecarProbe?.error ?? "sidecar endpoint probe failed") : (probe.error ?? "endpoint probe failed");
+    const reason = said.length ? `${detail}\n${said.join("\n").split(/\r?\n/).filter(Boolean).slice(-8).join("\n")}` : detail;
+    throw new Error(`managed runtime did not become reachable: ${reason}`);
   }
   return { mainProcess, sidecarProcess, baseUrl: request.baseUrl, sidecarBaseUrl, plan, probe, sidecarProbe };
 }
