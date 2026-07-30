@@ -75,9 +75,32 @@ Kitten application core (cheater-pi/src/core/, Pi-free)
 | **7 — Release** (completions, export, zero-dependency package gate) | ✅ landed |
 | **8 — VS Code extension** | ⬜ not started |
 
+## Native-era correctness sweep (July 30, 2026)
+
+The modules the native product is built on — `desktopEngine`, `taskGraph`, `sidecar*`, `model*`,
+`workspace*` — were written at high velocity and had never been through a correctness pass. Six
+defects were found and fixed with regression tests; each one violated a stated invariant.
+
+| Defect | Invariant it broke | Fix |
+|---|---|---|
+| The engine's local socket had **no authentication**: any process running as this user could `conversation.submit` into any directory (file writes + shell), repoint `baseUrl` at a collecting endpoint via `settings.update`, or passively receive the whole event stream — prompts, output, diffs. The pipe name was predictable and every socket joined the broadcast set before sending a byte. | KITTEN-PLAN §2 specified "a random per-launch handshake secret"; never implemented | per-launch 24-byte token published with the socket path to `<kittenHome>/engine.json` (0600, withdrawn on close). Nothing is served — not liveness, above all not events — before a valid `hello`; a wrong token or an idle deadline closes the connection |
+| `app.recover()` ran **before** the socket bind, so a second launch (which then loses the bind) flipped the live instance's in-flight runs to `interrupted` in the shared store | "crash never lies about run state" | recovery runs only after the bind; the bind is the single-instance lock |
+| A lost bind also leaked the open store handle + event subscription (on Windows the `.db` stayed locked) | — | the failure path closes both before rethrowing |
+| **Stop on a sidecar workflow** only cancelled the step in flight. A Stop during the initial index warm, or between steps, was dropped and every remaining step ran | "cancellation that leaves hidden work running is release-blocking" | one pack-wide cancellation flag registered before the first await; the result reports `cancelled`/`completedSteps` honestly |
+| `read`/`write`/`edit` **left the project root** whenever a task had no allow-list (the common case): `../../anything` and bare absolute paths were accepted. Matching was lexical and case-sensitive, so a symlink/junction widened the root and `Secrets/` slipped past a `secrets` forbid entry | §0.2 "lexical- and real-path confined"; symlink/junction escape is always-block. `realpathSync` appeared nowhere in src | the project root is an absolute first gate for every tool path, resolved through the nearest existing ancestor, case-folded where the filesystem folds |
+| A **model download that broke once stayed broken**: any `.part` was resumed with no record of which artifact produced it, and a checksum failure left the bad partial in place, so every retry appended to bytes that could never verify | "no silent downloads or installs" implies a recoverable one | partials are claimed (id/URL/hash sidecar) and resumed only on a match; a proven-bad partial is discarded and the error says so |
+
+An `ok:true` frame with an undefined result also serialized without the field, which a typed client
+reads as a hard failure; success frames now always carry `result`.
+
+The release smoke gate additionally asserts that an unauthenticated client is **refused**, so an open
+engine fails the release rather than shipping. `.github/workflows/desktop.yml` restores the compile
+gate for the C# shell (`-warnaserror`) plus the bundle + IPC smoke, because no Node test can catch a
+break in the native shell.
+
 ## Tests
 
-Core and desktop-engine tests: **912 green**.
+Core and desktop-engine tests: **924 green** (912 before the sweep; +12 regression tests).
 
 The native Agent library includes seven additional sidecar specialists (`architect`, `security`,
 `debug`, `test`, `release`, `docs`, and `performance`) with bounded permissions and durable
@@ -121,4 +144,8 @@ All offline/deterministic — no model endpoint needed.
   populate tier-compatible advertised model suggestions; the composer accepts `@agent objective`
   for direct durable specialist sessions.
 - **Native IPC smoke gate**: release packaging launches the bundled hidden engine with an isolated
-  local pipe and requires a successful health response before the archive is produced.
+  local pipe and requires a successful health response before the archive is produced — and requires
+  that an unauthenticated client is refused first.
+- **The engine channel is authenticated**: the local socket carries a per-launch handshake token
+  published to `<kittenHome>/engine.json` (0600). It is not a formality — that channel can write files
+  and run commands, so an unauthenticated peer is told nothing but "unauthorized" and disconnected.

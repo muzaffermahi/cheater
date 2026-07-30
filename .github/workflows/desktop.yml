@@ -1,0 +1,86 @@
+name: Desktop
+
+# The native shell is the only supported user surface, and it is C#: nothing in the Node test suite
+# can catch a break in it. This workflow is therefore the compile gate for desktop/ — it must run on
+# every change that touches the shell, the engine it talks to, or the packaging scripts.
+
+on:
+  push:
+    branches: [main, kitten-product, kitten-hardening]
+    paths:
+      - 'desktop/**'
+      - 'cheater-pi/src/core/desktopEngine.ts'
+      - 'cheater-pi/src/core/desktopProtocol.ts'
+      - 'cheater-pi/scripts/package-desktop*.mjs'
+      - 'cheater-pi/scripts/native-engine-smoke.mjs'
+      - '.github/workflows/desktop.yml'
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'cheater-pi/src/core/desktopEngine.ts'
+      - 'cheater-pi/src/core/desktopProtocol.ts'
+      - 'cheater-pi/scripts/package-desktop*.mjs'
+      - 'cheater-pi/scripts/native-engine-smoke.mjs'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: native shell build + engine IPC smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Warnings are errors here: an unused-variable warning in the shell is how a half-finished
+      # handler ships.
+      - name: Build native shell
+        working-directory: desktop
+        run: dotnet build Kitten.Desktop.csproj -c Release -warnaserror
+
+      - name: Build GUI installer
+        working-directory: desktop/Installer
+        run: dotnet build Kitten.Setup.csproj -c Release -warnaserror
+
+      - name: Publish self-contained shell
+        working-directory: desktop
+        run: dotnet publish Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -o ${{ github.workspace }}/artifacts/kitten-desktop
+
+      - name: Build engine
+        working-directory: cheater-pi
+        run: |
+          npm install
+          npm run build
+
+      # The bundled engine needs its own Node runtime; the packager refuses to assemble without one.
+      - name: Stage Node runtime for the bundle
+        shell: pwsh
+        run: |
+          $node = (Get-Command node).Source
+          Copy-Item $node "${{ github.workspace }}/artifacts/node.exe"
+          "KITTEN_NODE_EXE=${{ github.workspace }}/artifacts/node.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Assemble native bundle
+        working-directory: cheater-pi
+        run: node scripts/package-desktop.mjs --publish ${{ github.workspace }}/artifacts/kitten-desktop --out ${{ github.workspace }}/artifacts/kitten-desktop-bundle
+
+      # Launches the bundled hidden engine for real and proves the IPC contract, including that an
+      # unauthenticated local client is refused. A shipped engine open to any local process fails here.
+      - name: Native engine IPC smoke
+        working-directory: cheater-pi
+        run: node scripts/native-engine-smoke.mjs --bundle ${{ github.workspace }}/artifacts/kitten-desktop-bundle --project-root ${{ github.workspace }}
+
+      - name: Upload bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kitten-desktop-bundle
+          path: ${{ github.workspace }}/artifacts/kitten-desktop-bundle
+          if-no-files-found: warn
