@@ -131,10 +131,35 @@ function detectWindowsGpus(): HardwareProfile["gpus"] {
       const lower = name.toLowerCase();
       const vendor = lower.includes("nvidia") ? "NVIDIA" : lower.includes("amd") || lower.includes("radeon") ? "AMD" : lower.includes("intel") ? "Intel" : "Unknown";
       const backend: ComputeBackend = vendor === "NVIDIA" ? "cuda" : vendor === "AMD" || vendor === "Intel" ? "vulkan" : "unknown";
-      const vram = Number(row.AdapterRAM);
-      return { name, vendor, backend, ...(Number.isFinite(vram) && vram > 0 ? { vramBytes: vram } : {}) };
+      // Win32_VideoController.AdapterRAM is a 32-bit field and saturates at ~4 GB, so an 8 GB card
+      // reports 4.3 GB. Ask the driver instead when it can answer; otherwise report nothing rather
+      // than a number we know is wrong — this value is shown to the user and sizes the offload advice.
+      const reported = Number(row.AdapterRAM);
+      const vram = vendor === "NVIDIA" ? nvidiaVramBytes(name) ?? plausibleVram(reported) : plausibleVram(reported);
+      return { name, vendor, backend, ...(vram !== undefined ? { vramBytes: vram } : {}) };
     }).filter((gpu) => gpu.name !== "Unknown GPU");
   } catch { return []; }
+}
+
+/** A saturated 32-bit AdapterRAM reading is not a VRAM size; treat it as unknown. */
+function plausibleVram(bytes: number): number | undefined {
+  if (!Number.isFinite(bytes) || bytes <= 0) return undefined;
+  return bytes >= 4_290_000_000 && bytes <= 4_300_000_000 ? undefined : bytes;
+}
+
+/** nvidia-smi knows the real number. Absent driver or non-NVIDIA card → undefined, never a guess. */
+function nvidiaVramBytes(name: string): number | undefined {
+  try {
+    const output = execFileSync("nvidia-smi", ["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"], { encoding: "utf8", timeout: 3000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    for (const line of output.split(/\r?\n/)) {
+      const [gpuName, mib] = line.split(",").map((part) => part.trim());
+      if (!gpuName || !mib) continue;
+      const megabytes = Number(mib);
+      if (!Number.isFinite(megabytes) || megabytes <= 0) continue;
+      if (name.toLowerCase().includes(gpuName.toLowerCase()) || gpuName.toLowerCase().includes(name.toLowerCase())) return megabytes * 1024 * 1024;
+    }
+  } catch { /* no driver tool: report nothing rather than a wrong number */ }
+  return undefined;
 }
 
 export function buildLaunchPlan(input: {
@@ -144,6 +169,13 @@ export function buildLaunchPlan(input: {
   sidecarModel?: string;
   contextTokens?: number;
   sidecarMode?: RuntimeLaunchPlan["sidecarMode"];
+  /** Where llama.cpp may persist KV slots, so a reopened conversation restores instead of re-prefilling. */
+  slotSavePath?: string;
+  /** MiB of host RAM llama.cpp may use as a prompt-cache pool across requests. */
+  promptCacheMiB?: number;
+  /** Overrides for tests; production measures the real file and the real device. */
+  modelBytes?: number;
+  vramBytes?: number;
 }): RuntimeLaunchPlan {
   const runtime = input.runtime ?? "managed-llama-cpp";
   const backend = input.backend ?? detectHardware().gpus.find((gpu) => gpu.backend !== "unknown")?.backend ?? "cpu";
@@ -154,6 +186,39 @@ export function buildLaunchPlan(input: {
   if (sidecarMode === "contended") warnings.push("The sidecar shares the main device and will yield during user-blocking generation.");
   if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, parallelSlots: 1, sidecarMode, args: [], warnings };
   const args = ["--model", input.mainModel, "--ctx-size", String(contextTokens), "--jinja", "--cont-batching"];
+
+  // Four flags were not a launch plan. Everything below is a consequence of the machine actually in
+  // front of us: a quantized MoE whose weights are several times the VRAM, so the experts stream from
+  // system RAM and the scarce resource is VRAM for attention + KV, not compute.
+  const vramBytes = input.vramBytes ?? detectHardware().gpus.find((gpu) => gpu.backend === backend)?.vramBytes;
+  const modelBytes = input.modelBytes ?? (existsSync(input.mainModel) ? statSync(input.mainModel).size : undefined);
+
+  if (backend !== "cpu") {
+    // Offload every layer that fits; llama.cpp clamps a too-large count to the layers that exist.
+    args.push("--n-gpu-layers", "999");
+    // Attention on GPU is where flash-attention pays; it is off by default and costs nothing to ask for.
+    args.push("--flash-attn", "on");
+  }
+
+  // KV quantization is a CAPACITY lever here, not a quality one: q8_0 is the safe default and roughly
+  // halves the cache, which is the difference between a usable context and an OOM on 8 GB. q4 is NOT
+  // enabled automatically — the evidence for it on multi-file code editing does not exist yet.
+  args.push("--cache-type-k", "q8_0", "--cache-type-v", "q8_0");
+
+  // The expert tensors are the bulk of a MoE and the part that does not fit. Pushing them to CPU keeps
+  // attention and the dense path resident instead of letting the driver thrash.
+  if (backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8) {
+    args.push("--cpu-moe");
+    warnings.push(`The model is ${(modelBytes / 1e9).toFixed(1)} GB against ${(vramBytes / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth.`);
+  }
+
+  // Prefix reuse is the largest latency lever on this hardware, and none of it is on by default:
+  // a similarity threshold so a near-identical prompt lands on the warm slot, a prompt-cache pool, and
+  // a disk path so a reopened conversation can restore instead of re-paying a 16k prefill.
+  args.push("--slot-prompt-similarity", "0.25");
+  if (input.slotSavePath) args.push("--slot-save-path", input.slotSavePath);
+  if (input.promptCacheMiB && input.promptCacheMiB > 0) args.push("--cache-ram", String(Math.floor(input.promptCacheMiB)));
+
   if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
   return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };
 }
