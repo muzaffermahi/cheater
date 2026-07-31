@@ -26,7 +26,91 @@ internal static class Program
             Uninstaller.RemoveDirectory(args[fromIndex + 1], quiet);
             return;
         }
+        // Scripted installs (E2E, provisioning): the same copy+shortcuts+registry path, no window,
+        // no auto-launch. Exit code says whether it worked.
+        if (args.Contains("--silent", StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                InstallerCore.Install(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar), progress: null);
+                Environment.ExitCode = 0;
+            }
+            catch (Exception error)
+            {
+                Console.Error.WriteLine($"silent install failed: {error.Message}");
+                Environment.ExitCode = 1;
+            }
+            return;
+        }
         Application.Run(new SetupForm());
+    }
+}
+
+/// <summary>The one install path both the GUI and --silent share, so they can never drift apart.</summary>
+internal static class InstallerCore
+{
+    public static string Install(string source, Action<int, int>? progress)
+    {
+        // Running straight out of a zip preview extracts only this exe — the payload is missing.
+        if (!File.Exists(Path.Combine(source, "Kitten.Desktop.exe")))
+            throw new FileNotFoundException("The install payload is missing. Extract the full Kitten zip to a folder first, then run Kitten.Setup.exe from there.");
+
+        var target = InstallInfo.TargetDirectory;
+        var files = Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories)
+            .Where(path => !path.StartsWith(target, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        long copiedBytes = 0;
+        for (var index = 0; index < files.Length; index++)
+        {
+            var sourcePath = files[index];
+            var relative = Path.GetRelativePath(source, sourcePath);
+            var destination = Path.Combine(target, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            File.Copy(sourcePath, destination, true);
+            copiedBytes += new FileInfo(sourcePath).Length;
+            progress?.Invoke(index + 1, files.Length);
+        }
+        var executable = Path.Combine(target, "Kitten.Desktop.exe");
+        if (!File.Exists(executable)) throw new FileNotFoundException("The desktop executable was missing from the package.", executable);
+
+        // Both shortcuts carry the app's own icon: the Start Menu for search, the Desktop for the
+        // one-click open the product promises.
+        CreateShortcut("Kitten", executable, InstallInfo.StartMenuShortcut);
+        CreateShortcut("Kitten", executable, InstallInfo.DesktopShortcut);
+        WriteUninstallRegistry(target, executable, copiedBytes, InstallInfo.BundleVersion(source));
+        return executable;
+    }
+
+    /// <summary>The Add/Remove Programs entry (HKCU — a per-user install needs no elevation).</summary>
+    private static void WriteUninstallRegistry(string target, string executable, long copiedBytes, string version)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(InstallInfo.RegistryKey);
+        key.SetValue("DisplayName", "Kitten");
+        key.SetValue("DisplayVersion", version);
+        key.SetValue("Publisher", "Kitten");
+        key.SetValue("InstallLocation", target);
+        key.SetValue("DisplayIcon", $"{executable},0");
+        key.SetValue("UninstallString", $"\"{Path.Combine(target, "Kitten.Setup.exe")}\" --uninstall");
+        key.SetValue("QuietUninstallString", $"\"{Path.Combine(target, "Kitten.Setup.exe")}\" --uninstall --quiet");
+        key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
+        key.SetValue("NoModify", 1, RegistryValueKind.DWord);
+        key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+        key.SetValue("EstimatedSize", (int)Math.Min(int.MaxValue, copiedBytes / 1024), RegistryValueKind.DWord);
+    }
+
+    private static void CreateShortcut(string title, string target, string shortcutPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(shortcutPath)!);
+        var shellType = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException("Windows shortcut support is unavailable.");
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        dynamic shortcut = shell.CreateShortcut(shortcutPath);
+        shortcut.TargetPath = target;
+        shortcut.WorkingDirectory = Path.GetDirectoryName(target);
+        shortcut.Description = title;
+        shortcut.IconLocation = $"{target},0";
+        shortcut.Save();
+        Marshal.FinalReleaseComObject(shortcut);
+        Marshal.FinalReleaseComObject(shell);
     }
 }
 
@@ -106,38 +190,13 @@ internal sealed class SetupForm : Form
         _progress.Visible = true;
         try
         {
-            // Running straight out of a zip preview extracts only this exe — the payload is missing.
-            if (!File.Exists(Path.Combine(_source, "Kitten.Desktop.exe")))
-                throw new FileNotFoundException("The install payload is missing. Extract the full Kitten zip to a folder first, then run Kitten.Setup.exe from there.");
-
-            var target = InstallInfo.TargetDirectory;
-            var files = Directory.EnumerateFiles(_source, "*", SearchOption.AllDirectories)
-                .Where(path => !path.StartsWith(target, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-            _progress.Maximum = Math.Max(1, files.Length);
-            long copiedBytes = 0;
-            for (var index = 0; index < files.Length; index++)
+            var executable = await Task.Run(() => InstallerCore.Install(_source, (done, total) =>
             {
-                var sourcePath = files[index];
-                var relative = Path.GetRelativePath(_source, sourcePath);
-                var destination = Path.Combine(target, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                File.Copy(sourcePath, destination, true);
-                copiedBytes += new FileInfo(sourcePath).Length;
-                _progress.Value = Math.Min(_progress.Maximum, index + 1);
-                if (index % 20 == 0) await Task.Yield();
-            }
-            var executable = Path.Combine(target, "Kitten.Desktop.exe");
-            if (!File.Exists(executable)) throw new FileNotFoundException("The desktop executable was missing from the package.", executable);
-
-            // Both shortcuts carry the app's own icon: the Start Menu for search, the Desktop for the
-            // one-click open the product promises.
-            CreateShortcut("Kitten", executable, InstallInfo.StartMenuShortcut);
-            CreateShortcut("Kitten", executable, InstallInfo.DesktopShortcut);
-            WriteUninstallRegistry(target, executable, copiedBytes);
-
+                if (done % 20 != 0 && done != total) return;
+                BeginInvoke(() => { _progress.Maximum = Math.Max(1, total); _progress.Value = Math.Min(_progress.Maximum, done); });
+            }));
             _status.Text = "Installed. Starting Kitten...";
-            Process.Start(new ProcessStartInfo(executable) { WorkingDirectory = target, UseShellExecute = true });
+            Process.Start(new ProcessStartInfo(executable) { WorkingDirectory = Path.GetDirectoryName(executable)!, UseShellExecute = true });
             Close();
         }
         catch (Exception error)
@@ -146,38 +205,6 @@ internal sealed class SetupForm : Form
             _progress.Visible = false;
             _install.Enabled = true;
         }
-    }
-
-    /// <summary>The Add/Remove Programs entry (HKCU — a per-user install needs no elevation).</summary>
-    private void WriteUninstallRegistry(string target, string executable, long copiedBytes)
-    {
-        using var key = Registry.CurrentUser.CreateSubKey(InstallInfo.RegistryKey);
-        key.SetValue("DisplayName", "Kitten");
-        key.SetValue("DisplayVersion", _version);
-        key.SetValue("Publisher", "Kitten");
-        key.SetValue("InstallLocation", target);
-        key.SetValue("DisplayIcon", $"{executable},0");
-        key.SetValue("UninstallString", $"\"{Path.Combine(target, "Kitten.Setup.exe")}\" --uninstall");
-        key.SetValue("QuietUninstallString", $"\"{Path.Combine(target, "Kitten.Setup.exe")}\" --uninstall --quiet");
-        key.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd"));
-        key.SetValue("NoModify", 1, RegistryValueKind.DWord);
-        key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
-        key.SetValue("EstimatedSize", (int)Math.Min(int.MaxValue, copiedBytes / 1024), RegistryValueKind.DWord);
-    }
-
-    private static void CreateShortcut(string title, string target, string shortcutPath)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(shortcutPath)!);
-        var shellType = Type.GetTypeFromProgID("WScript.Shell") ?? throw new InvalidOperationException("Windows shortcut support is unavailable.");
-        dynamic shell = Activator.CreateInstance(shellType)!;
-        dynamic shortcut = shell.CreateShortcut(shortcutPath);
-        shortcut.TargetPath = target;
-        shortcut.WorkingDirectory = Path.GetDirectoryName(target);
-        shortcut.Description = title;
-        shortcut.IconLocation = $"{target},0";
-        shortcut.Save();
-        Marshal.FinalReleaseComObject(shortcut);
-        Marshal.FinalReleaseComObject(shell);
     }
 }
 
