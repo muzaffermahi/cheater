@@ -9,8 +9,10 @@
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
+    <ApplicationIcon>..\assets\icon\kitten.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <AvaloniaResource Include="..\assets\icon\kitten.ico" Link="Assets/kitten.ico" />
     <Compile Remove="Installer\**" />
     <EmbeddedResource Remove="Installer\**" />
     <None Remove="Installer\**" />

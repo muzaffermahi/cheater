@@ -31,6 +31,7 @@ internal sealed class SetupForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
+        try { Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { /* generic icon is fine */ }
 
         var title = new Label { Text = "Kitten", Font = new Font("Segoe UI", 18, FontStyle.Bold), AutoSize = true, Location = new Point(28, 24) };
         var description = new Label { Text = "Install the native desktop coding agent and its private local engine.", AutoSize = true, Location = new Point(30, 64) };

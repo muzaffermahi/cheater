@@ -2,7 +2,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="Kitten.Desktop.MainWindow"
         Width="1320" Height="860" MinWidth="960" MinHeight="620"
-        Title="Kitten" Opened="OnOpened" KeyDown="WindowKeyDown">
+        Title="Kitten" Icon="avares://Kitten.Desktop/Assets/kitten.ico"
+        Opened="OnOpened" KeyDown="WindowKeyDown">
 
   <!-- Three regions and a status line. Sessions on the left, the conversation in the middle, what the
        run produced on the right. Everything else — models, benchmarks, agents, workspace tools,

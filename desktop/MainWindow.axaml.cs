@@ -406,7 +406,7 @@ public partial class MainWindow : Window
                 Title = "Kitten bakeoff report",
                 Width = 900,
                 Height = 680,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new DockPanel
                 {
                     Margin = new Avalonia.Thickness(18),
@@ -433,7 +433,7 @@ public partial class MainWindow : Window
             Title = "Apply bakeoff winners",
             Width = 620,
             Height = 360,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -538,7 +538,7 @@ public partial class MainWindow : Window
                 Title = "Kitten model recovery",
                 Width = 640,
                 Height = Math.Min(520, 180 + candidates.Count * 64),
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             };
             var content = new StackPanel { Margin = new Avalonia.Thickness(24), Spacing = 10 };
             content.Children.Add(new TextBlock { Text = "Nothing changes automatically. Select a responding candidate only when you want to use it.", TextWrapping = Avalonia.Media.TextWrapping.Wrap });
@@ -613,7 +613,7 @@ public partial class MainWindow : Window
             Title = "Kitten workspace explorer",
             Width = 900,
             Height = 760,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -691,7 +691,7 @@ public partial class MainWindow : Window
             Title = "Kitten agent library",
             Width = 900,
             Height = 680,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             // The definition list is long, so the actions dock instead of scrolling out of reach.
             Content = new DockPanel
             {
@@ -752,7 +752,7 @@ public partial class MainWindow : Window
             var createDialog = new Window
             {
                 Title = "Create project agent", Width = 560, Height = 520,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new StackPanel
                 {
                     Margin = new Avalonia.Thickness(24), Spacing = 12,
@@ -811,7 +811,7 @@ public partial class MainWindow : Window
                 Title = "Run Kitten subagent",
                 Width = 640,
                 Height = 420,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new StackPanel
                 {
                     Margin = new Avalonia.Thickness(24), Spacing = 12,
@@ -984,7 +984,7 @@ public partial class MainWindow : Window
             Title = "Kitten task board",
             Width = 860,
             Height = 640,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1065,7 +1065,7 @@ public partial class MainWindow : Window
             Title = "Kitten changes",
             Width = 980,
             Height = 760,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1182,7 +1182,7 @@ public partial class MainWindow : Window
             Title = "Kitten sidecar toolbox",
             Width = 780,
             Height = 680,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1364,7 +1364,7 @@ public partial class MainWindow : Window
             Height = 720,
             MinWidth = 560,
             MinHeight = 420,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             // Save and Cancel are docked, not scrolled: the primary action must never be below the fold.
             Content = new DockPanel
             {
@@ -2316,7 +2316,7 @@ public partial class MainWindow : Window
             Title = "Approve bounded implementation",
             Width = 620,
             Height = 420,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
