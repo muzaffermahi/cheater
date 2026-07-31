@@ -138,8 +138,16 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
         // model back — surface it as a failed check so a UI can show the "bug/repair" state (Goal §4).
         ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: e.detail });
         break;
+      case "error":
+        // A model error mid-run is exactly when the user starts wondering if the app is dead. Say it.
+        ctx.emit({ type: "run.status", runId: ctx.runId, status: "running", detail: `model error: ${e.detail.slice(0, 200)}` });
+        break;
+      case "nudge":
+        // Only the recovery nudges are user-relevant ("retrying (2/3)"); pacing nudges stay internal.
+        if (/retrying/i.test(e.detail)) ctx.emit({ type: "run.status", runId: ctx.runId, status: "running", detail: e.detail.slice(0, 200) });
+        break;
       default:
-        break; // finish/nudge/error are represented by the terminal outcome, not interim events
+        break; // finish is represented by the terminal outcome, not interim events
     }
   };
 

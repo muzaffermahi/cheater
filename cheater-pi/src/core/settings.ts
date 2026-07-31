@@ -19,6 +19,28 @@ export interface ManagedRuntimeSettings {
   sidecarModelPath?: string;
 }
 
+/**
+ * User-tunable llama.cpp launch behavior. Every field defaults to "auto" (the measured-machine
+ * heuristics), because the heuristics are a starting point, not a verdict: the user who hand-tunes
+ * their own llama-server invocation must be able to reproduce it here — the observed gap on this
+ * class of hardware was 7 tok/s under the auto cpu-moe plan vs 30 tok/s under a hand-tuned launch.
+ */
+export interface RuntimeTuningSettings {
+  /** --n-gpu-layers: "auto" = offload everything that fits (999); a number is passed verbatim (0 = CPU). */
+  gpuLayers?: number | "auto";
+  /** --cpu-moe --no-mmap: "auto" = only when the weights dwarf VRAM; "on"/"off" force it. */
+  cpuMoe?: "auto" | "on" | "off";
+  /** --flash-attn: "auto" = on for any GPU backend. */
+  flashAttn?: "auto" | "on" | "off";
+  /** --cache-type-k/v. "f16" is llama.cpp's default quality; "q8_0" halves KV memory (Kitten's auto). */
+  kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  /** Where the sidecar model lives: "cpu" (default — RAM, real parallelism with the GPU-bound main
+   *  model) or "gpu" (contends with the main model's VRAM). */
+  sidecarDevice?: "cpu" | "gpu";
+  /** Raw extra flags appended verbatim at the end of the llama-server command (last wins). */
+  extraArgs?: string;
+}
+
 /** Task Compiler rollout switch. `off` restores pre-compiler behavior byte for byte, which is what
  *  makes this feature reversible without a code change. */
 export type TaskCompilerFlag = "off" | "auto" | "force";
@@ -26,6 +48,7 @@ export type TaskCompilerFlag = "off" | "auto" | "force";
 export interface KittenSettings {
   models: KittenModels;
   managedRuntime: ManagedRuntimeSettings;
+  runtimeTuning: RuntimeTuningSettings;
   approvalPolicy: ApprovalPolicy;
   /** "auto" (the default) sizes the server context from the machine (VRAM + GGUF geometry) at
    *  launch; a number is an explicit pin that reaches the server verbatim. */
@@ -54,6 +77,12 @@ export interface SettingsUpdate {
   sidecarModelPath?: string;
   taskCompiler?: TaskCompilerFlag;
   webAccess?: "allowlist" | "open" | "off";
+  gpuLayers?: number | "auto";
+  cpuMoe?: "auto" | "on" | "off";
+  flashAttn?: "auto" | "on" | "off";
+  kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  sidecarDevice?: "cpu" | "gpu";
+  extraArgs?: string;
 }
 
 const KNOWN_KEYS = new Set([
@@ -61,6 +90,7 @@ const KNOWN_KEYS = new Set([
   "approvalPolicy", "contextWindowTokens",
   "runtimeExecutable", "mainModelPath", "sidecarModelPath",
   "taskCompiler", "webAccess",
+  "gpuLayers", "cpuMoe", "flashAttn", "kvCacheType", "sidecarDevice", "extraArgs",
 ]);
 
 interface RawConfig {
@@ -68,6 +98,7 @@ interface RawConfig {
   approvalPolicy?: string; contextWindowTokens?: number | string;
   runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
   taskCompiler?: string; webAccess?: string;
+  gpuLayers?: number | string; cpuMoe?: string; flashAttn?: string; kvCacheType?: string; sidecarDevice?: string; extraArgs?: string;
 }
 
 function readConfig(path: string, warnings: string[]): RawConfig | null {
@@ -143,6 +174,12 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
     sidecarModelPath: undefined,
     taskCompiler: envStr("KITTEN_TASK_COMPILER"),
     webAccess: envStr("KITTEN_WEB_ACCESS"),
+    gpuLayers: envStr("KITTEN_GPU_LAYERS"),
+    cpuMoe: envStr("KITTEN_CPU_MOE"),
+    flashAttn: envStr("KITTEN_FLASH_ATTN"),
+    kvCacheType: envStr("KITTEN_KV_CACHE_TYPE"),
+    sidecarDevice: envStr("KITTEN_SIDECAR_DEVICE"),
+    extraArgs: envStr("KITTEN_RUNTIME_EXTRA_ARGS"),
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
@@ -182,7 +219,20 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
   const webAccess: KittenSettings["webAccess"] = rawWeb === "allowlist" || rawWeb === "open" || rawWeb === "off" ? rawWeb : "open";
   if (rawWeb && rawWeb !== webAccess) warnings.push(`webAccess "${rawWeb}" is not one of allowlist|open|off — using "open"`);
 
-  return { models, managedRuntime, approvalPolicy, contextWindowTokens, taskCompiler, webAccess, sources, warnings };
+  const oneOf = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T =>
+    typeof value === "string" && (allowed as readonly string[]).includes(value) ? value as T : fallback;
+  const rawGpuLayers = pick("gpuLayers");
+  const runtimeTuning: RuntimeTuningSettings = {
+    gpuLayers: typeof rawGpuLayers === "number" && Number.isFinite(rawGpuLayers) && rawGpuLayers >= 0 ? Math.floor(rawGpuLayers)
+      : typeof rawGpuLayers === "string" && /^\d+$/.test(rawGpuLayers) ? Number(rawGpuLayers) : "auto",
+    cpuMoe: oneOf(pick("cpuMoe"), ["auto", "on", "off"] as const, "auto"),
+    flashAttn: oneOf(pick("flashAttn"), ["auto", "on", "off"] as const, "auto"),
+    kvCacheType: oneOf(pick("kvCacheType"), ["auto", "q8_0", "f16", "q4_0"] as const, "auto"),
+    sidecarDevice: oneOf(pick("sidecarDevice"), ["cpu", "gpu"] as const, "cpu"),
+    extraArgs: typeof pick("extraArgs") === "string" ? String(pick("extraArgs")).trim() : "",
+  };
+
+  return { models, managedRuntime, runtimeTuning, approvalPolicy, contextWindowTokens, taskCompiler, webAccess, sources, warnings };
 }
 
 /** Persist non-secret app settings atomically. API keys remain environment/config-file only. */

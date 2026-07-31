@@ -102,6 +102,45 @@ test("direct lane: runner translates to paired tool.started/tool.completed with 
   }
 });
 
+// ── No random stops: recoverable model errors retry in-run ──────────────────────────────────────
+
+test("a truncated tool-call 500 is retried with corrective guidance instead of killing the run", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-live-retry-"));
+  // Turn 1 fails the way llama.cpp fails on an oversized tool call; turn 2 succeeds.
+  let calls = 0;
+  const seenMessages: string[][] = [];
+  const llm = {
+    models: { main: "fake" },
+    chat: async (p: ChatParams): Promise<ChatResult> => {
+      calls++;
+      seenMessages.push(p.messages.map((m) => `${m.role}:${String(m.content).slice(0, 300)}`));
+      if (calls === 1) {
+        return { content: "", reasoning: "", toolCalls: [], finishReason: "", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, ok: false, error: "HTTP 500: Failed to parse tool call arguments as JSON: parse error - invalid string: missing closing quote", elapsedMs: 1 };
+      }
+      return { content: "", reasoning: "", toolCalls: [{ id: "c", name: "finish", args: { summary: "done in small steps" }, raw: "" }], finishReason: "tool_calls", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 1 };
+    },
+  } as unknown as KittenLLM;
+  const events: import("../src/core/agent.js").AgentEvent[] = [];
+  const r = await runAgent({ task: "rewrite the page", cwd, llm, onEvent: (e) => events.push(e) });
+  assert.equal(r.finished, true, "the run recovered instead of dying");
+  assert.equal(r.stopReason, "finish");
+  assert.ok(events.some((e) => e.kind === "nudge" && /retrying \(1\/3\)/.test(e.detail)), "the retry is announced");
+  const secondCall = seenMessages[1] ?? [];
+  assert.ok(secondCall.some((m) => /SMALLER pieces/.test(m)), "the retry carries the smaller-steps guidance");
+});
+
+test("a hard non-transient model error still fails honestly after the retry budget", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-live-hard-"));
+  const llm = {
+    models: { main: "fake" },
+    chat: async (): Promise<ChatResult> => ({ content: "", reasoning: "", toolCalls: [], finishReason: "", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, ok: false, error: "HTTP 401: bad api key", elapsedMs: 1 }),
+  } as unknown as KittenLLM;
+  const r = await runAgent({ task: "x", cwd, llm });
+  assert.equal(r.finished, false);
+  assert.equal(r.stopReason, "error");
+  assert.match(r.summary, /HTTP 401/);
+});
+
 // ── E2: the finish-gate verification bridge ─────────────────────────────────────────────────────
 
 test("reliable lane: finish gate emits verification.started + passed once an execution receipt exists", async () => {

@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { autoSizeContextTokens, buildLaunchPlan, classifyEndpoint, CTX_LADDER, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables, kvBytesPerToken, readGgufKvMeta } from "../src/core/modelRuntime.js";
+import { autoSizeContextTokens, buildLaunchPlan, classifyEndpoint, CTX_LADDER, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables, kvBytesPerToken, listModelFiles, readGgufKvMeta, splitExtraArgs } from "../src/core/modelRuntime.js";
 
 test("runtime classification recognizes common local endpoints", () => {
   assert.equal(classifyEndpoint("http://127.0.0.1:11434"), "ollama");
@@ -122,6 +122,55 @@ test("local endpoint discovery probes candidates in parallel and returns only re
     assert.equal(found.length, 1);
     assert.deepEqual(found[0].models, ["ornith-1.0-35b", "qwen3.5-2b"]);
   } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+// ── user runtime tuning ─────────────────────────────────────────────────────────────────────────
+
+test("tuning overrides beat every heuristic: cpuMoe off, explicit gpu layers, f16 cache, extra args last", () => {
+  // The 7-vs-30 tok/s case: same oversized MoE, but the user says NO cpu-moe and pins their layers.
+  const tuned = buildLaunchPlan({
+    mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, contextTokens: 32768,
+    tuning: { cpuMoe: "off", gpuLayers: 28, kvCacheType: "f16", extraArgs: "--threads 12 --override-tensor \"exps=CPU\"" },
+  });
+  assert.ok(!tuned.args.includes("--cpu-moe"), "cpuMoe off wins over the VRAM heuristic");
+  assert.ok(!tuned.args.includes("--no-mmap"));
+  const ngl = tuned.args.indexOf("--n-gpu-layers");
+  assert.equal(tuned.args[ngl + 1], "28", "explicit layer count passed verbatim");
+  const kv = tuned.args.indexOf("--cache-type-k");
+  assert.equal(tuned.args[kv + 1], "f16");
+  assert.deepEqual(tuned.args.slice(-4), ["--threads", "12", "--override-tensor", "exps=CPU"], "extra args land at the end (last wins), quoted tokens whole");
+  // Forcing cpuMoe on works even when the heuristic would not fire.
+  const forced = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 48e9, modelBytes: 8e9, contextTokens: 16384, tuning: { cpuMoe: "on" } });
+  assert.ok(forced.args.includes("--cpu-moe"));
+  // gpuLayers 0 = CPU load: no flash-attn either (auto follows the device).
+  const cpuLoad = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 2e9, contextTokens: 8192, tuning: { gpuLayers: 0 } });
+  assert.equal(cpuLoad.args[cpuLoad.args.indexOf("--n-gpu-layers") + 1], "0");
+  assert.ok(!cpuLoad.args.includes("--flash-attn"), "auto flash-attn stays off for a 0-layer load");
+});
+
+test("splitExtraArgs tokenizes with quotes and bounds", () => {
+  assert.deepEqual(splitExtraArgs('--threads 12 --override-tensor "exps=CPU" --lora \'my file.gguf\''), ["--threads", "12", "--override-tensor", "exps=CPU", "--lora", "my file.gguf"]);
+  assert.deepEqual(splitExtraArgs("   "), []);
+  assert.deepEqual(splitExtraArgs(undefined), []);
+});
+
+test("listModelFiles finds ggufs beside the configured weights and in extra dirs, deduped", () => {
+  const root = mkdtempSync(join(tmpdir(), "kitten-models-"));
+  writeFileSync(join(root, "ornith-35b-q4.gguf"), Buffer.alloc(2048));
+  writeFileSync(join(root, "qwen-2b-q8.gguf"), Buffer.alloc(1024));
+  writeFileSync(join(root, "readme.txt"), "not a model");
+  const nested = mkdtempSync(join(tmpdir(), "kitten-models-lm-"));
+  writeFileSync(join(nested, "other-7b.gguf"), Buffer.alloc(512));
+  const files = listModelFiles([join(root, "ornith-35b-q4.gguf"), join(root, "ornith-35b-q4.gguf")], [nested]);
+  const names = files.map((f) => f.name);
+  assert.ok(names.includes("ornith-35b-q4.gguf"));
+  assert.ok(names.includes("qwen-2b-q8.gguf"), "siblings of the configured weight are offered");
+  assert.ok(names.includes("other-7b.gguf"), "extra dirs are scanned");
+  assert.ok(!names.includes("readme.txt"));
+  assert.equal(names.filter((n) => n === "ornith-35b-q4.gguf").length, 1, "deduped");
+  // Largest-first within a directory: the quant someone downloaded on purpose leads.
+  const inRoot = files.filter((f) => f.dir === root);
+  assert.equal(inRoot[0].name, "ornith-35b-q4.gguf");
 });
 
 test("the launch plan enables prompt-lookup speculation, and can turn it off", () => {

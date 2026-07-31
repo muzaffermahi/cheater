@@ -42,11 +42,22 @@ public partial class MainWindow : Window
     /// <summary>The workspace a launcher/shortcut asked for (`--project-root`), consumed on connect.</summary>
     public static string? InitialProjectRoot;
 
+    /// <summary>A project header row in the sessions list. Not selectable; purely structure.</summary>
+    private sealed record ProjectGroupHeader(string Root)
+    {
+        public override string ToString() => string.IsNullOrWhiteSpace(Root) ? "NO PROJECT" : Path.GetFileName(Path.TrimEndingDirectorySeparator(Root)).ToUpperInvariant();
+        public string Age => "";
+    }
+
     private EngineClient? _engine;
     private readonly TranscriptView _transcript;
     private readonly ActivityPanel _activity;
     private readonly EngineProcess _engineProcess = new();
     private string _effort = "balanced";
+    private string? _lastSubmittedText;
+    private DateTimeOffset _lastRunEventAt = DateTimeOffset.UtcNow;
+    private bool _stallWarned;
+    private readonly DispatcherTimer _stallTimer = new() { Interval = TimeSpan.FromSeconds(15) };
     /// <summary>Once a runtime.state push arrives, the poll's own offline verdict stops competing with it.</summary>
     private bool _runtimeStatePushed;
     private readonly List<ConversationItem> _conversationItems = new();
@@ -76,6 +87,19 @@ public partial class MainWindow : Window
         InitializeComponent();
         _transcript = new TranscriptView(TranscriptHost, TranscriptScroll);
         _activity = new ActivityPanel(RunMeta, RouteLine, PlanCard, PlanGoal, PlanContract, PlanSteps, PlanDetailButton, CurrentToolLine, VerificationLine);
+        // The stall watchdog: a run with NO events for 90s is the "is it dead?" moment — say something
+        // instead of letting the user stare at a silent window.
+        _stallTimer.Tick += (_, _) =>
+        {
+            if (_activeRunId is null) { _stallWarned = false; return; }
+            var silentFor = DateTimeOffset.UtcNow - _lastRunEventAt;
+            if (silentFor > TimeSpan.FromSeconds(90) && !_stallWarned)
+            {
+                _stallWarned = true;
+                Activity.Text = $"No output from the model for {(int)silentFor.TotalSeconds}s. A long generation can look like this — but if it persists, press Stop and Retry.";
+            }
+        };
+        _stallTimer.Start();
     }
 
     private async void OnOpened(object? sender, EventArgs e)
@@ -189,8 +213,19 @@ public partial class MainWindow : Window
                 item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0,
                 item.TryGetProperty("effort", out var effort) && effort.ValueKind == JsonValueKind.String ? effort.GetString() ?? "balanced" : "balanced"));
         }
+        // Sessions live UNDER their project: a header per project root (most recently active project
+        // first), its sessions newest-first beneath it. One project, many sessions — the mental model
+        // the user actually has.
+        var grouped = new List<object>();
+        foreach (var projectGroup in _conversationItems
+            .GroupBy(item => item.ProjectRoot, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Max(item => item.UpdatedAt)))
+        {
+            grouped.Add(new ProjectGroupHeader(projectGroup.Key));
+            grouped.AddRange(projectGroup.OrderByDescending(item => item.UpdatedAt));
+        }
         ConversationList.ItemsSource = null;
-        ConversationList.ItemsSource = _conversationItems;
+        ConversationList.ItemsSource = grouped;
         var wanted = selectId is null ? _conversationItems.FirstOrDefault() : _conversationItems.FirstOrDefault(x => x.Id == selectId);
         if (wanted is not null) ConversationList.SelectedItem = wanted;
         else
@@ -1386,12 +1421,29 @@ public partial class MainWindow : Window
         var findRuntime = new Button { Content = "Find installed runtime" };
         var browseMainModel = new Button { Content = "Browse main model" };
         var browseSidecarModel = new Button { Content = "Browse sidecar model" };
+        // Performance tuning — the llama.cpp control surface. Auto = Kitten's heuristics; every knob
+        // exists precisely because a hand-tuner beat the heuristics 30 tok/s to 7 on this hardware.
+        var contextTokensBox = new TextBox { Watermark = "auto (sized from VRAM) — or e.g. 32768", MinWidth = 200 };
+        var gpuLayersBox = new TextBox { Watermark = "auto — or a layer count (0 = CPU)", MinWidth = 200 };
+        string[] triState = { "auto", "on", "off" };
+        var cpuMoeBox = new ComboBox { ItemsSource = triState, SelectedIndex = 0, MinWidth = 120 };
+        var flashAttnBox = new ComboBox { ItemsSource = triState, SelectedIndex = 0, MinWidth = 120 };
+        var kvCacheBox = new ComboBox { ItemsSource = new[] { "auto", "q8_0", "f16", "q4_0" }, SelectedIndex = 0, MinWidth = 120 };
+        var sidecarDeviceBox = new ComboBox { ItemsSource = new[] { "cpu", "gpu" }, SelectedIndex = 0, MinWidth = 120 };
+        var extraArgsBox = new TextBox { Watermark = "extra llama-server flags, appended last (they win)", MinWidth = 420 };
+        var commandPreview = new SelectableTextBlock { Text = "", FontFamily = new Avalonia.Media.FontFamily("Cascadia Mono,Consolas,monospace"), FontSize = 11.5, TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.8 };
+        var previewCommand = new Button { Content = "Preview launch command" };
+        // Local model pickers: everything already on disk (the configured weights' folders + the LM
+        // Studio trees), so LM Studio downloads are one click away.
+        var mainModelList = new ComboBox { MinWidth = 420, PlaceholderText = "Pick a local .gguf for the main model…" };
+        var sidecarModelList = new ComboBox { MinWidth = 420, PlaceholderText = "Pick a local .gguf for the sidecar…" };
+        var rescanModels = new Button { Content = "Rescan model folders" };
         JsonElement[] catalogEntries = Array.Empty<JsonElement>();
         string? activeDownloadId = null;
+        var dialogProjectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
         try
         {
-            var selectedProjectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-            var current = await _engine.CallAsync("settings.inspect", new { projectRoot = selectedProjectRoot });
+            var current = await _engine.CallAsync("settings.inspect", new { projectRoot = dialogProjectRoot });
             if (current is { } value && value.ValueKind == JsonValueKind.Object)
             {
                 var models = value.GetProperty("models");
@@ -1404,6 +1456,25 @@ public partial class MainWindow : Window
                     if (managedRuntime.TryGetProperty("executable", out var executable) && executable.ValueKind == JsonValueKind.String) runtimeExecutable.Text = executable.GetString();
                     if (managedRuntime.TryGetProperty("mainModelPath", out var mainPath) && mainPath.ValueKind == JsonValueKind.String) mainModelPath.Text = mainPath.GetString();
                     if (managedRuntime.TryGetProperty("sidecarModelPath", out var sidecarPath) && sidecarPath.ValueKind == JsonValueKind.String) sidecarModelPath.Text = sidecarPath.GetString();
+                }
+                contextTokensBox.Text = value.TryGetProperty("contextWindowTokens", out var ctxValue)
+                    ? (ctxValue.ValueKind == JsonValueKind.Number ? ctxValue.GetInt32().ToString() : "auto")
+                    : "auto";
+                if (value.TryGetProperty("runtimeTuning", out var tuningValue) && tuningValue.ValueKind == JsonValueKind.Object)
+                {
+                    static void Select(ComboBox box, JsonElement parent, string key)
+                    {
+                        if (!parent.TryGetProperty(key, out var v) || v.ValueKind != JsonValueKind.String) return;
+                        var items = (box.ItemsSource as string[]) ?? Array.Empty<string>();
+                        var index = Array.IndexOf(items, v.GetString());
+                        if (index >= 0) box.SelectedIndex = index;
+                    }
+                    Select(cpuMoeBox, tuningValue, "cpuMoe");
+                    Select(flashAttnBox, tuningValue, "flashAttn");
+                    Select(kvCacheBox, tuningValue, "kvCacheType");
+                    Select(sidecarDeviceBox, tuningValue, "sidecarDevice");
+                    if (tuningValue.TryGetProperty("gpuLayers", out var layers)) gpuLayersBox.Text = layers.ValueKind == JsonValueKind.Number ? layers.GetInt32().ToString() : "auto";
+                    if (tuningValue.TryGetProperty("extraArgs", out var extras) && extras.ValueKind == JsonValueKind.String) extraArgsBox.Text = extras.GetString();
                 }
             }
         }
@@ -1470,6 +1541,20 @@ public partial class MainWindow : Window
                         Field("Runtime executable (for example llama-server.exe)", PathRow(runtimeExecutable, browseRuntime, findRuntime)),
                         Field("Main model file (.gguf)", PathRow(mainModelPath, browseMainModel)),
                         Field("Sidecar model file (.gguf, optional)", PathRow(sidecarModelPath, browseSidecarModel)),
+                        Field("Models already on this machine", mainModelList),
+                        Field("Local sidecar candidates", sidecarModelList),
+                        ButtonRow(rescanModels),
+                        Section("Performance tuning"),
+                        Hint("Auto uses Kitten's measured-machine heuristics. Every knob here maps to a llama-server flag — if your own launch beats auto, reproduce it here and it becomes the managed launch. Extra flags go last, so they win."),
+                        Field("Context tokens (--ctx-size)", contextTokensBox),
+                        Field("GPU layers (--n-gpu-layers)", gpuLayersBox),
+                        Field("CPU MoE offload (--cpu-moe)", cpuMoeBox),
+                        Field("Flash attention (--flash-attn)", flashAttnBox),
+                        Field("KV cache type (--cache-type-k/v)", kvCacheBox),
+                        Field("Sidecar device (cpu = RAM, real parallelism)", sidecarDeviceBox),
+                        Field("Extra llama-server flags", extraArgsBox),
+                        ButtonRow(previewCommand),
+                        commandPreview,
                                 ButtonRow(startRuntime, stopRuntime),
                                 runtimeStatus,
                             },
@@ -1682,15 +1767,79 @@ public partial class MainWindow : Window
             catch (Exception ex) { discoverStatus.Text = ex.Message.Contains("cancel", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("abort", StringComparison.OrdinalIgnoreCase) ? "Model download cancelled." : $"Model download failed: {ex.Message}"; }
             finally { activeDownloadId = null; downloadCatalog.IsEnabled = true; cancelDownload.IsEnabled = false; }
         };
+        // ── Local model discovery + tuning wiring ────────────────────────────────────────────────
+        var modelChoices = new List<(string Path, string Display)>();
+        async Task ScanModelFilesAsync()
+        {
+            try
+            {
+                var files = await _engine.CallAsync("model.files", new { projectRoot = dialogProjectRoot });
+                modelChoices.Clear();
+                if (files is { } list && list.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var file in list.EnumerateArray())
+                    {
+                        var path = file.TryGetProperty("path", out var pathValue) ? pathValue.GetString() : null;
+                        var name = file.TryGetProperty("name", out var nameValue) ? nameValue.GetString() ?? "" : "";
+                        var bytes = file.TryGetProperty("bytes", out var bytesValue) && bytesValue.ValueKind == JsonValueKind.Number ? bytesValue.GetInt64() : 0;
+                        if (string.IsNullOrWhiteSpace(path)) continue;
+                        modelChoices.Add((path!, $"{name}  ({bytes / 1e9:0.0} GB)"));
+                    }
+                }
+                var display = modelChoices.Select(choice => choice.Display).ToArray();
+                mainModelList.ItemsSource = display;
+                sidecarModelList.ItemsSource = display;
+                if (display.Length == 0) discoverStatus.Text = "No local .gguf files were found beside the configured weights or in the LM Studio folders. Use Browse.";
+            }
+            catch (Exception ex) { discoverStatus.Text = $"Model folder scan failed: {ex.Message}"; }
+        }
+        mainModelList.SelectionChanged += (_, _) => { if (mainModelList.SelectedIndex >= 0 && mainModelList.SelectedIndex < modelChoices.Count) mainModelPath.Text = modelChoices[mainModelList.SelectedIndex].Path; };
+        sidecarModelList.SelectionChanged += (_, _) => { if (sidecarModelList.SelectedIndex >= 0 && sidecarModelList.SelectedIndex < modelChoices.Count) sidecarModelPath.Text = modelChoices[sidecarModelList.SelectedIndex].Path; };
+        rescanModels.Click += async (_, _) => await ScanModelFilesAsync();
+        _ = ScanModelFilesAsync();
+
+        (object GpuLayers, string CpuMoe, string FlashAttn, string KvCache, string SidecarDevice, string ExtraArgs) Tuning() => (
+            int.TryParse(gpuLayersBox.Text?.Trim(), out var layerCount) && layerCount >= 0 ? layerCount : "auto",
+            cpuMoeBox.SelectedItem as string ?? "auto",
+            flashAttnBox.SelectedItem as string ?? "auto",
+            kvCacheBox.SelectedItem as string ?? "auto",
+            sidecarDeviceBox.SelectedItem as string ?? "cpu",
+            extraArgsBox.Text?.Trim() ?? "");
+        previewCommand.Click += async (_, _) =>
+        {
+            try
+            {
+                var ctxText = contextTokensBox.Text?.Trim();
+                var t = Tuning();
+                var plan = await _engine.CallAsync("model.launch-plan", new
+                {
+                    projectRoot = dialogProjectRoot,
+                    mainModel = string.IsNullOrWhiteSpace(mainModelPath.Text) ? main.Text : Path.GetFileNameWithoutExtension(mainModelPath.Text),
+                    contextTokens = int.TryParse(ctxText, out var ctxNumber) && ctxNumber > 0 ? (int?)ctxNumber : null,
+                    tuning = new { gpuLayers = t.GpuLayers, cpuMoe = t.CpuMoe, flashAttn = t.FlashAttn, kvCacheType = t.KvCache, extraArgs = t.ExtraArgs },
+                });
+                if (plan is { } planned && planned.ValueKind == JsonValueKind.Object && planned.TryGetProperty("args", out var argv) && argv.ValueKind == JsonValueKind.Array)
+                {
+                    var parts = argv.EnumerateArray().Select(item => item.GetString() ?? "").Select(part => part.Contains(' ') ? $"\"{part}\"" : part);
+                    var planWarnings = planned.TryGetProperty("warnings", out var warningList) && warningList.ValueKind == JsonValueKind.Array
+                        ? string.Join("\n", warningList.EnumerateArray().Select(item => "· " + item.GetString()))
+                        : "";
+                    commandPreview.Text = $"llama-server {string.Join(" ", parts)}{(planWarnings.Length > 0 ? $"\n{planWarnings}" : "")}";
+                }
+            }
+            catch (Exception ex) { commandPreview.Text = $"Preview failed: {ex.Message}"; }
+        };
+
         save.Click += async (_, _) =>
         {
             try
             {
-                var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
+                var ctxText = contextTokensBox.Text?.Trim();
+                var t = Tuning();
                 await _engine.CallAsync("settings.update", new
                 {
                     scope = "project",
-                    projectRoot,
+                    projectRoot = dialogProjectRoot,
                     update = new
                     {
                         baseUrl = endpoint.Text,
@@ -1700,10 +1849,17 @@ public partial class MainWindow : Window
                         runtimeExecutable = string.IsNullOrWhiteSpace(runtimeExecutable.Text) ? null : runtimeExecutable.Text,
                         mainModelPath = string.IsNullOrWhiteSpace(mainModelPath.Text) ? null : mainModelPath.Text,
                         sidecarModelPath = string.IsNullOrWhiteSpace(sidecarModelPath.Text) ? null : sidecarModelPath.Text,
+                        contextWindowTokens = int.TryParse(ctxText, out var ctxNumber) && ctxNumber > 0 ? (object)ctxNumber : "auto",
+                        gpuLayers = t.GpuLayers,
+                        cpuMoe = t.CpuMoe,
+                        flashAttn = t.FlashAttn,
+                        kvCacheType = t.KvCache,
+                        sidecarDevice = t.SidecarDevice,
+                        extraArgs = t.ExtraArgs,
                     },
                 });
                 await RefreshModelStatusAsync();
-                Activity.Text = "Model settings saved";
+                Activity.Text = "Model settings saved. Restart the runtime to apply launch changes.";
                 dialog.Close();
             }
             catch (Exception ex) { Activity.Text = $"Could not save model settings: {ex.Message}"; }
@@ -1713,6 +1869,12 @@ public partial class MainWindow : Window
 
     private async void SelectConversation(object? sender, SelectionChangedEventArgs e)
     {
+        // Project headers are structure, not sessions: clicking one bounces back to the active session.
+        if (ConversationList.SelectedItem is ProjectGroupHeader)
+        {
+            ConversationList.SelectedItem = _conversationItems.FirstOrDefault(x => x.Id == _conversationId);
+            return;
+        }
         if (ConversationList.SelectedItem is ConversationItem item) await ActivateConversationAsync(item);
     }
 
@@ -2014,6 +2176,9 @@ public partial class MainWindow : Window
             }
             var eventConversation = frame.TryGetProperty("conversationId", out var conversation) ? conversation.GetString() : null;
             if (eventConversation is not null && eventConversation != _conversationId) return;
+            // Any event for the active conversation is proof of life for the stall watchdog.
+            _lastRunEventAt = DateTimeOffset.UtcNow;
+            if (_stallWarned && _activeRunId is not null) { _stallWarned = false; }
             var payload = frame.TryGetProperty("payload", out var payloadValue) ? payloadValue : default;
             var runId = payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("runId", out var rid) ? rid.GetString() : null;
             switch (type)
@@ -2102,8 +2267,12 @@ public partial class MainWindow : Window
                 case "run.status":
                     {
                         var runStatus = payload.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : null;
+                        var statusDetail = payload.TryGetProperty("detail", out var detailValue) ? detailValue.GetString() : null;
                         if (runStatus == "waiting_approval") Activity.Text = "Waiting for your approval";
                         else if (runStatus == "cancelling") Activity.Text = "Stopping…";
+                        // A detail on a running status is the engine narrating recovery ("model error —
+                        // retrying (1/3)") — the exact moment the user must NOT be left guessing.
+                        else if (runStatus == "running" && !string.IsNullOrWhiteSpace(statusDetail)) Activity.Text = statusDetail!;
                         else if (runStatus == "running" && _activeRunId is not null) Activity.Text = "Running…";
                         break;
                     }
@@ -2124,6 +2293,9 @@ public partial class MainWindow : Window
                 case "run.started":
                     _activeRunId = runId;
                     ResumeButton.IsEnabled = false;
+                    RetryRunButton.IsEnabled = false;
+                    _stallWarned = false;
+                    _lastRunEventAt = DateTimeOffset.UtcNow;
                     _assistantStreamed = false;
                     _activeRunFiles.Clear();
                     _activeRunAdded = 0;
@@ -2244,14 +2416,17 @@ public partial class MainWindow : Window
                     break;
                 case "run.failed":
                     var failureMessage = payload.TryGetProperty("error", out var failure) ? failure.GetString() ?? "Run failed" : "Run failed";
-                    Activity.Text = System.Text.RegularExpressions.Regex.IsMatch(failureMessage, "timeout|timed out|unloaded|model.*respond", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-                        ? $"Main model is unavailable or still loading: {failureMessage}\nUse Model health to find a responding local tier."
-                        : $"Run failed: {failureMessage}";
-                    Evidence.Text = Activity.Text;
+                    var friendly = FriendlyModelFailure(failureMessage);
+                    Activity.Text = friendly.Headline;
+                    Evidence.Text = $"{friendly.Headline}\n{failureMessage}";
+                    // The failure lands in the CONVERSATION, in red, with the plain-language cause and
+                    // what to do next — never only in a side panel.
+                    _transcript.AddFailure($"Run failed — {friendly.Headline}", $"{friendly.Advice}\n\nDetail: {failureMessage}");
                     _activeRunId = null;
                     _activity.RunEnded();
                     _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
+                    RetryRunButton.IsEnabled = _lastSubmittedText is not null;
                     SetRunControls(false);
                     break;
                 case "run.cancelled":
@@ -2403,6 +2578,43 @@ public partial class MainWindow : Window
         catch (Exception ex) { Activity.Text = $"Could not load the contract: {ex.Message}"; }
     }
 
+    /// <summary>Translate a raw model-failure string into a headline + what-to-do, in user language.</summary>
+    private static (string Headline, string Advice) FriendlyModelFailure(string error)
+    {
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "parse|json|unterminated|missing closing", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model's reply was cut off mid-tool-call",
+                "Kitten already retried this in-run; the model kept producing oversized tool calls. A larger context window usually fixes it (Model settings → Performance tuning → Context tokens), or press Retry to run the request again.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "context size|context.*exceed", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the context window overflowed",
+                "The conversation plus the work no longer fit the model's context. Raise Context tokens in Model settings (auto sizes it from your GPU), or start a fresh task for this request.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "timeout|timed out|unloaded|model.*respond|ECONNREFUSED|fetch failed", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model endpoint stopped responding",
+                "Check the runtime segment in the status bar — if it shows offline or failed, start/retry the runtime there, then press Retry.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "HTTP 5\\d\\d", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model server returned an internal error",
+                "Kitten retried in-run without success. The runtime tooltip in the status bar carries the server's own last words; a runtime restart usually clears it. Then press Retry.");
+        return ("the run hit an unrecoverable error", "Press Retry to run the request again, or check the runtime status below.");
+    }
+
+    /// <summary>Re-run the last failed request with one click — a dead run must never be a dead end.</summary>
+    private async void RetryFailedRun(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null || _conversationId is null || _lastSubmittedText is null || _activeRunId is not null || _submissionActive) return;
+        RetryRunButton.IsEnabled = false;
+        var text = _lastSubmittedText;
+        _submissionActive = true;
+        Activity.Text = "Retrying the failed request…";
+        _transcript.AddUser(text);
+        _transcript.BeginAssistant("Kitten");
+        SetRunControls(true);
+        try
+        {
+            await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text, effort = _effort });
+        }
+        catch (Exception ex) { Activity.Text = $"Retry failed: {ex.Message}"; RetryRunButton.IsEnabled = true; }
+        finally { _submissionActive = false; SetRunControls(false); }
+    }
+
     private static string ShortId(string id) => id[..Math.Min(8, id.Length)];
 
     private static string? BakeoffRoleForModel(string model)
@@ -2440,7 +2652,8 @@ public partial class MainWindow : Window
         var project = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
         if (string.IsNullOrWhiteSpace(project))
         {
-            Activity.Text = "Open a project before starting a new task.";
+            // No project yet → this IS the choose-a-project moment; open the picker instead of nagging.
+            OpenProject(sender, e);
             return;
         }
         try
@@ -2489,6 +2702,7 @@ public partial class MainWindow : Window
             await SubmitMentionAsync(mention.Groups["agent"].Value, mention.Groups["prompt"].Value.Trim());
             return;
         }
+        _lastSubmittedText = text;
         _submissionActive = true;
         Activity.Text = "Running...";
         _transcript.AddUser(text);

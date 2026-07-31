@@ -15,7 +15,7 @@ import { DESKTOP_PROTOCOL_VERSION, encodeFrame, FrameDecoder, type DesktopComman
 import type { KittenEvent } from "./events.js";
 import { WorkspaceIndex } from "./workspaceIndex.js";
 import { inspectWorkspaceChanges } from "./workspaceChanges.js";
-import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, CTX_LADDER } from "./modelRuntime.js";
+import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, listModelFiles, CTX_LADDER, type RuntimeTuning } from "./modelRuntime.js";
 import { SidecarControlPlane } from "./sidecarControlPlane.js";
 import { SidecarAssist } from "./sidecarAssist.js";
 import { runCatalogJob, SIDECAR_JOB_TYPES, SIDECAR_WORKFLOWS, isSidecarJobType, sidecarWorkflow, type SidecarJobType } from "./sidecarJobs.js";
@@ -237,6 +237,10 @@ interface ManagedRuntimeLaunchRequest {
   sidecarBaseUrl?: string;
   backend?: Parameters<typeof buildLaunchPlan>[0]["backend"];
   contextTokens?: number;
+  /** User launch tuning (settings.runtimeTuning) applied to the MAIN model's plan. */
+  tuning?: RuntimeTuning;
+  /** "cpu" (default) keeps the sidecar in RAM so it runs in real parallel with the GPU-bound main. */
+  sidecarDevice?: "cpu" | "gpu";
   runtimeRoot: string;
   bootstrapScript?: string;
   probeTimeoutMs?: number;
@@ -308,7 +312,7 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
     : undefined;
   const endpoint = endpointHostPort(request.baseUrl);
   const sidecarEndpoint = sidecarBaseUrl ? endpointHostPort(sidecarBaseUrl) : undefined;
-  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, contextTokens: request.contextTokens });
+  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, contextTokens: request.contextTokens, tuning: request.tuning });
   const args = [...plan.args, "--host", endpoint.host, "--port", String(endpoint.port)];
   if (request.bootstrapScript) {
     if (!existsSync(request.bootstrapScript)) throw new Error("managed runtime bootstrap script does not exist");
@@ -321,8 +325,14 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
     mainProcess = spawnManagedRuntime(request.executable, args, request.runtimeRoot);
     if (request.sidecarModelPath && sidecarEndpoint) {
       // The clerical 2B sidecar gets a fixed modest window — auto-sizing it with the main model
-      // already resident would double-count the same VRAM.
-      const sidecarPlan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.sidecarModelPath, contextTokens: request.contextTokens ?? 8192 });
+      // already resident would double-count the same VRAM. Default device is CPU/RAM: a 2B decodes
+      // fine on cores, and it means the sidecar genuinely runs in parallel with the GPU-bound main
+      // model instead of contending for the same VRAM.
+      const sidecarOnCpu = (request.sidecarDevice ?? "cpu") === "cpu";
+      const sidecarPlan = buildLaunchPlan({
+        runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.sidecarModelPath, contextTokens: request.contextTokens ?? 8192,
+        tuning: sidecarOnCpu ? { gpuLayers: 0, cpuMoe: "off", flashAttn: "off" } : undefined,
+      });
       const sidecarArgs = [...sidecarPlan.args, "--host", sidecarEndpoint.host, "--port", String(sidecarEndpoint.port)];
       if (request.bootstrapScript) sidecarArgs.unshift(request.bootstrapScript);
       sidecarProcess = spawnManagedRuntime(request.executable, sidecarArgs, request.runtimeRoot);
@@ -616,6 +626,14 @@ function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
   else if (raw.contextWindowTokens === "auto") update.contextWindowTokens = "auto";
   if (raw.taskCompiler === "off" || raw.taskCompiler === "auto" || raw.taskCompiler === "force") update.taskCompiler = raw.taskCompiler;
   if (raw.webAccess === "allowlist" || raw.webAccess === "open" || raw.webAccess === "off") update.webAccess = raw.webAccess;
+  // Runtime tuning knobs (the llama.cpp control surface).
+  if (typeof raw.gpuLayers === "number" && Number.isFinite(raw.gpuLayers) && raw.gpuLayers >= 0) update.gpuLayers = Math.floor(raw.gpuLayers);
+  else if (raw.gpuLayers === "auto") update.gpuLayers = "auto";
+  if (raw.cpuMoe === "auto" || raw.cpuMoe === "on" || raw.cpuMoe === "off") update.cpuMoe = raw.cpuMoe;
+  if (raw.flashAttn === "auto" || raw.flashAttn === "on" || raw.flashAttn === "off") update.flashAttn = raw.flashAttn;
+  if (raw.kvCacheType === "auto" || raw.kvCacheType === "q8_0" || raw.kvCacheType === "f16" || raw.kvCacheType === "q4_0") update.kvCacheType = raw.kvCacheType;
+  if (raw.sidecarDevice === "cpu" || raw.sidecarDevice === "gpu") update.sidecarDevice = raw.sidecarDevice;
+  if (typeof raw.extraArgs === "string") update.extraArgs = raw.extraArgs.trim();
   if (!Object.keys(update).length) throw new Error("settings.update contained no valid non-secret settings");
   // Settings are a durable source of truth, so reject a known-size model that would
   // put either lane outside Kitten's supported contract. Unknown-size IDs remain
@@ -847,6 +865,8 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           baseUrl: runtime.models.baseUrl,
           sidecarBaseUrl: sidecarModelPath ? runtime.models.sidecarBaseUrl : undefined,
           contextTokens: explicitContextTokens(settings),
+          tuning: settings.runtimeTuning,
+          sidecarDevice: settings.runtimeTuning.sidecarDevice,
           runtimeRoot: opts.projectRoot ?? process.cwd(),
           probeTimeoutMs: 5_000,
         }, managedRuntime);
@@ -916,6 +936,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
           taskCompiler: current.taskCompiler,
           webAccess: current.webAccess,
+          runtimeTuning: current.runtimeTuning,
           warnings: [...current.warnings, ...modelTierWarnings(active.models)],
         };
         break;
@@ -951,6 +972,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
           taskCompiler: fresh.taskCompiler,
           webAccess: fresh.webAccess,
+          runtimeTuning: fresh.runtimeTuning,
           warnings: [...fresh.warnings, ...modelTierWarnings(runtime.models)],
         };
         break;
@@ -1124,7 +1146,23 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const sidecarModel = typeof p.sidecarModel === "string" ? p.sidecarModel : undefined;
         const tierError = modelTierMismatch("main", mainModel) ?? (sidecarModel ? modelTierMismatch("sidecar", sidecarModel) : null);
         if (tierError) throw new Error(tierError);
-        result = buildLaunchPlan({ runtime: typeof p.runtime === "string" ? p.runtime as never : undefined, backend: typeof p.backend === "string" ? p.backend as never : undefined, mainModel, sidecarModel, contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined, sidecarMode: typeof p.sidecarMode === "string" ? p.sidecarMode as never : undefined });
+        // Tuning comes from the payload when the settings dialog previews unsaved values, else from
+        // the saved settings — the preview must show the command that would actually run.
+        const planRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const tuning: RuntimeTuning = p.tuning && typeof p.tuning === "object" ? p.tuning as RuntimeTuning : settingsFor(opts, planRoot).runtimeTuning;
+        result = buildLaunchPlan({ runtime: typeof p.runtime === "string" ? p.runtime as never : undefined, backend: typeof p.backend === "string" ? p.backend as never : undefined, mainModel, sidecarModel, contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined, sidecarMode: typeof p.sidecarMode === "string" ? p.sidecarMode as never : undefined, tuning });
+        break;
+      }
+      case "model.files": {
+        // Everything already on this machine a user could load: the configured weights' own folders
+        // plus the LM Studio trees. This is how "use the model I downloaded yesterday" becomes a
+        // dropdown instead of a filesystem safari.
+        const filesRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const fileSettings = settingsFor(opts, filesRoot);
+        result = listModelFiles(
+          [fileSettings.managedRuntime.mainModelPath, fileSettings.managedRuntime.sidecarModelPath],
+          Array.isArray(p.extraDirs) ? p.extraDirs.map(String) : [],
+        );
         break;
       }
       case "model.recommend": {
@@ -1180,6 +1218,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             baseUrl: active.models.baseUrl,
             sidecarBaseUrl: sidecarModelPath ? active.models.sidecarBaseUrl : undefined,
             contextTokens: explicitContextTokens(projectSettings),
+            tuning: projectSettings.runtimeTuning,
+            sidecarDevice: projectSettings.runtimeTuning.sidecarDevice,
             runtimeRoot: projectRoot,
             probeTimeoutMs: 5_000,
           }, managedRuntime);
@@ -1246,6 +1286,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             executable, mainModelPath, sidecarModelPath, baseUrl, sidecarBaseUrl,
             backend: typeof p.backend === "string" ? p.backend as ManagedRuntimeLaunchRequest["backend"] : undefined,
             contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : explicitContextTokens(settingsFor(opts, runtimeRoot)),
+            tuning: settingsFor(opts, runtimeRoot).runtimeTuning,
+            sidecarDevice: settingsFor(opts, runtimeRoot).runtimeTuning.sidecarDevice,
             runtimeRoot, bootstrapScript: bootstrap,
           }, managedRuntime);
         } catch (error) {

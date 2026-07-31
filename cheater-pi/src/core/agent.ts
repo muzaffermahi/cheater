@@ -117,6 +117,9 @@ Rules:
 
 const DEFAULT_MAX_TURNS = 40;
 
+/** Recoverable model errors (transport 5xx / truncated tool calls) get this many in-run retries. */
+const MAX_MODEL_ERROR_RETRIES = 3;
+
 // A bash command that actually exercises code (not a bare read/ls) — used only to count how many times
 // the model has re-verified after editing, so the loop can nudge it to stop re-checking what passes.
 const RUN_CHECK_RE = /\b(pytest|unittest|python3?\s+\S|node\s+\S|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S)/i;
@@ -159,6 +162,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let emptyStreak = 0;
   let finishRejections = 0;
   let forcedFinish = false;
+  let modelErrorRetries = 0;
   const maxFinishRejections = params.maxFinishRejections ?? 2;
   // Verification-spiral cap: after the model has edited code and then run several PASSING checks, one
   // gentle nudge toward finish. Fires only after thorough verification (never on the ~3-turn median),
@@ -228,8 +232,28 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       // top-of-loop abort check only catches a cancel BETWEEN turns, not one mid-generation.
       if (params.signal?.aborted || result.error === "cancelled") { stopReason = "aborted"; break; }
       emit({ turn, kind: "error", detail: result.error ?? "llm error" });
-      // One retry on a transient error, then stop.
-      if (turn < maxTurns && /timeout|network/.test(result.error ?? "")) continue;
+      const err = result.error ?? "";
+      // "The model randomly stops" must not be a thing. Two recoverable classes, both retried with
+      // backoff instead of killing the run:
+      //   • transient transport/server trouble (timeouts, resets, 5xx while the server GC's/paging);
+      //   • a MALFORMED/TRUNCATED TOOL CALL — llama.cpp 500s with a JSON parse error when the model's
+      //     tool-call arguments blow past the generation budget mid-string (observed live: a whole
+      //     HTML file inside one `write` call). Retrying alone would reproduce it, so the retry also
+      //     tells the model to work in smaller steps.
+      const transient = /timeout|network|ECONNRESET|ECONNREFUSED|EPIPE|socket|fetch failed|stream error|HTTP 5\d\d/i.test(err);
+      const truncatedToolCall = /parse|unterminated|missing closing|invalid string|json/i.test(err);
+      if (turn < maxTurns && (transient || truncatedToolCall) && modelErrorRetries < MAX_MODEL_ERROR_RETRIES) {
+        modelErrorRetries++;
+        if (truncatedToolCall) {
+          messages.push({
+            role: "user",
+            content: "Your previous reply failed: a tool call was malformed or too large and was cut off before it finished. Re-do that step in SMALLER pieces — use edit with a bounded snippet, or write the file in parts across several calls. Never emit one huge tool call.",
+          });
+        }
+        emit({ turn, kind: "nudge", detail: `model error — retrying (${modelErrorRetries}/${MAX_MODEL_ERROR_RETRIES}): ${err.slice(0, 120)}` });
+        await new Promise((resolveWait) => setTimeout(resolveWait, 750 * modelErrorRetries));
+        continue;
+      }
       stopReason = "error";
       // Carry the reason out with the run. The summary is what every client shows, and it fell back to
       // the bare word "error" — a dead run with no diagnosis anywhere the user can see it.

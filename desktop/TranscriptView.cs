@@ -267,6 +267,29 @@ public sealed class TranscriptView
 
     public void AddNote(string title, string body) => Add(Role.Note, title, body);
 
+    /// <summary>
+    /// A failure the user must actually SEE: red header, red border, plain-language body. A run that
+    /// dies quietly into a grey note is how "the model randomly stops and the UI says nothing" happens.
+    /// </summary>
+    public void AddFailure(string title, string body)
+    {
+        if (IsStreaming) CompleteAssistant();
+        var stack = new StackPanel { Spacing = 4 };
+        stack.Children.Add(new TextBlock { Text = title, FontSize = 12, FontWeight = FontWeight.SemiBold, Foreground = Err });
+        if (!string.IsNullOrWhiteSpace(body)) stack.Children.Add(new SelectableTextBlock { Text = body, TextWrapping = TextWrapping.Wrap, FontSize = 13.5, Foreground = Text, LineHeight = 20 });
+        _host.Children.Add(new Border
+        {
+            Child = stack,
+            Padding = new Thickness(12, 10),
+            Margin = new Thickness(0, 0, 0, 10),
+            CornerRadius = new CornerRadius(8),
+            Background = new SolidColorBrush(Color.Parse("#1c1012")),
+            BorderBrush = new SolidColorBrush(Color.Parse("#7f2d2d")),
+            BorderThickness = new Thickness(1),
+        });
+        ScrollToEnd();
+    }
+
     /// <summary>Open the card the model streams into. Deltas append; the body re-renders when it ends.</summary>
     public void BeginAssistant(string header)
     {

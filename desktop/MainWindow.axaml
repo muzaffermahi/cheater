@@ -127,6 +127,7 @@
                 <Button Name="UndoButton" Content="Undo" Click="UndoLastRun" IsEnabled="False" Classes="tiny" />
                 <Button Name="RedoButton" Content="Redo" Click="RedoLastRun" IsEnabled="False" Classes="tiny" />
                 <Button Name="ResumeButton" Content="Resume" Click="ResumeInterrupted" IsEnabled="False" Classes="tiny" />
+                <Button Name="RetryRunButton" Content="Retry" Click="RetryFailedRun" IsEnabled="False" Classes="tiny" />
               </StackPanel>
             </StackPanel>
 

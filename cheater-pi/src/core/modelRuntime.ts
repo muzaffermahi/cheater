@@ -3,7 +3,7 @@
 // files, and produce a safe launch plan without opening a terminal or mutating user configuration.
 
 import { createHash } from "node:crypto";
-import { existsSync, statSync, readFileSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
+import { existsSync, statSync, readFileSync, mkdirSync, openSync, readSync, closeSync, readdirSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { cpus, totalmem } from "node:os";
@@ -171,15 +171,17 @@ export function kvBytesPerToken(meta: GgufKvMeta, cacheType: "q8_0" | "f16" = "q
  * optional — each missing fact degrades to a conservative documented guess, and the reason string
  * always says which path was taken (it lands in the launch plan warnings).
  */
-export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: number; vramBytes?: number; reserveBytes?: number }): { contextTokens: number; reason: string } {
+export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: number; vramBytes?: number; reserveBytes?: number; cacheType?: "q8_0" | "f16" }): { contextTokens: number; reason: string } {
   const { modelBytes, vramBytes } = input;
   if (!vramBytes || vramBytes <= 0) {
     return { contextTokens: 16384, reason: "ctx auto-sized to 16384: no VRAM reading (conservative default)" };
   }
   const meta = input.modelPath ? readGgufKvMeta(input.modelPath) : null;
+  const cacheType = input.cacheType ?? "q8_0";
   // Heuristic fallback when the header is unreadable: a large MoE ~35B lands near 160 KiB/token at
   // q8_0; a mid-size dense model nearer 96 KiB. A guess, and labeled as one.
-  const perToken = meta ? kvBytesPerToken(meta) : (modelBytes && modelBytes > 20e9 ? 160 * 1024 : 96 * 1024);
+  const heuristic = (modelBytes && modelBytes > 20e9 ? 160 * 1024 : 96 * 1024) * (cacheType === "f16" ? 2 : 1);
+  const perToken = meta ? kvBytesPerToken(meta, cacheType) : heuristic;
   const residentWeights = modelBytes === undefined ? vramBytes * 0.5
     : modelBytes > vramBytes * 0.8 ? vramBytes * 0.45 // cpu-moe: only attention + dense stay resident (mirrors the launch-plan branch)
     : modelBytes;
@@ -307,6 +309,25 @@ function nvidiaVramBytes(name: string): number | undefined {
   return undefined;
 }
 
+/** User launch tuning (settings.runtimeTuning). Every "auto" falls through to the heuristics. */
+export interface RuntimeTuning {
+  gpuLayers?: number | "auto";
+  cpuMoe?: "auto" | "on" | "off";
+  flashAttn?: "auto" | "on" | "off";
+  kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  extraArgs?: string;
+}
+
+/** Split a raw extra-flags string into argv tokens (quoted segments stay whole). */
+export function splitExtraArgs(raw: string | undefined): string[] {
+  if (!raw || !raw.trim()) return [];
+  const out: string[] = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out.slice(0, 64);
+}
+
 export function buildLaunchPlan(input: {
   runtime?: RuntimeKind;
   backend?: ComputeBackend;
@@ -314,6 +335,8 @@ export function buildLaunchPlan(input: {
   sidecarModel?: string;
   contextTokens?: number;
   sidecarMode?: RuntimeLaunchPlan["sidecarMode"];
+  /** User overrides for the heuristics below; "auto"/absent keeps the measured-machine defaults. */
+  tuning?: RuntimeTuning;
   /** Where llama.cpp may persist KV slots, so a reopened conversation restores instead of re-prefilling. */
   slotSavePath?: string;
   /** MiB of host RAM llama.cpp may use as a prompt-cache pool across requests. */
@@ -334,12 +357,15 @@ export function buildLaunchPlan(input: {
   const vramBytes = input.vramBytes ?? hardware?.gpus.find((gpu) => gpu.backend === backend)?.vramBytes;
   const modelBytes = input.modelBytes ?? (existsSync(input.mainModel) ? statSync(input.mainModel).size : undefined);
 
+  const tuning = input.tuning ?? {};
+  const kvCacheType = tuning.kvCacheType && tuning.kvCacheType !== "auto" ? tuning.kvCacheType : "q8_0";
+
   // No pinned context ⇒ size it from the machine instead of wishing for 16384. An explicit number
   // (settings pin, per-run request) is honored exactly as before.
   const contextSource: RuntimeLaunchPlan["contextSource"] = input.contextTokens === undefined ? "auto" : "explicit";
   let contextTokens: number;
   if (contextSource === "auto") {
-    const sized = autoSizeContextTokens({ modelPath: input.mainModel, modelBytes, vramBytes });
+    const sized = autoSizeContextTokens({ modelPath: input.mainModel, modelBytes, vramBytes, cacheType: kvCacheType === "f16" ? "f16" : "q8_0" });
     contextTokens = sized.contextTokens;
     warnings.push(sized.reason);
   } else {
@@ -351,24 +377,33 @@ export function buildLaunchPlan(input: {
   if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: 1, sidecarMode, args: [], warnings };
   const args = ["--model", input.mainModel, "--ctx-size", String(contextTokens), "--jinja", "--cont-batching"];
 
-  if (backend !== "cpu") {
-    // Offload every layer that fits; llama.cpp clamps a too-large count to the layers that exist.
+  // GPU offload: "auto" offloads everything that fits (llama.cpp clamps 999 to the real layer
+  // count); an explicit number is the user's call — including 0 for a pure-CPU load.
+  const gpuLayers = tuning.gpuLayers !== undefined && tuning.gpuLayers !== "auto" ? Math.max(0, Math.floor(tuning.gpuLayers)) : null;
+  if (gpuLayers !== null) {
+    args.push("--n-gpu-layers", String(gpuLayers));
+  } else if (backend !== "cpu") {
     args.push("--n-gpu-layers", "999");
-    // Attention on GPU is where flash-attention pays; it is off by default and costs nothing to ask for.
-    args.push("--flash-attn", "on");
   }
+  // Attention on GPU is where flash-attention pays; auto = on for any GPU backend.
+  const flashOn = tuning.flashAttn === "on" || (tuning.flashAttn !== "off" && backend !== "cpu" && gpuLayers !== 0);
+  if (flashOn) args.push("--flash-attn", "on");
 
   // KV quantization is a CAPACITY lever here, not a quality one: q8_0 is the safe default and roughly
-  // halves the cache, which is the difference between a usable context and an OOM on 8 GB. q4 is NOT
-  // enabled automatically — the evidence for it on multi-file code editing does not exist yet.
-  args.push("--cache-type-k", "q8_0", "--cache-type-v", "q8_0");
+  // halves the cache, which is the difference between a usable context and an OOM on 8 GB. The user
+  // can pin f16 (quality/default) or q4_0 (capacity) — q4 is never chosen automatically.
+  args.push("--cache-type-k", kvCacheType, "--cache-type-v", kvCacheType);
 
   // The expert tensors are the bulk of a MoE and the part that does not fit. Pushing them to CPU keeps
-  // attention and the dense path resident instead of letting the driver thrash.
-  if (backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8) {
+  // attention and the dense path resident instead of letting the driver thrash. This is also the
+  // heuristic a hand-tuner most often wants to OVERRIDE (measured on the dev box: auto cpu-moe gave
+  // 7 tok/s where the user's own launch gave 30) — so "off" is a first-class choice, not a hack.
+  const wantCpuMoe = tuning.cpuMoe === "on"
+    || (tuning.cpuMoe !== "off" && backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8);
+  if (wantCpuMoe && backend !== "cpu") {
     // llama.cpp itself warns that CPU tensor overrides with mmap enabled are slower, so take its advice.
     args.push("--cpu-moe", "--no-mmap");
-    warnings.push(`The model is ${(modelBytes / 1e9).toFixed(1)} GB against ${(vramBytes / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth.`);
+    if (tuning.cpuMoe !== "on") warnings.push(`The model is ${((modelBytes ?? 0) / 1e9).toFixed(1)} GB against ${((vramBytes ?? 0) / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth. Override with cpuMoe:"off" if your own tuning beats this.`);
   }
 
   // Prefix reuse is the largest latency lever on this hardware, and none of it is on by default:
@@ -406,7 +441,72 @@ export function buildLaunchPlan(input: {
   }
 
   if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
+
+  // User extra flags go LAST so they win over every heuristic above (llama.cpp takes the final value
+  // of a repeated flag). This is the escape hatch for anything the structured fields don't cover.
+  const extra = splitExtraArgs(tuning.extraArgs);
+  if (extra.length) args.push(...extra);
+
   return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };
+}
+
+// ── Model file discovery ────────────────────────────────────────────────────────────────────────
+// The picker must show what is ALREADY on the machine: the folders the configured weights live in,
+// plus the standard LM Studio trees, so a model installed via LM Studio or a manual llama.cpp
+// download is one click away instead of a filesystem safari.
+
+export interface LocalModelFile {
+  path: string;
+  name: string;
+  bytes: number;
+  dir: string;
+}
+
+/** Recursively collect *.gguf files under `root` (bounded depth + count; never throws). */
+function collectGguf(root: string, depth: number, out: LocalModelFile[], cap: number): void {
+  if (out.length >= cap || depth < 0) return;
+  let entries: string[];
+  try { entries = readdirSync(root); } catch { return; }
+  for (const entry of entries) {
+    if (out.length >= cap) return;
+    const full = `${root.replace(/[\\/]+$/, "")}${process.platform === "win32" ? "\\" : "/"}${entry}`;
+    try {
+      const st = statSync(full);
+      if (st.isDirectory()) collectGguf(full, depth - 1, out, cap);
+      else if (st.isFile() && entry.toLowerCase().endsWith(".gguf")) out.push({ path: full, name: entry, bytes: st.size, dir: root });
+    } catch { /* unreadable entry */ }
+  }
+}
+
+/**
+ * All local model files a user could plausibly want to load: the directories of the currently
+ * configured weights first, then the LM Studio model trees. De-duplicated, largest-first within a
+ * directory (the quant someone actually uses is usually the big one they downloaded on purpose).
+ */
+export function listModelFiles(seedPaths: ReadonlyArray<string | undefined> = [], extraDirs: ReadonlyArray<string> = []): LocalModelFile[] {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  const roots = new Set<string>();
+  for (const seed of seedPaths) {
+    if (!seed || !seed.trim()) continue;
+    try { const dir = seed.replace(/[\\/][^\\/]+$/, ""); if (dir && existsSync(dir)) roots.add(dir); } catch { /* skip */ }
+  }
+  for (const dir of extraDirs) if (dir && existsSync(dir)) roots.add(dir);
+  if (home) {
+    for (const candidate of [
+      `${home}\\.lmstudio\\models`,
+      `${home}\\.cache\\lm-studio\\models`,
+      `${home}/.lmstudio/models`,
+      `${home}/.cache/lm-studio/models`,
+    ]) {
+      if (existsSync(candidate)) roots.add(candidate);
+    }
+  }
+  const out: LocalModelFile[] = [];
+  for (const root of roots) collectGguf(root, 3, out, 200);
+  const seen = new Set<string>();
+  return out
+    .filter((f) => { const key = f.path.toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; })
+    .sort((a, b) => a.dir.localeCompare(b.dir) || b.bytes - a.bytes);
 }
 
 /** Spawn a managed runtime without inheriting a console window or arbitrary environment secrets. */
