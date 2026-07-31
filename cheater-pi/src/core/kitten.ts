@@ -15,6 +15,7 @@
 import { resolve } from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { SidecarAssist } from "./sidecarAssist.js";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
@@ -122,7 +123,7 @@ async function cmdRun(rest: string[]): Promise<number> {
   const resolvedModel = model ?? settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
   // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: dangerous ? "auto-allow" : "auto-deny" });
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: dangerous ? "auto-allow" : "auto-deny", taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
   app.recover();
   if (!json) {
     // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
@@ -372,6 +373,23 @@ async function cmdDoctor(): Promise<number> {
       }
     }
   }
+  // The sidecar tier, stated plainly. A single-model endpoint answers a request for a 2B with
+  // whatever is loaded instead of returning 404, so a misconfigured sidecar looks EXACTLY like a
+  // working one — and every latency assumption built on "a 2B answers this" is then wrong.
+  {
+    const assist = new SidecarAssist({ llm: new KittenLLM(tierSidecar(models)) });
+    const identity = await assist.probeIdentity();
+    if (!identity.configured) {
+      process.stdout.write(dim("○ no sidecar model configured — clerical work runs on the main model\n"));
+    } else if (identity.sharedWithMain) {
+      process.stdout.write(`${yellow("○")} sidecar '${identity.configured}' is answered by the main model\n`);
+      process.stdout.write(dim(`    ${identity.detail}\n`));
+      process.stdout.write(dim("    → point sidecarBaseUrl at a second endpoint serving a small model to get a real fast tier\n"));
+    } else {
+      process.stdout.write(`${green("✓")} sidecar '${identity.configured}' runs on its own endpoint\n`);
+    }
+  }
+
   // Show the resolved model name if set, otherwise default.
   if (!settings.models.main || settings.models.main === DEFAULT_MODELS.main) {
     process.stdout.write(dim("○ no KITTEN_MAIN_MODEL set — using default (set it to your loaded model name)\n"));

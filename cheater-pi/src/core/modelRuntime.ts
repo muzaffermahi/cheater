@@ -173,6 +173,8 @@ export function buildLaunchPlan(input: {
   slotSavePath?: string;
   /** MiB of host RAM llama.cpp may use as a prompt-cache pool across requests. */
   promptCacheMiB?: number;
+  /** Prompt-lookup speculation. `"ngram"` (default) drafts from the context; `"off"` disables it. */
+  speculation?: "ngram" | "off";
   /** Overrides for tests; production measures the real file and the real device. */
   modelBytes?: number;
   vramBytes?: number;
@@ -225,6 +227,27 @@ export function buildLaunchPlan(input: {
     catch { warnings.push(`KV slots cannot be persisted: ${input.slotSavePath} is not writable. Resume will re-prefill instead of restoring.`); }
   }
   if (input.promptCacheMiB && input.promptCacheMiB > 0) args.push("--cache-ram", String(Math.floor(input.promptCacheMiB)));
+
+  // Prompt-lookup (n-gram) speculation. Decode here is memory-bandwidth-bound, not compute-bound —
+  // 24.7 GB of weights stream past an 8 GB card for every token — so verifying several drafted tokens
+  // in one pass is close to free when the drafts hit. Coding agents are the ideal workload for it:
+  // the model constantly re-emits text already present in the context (the file it is editing, an
+  // error string, a repeated signature), which is exactly what an n-gram draft predicts.
+  //
+  // `ngram-mod` needs NO draft model, so it costs no VRAM — which is why it is preferred here over
+  // pairing a small model as a drafter on a card that has nothing spare.
+  //
+  // SAFETY: speculative decoding is output-LOSSLESS. Drafted tokens are accepted only if they match
+  // what the target model would have produced, so the sampled distribution is unchanged. The only
+  // risk is a throughput regression when drafts miss, never a quality regression — which is why this
+  // defaults on where the schema constraint (which DID change content) defaults off.
+  //
+  // UNMEASURED ON THIS BOX: A/B-ing it needs a second server instance, and with the 35B resident
+  // there was 1.9 GB of 31.7 GB free — no headroom to run both. To measure, stop the live server and
+  // compare tokens/s with and without `--spec-type ngram-mod` on a realistic edit prompt.
+  if (input.speculation !== "off") {
+    args.push("--spec-type", "ngram-mod");
+  }
 
   if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
   return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };

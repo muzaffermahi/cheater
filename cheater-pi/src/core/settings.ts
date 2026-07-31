@@ -19,11 +19,17 @@ export interface ManagedRuntimeSettings {
   sidecarModelPath?: string;
 }
 
+/** Task Compiler rollout switch. `off` restores pre-compiler behavior byte for byte, which is what
+ *  makes this feature reversible without a code change. */
+export type TaskCompilerFlag = "off" | "auto" | "force";
+
 export interface KittenSettings {
   models: KittenModels;
   managedRuntime: ManagedRuntimeSettings;
   approvalPolicy: ApprovalPolicy;
   contextWindowTokens: number;
+  /** How the Task Compiler participates in the request path. Default "auto". */
+  taskCompiler: TaskCompilerFlag;
   /** Config files that were merged (for `kitten doctor` transparency). */
   sources: string[];
   /** Non-fatal problems (unknown keys, unreadable files) to surface in doctor. */
@@ -41,18 +47,21 @@ export interface SettingsUpdate {
   runtimeExecutable?: string;
   mainModelPath?: string;
   sidecarModelPath?: string;
+  taskCompiler?: TaskCompilerFlag;
 }
 
 const KNOWN_KEYS = new Set([
   "baseUrl", "sidecarBaseUrl", "mainModel", "sidecarModel", "embedModel", "apiKey",
   "approvalPolicy", "contextWindowTokens",
   "runtimeExecutable", "mainModelPath", "sidecarModelPath",
+  "taskCompiler",
 ]);
 
 interface RawConfig {
   baseUrl?: string; sidecarBaseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
   approvalPolicy?: string; contextWindowTokens?: number;
   runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
+  taskCompiler?: string;
 }
 
 function readConfig(path: string, warnings: string[]): RawConfig | null {
@@ -123,6 +132,7 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
     runtimeExecutable: undefined,
     mainModelPath: undefined,
     sidecarModelPath: undefined,
+    taskCompiler: envStr("KITTEN_TASK_COMPILER"),
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
@@ -148,7 +158,11 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
 
   const contextWindowTokens = Number(pick("contextWindowTokens")) > 0 ? Number(pick("contextWindowTokens")) : 16384;
 
-  return { models, managedRuntime, approvalPolicy, contextWindowTokens, sources, warnings };
+  const rawCompiler = pick("taskCompiler");
+  const taskCompiler: TaskCompilerFlag = rawCompiler === "off" || rawCompiler === "auto" || rawCompiler === "force" ? rawCompiler : "auto";
+  if (rawCompiler && rawCompiler !== taskCompiler) warnings.push(`taskCompiler "${rawCompiler}" is not one of off|auto|force — using "auto"`);
+
+  return { models, managedRuntime, approvalPolicy, contextWindowTokens, taskCompiler, sources, warnings };
 }
 
 /** Persist non-secret app settings atomically. API keys remain environment/config-file only. */

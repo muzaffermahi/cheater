@@ -14,6 +14,7 @@
 // verifier-confirmed solve, remember it (A3, disjoint). Every lever is TOGGLEABLE so Part D's ablation
 // can measure each one's marginal Best@1 — and each lever fails gracefully to the path below it.
 
+import { distillAttempt, renderDigests, digestsAreInformative, digestReceiptLine } from "./distill.js";
 import type { KittenLLM } from "./llm.js";
 import type { AgentEvent } from "./agent.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
@@ -106,6 +107,9 @@ export interface AscentResult {
   usage: { prompt: number; completion: number; reasoning: number };
   formatRescues?: number;
   wallMs: number;
+  /** Files the winner's workspace brought in. The authoritative "what changed" when the workspace is
+   *  not a git repository and there is therefore no snapshot to diff against. */
+  adoptedFiles: string[];
 }
 
 const DEFAULT_EST_TOKENS = 8000;
@@ -311,7 +315,21 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       }
       // A concrete got≠expected on a real example is the strongest repair signal — lead with it.
       const failReason = gtFailSeed ? `Your previous attempt finished but FAILED the task's own examples:\n${gtFailSeed}` : (errSig ?? "the previous attempt did not finish");
-      repairSeed = [repairDirective(failReason, worst?.plan.stance), webBrief].filter(Boolean).join("\n");
+
+      // PDR (arXiv 2604.16529): condition the next round on a distilled summary of EVERY prior
+      // attempt, not just the one failure that happened to be found first. Two candidates can fail
+      // for two different reasons, and the second reason used to be discarded — which meant the
+      // repair round could walk straight back into it. Reuse is cheaper than another rollout here:
+      // a third candidate costs ~290 s on this hardware, this costs a few hundred prompt tokens.
+      const digests = allAttempts.map((attempt) => distillAttempt(
+        attempt,
+        // Attach ground-truth evidence to the attempt it actually belongs to.
+        attempt === failing && gtFailSeed ? gtFailSeed : undefined,
+      ));
+      const priorEvidence = digestsAreInformative(digests) ? renderDigests(digests) : "";
+      if (priorEvidence) receipts.push(digestReceiptLine(digests));
+
+      repairSeed = [repairDirective(failReason, worst?.plan.stance), priorEvidence, webBrief].filter(Boolean).join("\n\n");
     }
   }
 
@@ -356,7 +374,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   }
 
   const winnerAttempt = verdict.winner ? survivorsByIndex.get(verdict.winner) ?? null : null;
-  if (winnerAttempt) adoptWorkspace(params.cwd, winnerAttempt.workspace);
+  const adoptedFiles = winnerAttempt ? adoptWorkspace(params.cwd, winnerAttempt.workspace) : [];
 
   // A3 — remember a verifier-confirmed solve (disjoint by construction; admit() hard-fails on an eval id).
   if (winnerAttempt && verdict.winnerHasExecutionReceipt && lever(config, "experience") && config.experienceStore && params.taskId) {
@@ -380,6 +398,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const result: AscentResult = {
     finished: !!winnerAttempt && verdict.winnerHasExecutionReceipt,
     summary: winnerAttempt?.result.summary ?? "",
+    adoptedFiles,
     winner: verdict.winner,
     selector: verdict.selector,
     winnerHasExecutionReceipt: verdict.winnerHasExecutionReceipt,

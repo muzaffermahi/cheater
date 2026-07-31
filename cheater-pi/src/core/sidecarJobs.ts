@@ -7,13 +7,14 @@ import type { WorkspaceIndex } from "./workspaceIndex.js";
 import { SidecarControlPlane, type SidecarPriority, type SidecarTier, type SidecarResult } from "./sidecarControlPlane.js";
 
 export type SidecarJobType =
+  | "critique_steps"
   | "classify_task" | "extract_contract" | "rank_files" | "orient_task" | "postflight_review" | "select_tests" | "compress_context" | "summarize_output"
   | "cluster_failure" | "detect_loop" | "review_diff" | "audit_evidence" | "predict_conflict" | "prepare_capsule"
   | "title" | "progress" | "choose_model" | "estimate_risk" | "summarize_diff" | "suggest_commands" | "explain_error"
   | "map_dependencies" | "generate_test_cases" | "detect_secrets" | "triage_logs" | "draft_commit" | "find_duplicates" | "estimate_tokens" | "summarize_tree";
 
 export const SIDECAR_JOB_TYPES = [
-  "classify_task", "extract_contract", "rank_files", "orient_task", "postflight_review", "select_tests", "compress_context", "summarize_output",
+  "critique_steps", "classify_task", "extract_contract", "rank_files", "orient_task", "postflight_review", "select_tests", "compress_context", "summarize_output",
   "cluster_failure", "detect_loop", "review_diff", "audit_evidence", "predict_conflict", "prepare_capsule",
   "title", "progress", "choose_model", "estimate_risk", "summarize_diff", "suggest_commands", "explain_error",
   "map_dependencies", "generate_test_cases", "detect_secrets", "triage_logs", "draft_commit", "find_duplicates", "estimate_tokens", "summarize_tree",
@@ -164,7 +165,7 @@ export interface SidecarJobOutput {
 }
 
 const priorities: Record<SidecarJobType, SidecarPriority> = {
-  classify_task: "user-blocking", extract_contract: "user-blocking", rank_files: "context", orient_task: "user-blocking", postflight_review: "verification", select_tests: "verification",
+  critique_steps: "speculative", classify_task: "user-blocking", extract_contract: "user-blocking", rank_files: "context", orient_task: "user-blocking", postflight_review: "verification", select_tests: "verification",
   compress_context: "context", summarize_output: "context", cluster_failure: "verification", detect_loop: "user-blocking",
   review_diff: "verification", audit_evidence: "verification", predict_conflict: "context", prepare_capsule: "context",
   title: "speculative", progress: "speculative", choose_model: "user-blocking", estimate_risk: "verification", summarize_diff: "context", suggest_commands: "verification", explain_error: "verification",
@@ -172,7 +173,7 @@ const priorities: Record<SidecarJobType, SidecarPriority> = {
 };
 
 const tiers: Record<SidecarJobType, SidecarTier> = {
-  classify_task: "clerk", extract_contract: "clerk", rank_files: "scout", orient_task: "scout", postflight_review: "specialist", select_tests: "scout", compress_context: "clerk",
+  critique_steps: "scout", classify_task: "clerk", extract_contract: "clerk", rank_files: "scout", orient_task: "scout", postflight_review: "specialist", select_tests: "scout", compress_context: "clerk",
   summarize_output: "clerk", cluster_failure: "scout", detect_loop: "clerk", review_diff: "specialist", audit_evidence: "specialist",
   predict_conflict: "scout", prepare_capsule: "scout", title: "clerk", progress: "clerk", choose_model: "clerk", estimate_risk: "specialist", summarize_diff: "clerk", suggest_commands: "scout", explain_error: "scout",
   map_dependencies: "scout", generate_test_cases: "scout", detect_secrets: "specialist", triage_logs: "scout", draft_commit: "clerk", find_duplicates: "scout", estimate_tokens: "clerk", summarize_tree: "clerk",
@@ -185,6 +186,7 @@ export function sidecarJobDefaults(input: SidecarJobInput): { priority: SidecarP
 export function deterministicSidecar(input: SidecarJobInput, index?: WorkspaceIndex): SidecarJobOutput {
   const text = input.text ?? "";
   switch (input.type) {
+    case "critique_steps": return { type: input.type, value: critiqueSteps(input.facts ?? []), confidence: "low", notes: ["error-adjacency floor"] };
     case "classify_task": return { type: input.type, value: classify(text), confidence: "medium", notes: ["regex floor"] };
     case "extract_contract": return { type: input.type, value: extractContract(text), confidence: "low", notes: ["explicit requirements only"] };
     case "rank_files": return { type: input.type, value: index ? index.search(input.query ?? text, 20).map((hit) => ({ path: hit.path, score: hit.score })) : (input.files ?? []).slice(0, 20), confidence: index ? "medium" : "low", notes: [index ? "workspace index" : "candidate order"] };
@@ -265,9 +267,116 @@ export function closedSetLabels(type: SidecarJobType): string[] | null {
   }
 }
 
+/**
+ * The exact output shape each structured job must produce.
+ *
+ * WHY THIS EXISTS: the job prompt used to say only "Return a concise JSON object for sidecar job
+ * <type>" — the model was never told which fields were expected. Measured live on ornith-1.0-35b, a
+ * `postflight_review` came back as `{id, type, job_id, status, summary, verified_files, notes}`:
+ * perfectly reasonable JSON, and none of the fields the validator requires. So it was rejected and
+ * the job silently fell back to its deterministic floor. That is the real reason the sidecar looked
+ * inert — its structured jobs were almost never usable, and the fallback hid it.
+ *
+ * The schema is sent as `response_format: json_schema`, which llama.cpp compiles to a GBNF grammar,
+ * so the wrong shape becomes UNGENERATABLE rather than merely rejected after the fact. Endpoints
+ * without the capability ignore the field and the validator plus floor still catch anything bad.
+ */
+export function jobSchema(type: SidecarJobType): { name: string; schema: Record<string, unknown> } | null {
+  const arrayOf = (description: string) => ({ type: "array", items: { type: "string" }, description });
+  const object = (properties: Record<string, unknown>) => ({
+    type: "object", additionalProperties: false,
+    required: Object.keys(properties), properties,
+  });
+  switch (type) {
+    case "critique_steps":
+      // SRFT (JetBrains, 2026): in UNSUCCESSFUL agent trajectories only ~24% of steps are actually
+      // wrong — the other ~76% is productive exploration that standard rejection-sampling throws
+      // away with the run. Labelling each step lets the useful part be kept.
+      return { name: "critique_steps", schema: { type: "object", additionalProperties: false,
+        required: ["steps"], properties: {
+          steps: { type: "array", items: { type: "object", additionalProperties: false,
+            required: ["step", "label", "why"], properties: {
+              step: { type: "integer", description: "1-based index of the step being labelled" },
+              label: { type: "string", enum: ["good", "unnecessary", "mistake", "recover"] },
+              why: { type: "string", description: "one short clause of justification" },
+            } } },
+        } } };
+    case "postflight_review":
+      return { name: "postflight_review", schema: object({
+        secrets: arrayOf("credential-like strings visible in the diff; empty when none"),
+        warnings: arrayOf("concrete problems in the change"),
+        evidenceWarnings: arrayOf("claims made without supporting execution evidence"),
+        recommendedTests: arrayOf("existing test file paths worth running"),
+        suggestedCommands: arrayOf("shell commands worth running to check this change"),
+        risk: { type: "string", enum: ["low", "medium", "high"] },
+        riskReasons: arrayOf("why the risk is what it is"),
+        generatedTestCases: arrayOf("edge cases this change should be checked against"),
+      }) };
+    case "triage_logs":
+      return { name: "triage_logs", schema: object({
+        severity: { type: "string", enum: ["error", "warning", "info"] },
+        signature: { type: "string", description: "one-line normalized failure signature" },
+        lines: arrayOf("the most salient log lines"),
+      }) };
+    case "explain_error":
+      return { name: "explain_error", schema: object({
+        signature: { type: "string", description: "one-line normalized failure signature" },
+        likelyCause: { type: "string", description: "the most probable cause, one sentence" },
+      }) };
+    case "extract_contract":
+      return { name: "extract_contract", schema: object({
+        requirements: arrayOf("explicit requirements stated by the user"),
+        forbidden: arrayOf("things the user explicitly prohibited"),
+      }) };
+    case "select_tests":
+      return { name: "select_tests", schema: object({ tests: arrayOf("test file paths, chosen only from the supplied candidates") }) };
+    case "review_diff":
+      return { name: "review_diff", schema: object({ warnings: arrayOf("concrete problems in the diff") }) };
+    case "estimate_risk":
+      return { name: "estimate_risk", schema: object({
+        level: { type: "string", enum: ["low", "medium", "high"] },
+        reasons: arrayOf("why"),
+      }) };
+    case "detect_secrets":
+      return { name: "detect_secrets", schema: object({ findings: arrayOf("descriptions of credential-like material found") }) };
+    case "generate_test_cases":
+      return { name: "generate_test_cases", schema: object({ cases: arrayOf("concrete edge cases worth asserting") }) };
+    case "detect_loop":
+      return { name: "detect_loop", schema: object({
+        repeated: { type: "boolean" },
+        signature: { type: "string" },
+      }) };
+    default:
+      return null;
+  }
+}
+
+/** A one-line description of the required fields, for endpoints that ignore `response_format`. */
+export function schemaHint(type: SidecarJobType): string {
+  const schema = jobSchema(type);
+  if (!schema) return "";
+  const properties = (schema.schema.properties ?? {}) as Record<string, { type?: string; enum?: string[] }>;
+  const fields = Object.entries(properties)
+    .map(([key, value]) => `${key}: ${value.enum ? value.enum.join("|") : value.type === "array" ? "string[]" : value.type}`)
+    .join(", ");
+  return ` The object must have exactly these keys — {${fields}}. Use an empty array when there is nothing to report.`;
+}
+
 export function validateSidecarValue(input: SidecarJobInput, value: unknown): unknown | null {
   if (value && typeof value === "object" && !Array.isArray(value) && "value" in value) value = (value as { value: unknown }).value;
   switch (input.type) {
+    case "critique_steps": {
+      if (!value || typeof value !== "object" || !Array.isArray((value as { steps?: unknown }).steps)) return null;
+      const labels = new Set(["good", "unnecessary", "mistake", "recover"]);
+      const steps = (value as { steps: unknown[] }).steps
+        .filter((step): step is { step: number; label: string; why: string } => Boolean(
+          step && typeof step === "object"
+          && Number.isFinite(Number((step as { step?: unknown }).step))
+          && labels.has(String((step as { label?: unknown }).label))))
+        .map((step) => ({ step: Math.max(1, Math.floor(Number(step.step))), label: String(step.label), why: String(step.why ?? "").slice(0, 200) }))
+        .slice(0, 64);
+      return steps.length ? { steps } : null;
+    }
     case "classify_task": {
       const label = typeof value === "string" ? value : value && typeof value === "object" ? (value as { label?: unknown; classification?: unknown }).label ?? (value as { classification?: unknown }).classification : undefined;
       return typeof label === "string" && /^(question|bug|feature|refactor|general)$/i.test(label) ? label.toLowerCase() : null;
@@ -386,24 +495,73 @@ export function validateSidecarValue(input: SidecarJobInput, value: unknown): un
   }
 }
 
-export async function runCatalogJob(scheduler: SidecarControlPlane, llm: KittenLLM | null, index: WorkspaceIndex | undefined, input: SidecarJobInput): Promise<SidecarResult<SidecarJobOutput>> {
+/**
+ * The job payload with Kitten's internal bookkeeping removed.
+ *
+ * `id`, `premise` and `deadlineMs` are scheduler fields — they are not task data, and a small model
+ * cannot tell the difference. Observed live on qwen3.5-2b: a `triage_logs` job came back with
+ * `signature: "assist-triage-0"` — it had faithfully copied the job id out of the serialized input
+ * into the answer. A JSON schema constrains the SHAPE of an answer, never its content, so the only
+ * reliable fix is to stop showing the model fields it has no business repeating.
+ */
+function modelFacingInput(input: SidecarJobInput): Record<string, unknown> {
+  const { id, premise, deadlineMs, ...rest } = input;
+  void id; void premise; void deadlineMs;
+  return rest;
+}
+
+export async function runCatalogJob(
+  scheduler: SidecarControlPlane,
+  llm: KittenLLM | null,
+  index: WorkspaceIndex | undefined,
+  input: SidecarJobInput,
+  /** Opt in to hard grammar-constrained JSON. Off by default — see the measurement at the call site. */
+  constrainStructuredOutput = false,
+): Promise<SidecarResult<SidecarJobOutput>> {
   const defaults = sidecarJobDefaults(input);
   return scheduler.enqueue({ id: input.id, type: input.type, tier: defaults.tier, priority: defaults.priority, premise: input.premise, deadlineMs: input.deadlineMs,
     run: async (signal) => {
-      if (!llm) return deterministicSidecar(input, index);
+      // No model configured is not a successful sidecar run. Returning the floor from inside `run`
+      // made the scheduler label it `source: "sidecar"`, so callers reported deterministic regex
+      // output as model analysis. Throw so the declared fallback handles it and the source is honest.
+      if (!llm) throw new Error("no sidecar model configured");
       // A closed-set answer is decoded under a grammar, so an out-of-set label cannot be produced at
       // all. That removes the parse-then-retry turn instead of making it rarer, and it is the single
       // cheapest use of owning the decoder. Endpoints without grammar support ignore the field and the
       // existing validator + deterministic floor still catch anything malformed.
       const closedSet = closedSetLabels(input.type);
+      const schema = closedSet ? null : jobSchema(input.type);
+      const payload = JSON.stringify(modelFacingInput(input)).slice(0, 12000);
       const prompt = closedSet
-        ? `Answer with exactly one label for sidecar job ${input.type}, and nothing else. Allowed: ${closedSet.join(", ")}.\n${JSON.stringify(input).slice(0, 12000)}`
-        : `Return a concise JSON object for sidecar job ${input.type}. Do not invent files or evidence.\n${JSON.stringify(input).slice(0, 12000)}`;
+        ? `Answer with exactly one label for sidecar job ${input.type}, and nothing else. Allowed: ${closedSet.join(", ")}.\n${payload}`
+        : `Return a concise JSON object for sidecar job ${input.type}. Do not invent files or evidence.${schemaHint(input.type)}\n${payload}`;
       const response = await llm.sidecar({
         messages: [{ role: "user", content: prompt }],
         maxTokens: closedSet ? 8 : 512,
         disableThinking: true,
         ...(closedSet ? { grammar: enumGrammar(closedSet) } : {}),
+        // The hard grammar constraint is OFF by default, and that is a MEASURED choice.
+        //
+        // The original bug was that the prompt never described the output at all, so the model
+        // returned reasonable-but-wrong keys and every structured job silently fell back. Adding
+        // `schemaHint` fixed that. Adding json_schema (→ GBNF) on top was assumed to help further.
+        // A/B on this workstation, postflight_review over the same diff:
+        //
+        //   qwen3.5-2b     constrained 4/4 valid, 8175 ms, found 0/4 warnings
+        //                unconstrained 4/4 valid, 7020 ms, found 2/4 warnings
+        //   ornith-35b     constrained 3/3 valid, 25217 ms, found 3/3 warnings
+        //                unconstrained 3/3 valid, 18255 ms, found 3/3 warnings
+        //
+        // The hint alone already yields valid output on both tiers; the grammar adds 16–38% latency
+        // and on the small model it measurably EMPTIED the content — it guaranteed the shape and
+        // cost findings. That matches "When Correct Isn't Usable" (arXiv 2605.02363), which reports
+        // constrained decoding at 3.6–8.2x latency and sometimes degrading task performance, with
+        // prompt optimization beating it outright.
+        //
+        // Kept available (and still exercised by the closed-set enum grammar above, where the answer
+        // is a single token and the constraint is nearly free) but not paid for by default. The
+        // validator plus deterministic floor remain the safety net.
+        ...(schema && constrainStructuredOutput ? { jsonSchema: schema } : {}),
         signal,
       });
       if (!response.ok || !response.content.trim()) throw new Error(response.error ?? "sidecar returned no content");
@@ -420,6 +578,27 @@ export async function runCatalogJob(scheduler: SidecarControlPlane, llm: KittenL
     },
     fallback: () => deterministicSidecar(input, index),
   });
+}
+
+/**
+ * Deterministic step critique: a step whose own output shows an error is a `mistake`; the step
+ * immediately after a mistake is a `recover`; everything else is `good`. Crude, but it never labels
+ * a step wrong for a reason it cannot see, which is the property that matters — a critic that
+ * guesses would mask productive exploration as error and delete the very signal SRFT exists to keep.
+ */
+const FAILED_STEP_RE = /\b(?:error|exception|failed|traceback|assertionerror|cannot|not found|denied)\b/i;
+
+function critiqueSteps(steps: string[]): { steps: Array<{ step: number; label: string; why: string }> } {
+  const out: Array<{ step: number; label: string; why: string }> = [];
+  let previousWasMistake = false;
+  steps.slice(0, 64).forEach((step, i) => {
+    const failed = FAILED_STEP_RE.test(step);
+    const label = failed ? "mistake" : previousWasMistake ? "recover" : "good";
+    const why = failed ? "the step's own output reports an error" : previousWasMistake ? "follows a failed step" : "no failure observed in this step";
+    out.push({ step: i + 1, label, why });
+    previousWasMistake = failed;
+  });
+  return { steps: out };
 }
 
 function classify(text: string): string { if (/\bwhy|how|what is|explain\b/i.test(text) && !/\b(fix|add|change|implement|create)\b/i.test(text)) return "question"; if (/\b(fix|bug|broken|failing|error|regression)\b/i.test(text)) return "bug"; if (/\b(refactor|rename|migrate|cleanup)\b/i.test(text)) return "refactor"; if (/\b(add|create|implement|build)\b/i.test(text)) return "feature"; return "general"; }

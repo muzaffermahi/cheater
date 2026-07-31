@@ -42,8 +42,10 @@ test("submitMessage persists the full ordered run and returns a completed run", 
   assert.equal(run.verified, true);
 
   const types = app.getEvents(conv.id).map((e) => e.type);
+  // `task.compiled` sits between the user's message and routing: the contract is compiled before the
+  // lane is chosen (so it can inform it) and before the expensive model runs.
   assert.deepEqual(types, [
-    "conversation.created", "user.message", "route.selected", "run.started",
+    "conversation.created", "user.message", "task.compiled", "route.selected", "run.started",
     "assistant.delta", "tool.completed", "file.changed",
     "run.completed", "receipt.finalized",
   ]);
@@ -180,7 +182,9 @@ test("a runner that throws is recorded as run.failed, history intact", async () 
   const boom: Runner = async () => { throw new Error("engine exploded"); };
   const app = makeApp(new ConversationStore(openSqlite(":memory:")), boom);
   const conv = app.createConversation();
-  const run = await app.submitMessage(conv.id, "fix it");
+  // A concrete request, so this test exercises runner-throw handling rather than the Task Compiler's
+  // clarification path (a bare "fix it" on a FRESH conversation has no referent and is asked about).
+  const run = await app.submitMessage(conv.id, "fix the off-by-one in a.py");
   assert.equal(run.status, "failed");
   assert.equal(run.error, "engine exploded");
   assert.ok(app.getEvents(conv.id).some((e) => e.type === "user.message"));

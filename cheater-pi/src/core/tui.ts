@@ -16,6 +16,7 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readFileSync, writeFileSync } from "node:fs";
+import { SidecarAssist } from "./sidecarAssist.js";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore, type ConversationRow } from "./store/conversationStore.js";
@@ -190,7 +191,7 @@ export async function runTui(argv: string[] = process.argv.slice(2)): Promise<vo
   const resolvedModel = modelFlagProvided ? model : settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
   model = resolvedModel;
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: interactive ? settings.approvalPolicy : "auto-deny" });
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: interactive ? settings.approvalPolicy : "auto-deny", taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
   app.recover();
 
   const st: TuiState = {

@@ -15,7 +15,7 @@
 import {
   ConversationStore, type ConversationRow, type RunRow,
 } from "./store/conversationStore.js";
-import type { EventPayload, KittenEvent, Lane } from "./events.js";
+import { EVENT_SCHEMA_VERSION, type EventPayload, type KittenEvent, type Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
 import { captureSnapshot, captureSnapshotAfter, restoreSnapshot, redoSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 import { ContextBuilder, contextBudgetForWindow } from "./context.js";
@@ -23,6 +23,13 @@ import { TaskGraphController, type TaskGraphPlan } from "./taskGraph.js";
 import type { TaskNodeRow } from "./store/conversationStore.js";
 import { exportConversationMarkdown } from "./export.js";
 import { getAgent } from "./agents.js";
+import type { WorkspaceIndex } from "./workspaceIndex.js";
+import { promptEpoch } from "./promptEpoch.js";
+import {
+  compileTask, serializeCompiledTask,
+  type CompileResult, type TaskCompilerFlag,
+} from "./taskCompiler/index.js";
+import { SidecarAssist, type RunFacts } from "./sidecarAssist.js";
 
 /** Everything a Runner needs to execute one run, plus the sink it emits progress into. */
 export interface RunContext {
@@ -91,6 +98,18 @@ export interface KittenAppOptions {
   newId?: (prefix: string) => string;
   /** How risky actions are approved. Default "auto-deny" (safe for unattended runs). */
   approvalPolicy?: ApprovalPolicy;
+  /** Task Compiler participation. "off" preserves pre-compiler behavior exactly. Default "auto". */
+  taskCompiler?: TaskCompilerFlag;
+  /**
+   * Advisory sidecar work after a run reaches a terminal state (postflight review, failure triage).
+   * Supplied by a client that has an LLM; absent ⇒ no assist, exactly as before. Scheduled only
+   * once the main model is idle — on a single-model endpoint the "sidecar" IS the main model.
+   */
+  sidecarAssist?: SidecarAssist;
+  /** Optional workspace index for candidate-file ranking during compilation, resolved per project
+   *  root. A client that already owns one (the desktop engine does) passes it; absent, grounding
+   *  stays deterministic — ranking degrades, correctness does not. */
+  workspaceIndex?: (projectRoot: string) => WorkspaceIndex | undefined;
 }
 
 export interface CreateConversationInput {
@@ -129,6 +148,20 @@ export interface SpawnChildInput {
 
 export type EventListener = (event: KittenEvent) => void;
 
+/** The durable Task Compiler record for one run, as clients and the verifier read it back. */
+export interface CompiledTaskRecord {
+  runId: string;
+  mode: string;
+  family: string;
+  /** Canonical CompiledTask JSON — the contract the run was actually held to. */
+  ir: string;
+  /** Full provenance (literals, repository facts, stage timings, validation). Debugging only. */
+  trace: string;
+  /** The exact bytes injected into the model-facing context. */
+  rendered: string;
+  promptEpoch: string;
+}
+
 export class KittenApp {
   private readonly store: ConversationStore;
   private readonly runner: Runner;
@@ -145,6 +178,11 @@ export class KittenApp {
   private readonly pendingApprovals = new Map<string, (allowed: boolean) => void>();
   private readonly context: ContextBuilder;
   private readonly tasks: TaskGraphController;
+  private taskCompiler: TaskCompilerFlag;
+  private readonly workspaceIndex?: (projectRoot: string) => WorkspaceIndex | undefined;
+  private readonly assist?: SidecarAssist;
+  /** In-flight advisory passes, so tests and shutdown can await them without blocking submitMessage. */
+  private readonly assistInFlight = new Set<Promise<void>>();
 
   constructor(opts: KittenAppOptions) {
     this.store = opts.store;
@@ -157,6 +195,25 @@ export class KittenApp {
     this.tasks = new TaskGraphController(opts.store, this.now);
     this.newId = opts.newId ?? defaultIdGen();
     this.approvalPolicy = opts.approvalPolicy ?? "auto-deny";
+    this.taskCompiler = opts.taskCompiler ?? "auto";
+    this.workspaceIndex = opts.workspaceIndex;
+    this.assist = opts.sidecarAssist;
+  }
+
+  /** Change Task Compiler participation at runtime (a settings change must not need a restart). */
+  setTaskCompiler(flag: TaskCompilerFlag): void {
+    this.taskCompiler = flag;
+  }
+
+  getTaskCompiler(): TaskCompilerFlag {
+    return this.taskCompiler;
+  }
+
+  /** The compiled contract a run was held to, reconstructed from the durable trace. */
+  getCompiledTask(runId: string): CompiledTaskRecord | null {
+    const row = this.store.getTaskCompilation(runId);
+    if (!row) return null;
+    return { runId: row.runId, mode: row.mode, family: row.family, ir: row.ir, trace: row.trace, rendered: row.rendered, promptEpoch: row.promptEpoch };
   }
 
   /** Change the approval policy (e.g. a TUI sets "ask", a --dangerous headless run sets "auto-allow"). */
@@ -422,6 +479,123 @@ export class KittenApp {
     if (ev) for (const fn of this.listeners) { try { fn(ev); } catch { /* ignore */ } }
   }
 
+  // ── Task Compiler ────────────────────────────────────────────────────────────────────────────
+  /**
+   * Compile the request into an execution contract, persist the trace, and record the decision.
+   *
+   * Two safety properties matter more than the compiler's usefulness:
+   *   • `off` is a true no-op — no compilation, no event, no context change, no store write.
+   *   • A compiler that throws, or produces an INVALID contract, is discarded rather than applied.
+   *     A malformed contract is worse than none: it would point the main model somewhere specific
+   *     and wrong, with a contract's authority behind it.
+   */
+  private compile(
+    runId: string,
+    conversationId: string,
+    projectRoot: string,
+    text: string,
+    hasHistory: boolean,
+    explicitLane: Lane | undefined,
+  ): CompileResult | null {
+    if (this.taskCompiler === "off") return null;
+    try {
+      const result = compileTask({
+        taskId: runId,
+        request: text,
+        cwd: projectRoot,
+        index: this.workspaceIndex?.(projectRoot),
+        flag: this.taskCompiler,
+        hasConversationHistory: hasHistory,
+      });
+      if (!result.validation.ok) {
+        // Record WHY it was discarded — a silently dropped compiler is an unobservable one.
+        this.emit(conversationId, {
+          type: "task.compiled", runId, mode: result.task.compilationMode, family: result.task.family,
+          goal: result.task.goal.slice(0, 300), reason: "discarded: contract failed validation",
+          requirementCount: 0, assumptionCount: 0, evidenceCount: 0,
+          ambiguityCounts: {}, rawRequestTokens: result.telemetry.rawRequestTokens, renderedContractTokens: 0,
+          repositoryQueries: result.telemetry.repositoryQueries, sidecarCalls: result.telemetry.sidecarCalls,
+          totalMs: result.telemetry.totalMs, promptEpoch: "",
+          warnings: result.validation.errors.map((e) => `${e.code}: ${e.message}`).slice(0, 8),
+        });
+        return null;
+      }
+      // The epoch identifies the stable prefix this turn was rendered against. It is recorded, not
+      // acted on yet: claiming cache compatibility requires the runtime to actually pin the prefix.
+      const epoch = promptEpoch({
+        templateVersion: `kitten-core/${EVENT_SCHEMA_VERSION}`,
+        systemPrompt: "",
+        toolNames: [],
+        repoCapsule: projectRoot,
+      });
+      this.store.saveTaskCompilation({
+        runId, conversationId,
+        mode: result.task.compilationMode, family: result.task.family,
+        ir: serializeCompiledTask(result.task),
+        trace: JSON.stringify(result.trace),
+        rendered: result.contractBlock,
+        promptEpoch: epoch.id,
+        ts: this.now(),
+      });
+      this.emit(conversationId, {
+        type: "task.compiled", runId,
+        mode: result.task.compilationMode, family: result.task.family, goal: result.task.goal.slice(0, 300),
+        reason: result.trace.familyReason.slice(0, 300),
+        requirementCount: result.telemetry.requirementCount,
+        assumptionCount: result.telemetry.assumptionCount,
+        evidenceCount: result.telemetry.evidenceCount,
+        ambiguityCounts: result.telemetry.ambiguityCounts,
+        rawRequestTokens: result.telemetry.rawRequestTokens,
+        renderedContractTokens: result.telemetry.renderedContractTokens,
+        repositoryQueries: result.telemetry.repositoryQueries,
+        sidecarCalls: result.telemetry.sidecarCalls,
+        totalMs: result.telemetry.totalMs,
+        promptEpoch: epoch.id,
+        warnings: result.validation.warnings.map((w) => `${w.code}: ${w.message}`).slice(0, 8),
+      });
+      // An explicit lane override means the user chose the execution shape themselves; the contract
+      // still grounds the prompt, but it must not redirect a lane the user asked for.
+      if (explicitLane) result.task.executionPolicy.laneHint = null;
+      return result;
+    } catch {
+      return null; // never fail a user's run because the compiler could not analyze the request
+    }
+  }
+
+  /** Route, letting a compiled contract supply a lane hint the deterministic router does not have. */
+  private route(text: string, conv: ConversationRow, opts: SubmitOptions, compiled: CompileResult | null): RouteDecision {
+    const explicit = opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode);
+    const decision = routeMessage(text, { lane: explicit, k: opts.k, cwd: conv.projectRoot });
+    const hint = compiled?.task.executionPolicy.laneHint;
+    if (explicit || !hint || hint === decision.lane) return decision;
+    return { ...decision, lane: hint, reasons: [...decision.reasons, compiled!.task.executionPolicy.laneReason] };
+  }
+
+  /** Ask the one blocking question and terminate the turn honestly: an answer, not a change. */
+  private requestClarification(conversationId: string, runId: string, text: string, compiled: CompileResult): RunRow {
+    const question = compiled.clarification ?? "What should change, and what should be true when it works?";
+    const blocking = compiled.task.ambiguities.find((a) => a.kind === "blocking");
+    this.emit(conversationId, { type: "route.selected", runId, lane: "answer", reasons: [compiled.task.executionPolicy.laneReason], k: 1 });
+    this.emit(conversationId, { type: "run.started", runId, request: text, lane: "answer", model: "", agent: "task-compiler" });
+    this.emit(conversationId, { type: "task.clarification_requested", runId, question, ambiguityId: blocking?.id ?? "", detail: blocking?.description ?? "" });
+    this.emit(conversationId, { type: "assistant.final", runId, text: question });
+    this.emit(conversationId, {
+      type: "run.completed", runId, finished: true, verified: false, lane: "answer",
+      summary: `clarification requested: ${question}`.slice(0, 300), wallMs: compiled.telemetry.totalMs,
+      usage: { prompt: 0, completion: 0, reasoning: 0 },
+    });
+    this.emit(conversationId, {
+      type: "receipt.finalized", runId,
+      lines: [
+        "task compiler: blocking ambiguity — asked one question instead of guessing",
+        ...(blocking ? [blocking.description] : []),
+        "no model call was made and no file was changed",
+      ],
+      filesChanged: [], verified: false,
+    });
+    return this.store.getRun(runId)!;
+  }
+
   // ── Execution ────────────────────────────────────────────────────────────────────────────────
   /**
    * Submit a user message: persist it, route it, run it (via the injectable Runner), persisting and
@@ -436,12 +610,29 @@ export class KittenApp {
     // (so the current request isn't duplicated into its own context). This is what makes resume real.
     const built = this.context.build(conversationId, conv.projectRoot);
     const sidecarContext = typeof opts.contextPreamble === "string" ? opts.contextPreamble.trim().slice(0, 12_000) : "";
-    const conversationContext = [built.preamble, sidecarContext].filter(Boolean).join("\n\n");
 
     this.emit(conversationId, { type: "user.message", text });
 
-    const decision: RouteDecision = routeMessage(text, { lane: opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode), k: opts.k, cwd: conv.projectRoot });
     const runId = this.newId("run");
+
+    // ── Task Compiler ────────────────────────────────────────────────────────────────────────────
+    // Compile BEFORE routing, so the contract can inform the lane, and before the expensive model
+    // runs, so the main call receives a narrower problem instead of a longer paraphrase. An explicit
+    // lane override is the user speaking directly — the compiler still grounds the task but never
+    // overrides that choice. A compiler failure is never allowed to fail the user's run.
+    const compiled = this.compile(runId, conversationId, conv.projectRoot, text, built.hasPriorTurns, opts.lane);
+
+    // Volatile-last: durable history and the sidecar capsule stay ahead of the per-turn contract, so
+    // the stable prefix survives across turns instead of being re-prefilled every time.
+    const conversationContext = [built.preamble, sidecarContext, compiled?.contractBlock ?? ""].filter(Boolean).join("\n\n");
+
+    // A blocking ambiguity is answered with ONE question rather than an expensive guess. This is a
+    // terminal, honest outcome — the turn produced an answer, it just did not produce a change.
+    if (compiled?.task.executionPolicy.requiresClarification && !opts.lane) {
+      return this.requestClarification(conversationId, runId, text, compiled);
+    }
+
+    const decision: RouteDecision = this.route(text, conv, opts, compiled);
     // Register the abort controller BEFORE emitting run events, so a synchronous subscriber can cancel
     // the instant the run appears (the run row already exists by the time run.started broadcasts).
     const controller = new AbortController();
@@ -485,18 +676,93 @@ export class KittenApp {
           type: "receipt.finalized", runId, lines: outcome.receiptLines,
           filesChanged: outcome.filesChanged, verified: outcome.verified,
         });
+        // The main model is now idle and the user is reading the result — the one window on a
+        // single-model endpoint where advisory work costs no foreground latency.
+        this.startAssist(conversationId, {
+          runId, status: "completed", summary: outcome.summary, verified: outcome.verified,
+          filesChanged: outcome.filesChanged, projectRoot: conv.projectRoot, evidence: outcome.receiptLines,
+        });
       }
     } catch (e) {
       if (controller.signal.aborted) {
         this.emit(conversationId, { type: "run.cancelled", runId });
       } else {
-        this.emit(conversationId, { type: "run.failed", runId, error: (e as Error).message.slice(0, 500) });
+        const error = (e as Error).message.slice(0, 500);
+        this.emit(conversationId, { type: "run.failed", runId, error });
+        // A failed run is the case where triage is worth the most: the next turn gets a compact
+        // signature instead of re-deriving one from raw output.
+        this.startAssist(conversationId, {
+          runId, status: "failed", summary: error, verified: false, filesChanged: [],
+          projectRoot: conv.projectRoot, evidence: [], error,
+        });
       }
     } finally {
       if (externalSignal && externalAbort) externalSignal.removeEventListener("abort", externalAbort);
       this.inflight.delete(runId);
     }
     return this.store.getRun(runId)!;
+  }
+
+  /**
+   * Run the advisory sidecar pass for a terminal run and persist what it found.
+   *
+   * Advisory means advisory: this NEVER changes a run's status, grade, or `verified` flag, and a
+   * failure here is swallowed. The run is already finished and recorded — an advisory pass that
+   * could fail it would make the sidecar a liability rather than a control plane.
+   */
+  private startAssist(conversationId: string, facts: RunFacts): void {
+    if (!this.assist) return;
+    // Fire-and-forget ON PURPOSE. run.completed and receipt.finalized have already been emitted, so a
+    // subscribed UI shows the finished run immediately; blocking submitMessage on an advisory pass
+    // would add its whole deadline budget to every request's perceived latency.
+    const task = this.runAssist(conversationId, facts).finally(() => { this.assistInFlight.delete(task); });
+    this.assistInFlight.add(task);
+  }
+
+  /** Await any in-flight advisory work. For tests and orderly shutdown — never on the hot path. */
+  async whenAssistSettled(): Promise<void> {
+    while (this.assistInFlight.size) await Promise.all([...this.assistInFlight]);
+  }
+
+  private async runAssist(conversationId: string, facts: RunFacts): Promise<void> {
+    if (!this.assist) return;
+    try {
+      if (SidecarAssist.needsReview(facts)) {
+        const review = await this.assist.reviewRun(facts);
+        this.recordSidecarPostflight(conversationId, { runId: facts.runId, ...review });
+      }
+      if (SidecarAssist.needsTriage(facts)) {
+        const triage = await this.assist.triageFailure(facts);
+        this.recordSidecarFailure(conversationId, { runId: facts.runId, ...triage });
+        // Label the trajectory step by step. A failed run is mostly productive exploration (SRFT
+        // measured ~76%), and until now Kitten wrote that trajectory to its receipts and never read
+        // it back — so the failure was a dead end rather than the cheapest data it owns.
+        const steps = this.runStepsFor(facts);
+        if (steps.length) {
+          const critique = await this.assist.critiqueSteps(facts, steps);
+          if (critique.steps.length) {
+            this.emit(conversationId, {
+              type: "run.step_critique", runId: facts.runId, source: critique.source,
+              steps: critique.steps.slice(0, 64), productiveRatio: critique.productiveRatio,
+            });
+          }
+        }
+      }
+    } catch { /* advisory work never affects the run it describes */ }
+  }
+
+  /** The run's tool trajectory, reconstructed from durable events — the input the step critic labels. */
+  private runStepsFor(facts: RunFacts): string[] {
+    const conversationId = this.runConversationId(facts.runId);
+    if (!conversationId) return [];
+    const steps: string[] = [];
+    for (const event of this.store.readEvents(conversationId, 0)) {
+      if (event.type !== "tool.completed" || event.runId !== facts.runId) continue;
+      const target = event.target ? ` ${event.target}` : "";
+      steps.push(`${event.name}${target} -> ${event.ok ? "ok" : "FAILED"}${event.output ? `: ${event.output.slice(0, 300)}` : ""}`);
+      if (steps.length >= 64) break;
+    }
+    return steps;
   }
 
   /** Signal an in-flight run to stop. The Runner observes ctx.signal; the app records run.cancelled. */

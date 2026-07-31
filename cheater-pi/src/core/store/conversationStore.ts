@@ -105,6 +105,20 @@ export interface TaskNodeRow {
   updatedAt: number;
 }
 
+/** A persisted Task Compiler result. `ir` is the canonical CompiledTask; `trace` is full provenance
+ *  (stage timings, literals, repository facts, validation) for debugging and evaluation. */
+export interface TaskCompilationRow {
+  runId: string;
+  conversationId: string;
+  mode: string;
+  family: string;
+  ir: string;
+  trace: string;
+  rendered: string;
+  promptEpoch: string;
+  createdAt: number;
+}
+
 export interface CreateTaskNodeInput {
   id: string;
   conversationId: string;
@@ -231,6 +245,23 @@ const MIGRATIONS: string[] = [
   CREATE INDEX idx_task_nodes_parent ON task_nodes(parent_id);
   CREATE INDEX idx_task_nodes_status ON task_nodes(status);
   `,
+  // v5 — Task Compiler traces. The compiled IR is what the run was actually held to, so the verifier
+  // must be able to reconstruct it after a restart rather than re-deriving it from a summary written
+  // after the fact. Keyed by run: one compilation per run, replaced if a run is recompiled.
+  `
+  CREATE TABLE task_compilations (
+    run_id          TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    mode            TEXT NOT NULL,
+    family          TEXT NOT NULL,
+    ir              TEXT NOT NULL,
+    trace           TEXT NOT NULL,
+    rendered        TEXT NOT NULL DEFAULT '',
+    prompt_epoch    TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL
+  );
+  CREATE INDEX idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
+  `,
 ];
 
 /**
@@ -286,6 +317,23 @@ const REPAIR_TABLES: ReadonlyArray<{ table: string; ddl: string }> = [
     CREATE INDEX IF NOT EXISTS idx_task_nodes_conversation ON task_nodes(conversation_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_task_nodes_parent ON task_nodes(parent_id);
     CREATE INDEX IF NOT EXISTS idx_task_nodes_status ON task_nodes(status);
+    `,
+  },
+  {
+    table: "task_compilations",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS task_compilations (
+      run_id          TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      mode            TEXT NOT NULL,
+      family          TEXT NOT NULL,
+      ir              TEXT NOT NULL,
+      trace           TEXT NOT NULL,
+      rendered        TEXT NOT NULL DEFAULT '',
+      prompt_epoch    TEXT NOT NULL DEFAULT '',
+      created_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
     `,
   },
 ];
@@ -611,6 +659,40 @@ export class ConversationStore {
   }
 
   /**
+   * Persist a Task Compiler result for a run. Upsert by run id: recompiling a run replaces its
+   * contract rather than accumulating versions the verifier would then have to choose between.
+   * The full IR is stored so the verifier evaluates the ORIGINAL compiled task after a restart —
+   * never a summary written after implementation, which would let the run grade its own homework.
+   */
+  saveTaskCompilation(input: {
+    runId: string; conversationId: string; mode: string; family: string;
+    ir: string; trace: string; rendered?: string; promptEpoch?: string; ts: number;
+  }): void {
+    this.db.prepare(
+      `INSERT INTO task_compilations (run_id, conversation_id, mode, family, ir, trace, rendered, prompt_epoch, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET
+         mode = excluded.mode, family = excluded.family, ir = excluded.ir, trace = excluded.trace,
+         rendered = excluded.rendered, prompt_epoch = excluded.prompt_epoch, created_at = excluded.created_at`,
+    ).run(
+      input.runId, input.conversationId, input.mode, input.family,
+      input.ir, input.trace, input.rendered ?? "", input.promptEpoch ?? "", input.ts,
+    );
+  }
+
+  getTaskCompilation(runId: string): TaskCompilationRow | null {
+    const row = this.db.prepare("SELECT * FROM task_compilations WHERE run_id = ?").get(runId);
+    return row ? mapTaskCompilation(row) : null;
+  }
+
+  listTaskCompilations(conversationId: string): TaskCompilationRow[] {
+    return this.db
+      .prepare("SELECT * FROM task_compilations WHERE conversation_id = ? ORDER BY created_at ASC")
+      .all(conversationId)
+      .map(mapTaskCompilation);
+  }
+
+  /**
    * Crash recovery (Goal §6): any run left in a transient state at startup was interrupted by a
    * crash/close. Flip each to `interrupted` and append a `run.interrupted` event so the history
    * reflects it — a UI must never show these as still running. Returns the appended events.
@@ -687,6 +769,14 @@ function mapTaskNode(r: Record<string, SqlValue>): TaskNodeRow {
     workspaceMode: String(r.workspace_mode) === "isolated-worktree" ? "isolated-worktree" : "shared-readonly",
     status: String(r.status) as TaskNodeStatus, budget: safeBudget(r.budget), report: String(r.report ?? ""), evidence: safeJsonArray(r.evidence),
     createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+  };
+}
+
+function mapTaskCompilation(r: Record<string, SqlValue>): TaskCompilationRow {
+  return {
+    runId: String(r.run_id), conversationId: String(r.conversation_id), mode: String(r.mode), family: String(r.family),
+    ir: String(r.ir), trace: String(r.trace), rendered: String(r.rendered ?? ""),
+    promptEpoch: String(r.prompt_epoch ?? ""), createdAt: Number(r.created_at),
   };
 }
 

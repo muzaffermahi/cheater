@@ -21,6 +21,14 @@ export interface BuiltContext {
   coveredSeq: number;
   /** Rough token estimate of the preamble (chars/4). */
   approxTokens: number;
+  /**
+   * Were there ACTUAL earlier turns? Distinct from `preamble.length`, because the preamble also
+   * carries the repository capsule — which is non-empty on a brand-new conversation in any git repo.
+   * Callers that need to know whether "it"/"that" has a referent must use this, not the preamble:
+   * treating a capsule as history is how a first-turn "fix it" gets mistaken for a resolvable
+   * follow-up (and how a genuine follow-up gets mistaken for an unanswerable request).
+   */
+  hasPriorTurns: boolean;
 }
 
 export interface ContextBudget {
@@ -83,7 +91,7 @@ export class ContextBuilder {
     if (!turns.length) {
       // First turn — no prior conversation, but still ground the model in current repo state.
       const repo = this.repoCapsule(cwd);
-      return { preamble: repo, coveredSeq, approxTokens: approxTokens(repo) };
+      return { preamble: repo, coveredSeq, approxTokens: approxTokens(repo), hasPriorTurns: false };
     }
 
     const capsule = this.repoCapsule(cwd);
@@ -110,7 +118,7 @@ export class ContextBuilder {
     const omitted = turns.length - rendered.length;
     const omittedNote = omitted > 0 ? `(${omitted} earlier turn${omitted === 1 ? "" : "s"} omitted for length)\n` : "";
     const preamble = header + omittedNote + rendered.join("") + capsule + footer;
-    return { preamble, coveredSeq, approxTokens: approxTokens(preamble) };
+    return { preamble, coveredSeq, approxTokens: approxTokens(preamble), hasPriorTurns: true };
   }
 
   /** Group events + run rows into per-turn digests, oldest first. */

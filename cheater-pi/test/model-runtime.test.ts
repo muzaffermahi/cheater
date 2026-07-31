@@ -50,3 +50,16 @@ test("local endpoint discovery probes candidates in parallel and returns only re
     assert.deepEqual(found[0].models, ["ornith-1.0-35b", "qwen3.5-2b"]);
   } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
 });
+
+test("the launch plan enables prompt-lookup speculation, and can turn it off", () => {
+  // ngram-mod needs no draft model, so it costs no VRAM — the reason it is preferred on a card with
+  // nothing spare. Speculative decoding is output-lossless, so the only risk is throughput.
+  const on = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9 });
+  const i = on.args.indexOf("--spec-type");
+  assert.ok(i >= 0, "speculation is on by default");
+  assert.equal(on.args[i + 1], "ngram-mod");
+  assert.ok(!on.args.includes("--model-draft"), "no draft model is loaded — that would cost VRAM");
+
+  const off = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, speculation: "off" });
+  assert.ok(!off.args.includes("--spec-type"), "it is switchable");
+});

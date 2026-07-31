@@ -159,6 +159,27 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   };
 }
 
+/**
+ * The winner's own summary is the last thing its agent said — which, after a long run, is often a
+ * transport or context error from a turn that happened AFTER the work was already done and verified.
+ * Reporting that verbatim on a green run is actively misleading: observed live, a from-scratch build
+ * that scored 13/13 on a hidden oracle was summarized as
+ * "model call failed: HTTP 500: Context size has been exceeded."
+ *
+ * So when execution evidence passed, lead with what was actually achieved and keep the error as
+ * trailing context — never drop it, because a run that hit its context ceiling is worth knowing about.
+ */
+function ascentSummary(a: { summary: string; winnerHasExecutionReceipt: boolean }, adopted: boolean): string {
+  const summary = a.summary.trim();
+  if (!adopted) return summary || "no candidate adopted";
+  const terminalError = /^(?:model call failed|HTTP \d{3}\b|request failed|stream error)/i.test(summary);
+  if (!summary) return a.winnerHasExecutionReceipt ? "solved (verified)" : "implemented (not independently verified)";
+  if (terminalError && a.winnerHasExecutionReceipt) {
+    return `solved (verified by execution); a later model call did not complete: ${summary.slice(0, 200)}`;
+  }
+  return summary;
+}
+
 /** Ascent lane: the full pass@k→pass@1 machine. Degrades to reliable if config assembly refuses. */
 async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void, profile: { systemPrompt?: string; model: string }): Promise<RunOutcome> {
   let config;
@@ -186,7 +207,12 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it
   // doesn't self-report changed files. Derive them from git against the pre-run snapshot and surface
   // them as events, so the diff view and /undo cover the Ascent lane too.
-  const filesChanged = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
+  // Prefer git (it distinguishes changed from merely-present), but fall back to what adoption
+  // actually copied. A non-git workspace has no snapshot, and reporting `[]` there made a run that
+  // wrote four correct files claim it changed nothing — which silently disables /undo, empties the
+  // diff view, and skips postflight review.
+  const fromGit = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
+  const filesChanged = fromGit.length ? fromGit : a.adoptedFiles;
   for (const f of filesChanged) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
   // Distinguish FINISHED (a winner was selected + adopted — work was produced and a candidate self-
   // verified) from VERIFIED (independent execution proof). A correct stateful/class solve with no clean
@@ -195,7 +221,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   const adopted = a.winner != null;
   return {
     finished: adopted,
-    summary: a.summary || (adopted ? (a.winnerHasExecutionReceipt ? "solved (verified)" : "implemented (not independently verified)") : "no candidate adopted"),
+    summary: ascentSummary(a, adopted),
     wallMs: a.wallMs,
     usage: a.usage,
     receiptLines: a.receipts,

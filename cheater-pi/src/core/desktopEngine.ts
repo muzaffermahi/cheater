@@ -17,6 +17,7 @@ import { WorkspaceIndex } from "./workspaceIndex.js";
 import { inspectWorkspaceChanges } from "./workspaceChanges.js";
 import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints } from "./modelRuntime.js";
 import { SidecarControlPlane } from "./sidecarControlPlane.js";
+import { SidecarAssist } from "./sidecarAssist.js";
 import { runCatalogJob, SIDECAR_JOB_TYPES, SIDECAR_WORKFLOWS, isSidecarJobType, sidecarWorkflow, type SidecarJobType } from "./sidecarJobs.js";
 import { downloadModel, parseModelCatalog, type ModelCatalogEntry } from "./modelCatalog.js";
 import { listAgents } from "./agents.js";
@@ -554,59 +555,7 @@ async function automaticSidecarCompaction(conversationId: string, app: KittenApp
   }
 }
 
-async function automaticSidecarFailure(run: { id: string; error?: string; summary: string }, runtime: { models: KittenModels; llm: KittenLLM }, scheduler: SidecarControlPlane): Promise<{ source: "sidecar" | "deterministic"; severity: "error" | "warning" | "info"; signature: string; likelyCause: string; salientLines: string[] }> {
-  const text = (run.error || run.summary || "unknown failure").slice(0, 12_000);
-  const model = runtime.models.sidecar ? runtime.llm : null;
-  const prefix = `failure-${Date.now().toString(36)}-${(automaticSidecarCounter++).toString(36)}`;
-  const [explanation, triage] = await Promise.all([
-    runCatalogJob(scheduler, model, undefined, { id: `${prefix}-explain`, type: "explain_error", premise: run.id, output: text, text, deadlineMs: 1400 }),
-    runCatalogJob(scheduler, model, undefined, { id: `${prefix}-triage`, type: "triage_logs", premise: run.id, output: text, text, deadlineMs: 1400 }),
-  ]);
-  const explained = explanation.value.value && typeof explanation.value.value === "object" ? explanation.value.value as { signature?: unknown; likelyCause?: unknown } : {};
-  const triaged = triage.value.value && typeof triage.value.value === "object" ? triage.value.value as { severity?: unknown; lines?: unknown[] } : {};
-  const severity = triaged.severity === "warning" || triaged.severity === "info" ? triaged.severity : "error";
-  return {
-    source: explanation.source === "sidecar" || triage.source === "sidecar" ? "sidecar" : "deterministic",
-    severity,
-    signature: typeof explained.signature === "string" && explained.signature.trim() ? explained.signature.trim() : text.split(/\r?\n/).find(Boolean) ?? "unknown failure",
-    likelyCause: typeof explained.likelyCause === "string" && explained.likelyCause.trim() ? explained.likelyCause.trim() : "Inspect the cited failure and reproduce it with a bounded check.",
-    salientLines: Array.isArray(triaged.lines) ? triaged.lines.map(String).filter(Boolean).slice(-12) : text.split(/\r?\n/).filter(Boolean).slice(-12),
-  };
-}
 
-async function automaticSidecarPostflight(run: { id: string; status: string; filesChanged: string[]; verified: boolean; summary: string }, root: string, runtime: { models: KittenModels; llm: KittenLLM }, indexes: Map<string, WorkspaceIndex>, scheduler: SidecarControlPlane): Promise<{ source: "sidecar" | "deterministic"; secrets: string[]; warnings: string[]; evidenceWarnings: string[]; recommendedTests: string[]; suggestedCommands: string[]; risk: "low" | "medium" | "high"; riskReasons: string[]; generatedTestCases: string[] }> {
-  if (!run.filesChanged.length) return { source: "deterministic", secrets: [], warnings: [], evidenceWarnings: ["no files changed"], recommendedTests: [], suggestedCommands: [], risk: "low", riskReasons: [], generatedTestCases: [] };
-  const changes = inspectWorkspaceChanges(root, { maxBytes: 40_000, maxFiles: 40 });
-  const diff = changes.diff.slice(0, 36_000);
-  // A single structured review keeps postflight useful on a 2B–9B sidecar without
-  // multiplying latency across seven serial requests. runCatalogJob still falls
-  // back to deterministic analysis when the endpoint is unavailable or times out.
-  const model = runtime.models.sidecar ? runtime.llm : null;
-  const prefix = `post-${Date.now().toString(36)}-${(automaticSidecarCounter++).toString(36)}`;
-  const index = getWorkspaceIndex(root, indexes);
-  if (!index.overview().files) { try { await index.refresh(root); persistWorkspaceIndex(root, index); } catch {} }
-  const tests = index.list().filter((record) => record.isTest).map((record) => record.path).slice(0, 80);
-  const result = await runCatalogJob(scheduler, model, index, {
-    id: `${prefix}-review`, type: "postflight_review", premise: run.id, diff,
-    files: run.filesChanged.slice(0, 40), tests,
-    facts: [`status=${run.status}`, `verified=${run.verified}`, run.summary.slice(0, 500)],
-    text: `${run.summary}\n${diff.slice(0, 12_000)}`, deadlineMs: 8000,
-  });
-  const value = result.value.value && typeof result.value.value === "object" ? result.value.value as Record<string, unknown> : {};
-  const strings = (entry: unknown, max: number): string[] => Array.isArray(entry) ? entry.map(String).filter(Boolean).slice(0, max) : [];
-  const risk = value.risk === "high" || value.risk === "medium" ? value.risk : "low";
-  return {
-    source: result.source,
-    secrets: strings(value.secrets, 12),
-    warnings: strings(value.warnings, 12),
-    evidenceWarnings: strings(value.evidenceWarnings, 12),
-    recommendedTests: strings(value.recommendedTests, 12),
-    suggestedCommands: strings(value.suggestedCommands, 8),
-    risk,
-    riskReasons: strings(value.riskReasons, 12),
-    generatedTestCases: strings(value.generatedTestCases, 12),
-  };
-}
 
 function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("settings.update requires an object");
@@ -647,6 +596,17 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     sidecarModel: runtime.models.sidecar,
     contextWindowTokens: settings.contextWindowTokens,
     approvalPolicy: settings.approvalPolicy,
+    taskCompiler: settings.taskCompiler,
+    sidecarAssist: new SidecarAssist({
+      llm: runtime.llm,
+      index: (projectRoot) => getWorkspaceIndex(projectRoot, indexes),
+    }),
+    // Only hand the compiler an index that has actually been populated: an empty one would rank
+    // nothing while looking like grounding succeeded. `indexes` is captured, not read, at construction.
+    workspaceIndex: (projectRoot) => {
+      const index = indexes.get(projectRoot);
+      return index && index.overview().files > 0 ? index : undefined;
+    },
   });
   appRef = app;
 
@@ -1438,18 +1398,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           if (conversation && /^(?:new task|new conversation)$/i.test(conversation.title.trim())) {
             void automaticSidecarTitle(text, activeRuntime, sidecar).then((title) => { if (title) app.rename(conversationId, title); }).catch(() => { /* title is cosmetic; the run must never depend on it */ });
           }
-          if (result && typeof result === "object" && "status" in result && (result as { status?: unknown }).status === "failed" && conversation) {
-            const failedRun = result as unknown as { id: string; error?: string; summary: string };
-            void automaticSidecarFailure(failedRun, activeRuntime, sidecar).then((card) => {
-              app.recordSidecarFailure(conversationId, { runId: failedRun.id, ...card });
-            }).catch(() => { /* failure explanation is advisory and must never mask the original error */ });
-          }
-          if (result && typeof result === "object" && "filesChanged" in result && Array.isArray((result as { filesChanged?: unknown }).filesChanged) && (result as { filesChanged: unknown[] }).filesChanged.length && conversation) {
-            const run = result as { id: string; status: string; filesChanged: string[]; verified: boolean; summary: string };
-            void automaticSidecarPostflight(run, conversation.projectRoot, activeRuntime, indexes, sidecar).then((postflight) => {
-              app.recordSidecarPostflight(conversationId, { runId: run.id, ...postflight });
-            }).catch(() => { /* postflight is advisory and never turns a completed run into a failure */ });
-          }
+          // Postflight review and failure triage now run inside KittenApp (sidecarAssist), so every
+          // client gets them from ONE implementation instead of only the desktop app.
         } finally {
           submitControllers.delete(conversationId);
         }

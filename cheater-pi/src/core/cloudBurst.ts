@@ -119,14 +119,43 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
 }
 
 /** Copy a winning attempt's workspace back onto the real cwd (mirrors bestofn's restore). */
-export function adoptWorkspace(cwd: string, workspace: string): void {
+/**
+ * Adopt a candidate workspace into `cwd`, returning the repository-relative files it brought in.
+ *
+ * The return value is not a convenience — it is the only honest source of "what changed" when the
+ * workspace is NOT a git repository. Ascent derives changed files from `git diff` against a pre-run
+ * snapshot, and a non-git workspace has no snapshot, so a run that wrote four correct files reported
+ * `filesChanged: []`. That silently disables `/undo`, shows an empty diff, and skips postflight
+ * review — the receipt claims nothing happened while the work sits on disk. Observed live: a
+ * from-scratch build scored 13/13 on a hidden oracle and reported zero changed files.
+ */
+export function adoptWorkspace(cwd: string, workspace: string): string[] {
   try {
     for (const name of readdirSync(cwd)) {
       if (["node_modules", ".git", "__pycache__"].includes(name)) continue;
       rmSync(join(cwd, name), { recursive: true, force: true });
     }
     cpSync(workspace, cwd, { recursive: true });
-  } catch { /* best-effort */ }
+    return listAdoptedFiles(workspace);
+  } catch {
+    return []; // best-effort: a failed adoption reports nothing rather than guessing
+  }
+}
+
+/** Repository-relative, `/`-separated files in an adopted workspace, excluding tooling noise. */
+function listAdoptedFiles(root: string, prefix = "", depth = 0): string[] {
+  if (depth > 8) return [];
+  const out: string[] = [];
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const entry of entries) {
+    if (["node_modules", ".git", "__pycache__", ".venv", "dist", "build"].includes(entry.name)) continue;
+    const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...listAdoptedFiles(join(root, entry.name), relative, depth + 1));
+    else if (entry.isFile()) out.push(relative);
+    if (out.length > 400) break; // a receipt listing thousands of files helps nobody
+  }
+  return out;
 }
 
 export function cleanupBurst(attempts: BurstAttempt[]): void {
