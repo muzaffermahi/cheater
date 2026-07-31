@@ -2,7 +2,9 @@ param(
   [string]$Publish = "..\artifacts\kitten-desktop",
   [string]$Out = "..\artifacts\kitten-desktop-bundle",
   [Parameter(Mandatory = $true)][string]$NodeExe,
-  [string]$SetupExe = "",
+  # MANDATORY: a release without its installer is how runtime114 shipped with no Kitten.Setup.exe and
+  # the README's install instructions became fiction. Every release carries the installer.
+  [Parameter(Mandatory = $true)][string]$SetupExe,
   [string]$Version = ""
 )
 
@@ -12,11 +14,11 @@ $packageRoot = Resolve-Path (Join-Path $scriptRoot "..")
 $publishPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $Publish))
 $outPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $Out))
 $nodePath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $NodeExe))
-$setupPath = if ([string]::IsNullOrWhiteSpace($SetupExe)) { "" } else { [System.IO.Path]::GetFullPath((Join-Path $packageRoot $SetupExe)) }
+$setupPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $SetupExe))
 
 if (-not (Test-Path -LiteralPath $publishPath -PathType Container)) { throw "Desktop publish directory does not exist: $publishPath" }
 if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw "Bundled node.exe does not exist: $nodePath" }
-if ($setupPath -and -not (Test-Path -LiteralPath $setupPath -PathType Leaf)) { throw "Native setup executable does not exist: $setupPath" }
+if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) { throw "Native setup executable does not exist: $setupPath" }
 
 $package = Get-Content (Join-Path $packageRoot "package.json") -Raw | ConvertFrom-Json
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = [string]$package.version }
@@ -28,7 +30,7 @@ try {
 }
 finally { Pop-Location }
 
-if ($setupPath) { Copy-Item -LiteralPath $setupPath -Destination (Join-Path $outPath "Kitten.Setup.exe") -Force }
+Copy-Item -LiteralPath $setupPath -Destination (Join-Path $outPath "Kitten.Setup.exe") -Force
 
 $signatureStatus = "unsigned-development"
 $signingRequired = $env:KITTEN_REQUIRE_SIGNATURE -eq "true" -or $env:KITTEN_REQUIRE_SIGNATURE -eq "1"
@@ -47,10 +49,9 @@ $manifest = Join-Path $outPath "kitten-manifest.json"
 $engine = Join-Path $outPath "engine\dist\src\core\desktopEngine.js"
 $runtime = Join-Path $outPath "engine\node.exe"
 $setup = Join-Path $outPath "Kitten.Setup.exe"
-foreach ($required in @($exe, $manifest, $engine, $runtime)) {
+foreach ($required in @($exe, $manifest, $engine, $runtime, $setup)) {
   if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Release payload is incomplete: $required" }
 }
-if ($setupPath -and -not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw "Release payload is missing Kitten.Setup.exe" }
 
 Push-Location $packageRoot
 try {
@@ -67,7 +68,7 @@ $releaseInfo = [ordered]@{
   browserFallback = $false
   engine = "engine/dist/src/core/desktopEngine.js"
   runtime = "engine/node.exe"
-  installer = if ($setupPath) { "Kitten.Setup.exe" } else { $null }
+  installer = "Kitten.Setup.exe"
   signature = $signatureStatus
   generatedAt = [DateTime]::UtcNow.ToString("o")
 }

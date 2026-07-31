@@ -39,6 +39,9 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>The workspace a launcher/shortcut asked for (`--project-root`), consumed on connect.</summary>
+    public static string? InitialProjectRoot;
+
     private EngineClient? _engine;
     private readonly TranscriptView _transcript;
     private readonly ActivityPanel _activity;
@@ -93,11 +96,14 @@ public partial class MainWindow : Window
         try
         {
             Exception? last = null;
+            // A restart must reconnect against the workspace the user is actually in, not the install
+            // directory the shell happens to run from.
+            var engineRoot = InitialProjectRoot ?? _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             for (var attempt = 0; attempt < 3 && _engine is null; attempt++)
             {
                 try
                 {
-                    _engineProcess.Start();
+                    _engineProcess.Start(engineRoot);
                     _engine = await EngineClient.ConnectAsync();
                 }
                 catch (Exception ex)
@@ -114,6 +120,12 @@ public partial class MainWindow : Window
             RetryEngineButton.IsEnabled = false;
             await RefreshModelStatusAsync();
             await RefreshConversationsAsync();
+            // A launch that named a workspace lands in it — most recent matching session, or a new one.
+            if (InitialProjectRoot is { } initialRoot)
+            {
+                InitialProjectRoot = null;
+                await OpenOrCreateForProjectAsync(initialRoot);
+            }
         }
         catch (Exception ex)
         {
@@ -128,6 +140,34 @@ public partial class MainWindow : Window
         if (_engine is not null) await _engine.DisposeAsync();
         _engineProcess.Dispose();
         base.OnClosed(e);
+    }
+
+    /// <summary>A second launch knocked on the activation pipe: come forward, switch project if asked.</summary>
+    public async void ActivateFromSecondInstance(string? projectRoot)
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Show();
+        Activate();
+        if (!string.IsNullOrWhiteSpace(projectRoot)) await OpenOrCreateForProjectAsync(projectRoot!);
+    }
+
+    /// <summary>Land in the named workspace: most recent matching session, or a fresh task in it.</summary>
+    private async Task OpenOrCreateForProjectAsync(string projectRoot)
+    {
+        if (_engine is null) return;
+        try
+        {
+            var existing = _conversationItems.FirstOrDefault(item => string.Equals(Path.TrimEndingDirectorySeparator(item.ProjectRoot), Path.TrimEndingDirectorySeparator(projectRoot), StringComparison.OrdinalIgnoreCase));
+            if (existing is not null)
+            {
+                ConversationList.SelectedItem = existing;
+                return;
+            }
+            var result = await _engine.CallAsync("conversation.create", new { title = "New task", projectRoot, agent = "general" });
+            var id = result?.ValueKind == JsonValueKind.Object && result.Value.TryGetProperty("id", out var idValue) ? idValue.GetString() : null;
+            await RefreshConversationsAsync(id);
+        }
+        catch (Exception ex) { Activity.Text = $"Could not open {projectRoot}: {ex.Message}"; }
     }
 
     private async Task RefreshConversationsAsync(string? selectId = null)
@@ -1736,12 +1776,34 @@ public partial class MainWindow : Window
         string? historicReceipt = null;
         string? historicPostflight = null;
         string? historicVerificationOutputText = null;
+        // An approval that was still pending when the window (or conversation) was switched must come
+        // back as a LIVE decision, not vanish: track the last unresolved request per run and whether
+        // that run ever reached a terminal state.
+        (string RunId, string CallId, string Prompt)? pendingApproval = null;
+        var terminalRuns = new HashSet<string>(StringComparer.Ordinal);
         foreach (var frame in events.Value.EnumerateArray())
         {
             var type = frame.TryGetProperty("type", out var typeValue) ? typeValue.GetString() ?? "" : "";
             var runId = frame.TryGetProperty("runId", out var runValue) ? runValue.GetString() ?? "" : "";
+            if (type is "run.completed" or "run.failed" or "run.cancelled" or "run.interrupted") terminalRuns.Add(runId);
             switch (type)
             {
+                case "tool.approval_required":
+                    {
+                        var approvalCall = frame.TryGetProperty("callId", out var approvalCallValue) ? approvalCallValue.GetString() ?? "" : "";
+                        var approvalName = frame.TryGetProperty("name", out var approvalNameValue) ? approvalNameValue.GetString() ?? "action" : "action";
+                        var approvalReason = frame.TryGetProperty("reason", out var approvalReasonValue) ? approvalReasonValue.GetString() ?? "" : "";
+                        pendingApproval = (runId, approvalCall, $"Approval needed: {approvalName}\n{approvalReason}");
+                        break;
+                    }
+                case "tool.approval_resolved":
+                    {
+                        // A decided approval replays as a note (it used to vanish from history entirely).
+                        if (pendingApproval is { } pending && pending.RunId == runId) pendingApproval = null;
+                        var allowed = frame.TryGetProperty("allowed", out var allowedValue) && allowedValue.ValueKind == JsonValueKind.True;
+                        text.Append($"Approval {(allowed ? "granted" : "denied")}\n\n");
+                        break;
+                    }
                 case "user.message":
                     if (frame.TryGetProperty("text", out var user)) text.Append($"You: {user.GetString()}\n\n");
                     break;
@@ -1855,6 +1917,16 @@ public partial class MainWindow : Window
             }
         }
         _transcript.Replay(text.ToString());
+        // Restore a still-live approval: the run never reached a terminal state, so the engine is
+        // still blocked waiting for this answer.
+        if (pendingApproval is { } stillPending && !terminalRuns.Contains(stillPending.RunId))
+        {
+            _approvalRunId = stillPending.RunId;
+            _approvalCallId = stillPending.CallId;
+            ShowApproval(stillPending.Prompt);
+            ApproveButton.IsEnabled = true;
+            DenyButton.IsEnabled = true;
+        }
         // A replayed session reports the files that session touched, instead of claiming "no changes".
         SetChangesSummary(replayedFiles.Count, 0, 0);
         if (historicPostflight is not null && !string.IsNullOrWhiteSpace(historicVerificationOutputText)) historicPostflight += $"\n\n{historicVerificationOutputText}";
@@ -1965,10 +2037,10 @@ public partial class MainWindow : Window
                     var postflightTestCases = ReadStringArray(payload, "generatedTestCases");
                     var postflightSource = payload.TryGetProperty("source", out var sourceValue) ? sourceValue.GetString() : "deterministic";
                     Activity.Text = secrets.Length > 0 ? "Postflight warning: possible secret material" : warnings.Length > 0 ? "Postflight review found a warning" : "Postflight review complete";
-                    Evidence.Text += $"\nSidecar postflight ({postflightSource}):\n" + (secrets.Length > 0 ? $"Possible secrets: {string.Join(", ", secrets)}\n" : "No credential patterns detected.\n") + (warnings.Length > 0 ? $"Review warnings: {string.Join("; ", warnings)}\n" : "No diff warnings.\n") + (evidenceWarnings.Length > 0 ? $"Evidence notes: {string.Join("; ", evidenceWarnings)}\n" : "Evidence packet present.\n") + $"Risk: {postflightRisk}{(postflightRiskReasons.Length > 0 ? $" ({string.Join(", ", postflightRiskReasons)})" : "")}";
-                    if (recommendedTests.Length > 0) Evidence.Text += $"\nRecommended tests: {string.Join(", ", recommendedTests)}";
-                    if (postflightTestCases.Length > 0) Evidence.Text += $"\nGenerated edge cases: {string.Join("; ", postflightTestCases)}";
-                    if (suggestedCommands.Length > 0) Evidence.Text += $"\nSuggested commands: {string.Join(" · ", suggestedCommands)}";
+                    AppendEvidence($"\nSidecar postflight ({postflightSource}):\n" + (secrets.Length > 0 ? $"Possible secrets: {string.Join(", ", secrets)}\n" : "No credential patterns detected.\n") + (warnings.Length > 0 ? $"Review warnings: {string.Join("; ", warnings)}\n" : "No diff warnings.\n") + (evidenceWarnings.Length > 0 ? $"Evidence notes: {string.Join("; ", evidenceWarnings)}\n" : "Evidence packet present.\n") + $"Risk: {postflightRisk}{(postflightRiskReasons.Length > 0 ? $" ({string.Join(", ", postflightRiskReasons)})" : "")}");
+                    if (recommendedTests.Length > 0) AppendEvidence($"\nRecommended tests: {string.Join(", ", recommendedTests)}");
+                    if (postflightTestCases.Length > 0) AppendEvidence($"\nGenerated edge cases: {string.Join("; ", postflightTestCases)}");
+                    if (suggestedCommands.Length > 0) AppendEvidence($"\nSuggested commands: {string.Join(" · ", suggestedCommands)}");
                     _suggestedCommands = suggestedCommands;
                     RunChecksButton.IsEnabled = suggestedCommands.Length > 0;
                     break;
@@ -1979,14 +2051,14 @@ public partial class MainWindow : Window
                     var failureCause = payload.TryGetProperty("likelyCause", out var failureCauseValue) ? failureCauseValue.GetString() : "inspect the failure";
                     var failureLines = ReadStringArray(payload, "salientLines");
                     Activity.Text = "Sidecar failure card ready";
-                    Evidence.Text += $"\nFailure card ({failureSource}, {failureSeverity})\nSignature: {failureSignature}\nLikely cause: {failureCause}" + (failureLines.Length > 0 ? $"\nSalient lines: {string.Join(" | ", failureLines)}" : "");
+                    AppendEvidence($"\nFailure card ({failureSource}, {failureSeverity})\nSignature: {failureSignature}\nLikely cause: {failureCause}" + (failureLines.Length > 0 ? $"\nSalient lines: {string.Join(" | ", failureLines)}" : ""));
                     break;
                 case "workspace.verification":
                     var verificationPassed = payload.TryGetProperty("passed", out var verificationPassedValue) && verificationPassedValue.ValueKind == JsonValueKind.True;
                     var verificationCancelled = payload.TryGetProperty("cancelled", out var verificationCancelledValue) && verificationCancelledValue.ValueKind == JsonValueKind.True;
                     var verificationCommands = ReadStringArray(payload, "commands");
                     Activity.Text = verificationCancelled ? "Verification cancelled" : verificationPassed ? "Suggested verification passed" : "Suggested verification failed";
-                    Evidence.Text += $"\nNative verification {(verificationCancelled ? "cancelled" : verificationPassed ? "passed" : "failed")}: {string.Join(" · ", verificationCommands)}";
+                    AppendEvidence($"\nNative verification {(verificationCancelled ? "cancelled" : verificationPassed ? "passed" : "failed")}: {string.Join(" · ", verificationCommands)}");
                     _activeVerificationId = null;
                     CancelChecksButton.IsEnabled = false;
                     RunChecksButton.IsEnabled = _suggestedCommands.Length > 0;
@@ -2342,6 +2414,13 @@ public partial class MainWindow : Window
 
     private static long ReadLong(JsonElement value, string property)
         => value.TryGetProperty(property, out var number) && number.ValueKind == JsonValueKind.Number ? number.GetInt64() : 0;
+
+    /// <summary>Append to the Evidence panel with a hard cap — unbounded += grew without limit on long sessions.</summary>
+    private void AppendEvidence(string chunk)
+    {
+        var combined = Evidence.Text + chunk;
+        Evidence.Text = combined.Length > 12_000 ? combined[^12_000..] : combined;
+    }
 
     private async void OpenProject(object? sender, RoutedEventArgs e)
     {

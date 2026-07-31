@@ -19,17 +19,24 @@ WebView, terminal, or TUI surface.
 
 ## Quick start
 
-The supported user path is the packaged native app. Download the latest
-[`Kitten desktop release`](./artifacts/kitten-desktop-final-runtime114.zip), run `Kitten.Setup.exe`,
-and launch **Kitten** from the Start Menu. The installer and app never open a terminal or browser.
+The supported user path is the packaged native app: extract the release zip, run `Kitten.Setup.exe`,
+and Kitten appears on your **Desktop and Start Menu** with its own icon — double-click it and the app
+opens; the engine and (if configured) the local llama.cpp runtime start themselves. The installer and
+app never open a terminal or browser, and uninstalling from *Add or remove programs* keeps your
+conversations (`~/.kitten`).
 
-For maintainers only, the shared engine can still be built from source with Node 22.5+.
+To build and install from source (Node 22.5+ and the .NET 8 SDK):
 
 ```sh
-cd cheater-pi
-npm install && npm run build
-dotnet publish ../desktop/Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true
+cd cheater-pi && npm install && npm run build && cd ..
+dotnet publish desktop/Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -o artifacts/kitten-desktop
+dotnet publish desktop/Installer/Kitten.Setup.csproj -c Release -r win-x64 --self-contained true -o artifacts/kitten-setup
+powershell -ExecutionPolicy Bypass -File cheater-pi/scripts/package-desktop-release.ps1 -Publish ../artifacts/kitten-desktop -Out ../artifacts/kitten-desktop-bundle -NodeExe "$(node -e "console.log(process.execPath)")" -SetupExe ../artifacts/kitten-setup/Kitten.Setup.exe
+# then run artifacts/kitten-desktop-bundle/Kitten.Setup.exe
 ```
+
+Developers iterating on the shell can use `scripts/dev-launch.ps1` (builds if needed, stages the
+engine, launches — not the shipped path).
 
 The terminal/web/CLI modules remain maintainer compatibility code and are not part of the native
 release payload or supported user workflow.
