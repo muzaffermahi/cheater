@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { isFromScratchBuild, proposeScaffoldFiles, repoHasManifest } from "../src/blueprint/scaffold.js";
+import { isFromScratchBuild, proposeScaffoldFiles, repoHasManifest, installCommandForManifest } from "../src/blueprint/scaffold.js";
 import { buildScaffoldCommitlets, createCommitletPlan, classifyScaffoldFile, groupScaffoldFilesIntoPhases } from "../src/commitlet/planner.js";
 import { runCommitletFinalReview } from "../src/commitlet/reviewer.js";
 import { buildCommitletExecutionPrompt } from "../src/commitlet/executor.js";
 import { isCreationDiff } from "../src/commitlet/guard.js";
 import { scorePatchHealth } from "../src/commitlet/health.js";
-import { gradeCommitlet } from "../src/commitlet/kernel.js";
+import { gradeCommitlet, resetScaffoldAttempts } from "../src/commitlet/kernel.js";
+import { ledgerAllowsFinish } from "../src/reliability/lifecycle.js";
 import { createRollbackPoint } from "../src/commitlet/rollback.js";
 import { defaultCommitletState } from "../src/commitlet/state.js";
 import { liveSessionState } from "../src/reliability/sessionState.js";
@@ -267,6 +268,38 @@ test("gradeCommitlet records a REAL WORKER's file edit into the main ledger (the
   defaultCommitletState.clear();
 });
 
+test("a command-less commitlet records a SKIPPED stage (not a vacuous ok) → finishes honestly-unverified, never 'verified'", async () => {
+  // Regression (triple-confirmed): runFocusedVerification returns a vacuous passed:true when a commitlet
+  // has no command-backed step. The kernel recorded that as focused_tests:ok, so isTerminalVerified /
+  // ledgerAllowsFinish reported "verified" with ZERO commands run — a false green — and the honest
+  // noRunnableCheck path was defeated. It must record skipped + noCommandAvailable instead.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-nocmd-verify-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    return 0\n", "utf8");
+  const decision = routeAutopilot({ cwd, message: "fix median in src/stats.py" });
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "fix median in src/stats.py", autopilotDecision: decision });
+  const commitlet = {
+    ...plan.commitlets[0], status: "running" as const, allowedFiles: ["src/stats.py"], expectedFilesTouched: ["src/stats.py"],
+    focusedVerification: [{ purpose: "manual review — no test command in this project", required: false }],
+  };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet);
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("fix median in src/stats.py");
+  writeFileSync(join(cwd, "src", "stats.py"), "def median(xs):\n    s = sorted(xs)\n    return s[len(s)//2]\n", "utf8");
+
+  await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG);
+
+  const ledger = liveSessionState.getLedger()!;
+  const focused = ledger.get().verification.find((v) => v.stage === "focused_tests");
+  assert.equal(focused?.status, "skipped", "a command-less verification is skipped, not a vacuous ok");
+  assert.equal((focused?.signals as Record<string, unknown> | undefined)?.noCommandAvailable, true);
+  const verdict = ledgerAllowsFinish(ledger);
+  assert.equal(verdict.allowed, true, "no runnable check → honest unverified finish, not forever-blocked");
+  assert.notEqual(verdict.reason, "verified", "must NOT claim verified when zero commands ran");
+  assert.match(verdict.reason, /unverified|no runnable/);
+  defaultCommitletState.clear();
+});
+
 test("scaffold phase STILL blocks when an expected file is genuinely absent by name (no false advance)", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cheater-scaffold-missing-"));
   mkdirSync(join(cwd, "src"), { recursive: true });
@@ -282,6 +315,30 @@ test("scaffold phase STILL blocks when an expected file is genuinely absent by n
   assert.equal(grade.advance, false, "a genuinely absent expected file keeps the phase incomplete");
   assert.match(grade.message, /not complete yet/);
   defaultCommitletState.clear();
+});
+
+test("resetScaffoldAttempts restarts the grace period so an interrupted build's counts don't leak into the next run", async () => {
+  // Regression: the scaffold-incomplete counter is a module-global keyed by a non-plan-scoped commitlet
+  // id. An interrupted build that reached the 2-attempt cap left the count behind, so a later same-process
+  // build reusing the id advanced immediately, skipping the intended "here's what's missing" grace re-asks.
+  const cwd = mkdtempSync(join(tmpdir(), "cheater-scaffold-reset-"));
+  mkdirSync(join(cwd, "src"), { recursive: true });
+  const decision = routeAutopilot({ cwd, message: "build a new app from scratch" });
+  const commitlets = buildScaffoldCommitlets([{ path: "src/index.tsx", purpose: "entry" }], "build a new app", decision);
+  const plan = createCommitletPlan({ repoRoot: cwd, userGoal: "build a new app", autopilotDecision: decision, commitlets, buildMode: "scaffold" });
+  const commitlet = { ...plan.commitlets[0], status: "running" as const };
+  commitlet.rollbackPoint = createRollbackPoint(cwd, commitlet);
+  defaultCommitletState.setPlan({ ...plan, status: "running", commitlets: [commitlet] } as any);
+  liveSessionState.reset("build a new app");
+  resetScaffoldAttempts(); // isolate from any prior test's leftover counts (the very leak under test)
+  writeFileSync(join(cwd, "src", "main.tsx"), "export const x = 1;\n", "utf8"); // never creates the exact name
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false); // attempt 1
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false); // attempt 2 (cap)
+  // A new run resets the counter; the same id must restart the grace period, not advance early.
+  resetScaffoldAttempts();
+  assert.equal((await gradeCommitlet(cwd, commitlet, DEFAULT_CONFIG)).advance, false, "grace restarts after reset (would be true without the fix)");
+  defaultCommitletState.clear();
+  resetScaffoldAttempts(); // don't pollute later tests sharing this scaffold id
 });
 
 test("a scaffold phase advances after 2 incomplete grades even if the exact expected NAME is never created (rename escape; build is the gate)", async () => {
@@ -431,4 +488,43 @@ test("scaffold phase prompt lists stamped files as existing, drops them from 'cr
   assert.match(on, /npm install/, "the install step survives even though package.json was stamped");
   endTaskRun();
   defaultCommitletState.clear();
+});
+
+test("isFromScratchBuild: empty-repo build yes; a fix goal or a monorepo subdir manifest is not from-scratch", () => {
+  const empty = mkdtempSync(join(tmpdir(), "sf-empty-"));
+  assert.equal(isFromScratchBuild(empty, "build a flask+react weather app"), true);
+  assert.equal(isFromScratchBuild(empty, "React + TypeScript todo app with components"), true, "terse verb-less build still detected");
+  assert.equal(isFromScratchBuild(empty, "fix the flask service routing in my app"), false, "a fix goal is not a from-scratch build");
+  const mono = mkdtempSync(join(tmpdir(), "sf-mono-"));
+  mkdirSync(join(mono, "frontend"), { recursive: true });
+  writeFileSync(join(mono, "frontend", "package.json"), "{}", "utf8");
+  assert.equal(isFromScratchBuild(mono, "create a new admin dashboard app"), false, "a subdir manifest means the project already exists");
+});
+
+test("installCommandForManifest picks the stack's install step, not always npm", () => {
+  assert.equal(installCommandForManifest("requirements.txt"), "pip install -r requirements.txt");
+  assert.equal(installCommandForManifest("Cargo.toml"), "cargo build");
+  assert.equal(installCommandForManifest("go.mod"), "go mod download");
+  assert.equal(installCommandForManifest("package.json"), "npm install");
+});
+
+test("classifyScaffoldFile: a React index entry in ANY directory is 'entry'; a barrel index.ts is not", () => {
+  assert.equal(classifyScaffoldFile("index.tsx"), "entry");
+  assert.equal(classifyScaffoldFile("app/index.tsx"), "entry", "entry-last ordering must apply regardless of directory");
+  assert.equal(classifyScaffoldFile("src/components/index.ts"), "features", "a barrel index.ts is not the app entry");
+});
+
+test("stampProfile skips the coupled entry set when the model relocated it off the canonical layout (no broken cross-links)", () => {
+  const stamp = (planned: string[]): string[] => {
+    const cwd = mkdtempSync(join(tmpdir(), "stamp-"));
+    return stampProfile(cwd, VITE_REACT_TS, { appName: "x", usesTailwind: false, entryComponent: "./App" }, planned).map((s) => s.path);
+  };
+  // Canonical layout: the entry set (index.html + src/main.tsx) is stamped, cross-links valid.
+  const canonical = stamp(["package.json", "vite.config.ts", "index.html", "src/main.tsx", "src/App.tsx", "src/index.css"]);
+  assert.ok(canonical.includes("index.html") && canonical.some((p) => /main\.tsx$/.test(p)), "canonical layout stamps the entry set");
+  // Flat layout (main.tsx at root): stamping index.html's hardcoded `/src/main.tsx` would dangle, so the
+  // entry set is SKIPPED (the model authors it); only cross-link-free config files are stamped.
+  const flat = stamp(["package.json", "vite.config.ts", "index.html", "main.tsx", "App.tsx"]);
+  assert.ok(!flat.includes("index.html") && !flat.some((p) => /main\.tsx$/.test(p)), "a relocated entry set is not stamped with broken links");
+  assert.ok(flat.includes("package.json"), "standalone config files are still stamped");
 });

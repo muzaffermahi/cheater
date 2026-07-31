@@ -10,9 +10,10 @@
 //   - bash = truncated output (a verbose result floods a small model's context; -worse than nothing).
 // Every tool returns a plain string the model sees, and never throws.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, statSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
 
 export interface ToolContext {
@@ -21,6 +22,13 @@ export interface ToolContext {
   filesRead: Set<string>;
   /** Files the agent has written this run. */
   filesWritten: Set<string>;
+  /** Abort signal for the run — a cancellable tool (bash) kills its process tree when this fires. */
+  signal?: AbortSignal;
+  /** Main-agent-only delegation hook. Subagents receive no hook and therefore cannot recurse. */
+  spawnTask?: (input: { agent: string; prompt: string; model?: string }) => Promise<{ conversationId: string; runId: string; status: string; summary: string }>;
+  /** Optional task scope. An empty allow-list means "workspace", otherwise paths must match it. */
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 export interface ToolResult {
@@ -32,7 +40,8 @@ export interface ToolResult {
 
 export interface Tool {
   schema: ToolSchema;
-  execute(args: Record<string, unknown>, ctx: ToolContext): ToolResult;
+  /** Sync tools return a ToolResult directly; a cancellable tool (bash) returns a Promise. */
+  execute(args: Record<string, unknown>, ctx: ToolContext): ToolResult | Promise<ToolResult>;
 }
 
 const READ_WINDOW = 400;
@@ -44,6 +53,51 @@ function abs(ctx: ToolContext, p: string): string {
 }
 function rel(ctx: ToolContext, p: string): string {
   return relative(ctx.cwd, p).replace(/\\/g, "/") || p;
+}
+
+/** Windows and macOS compare paths case-insensitively; a scope check that does not would be bypassable. */
+const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
+function fold(value: string): string {
+  return CASE_INSENSITIVE_PATHS ? value.toLowerCase() : value;
+}
+
+/**
+ * Resolve a tool path against the project root and return it as a root-relative POSIX path, or
+ * `null` when it lands outside the root. Resolution walks to the nearest existing ancestor first, so
+ * a file that does not exist yet is judged by the real directory it would be created in: a lexical
+ * check alone is satisfied by a `..` chain, and also by a symlink or NTFS junction inside the project
+ * that points at the rest of the disk.
+ */
+function rootRelative(root: string, target: string): string | null {
+  const segments: string[] = [];
+  let probe = resolve(target);
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    segments.unshift(basename(probe));
+    probe = parent;
+  }
+  const real = (value: string): string => { try { return realpathSync(value); } catch { return resolve(value); } };
+  const resolvedRoot = real(root);
+  const full = segments.length ? join(real(probe), ...segments) : real(probe);
+  const relativePath = relative(resolvedRoot, full).replace(/\\/g, "/");
+  if (relativePath.startsWith("../") || relativePath === ".." || isAbsolute(relativePath)) return null;
+  return relativePath;
+}
+
+function scopeError(ctx: ToolContext, p: string): string | undefined {
+  // Two independent gates. The project root is absolute: every tool path must land inside it, task
+  // scope or not. The task scope then narrows further for a bounded subagent.
+  const normalized = rootRelative(ctx.cwd, abs(ctx, p));
+  if (normalized === null) return `path scope denied: ${p} resolves outside the project root`;
+  const matches = (candidate: string): boolean => {
+    const value = fold(candidate.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, ""));
+    const subject = fold(normalized);
+    return Boolean(value) && (subject === value || subject.startsWith(`${value}/`));
+  };
+  if ((ctx.forbiddenFiles ?? []).some(matches)) return `path scope denied: ${p} is forbidden for this task`;
+  if ((ctx.allowedFiles?.length ?? 0) > 0 && !ctx.allowedFiles!.some(matches)) return `path scope denied: ${p} is outside the task's allowed files`;
+  return undefined;
 }
 
 // --- read -----------------------------------------------------------------------------------
@@ -65,6 +119,8 @@ export const readTool: Tool = {
   execute(args, ctx) {
     const p = String(args.path ?? "");
     if (!p) return { output: "read: missing path", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `read: ${denied}`, isError: true };
     const full = abs(ctx, p);
     if (!existsSync(full)) return { output: `read: file not found: ${p}`, isError: true };
     let text: string;
@@ -97,6 +153,8 @@ export const writeTool: Tool = {
     const p = String(args.path ?? "");
     const content = typeof args.content === "string" ? args.content : "";
     if (!p) return { output: "write: missing path", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `write: ${denied}`, isError: true };
     const full = abs(ctx, p);
     try {
       mkdirSync(dirname(full), { recursive: true });
@@ -134,6 +192,8 @@ export const editTool: Tool = {
     const search = typeof args.search === "string" ? args.search : "";
     const replace = typeof args.replace === "string" ? args.replace : "";
     if (!p || !search) return { output: "edit: need path and non-empty search", isError: true };
+    const denied = scopeError(ctx, p);
+    if (denied) return { output: `edit: ${denied}`, isError: true };
     const full = abs(ctx, p);
     if (!existsSync(full)) return { output: `edit: file not found: ${p} (use write to create a new file)`, isError: true };
     let text: string;
@@ -147,6 +207,9 @@ export const editTool: Tool = {
     // 2. Lenient (whitespace-normalized) match: find the line span whose normalized form equals the
     //    normalized search. This rescues a small model that got indentation/spacing slightly wrong.
     const lenient = findLenient(text, search);
+    if (lenient && "ambiguous" in lenient) {
+      return { output: `edit: 'search' leniently matched ${lenient.ambiguous} places — add more surrounding context so it is unique.`, isError: true };
+    }
     if (lenient) return applyEdit(ctx, full, p, text, lenient.start, lenient.len, replace);
 
     // 3. No match — repair-ready error with the nearest lines.
@@ -162,22 +225,28 @@ function indexAllExact(text: string, needle: string): number[] {
   return out;
 }
 
-function findLenient(text: string, search: string): { start: number; len: number } | null {
+function findLenient(text: string, search: string): { start: number; len: number } | { ambiguous: number } | null {
   const normSearch = normWs(search);
   if (!normSearch) return null;
   const searchLineCount = search.split(/\r?\n/).length;
-  const lines = text.split(/\r?\n/);
-  // Precompute cumulative char offsets per line (accounting for the \n we split on — assume \n; if
-  // the file has \r\n this is approximate but applyEdit re-reads via indexOf so we snap to exact).
-  let matchWindow: string | null = null;
-  for (let i = 0; i + searchLineCount <= lines.length; i++) {
-    const window = lines.slice(i, i + searchLineCount).join("\n");
-    if (normWs(window) === normSearch) { matchWindow = window; break; }
+  // Map matched line spans back to EXACT char offsets in the ORIGINAL text. A prior version rejoined
+  // lines with "\n" and indexOf'd that, which never matched a \r\n (Windows) file — so the lenient
+  // rescue was dead on CRLF. lineStarts[k] = char offset where line k begins (terminators preserved).
+  const lineStarts = [0];
+  for (let k = 0; k < text.length; k++) if (text.charCodeAt(k) === 10) lineStarts.push(k + 1);
+  const matches: Array<{ start: number; len: number }> = [];
+  for (let i = 0; i + searchLineCount <= lineStarts.length; i++) {
+    const start = lineStarts[i];
+    let end = i + searchLineCount < lineStarts.length ? lineStarts[i + searchLineCount] : text.length;
+    // Trim the trailing terminator of the last window line so the replaced span is line CONTENT (the
+    // following newline stays intact, matching the exact-match path) — handles both \n and \r\n.
+    if (end > start && text.charCodeAt(end - 1) === 10) { end--; if (end > start && text.charCodeAt(end - 1) === 13) end--; }
+    if (normWs(text.slice(start, end)) === normSearch) matches.push({ start, len: end - start });
   }
-  if (matchWindow === null) return null;
-  const start = text.indexOf(matchWindow);
-  if (start < 0) return null;
-  return { start, len: matchWindow.length };
+  // Mirror the exact-match path: a lenient search matching 2+ regions is ambiguous — never guess which.
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) return { ambiguous: matches.length };
+  return null;
 }
 
 function applyEdit(ctx: ToolContext, full: string, p: string, text: string, start: number, len: number, replace: string): ToolResult {
@@ -224,22 +293,62 @@ export const bashTool: Tool = {
       required: ["command"]
     }
   },
-  execute(args, ctx) {
+  execute(args, ctx): Promise<ToolResult> {
     const command = String(args.command ?? "");
-    if (!command.trim()) return { output: "bash: empty command", isError: true };
-    const timeoutMs = Math.max(1000, Number(args.timeout_seconds ?? 120) * 1000);
-    let out = "", err = "", code = 0, timedOut = false;
-    try {
-      const r = spawnSync(command, { cwd: ctx.cwd, shell: true, encoding: "utf8", timeout: timeoutMs, windowsHide: true, maxBuffer: 20 * 1024 * 1024 });
-      out = r.stdout ?? ""; err = r.stderr ?? "";
-      code = typeof r.status === "number" ? r.status : 1;
-      timedOut = r.signal === "SIGTERM";
-    } catch (e) { return { output: `bash: ${(e as Error).message}`, isError: true }; }
-    const combined = truncate([out, err].filter(Boolean).join("\n"));
-    const status = timedOut ? `(timed out after ${timeoutMs / 1000}s)` : `exit ${code}`;
-    return { output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`, isError: code !== 0 || timedOut, meta: { exitCode: code, timedOut } };
+    if (!command.trim()) return Promise.resolve({ output: "bash: empty command", isError: true });
+    // A non-numeric timeout_seconds (the model can emit "5 minutes"; args aren't schema-coerced) would
+    // make Number(...) NaN → setTimeout(NaN) ≈ 0ms → the command is killed instantly and falsely reported
+    // as timed out. Fall back to the 120s default for anything that doesn't parse to a finite number.
+    const rawTimeout = Number(args.timeout_seconds ?? 120);
+    const timeoutMs = Math.max(1000, (Number.isFinite(rawTimeout) ? rawTimeout : 120) * 1000);
+    return new Promise<ToolResult>((resolve) => {
+      // Already-cancelled: don't even start.
+      if (ctx.signal?.aborted) { resolve({ output: `$ ${command}\n[cancelled before start]`, isError: true, meta: { cancelled: true } }); return; }
+      // detached on POSIX so we can signal the whole process GROUP; on Windows we taskkill the tree.
+      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
+      let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
+      const CAP = 12 * 1024 * 1024;
+      // Decode via StringDecoder so a multibyte UTF-8 char split across two chunks isn't corrupted into
+      // U+FFFD (a plain per-chunk d.toString("utf8") mangles boundary-straddling sequences).
+      const decOut = new StringDecoder("utf8"), decErr = new StringDecoder("utf8");
+      const onOut = (d: Buffer): void => { if (out.length < CAP) out += decOut.write(d); };
+      const onErr = (d: Buffer): void => { if (err.length < CAP) err += decErr.write(d); };
+      child.stdout?.on("data", onOut);
+      child.stderr?.on("data", onErr);
+      const timer = setTimeout(() => { killedBy = "timeout"; killTree(child); }, timeoutMs);
+      const onAbort = (): void => { killedBy = "cancelled"; killTree(child); };
+      ctx.signal?.addEventListener("abort", onAbort, { once: true });
+      const done = (code: number | null, signalName: NodeJS.Signals | null): void => {
+        clearTimeout(timer);
+        ctx.signal?.removeEventListener("abort", onAbort);
+        out += decOut.end(); err += decErr.end(); // flush any trailing partial multibyte sequence
+        const combined = truncate([out, err].filter(Boolean).join("\n"));
+        const status = killedBy === "timeout" ? `(timed out after ${timeoutMs / 1000}s — process tree killed)`
+          : killedBy === "cancelled" ? "(cancelled — process tree killed)"
+          : signalName ? `killed by ${signalName}` : `exit ${code ?? 1}`;
+        resolve({
+          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`,
+          isError: killedBy !== null || (code ?? 1) !== 0 || !!signalName,
+          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName },
+        });
+      };
+      child.on("close", done);
+      child.on("error", (e) => { clearTimeout(timer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
+    });
   }
 };
+
+/** Kill a child and its whole descendant tree (a shell often spawns grandchildren — e.g. a test server). */
+function killTree(child: import("node:child_process").ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true });
+    } else {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } // negative pid = process group
+    }
+  } catch { /* already gone */ }
+}
 
 function truncate(s: string): string {
   if (s.length <= BASH_HEAD + BASH_TAIL + 100) return s;
@@ -250,6 +359,43 @@ function truncate(s: string): string {
 // --- ls / glob / grep -----------------------------------------------------------------------
 
 const SKIP_DIRS = new Set([".git", "node_modules", ".cheater", "dist", "build", "__pycache__", ".venv", "venv", ".next", "out", "coverage", "target", ".pytest_cache"]);
+
+/** A grep that silently stops at its ceiling teaches the model the repo is smaller than it is. */
+const GREP_MAX_HITS = 400;
+const GLOB_MAX_HITS = 400;
+
+/**
+ * Translate a shell-style glob into an anchored RegExp over root-relative POSIX paths.
+ * `**` crosses directory separators, `*` and `?` do not — the usual contract, so a model that has
+ * seen any other tool gets what it expects.
+ */
+export function globToRegExp(pattern: string): RegExp {
+  let source = "";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        // `**/` must also match zero directories, so `**/*.ts` finds a root-level file.
+        if (pattern[i + 2] === "/") { source += "(?:.*/)?"; i += 2; continue; }
+        source += ".*"; i += 1; continue;
+      }
+      source += "[^/]*";
+      continue;
+    }
+    if (ch === "?") { source += "[^/]"; continue; }
+    source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${source}$`, CASE_INSENSITIVE_PATHS ? "i" : "");
+}
+
+/**
+ * Does a file match the pattern? A pattern containing `/` is judged against the whole root-relative
+ * path; a bare one (`*.ts`) is judged against the basename at any depth. Forcing a globstar prefix
+ * for the common case would just be a trap for a weak model.
+ */
+function globMatches(re: RegExp, hasSlash: boolean, relativePath: string, name: string): boolean {
+  return re.test(hasSlash ? relativePath : name);
+}
 
 export const lsTool: Tool = {
   schema: {
@@ -293,29 +439,84 @@ export const grepTool: Tool = {
     if (!pattern) return { output: "grep: missing pattern", isError: true };
     let re: RegExp;
     try { re = new RegExp(pattern); } catch (e) { return { output: `grep: bad pattern: ${(e as Error).message}`, isError: true }; }
-    const globRe = args.glob ? new RegExp("^" + String(args.glob).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$") : null;
+    const globPattern = args.glob ? String(args.glob) : "";
+    const globRe = globPattern ? globToRegExp(globPattern) : null;
+    const globHasSlash = globPattern.includes("/");
     const root = abs(ctx, String(args.path ?? "."));
     const hits: string[] = [];
+    let truncated = false;
     const walk = (dir: string, depth: number): void => {
-      if (depth > 8 || hits.length > 100) return;
+      if (depth > 8 || truncated) return;
       let entries: import("node:fs").Dirent[];
       try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
+        if (truncated) return;
         if (SKIP_DIRS.has(e.name)) continue;
         const full = join(dir, e.name);
         if (e.isDirectory()) { walk(full, depth + 1); continue; }
-        if (globRe && !globRe.test(e.name)) continue;
+        if (globRe && !globMatches(globRe, globHasSlash, rel(ctx, full), e.name)) continue;
         try {
           if (statSync(full).size > 1024 * 1024) continue;
           const content = readFileSync(full, "utf8");
-          content.split(/\r?\n/).forEach((line, i) => {
-            if (hits.length <= 100 && re.test(line)) hits.push(`${rel(ctx, full)}:${i + 1}: ${line.trim().slice(0, 200)}`);
-          });
+          const lines = content.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i += 1) {
+            if (hits.length >= GREP_MAX_HITS) { truncated = true; return; }
+            if (re.test(lines[i])) hits.push(`${rel(ctx, full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+          }
         } catch { /* binary/unreadable */ }
       }
     };
     walk(root, 0);
-    return { output: hits.length ? hits.join("\n") : `(no matches for /${pattern}/)`, isError: false, meta: { count: hits.length } };
+    if (!hits.length) return { output: `(no matches for /${pattern}/)`, isError: false, meta: { count: 0, truncated: false } };
+    // Say so explicitly: a model that assumes it saw every match will "fix" one call site of three.
+    const notice = truncated ? `\n(truncated at ${GREP_MAX_HITS} matches - narrow the pattern or pass path/glob to see the rest)` : "";
+    return { output: hits.join("\n") + notice, isError: false, meta: { count: hits.length, truncated } };
+  }
+};
+
+export const globTool: Tool = {
+  schema: {
+    name: "glob",
+    description: "Find files by name pattern, e.g. '**/*.test.ts' or 'Dockerfile'. Returns project-relative paths. Use this to locate files; use grep to search their contents.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "glob pattern; ** crosses directories, * and ? do not" },
+        path: { type: "string", description: "optional subdir to search under (default '.')" }
+      },
+      required: ["pattern"]
+    }
+  },
+  execute(args, ctx) {
+    const pattern = String(args.pattern ?? "").trim();
+    if (!pattern) return { output: "glob: missing pattern", isError: true };
+    const start = String(args.path ?? ".");
+    const denied = scopeError(ctx, start);
+    if (denied) return { output: `glob: ${denied}`, isError: true };
+    const root = abs(ctx, start);
+    if (!existsSync(root)) return { output: `glob: not found: ${start}`, isError: true };
+    let re: RegExp;
+    try { re = globToRegExp(pattern); } catch (e) { return { output: `glob: bad pattern: ${(e as Error).message}`, isError: true }; }
+    const hasSlash = pattern.includes("/");
+    const matches: string[] = [];
+    let truncated = false;
+    const walk = (dir: string, depth: number): void => {
+      if (depth > 12 || truncated) return;
+      let entries: import("node:fs").Dirent[];
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (truncated) return;
+        if (SKIP_DIRS.has(e.name)) continue;
+        const full = join(dir, e.name);
+        if (e.isDirectory()) { walk(full, depth + 1); continue; }
+        if (matches.length >= GLOB_MAX_HITS) { truncated = true; return; }
+        if (globMatches(re, hasSlash, rel(ctx, full), e.name)) matches.push(rel(ctx, full));
+      }
+    };
+    walk(root, 0);
+    if (!matches.length) return { output: `(no files match ${pattern})`, isError: false, meta: { count: 0, truncated: false } };
+    const notice = truncated ? `\n(truncated at ${GLOB_MAX_HITS} files - narrow the pattern or pass path to see the rest)` : "";
+    return { output: matches.join("\n") + notice, isError: false, meta: { count: matches.length, truncated } };
   }
 };
 
@@ -332,7 +533,35 @@ export const finishTool: Tool = {
   }
 };
 
-export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, grepTool, finishTool];
+export const taskTool: Tool = {
+  schema: {
+    name: "task",
+    description: "Delegate a bounded coding subtask to a named Kitten agent and wait for its durable report. Use explore/review/verify for read-only work; use general only when edits are explicitly required.",
+    parameters: {
+      type: "object",
+      properties: {
+        agent: { type: "string", description: "agent profile: explore, review, verify, or general" },
+        prompt: { type: "string", description: "self-contained objective and acceptance criteria; do not assume the child sees this conversation" },
+        model: { type: "string", description: "optional model override" }
+      },
+      required: ["agent", "prompt"]
+    }
+  },
+  async execute(args, ctx) {
+    if (!ctx.spawnTask) return { output: "task: delegation is unavailable in this agent profile", isError: true };
+    const agent = String(args.agent ?? "").trim();
+    const prompt = String(args.prompt ?? "").trim();
+    if (!agent || !prompt) return { output: "task: agent and prompt are required", isError: true };
+    try {
+      const result = await ctx.spawnTask({ agent, prompt: prompt.slice(0, 4000), model: typeof args.model === "string" ? args.model : undefined });
+      return { output: `child ${result.conversationId} (${result.status}): ${result.summary}`.slice(0, 2000), isError: result.status === "failed" || result.status === "cancelled", meta: result };
+    } catch (error) {
+      return { output: `task failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 2000), isError: true };
+    }
+  }
+};
+
+export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, globTool, grepTool, taskTool, finishTool];
 
 export function toolByName(name: string): Tool | undefined {
   return CORE_TOOLS.find((t) => t.schema.name === name);

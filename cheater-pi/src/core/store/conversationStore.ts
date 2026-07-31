@@ -29,6 +29,10 @@ export interface ConversationRow {
   updatedAt: number;
   archived: boolean;
   lastSeq: number;
+  provider?: string | null;
+  agent?: string | null;
+  parentConversationId?: string | null;
+  parentRunId?: string | null;
 }
 
 export interface RunRow {
@@ -50,6 +54,11 @@ export interface RunRow {
   endedAt: number | null;
   /** Pre-run git snapshot for /undo (JSON of RunSnapshot), or null. */
   snapshot: string | null;
+  model: string | null;
+  agent: string | null;
+  parentRunId: string | null;
+  undone: boolean;
+  snapshotAfter: string | null;
 }
 
 export interface CreateConversationInput {
@@ -60,6 +69,10 @@ export interface CreateConversationInput {
   model: string;
   mode: Lane | "auto";
   ts: number;
+  provider?: string | null;
+  agent?: string | null;
+  parentConversationId?: string | null;
+  parentRunId?: string | null;
 }
 
 export interface ListConversationsOptions {
@@ -67,6 +80,61 @@ export interface ListConversationsOptions {
   includeArchived?: boolean;
   search?: string;
   limit?: number;
+}
+
+export type TaskNodeStatus = "queued" | "blocked" | "running" | "waiting" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted";
+
+export interface TaskNodeRow {
+  id: string;
+  conversationId: string;
+  runId: string | null;
+  parentId: string | null;
+  agent: string;
+  objective: string;
+  acceptanceCriteria: string[];
+  dependencies: string[];
+  allowedFiles: string[];
+  forbiddenFiles: string[];
+  modelTier: string;
+  workspaceMode: "shared-readonly" | "isolated-worktree";
+  status: TaskNodeStatus;
+  budget: { maxTurns: number; maxTokens: number; maxWallMs: number; maxToolCalls: number };
+  report: string;
+  evidence: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A persisted Task Compiler result. `ir` is the canonical CompiledTask; `trace` is full provenance
+ *  (stage timings, literals, repository facts, validation) for debugging and evaluation. */
+export interface TaskCompilationRow {
+  runId: string;
+  conversationId: string;
+  mode: string;
+  family: string;
+  ir: string;
+  trace: string;
+  rendered: string;
+  promptEpoch: string;
+  createdAt: number;
+}
+
+export interface CreateTaskNodeInput {
+  id: string;
+  conversationId: string;
+  runId?: string | null;
+  parentId?: string | null;
+  agent: string;
+  objective: string;
+  acceptanceCriteria?: string[];
+  dependencies?: string[];
+  allowedFiles?: string[];
+  forbiddenFiles?: string[];
+  modelTier?: string;
+  workspaceMode?: "shared-readonly" | "isolated-worktree";
+  status?: TaskNodeStatus;
+  budget?: Partial<TaskNodeRow["budget"]>;
+  ts: number;
 }
 
 // ── Migrations ────────────────────────────────────────────────────────────────────────────────────
@@ -129,15 +197,218 @@ const MIGRATIONS: string[] = [
   `
   ALTER TABLE runs ADD COLUMN snapshot TEXT;
   `,
+  // v3 — model identity, agent, parent links, undo tracking, provider.
+  `
+  ALTER TABLE runs          ADD COLUMN model TEXT;
+  ALTER TABLE runs          ADD COLUMN agent TEXT;
+  ALTER TABLE runs          ADD COLUMN parent_run_id TEXT;
+  ALTER TABLE runs          ADD COLUMN undone INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE runs          ADD COLUMN snapshot_after TEXT;
+  ALTER TABLE conversations ADD COLUMN provider TEXT;
+  ALTER TABLE conversations ADD COLUMN agent TEXT;
+  ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT;
+  ALTER TABLE conversations ADD COLUMN parent_run_id TEXT;
+  CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_conversation_id);
+  CREATE TABLE IF NOT EXISTS input_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    input TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    conversation_id TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_input_history_ts ON input_history(ts DESC);
+  `,
+  // v4 — durable subagent task DAG. The task table is a projection; task lifecycle events remain in
+  // the parent conversation event log so the desktop client can replay the same visible history.
+  `
+  CREATE TABLE task_nodes (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    run_id TEXT,
+    parent_id TEXT,
+    agent TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    dependencies TEXT NOT NULL DEFAULT '[]',
+    allowed_files TEXT NOT NULL DEFAULT '[]',
+    forbidden_files TEXT NOT NULL DEFAULT '[]',
+    model_tier TEXT NOT NULL DEFAULT 'main',
+    workspace_mode TEXT NOT NULL DEFAULT 'shared-readonly',
+    status TEXT NOT NULL DEFAULT 'queued',
+    budget TEXT NOT NULL DEFAULT '{}',
+    report TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(parent_id) REFERENCES task_nodes(id) ON DELETE SET NULL
+  );
+  CREATE INDEX idx_task_nodes_conversation ON task_nodes(conversation_id, created_at);
+  CREATE INDEX idx_task_nodes_parent ON task_nodes(parent_id);
+  CREATE INDEX idx_task_nodes_status ON task_nodes(status);
+  `,
+  // v5 — Task Compiler traces. The compiled IR is what the run was actually held to, so the verifier
+  // must be able to reconstruct it after a restart rather than re-deriving it from a summary written
+  // after the fact. Keyed by run: one compilation per run, replaced if a run is recompiled.
+  `
+  CREATE TABLE task_compilations (
+    run_id          TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    mode            TEXT NOT NULL,
+    family          TEXT NOT NULL,
+    ir              TEXT NOT NULL,
+    trace           TEXT NOT NULL,
+    rendered        TEXT NOT NULL DEFAULT '',
+    prompt_epoch    TEXT NOT NULL DEFAULT '',
+    created_at      INTEGER NOT NULL
+  );
+  CREATE INDEX idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
+  `,
 ];
 
+/**
+ * The additive safety net under the migration list.
+ *
+ * `user_version` is only a claim, and a store on a real machine may carry a stamp this code line never
+ * wrote — an older or forked Kitten whose migration list was numbered differently. A store found at
+ * `user_version` 6 with only four migrations here took the "already current" fast path while missing
+ * every column v3 adds, so **every** new conversation failed with "table conversations has no column
+ * named provider": the app was unusable on the very store it had been using.
+ *
+ * So the schema itself is checked, never just the number. Everything here is additive and idempotent —
+ * missing tables and columns are created, nothing is dropped, renamed or rewritten — which makes it
+ * safe to run on every open regardless of which line stamped the file.
+ */
+const REPAIR_TABLES: ReadonlyArray<{ table: string; ddl: string }> = [
+  {
+    table: "input_history",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS input_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      input TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      conversation_id TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_input_history_ts ON input_history(ts DESC);
+    `,
+  },
+  {
+    table: "task_nodes",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS task_nodes (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      run_id TEXT,
+      parent_id TEXT,
+      agent TEXT NOT NULL,
+      objective TEXT NOT NULL,
+      acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+      dependencies TEXT NOT NULL DEFAULT '[]',
+      allowed_files TEXT NOT NULL DEFAULT '[]',
+      forbidden_files TEXT NOT NULL DEFAULT '[]',
+      model_tier TEXT NOT NULL DEFAULT 'main',
+      workspace_mode TEXT NOT NULL DEFAULT 'shared-readonly',
+      status TEXT NOT NULL DEFAULT 'queued',
+      budget TEXT NOT NULL DEFAULT '{}',
+      report TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY(parent_id) REFERENCES task_nodes(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_conversation ON task_nodes(conversation_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_parent ON task_nodes(parent_id);
+    CREATE INDEX IF NOT EXISTS idx_task_nodes_status ON task_nodes(status);
+    `,
+  },
+  {
+    table: "task_compilations",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS task_compilations (
+      run_id          TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      mode            TEXT NOT NULL,
+      family          TEXT NOT NULL,
+      ir              TEXT NOT NULL,
+      trace           TEXT NOT NULL,
+      rendered        TEXT NOT NULL DEFAULT '',
+      prompt_epoch    TEXT NOT NULL DEFAULT '',
+      created_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
+    `,
+  },
+];
+
+/** Every column this code line reads or writes beyond the v1 tables. */
+const REPAIR_COLUMNS: ReadonlyArray<{ table: string; column: string; type: string }> = [
+  { table: "runs", column: "snapshot", type: "TEXT" },
+  { table: "runs", column: "model", type: "TEXT" },
+  { table: "runs", column: "agent", type: "TEXT" },
+  { table: "runs", column: "parent_run_id", type: "TEXT" },
+  { table: "runs", column: "undone", type: "INTEGER NOT NULL DEFAULT 0" },
+  { table: "runs", column: "snapshot_after", type: "TEXT" },
+  { table: "conversations", column: "provider", type: "TEXT" },
+  { table: "conversations", column: "agent", type: "TEXT" },
+  { table: "conversations", column: "parent_conversation_id", type: "TEXT" },
+  { table: "conversations", column: "parent_run_id", type: "TEXT" },
+];
+
+function tableNames(db: SqlDatabase): Set<string> {
+  const rows = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+function columnNames(db: SqlDatabase, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info('${table}')`).all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+/** What this store is missing, as executable additive statements. Read-only: takes no write lock. */
+export function pendingRepairs(db: SqlDatabase): Array<{ label: string; sql: string }> {
+  const pending: Array<{ label: string; sql: string }> = [];
+  const tables = tableNames(db);
+  if (!tables.has("conversations")) return pending; // an empty file: the migrations own it
+  for (const { table, ddl } of REPAIR_TABLES) {
+    if (!tables.has(table)) pending.push({ label: `created table ${table}`, sql: ddl });
+  }
+  for (const { table, column, type } of REPAIR_COLUMNS) {
+    if (!tables.has(table) || columnNames(db, table).has(column)) continue;
+    pending.push({ label: `added ${table}.${column}`, sql: `ALTER TABLE ${table} ADD COLUMN ${column} ${type}` });
+  }
+  return pending;
+}
+
+/** Apply the additive repairs. Returns what it did, so a caller can surface the reconciliation. */
+export function reconcileSchema(db: SqlDatabase): string[] {
+  const pending = pendingRepairs(db);
+  for (const repair of pending) db.exec(repair.sql);
+  return pending.map((repair) => repair.label);
+}
+
 function migrate(db: SqlDatabase): void {
-  const from = userVersion(db);
-  if (from >= MIGRATIONS.length) return;
+  if (userVersion(db) >= MIGRATIONS.length) {
+    // The stamp says current — verify it, because a foreign stamp is exactly how a store ends up
+    // "current" without the columns. The check is read-only, so the common case still takes no write
+    // lock; only an actually-drifted store is repaired, additively, under a transaction.
+    if (!pendingRepairs(db).length) return;
+    const repaired = transact(db, () => reconcileSchema(db));
+    if (repaired.length) process.emitWarning(`kitten store schema reconciled: ${repaired.join(", ")}`);
+    return;
+  }
+  // Read the version, apply migrations, AND bump the version all inside ONE BEGIN IMMEDIATE. This store
+  // is explicitly opened by two processes (a TUI and a web client on the same file), so a concurrent
+  // first-open must not double-migrate: BEGIN IMMEDIATE serializes them, and the loser re-reads the
+  // bumped version inside the lock and finds nothing to do (rather than re-running CREATE TABLE →
+  // "table already exists"). Setting the version in the SAME transaction also makes a crash atomic —
+  // it can never leave committed tables with a stale user_version.
   transact(db, () => {
+    const from = userVersion(db);
+    if (from >= MIGRATIONS.length) { reconcileSchema(db); return; } // another process migrated while we waited
     for (let v = from; v < MIGRATIONS.length; v++) db.exec(MIGRATIONS[v]);
+    setUserVersion(db, MIGRATIONS.length);
+    // A partially-migrated store from another line can leave this list with nothing to do for a
+    // version it never actually applied; reconcile before anyone reads or writes a row.
+    reconcileSchema(db);
   });
-  setUserVersion(db, MIGRATIONS.length);
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────────────────────────
@@ -165,11 +436,11 @@ export class ConversationStore {
   createConversation(input: CreateConversationInput): { conversation: ConversationRow; event: KittenEvent } {
     return transact(this.db, () => {
       this.db.prepare(
-        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)`
+        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`
       ).run(
         input.id, input.title, input.projectRoot, input.projectId, input.model, input.mode,
-        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION
+        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null
       );
       const event = this._append(input.id, {
         type: "conversation.created", title: input.title, projectRoot: input.projectRoot,
@@ -195,6 +466,11 @@ export class ConversationStore {
       `ORDER BY updated_at DESC LIMIT ?`;
     params.push(Math.max(1, Math.min(1000, opts.limit ?? 100)));
     return this.db.prepare(sqlText).all(...params).map(mapConversation);
+  }
+
+  /** Child conversations form the durable lineage tree used for subagent cancellation. */
+  listChildConversations(parentConversationId: string): ConversationRow[] {
+    return this.db.prepare("SELECT * FROM conversations WHERE parent_conversation_id = ? ORDER BY created_at ASC").all(parentConversationId).map(mapConversation);
   }
 
   renameConversation(id: string, title: string, ts: number): KittenEvent | null {
@@ -243,8 +519,11 @@ export class ConversationStore {
     if (payload.type === "user.message") searchAdd = payload.text;
     else if (payload.type === "assistant.final") searchAdd = payload.text;
     if (searchAdd) {
+      // Keep the NEWEST 20000 chars (negative substr counts from the right). `1, 20000` kept the OLDEST
+      // instead, so once a long conversation filled the index every later message fell past position
+      // 20000 and became unsearchable. The full text is retained in the event log; this is just the index.
       this.db.prepare(
-        "UPDATE conversations SET last_seq = ?, updated_at = ?, search_text = substr(search_text || ' ' || ?, 1, 20000) WHERE id = ?"
+        "UPDATE conversations SET last_seq = ?, updated_at = ?, search_text = substr(search_text || ' ' || ?, -20000) WHERE id = ?"
       ).run(seq, ts, searchAdd.toLowerCase(), conversationId);
     } else {
       this.db.prepare("UPDATE conversations SET last_seq = ?, updated_at = ? WHERE id = ?").run(seq, ts, conversationId);
@@ -276,7 +555,7 @@ export class ConversationStore {
         break;
       case "run.started":
         ensure();
-        set("request = ?, lane = ?, status = 'running', started_at = ?", payload.request, payload.lane, ts);
+        set("request = ?, lane = ?, status = 'running', started_at = ?, model = ?", payload.request, payload.lane, ts, payload.model ?? null);
         break;
       case "run.status":
         ensure();
@@ -297,8 +576,8 @@ export class ConversationStore {
       case "run.completed":
         ensure();
         set(
-          "status = 'completed', finished = ?, summary = ?, usage = ?, ended_at = ?",
-          payload.finished ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts
+          "status = 'completed', finished = ?, verified = ?, summary = ?, usage = ?, ended_at = ?, model = ?",
+          payload.finished ? 1 : 0, payload.verified ? 1 : 0, payload.summary, JSON.stringify(payload.usage), ts, payload.model ?? null
         );
         break;
       case "run.failed":
@@ -329,11 +608,88 @@ export class ConversationStore {
     this.db.prepare("UPDATE runs SET snapshot = ? WHERE id = ?").run(snapshotJson, runId);
   }
 
+  setRunSnapshotAfter(runId: string, snapshotJson: string): void {
+    this.db.prepare("UPDATE runs SET snapshot_after = ? WHERE id = ?").run(snapshotJson, runId);
+  }
+
+  setRunUndone(runId: string, undone: boolean): void {
+    this.db.prepare("UPDATE runs SET undone = ? WHERE id = ?").run(undone ? 1 : 0, runId);
+  }
+
   listRuns(conversationId: string): RunRow[] {
     return this.db
       .prepare("SELECT * FROM runs WHERE conversation_id = ? ORDER BY started_at ASC")
       .all(conversationId)
       .map(mapRun);
+  }
+
+  createTaskNode(input: CreateTaskNodeInput): TaskNodeRow {
+    const budget = { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40, ...(input.budget ?? {}) };
+    this.db.prepare(
+      `INSERT INTO task_nodes (id, conversation_id, run_id, parent_id, agent, objective, acceptance_criteria,
+       dependencies, allowed_files, forbidden_files, model_tier, workspace_mode, status, budget, report, evidence, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '[]', ?, ?)`
+    ).run(
+      input.id, input.conversationId, input.runId ?? null, input.parentId ?? null, input.agent, input.objective.slice(0, 4000),
+      JSON.stringify((input.acceptanceCriteria ?? []).slice(0, 32)), JSON.stringify((input.dependencies ?? []).slice(0, 32)),
+      JSON.stringify((input.allowedFiles ?? []).slice(0, 64)), JSON.stringify((input.forbiddenFiles ?? []).slice(0, 64)),
+      input.modelTier ?? "main", input.workspaceMode ?? "shared-readonly", input.status ?? "queued", JSON.stringify(budget), input.ts, input.ts
+    );
+    return this.getTaskNode(input.id)!;
+  }
+
+  getTaskNode(id: string): TaskNodeRow | null {
+    const row = this.db.prepare("SELECT * FROM task_nodes WHERE id = ?").get(id);
+    return row ? mapTaskNode(row) : null;
+  }
+
+  listTaskNodes(conversationId: string): TaskNodeRow[] {
+    return this.db.prepare("SELECT * FROM task_nodes WHERE conversation_id = ? ORDER BY created_at ASC").all(conversationId).map(mapTaskNode);
+  }
+
+  updateTaskNode(id: string, update: { status?: TaskNodeStatus; report?: string; evidence?: string[]; runId?: string | null; ts: number }): TaskNodeRow | null {
+    const current = this.getTaskNode(id);
+    if (!current) return null;
+    const status = update.status ?? current.status;
+    const report = update.report ?? current.report;
+    const evidence = update.evidence ?? current.evidence;
+    this.db.prepare("UPDATE task_nodes SET status = ?, report = ?, evidence = ?, run_id = ?, updated_at = ? WHERE id = ?")
+      .run(status, report.slice(0, 12000), JSON.stringify(evidence.slice(0, 64)), update.runId === undefined ? current.runId : update.runId, update.ts, id);
+    return this.getTaskNode(id);
+  }
+
+  /**
+   * Persist a Task Compiler result for a run. Upsert by run id: recompiling a run replaces its
+   * contract rather than accumulating versions the verifier would then have to choose between.
+   * The full IR is stored so the verifier evaluates the ORIGINAL compiled task after a restart —
+   * never a summary written after implementation, which would let the run grade its own homework.
+   */
+  saveTaskCompilation(input: {
+    runId: string; conversationId: string; mode: string; family: string;
+    ir: string; trace: string; rendered?: string; promptEpoch?: string; ts: number;
+  }): void {
+    this.db.prepare(
+      `INSERT INTO task_compilations (run_id, conversation_id, mode, family, ir, trace, rendered, prompt_epoch, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(run_id) DO UPDATE SET
+         mode = excluded.mode, family = excluded.family, ir = excluded.ir, trace = excluded.trace,
+         rendered = excluded.rendered, prompt_epoch = excluded.prompt_epoch, created_at = excluded.created_at`,
+    ).run(
+      input.runId, input.conversationId, input.mode, input.family,
+      input.ir, input.trace, input.rendered ?? "", input.promptEpoch ?? "", input.ts,
+    );
+  }
+
+  getTaskCompilation(runId: string): TaskCompilationRow | null {
+    const row = this.db.prepare("SELECT * FROM task_compilations WHERE run_id = ?").get(runId);
+    return row ? mapTaskCompilation(row) : null;
+  }
+
+  listTaskCompilations(conversationId: string): TaskCompilationRow[] {
+    return this.db
+      .prepare("SELECT * FROM task_compilations WHERE conversation_id = ? ORDER BY created_at ASC")
+      .all(conversationId)
+      .map(mapTaskCompilation);
   }
 
   /**
@@ -370,6 +726,10 @@ function mapConversation(r: Record<string, SqlValue>): ConversationRow {
     updatedAt: Number(r.updated_at),
     archived: Number(r.archived) !== 0,
     lastSeq: Number(r.last_seq),
+    provider: r.provider != null ? String(r.provider) : null,
+    agent: r.agent != null ? String(r.agent) : null,
+    parentConversationId: r.parent_conversation_id != null ? String(r.parent_conversation_id) : null,
+    parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
   };
 }
 
@@ -392,6 +752,31 @@ function mapRun(r: Record<string, SqlValue>): RunRow {
     startedAt: Number(r.started_at),
     endedAt: r.ended_at != null ? Number(r.ended_at) : null,
     snapshot: r.snapshot != null ? String(r.snapshot) : null,
+    model: r.model != null ? String(r.model) : null,
+    agent: r.agent != null ? String(r.agent) : null,
+    parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
+    undone: Number(r.undone ?? 0) !== 0,
+    snapshotAfter: r.snapshot_after != null ? String(r.snapshot_after) : null,
+  };
+}
+
+function mapTaskNode(r: Record<string, SqlValue>): TaskNodeRow {
+  return {
+    id: String(r.id), conversationId: String(r.conversation_id), runId: r.run_id == null ? null : String(r.run_id),
+    parentId: r.parent_id == null ? null : String(r.parent_id), agent: String(r.agent), objective: String(r.objective),
+    acceptanceCriteria: safeJsonArray(r.acceptance_criteria), dependencies: safeJsonArray(r.dependencies),
+    allowedFiles: safeJsonArray(r.allowed_files), forbiddenFiles: safeJsonArray(r.forbidden_files), modelTier: String(r.model_tier),
+    workspaceMode: String(r.workspace_mode) === "isolated-worktree" ? "isolated-worktree" : "shared-readonly",
+    status: String(r.status) as TaskNodeStatus, budget: safeBudget(r.budget), report: String(r.report ?? ""), evidence: safeJsonArray(r.evidence),
+    createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+  };
+}
+
+function mapTaskCompilation(r: Record<string, SqlValue>): TaskCompilationRow {
+  return {
+    runId: String(r.run_id), conversationId: String(r.conversation_id), mode: String(r.mode), family: String(r.family),
+    ir: String(r.ir), trace: String(r.trace), rendered: String(r.rendered ?? ""),
+    promptEpoch: String(r.prompt_epoch ?? ""), createdAt: Number(r.created_at),
   };
 }
 
@@ -410,4 +795,10 @@ function safeUsage(v: SqlValue): { prompt: number; completion: number; reasoning
     const u = JSON.parse(String(v ?? "{}"));
     return { prompt: Number(u.prompt ?? 0), completion: Number(u.completion ?? 0), reasoning: Number(u.reasoning ?? 0) };
   } catch { return { prompt: 0, completion: 0, reasoning: 0 }; }
+}
+function safeBudget(v: SqlValue): TaskNodeRow["budget"] {
+  try {
+    const b = JSON.parse(String(v ?? "{}"));
+    return { maxTurns: Number(b.maxTurns ?? 12), maxTokens: Number(b.maxTokens ?? 12000), maxWallMs: Number(b.maxWallMs ?? 900_000), maxToolCalls: Number(b.maxToolCalls ?? 40) };
+  } catch { return { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40 }; }
 }

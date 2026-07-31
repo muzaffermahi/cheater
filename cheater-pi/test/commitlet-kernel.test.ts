@@ -8,7 +8,7 @@ import { routeAutopilot } from "../src/autopilot/router.js";
 import { createCommitletPlan } from "../src/commitlet/planner.js";
 import { forgeCommitletSpec } from "../src/commitlet/spec.js";
 import { cleanupOldRollbackSnapshots, createRollbackPoint, revertRollbackPoint, rollbackAvailable } from "../src/commitlet/rollback.js";
-import { runDiffGuard } from "../src/commitlet/guard.js";
+import { runDiffGuard, countDiffLines, taskInvolvesDependency } from "../src/commitlet/guard.js";
 import { scorePatchHealth } from "../src/commitlet/health.js";
 import { auditTestChanges } from "../src/commitlet/testAudit.js";
 import { runCommitletFinalReview } from "../src/commitlet/reviewer.js";
@@ -477,4 +477,46 @@ test("reliability benchmark includes variant E kernel metrics", () => {
   const results = runReliabilityBenchmark({ cwd: process.cwd(), variant: "E", limit: 2 });
   assert.equal(results.length, 2);
   assert.ok(results.every((result) => typeof result.healthScore === "number"));
+});
+
+test("countDiffLines counts content lines containing --- and excludes only the diff headers", () => {
+  // Regression: an unanchored `---` dropped real content lines (front-matter/YAML/`"---"` literals),
+  // under-counting the diff (which feeds the size cap, health scoring, and the smaller-is-better tiebreak).
+  const diff = [
+    "--- a/notes.md", "+++ b/notes.md",
+    "+---",                       // markdown front-matter fence — a real added line
+    "+title: hi",
+    "+const sep = \"---\";",     // a real added line containing ---
+    "+ok",
+    "-old --- line",              // a real removed line containing ---
+  ].join("\n");
+  assert.equal(countDiffLines(diff), 5, "5 real +/- content lines; the 2 headers excluded");
+});
+
+test("taskInvolvesDependency: real dependency intent yes; product 'package'/'module' nouns no", () => {
+  const t = (title: string): boolean => taskInvolvesDependency({ title, purpose: "", spec: undefined } as never);
+  // real dependency tasks
+  assert.equal(t("npm install axios"), true);
+  assert.equal(t("add a dependency on lodash"), true);
+  assert.equal(t("add the axios package and use it in api.ts"), true, "naming a package (head noun) is a dep task");
+  assert.equal(t("add a package"), true);
+  // product features that merely contain the words — must NOT demote the manifest-edit block
+  assert.equal(t("add package tracking to the shipping dashboard"), false, "package modifies 'tracking' → product feature");
+  assert.equal(t("integrate the payments module"), false);
+  assert.equal(t("add a user module to the admin area"), false);
+});
+
+test("forgeCommitletSpec: multi-file acceptance criteria name targets jointly, not contradictory 'only' lines", () => {
+  const multi = forgeCommitletSpec({ expectedFilesTouched: ["a.ts", "b.ts", "c.ts"], focusedVerification: [], purpose: "p", scope: "edit" } as never, "feature_addition", "build");
+  assert.equal(multi.acceptanceCriteria.length, 1, "one joint line, not one contradictory 'only' line per file");
+  assert.match(multi.acceptanceCriteria[0], /a\.ts, b\.ts, c\.ts/);
+  const single = forgeCommitletSpec({ expectedFilesTouched: ["only.ts"], focusedVerification: [], purpose: "p", scope: "edit" } as never, "feature_addition", "build");
+  assert.match(single.acceptanceCriteria[0], /only\.ts is the only expected edit target/);
+});
+
+test("classifyImpact: TS method/arrow signatures counted; slash paths are not command registrations", () => {
+  assert.ok(classifyImpact(["src/foo.ts"], "-  run(a) {\n+  run(a, b) {\n").includes("method_signature_change"), "keyword-less TS method sig change");
+  assert.ok(!classifyImpact(["src/x.ts"], "+  if (cond) {\n").includes("method_signature_change"), "an if-statement is not a signature change");
+  assert.ok(!classifyImpact(["src/math.py"], "+def add(a,b):\n+    return a/b\n").includes("command_registration_change"), "integer division a/b is not a command registration");
+  assert.ok(classifyImpact(["src/x.ts"], '+ pi.registerCommand("hi", {})').includes("command_registration_change"), "a real registerCommand call still counts");
 });

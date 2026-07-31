@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ConversationStore } from "../src/core/store/conversationStore.js";
+import { ConversationStore, pendingRepairs } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 
 function memStore(): ConversationStore {
@@ -49,7 +49,7 @@ test("run projection tracks lifecycle: started -> files -> completed", () => {
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "a.py", added: 2, removed: 0 }, 2001);
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "a.py", added: 1, removed: 0 }, 2002); // dedup
   s.appendEvent("c1", { type: "file.changed", runId: "r1", path: "b.py", added: 5, removed: 1 }, 2003);
-  s.appendEvent("c1", { type: "run.completed", runId: "r1", finished: true, lane: "reliable", summary: "done", wallMs: 12, usage: { prompt: 3, completion: 4, reasoning: 1 } }, 2004);
+  s.appendEvent("c1", { type: "run.completed", runId: "r1", finished: true, verified: true, lane: "reliable", summary: "done", wallMs: 12, usage: { prompt: 3, completion: 4, reasoning: 1 } }, 2004);
   const run = s.getRun("r1")!;
   assert.equal(run.status, "completed");
   assert.equal(run.finished, true);
@@ -75,7 +75,7 @@ test("recoverInterruptedRuns flips transient runs to interrupted and logs an eve
   seedConversation(s);
   s.appendEvent("c1", { type: "run.started", runId: "live", request: "x", lane: "reliable" }, 4000);
   s.appendEvent("c1", { type: "run.started", runId: "done", request: "y", lane: "reliable" }, 4001);
-  s.appendEvent("c1", { type: "run.completed", runId: "done", finished: true, lane: "reliable", summary: "ok", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 } }, 4002);
+  s.appendEvent("c1", { type: "run.completed", runId: "done", finished: true, verified: true, lane: "reliable", summary: "ok", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 } }, 4002);
   const recovered = s.recoverInterruptedRuns(9999);
   assert.equal(recovered.length, 1);
   assert.equal(recovered[0].type, "run.interrupted");
@@ -84,6 +84,18 @@ test("recoverInterruptedRuns flips transient runs to interrupted and logs an eve
   assert.equal(s.getRun("done")!.status, "completed"); // untouched
   // recovery is idempotent — a second pass finds nothing.
   assert.equal(s.recoverInterruptedRuns(10000).length, 0);
+});
+
+test("a second store on the same file migrates cleanly (no double-migrate) and reads the data", () => {
+  // Migration reads/applies/bumps the version inside one transaction, so re-opening (or a concurrent
+  // opener) re-reads the current version and no-ops instead of re-running CREATE TABLE.
+  const path = join(mkdtempSync(join(tmpdir(), "kitten-store-")), "conv.db");
+  const s1 = ConversationStore.open(path);
+  s1.createConversation({ id: "x", title: "t", projectRoot: "/p", projectId: "/p", model: "m", mode: "auto", ts: 1 });
+  s1.close();
+  const s2 = ConversationStore.open(path); // must not throw "table already exists"
+  assert.equal(s2.getConversation("x")?.id, "x", "the second store reads the migrated data");
+  s2.close();
 });
 
 test("appendEvent to an unknown conversation throws", () => {
@@ -104,6 +116,16 @@ test("listConversations filters by project, archive, and search", () => {
   assert.equal(s.listConversations({ includeArchived: true }).length, 2);
 });
 
+test("recent messages stay searchable in a long conversation (index keeps the newest text, not the oldest)", () => {
+  // Regression: the search index kept the FIRST 20000 chars, so after a long conversation filled it,
+  // every later message fell past the cutoff and became unsearchable.
+  const s = memStore();
+  s.createConversation({ id: "long", title: "t", projectRoot: "/p", projectId: "/p", model: "m", mode: "auto", ts: 1 });
+  s.appendEvent("long", { type: "user.message", text: "alpha ".repeat(5000) }, 2); // ~30000 chars of early bulk
+  s.appendEvent("long", { type: "user.message", text: "please add rate limiting to the uploader" }, 3);
+  assert.deepEqual(s.listConversations({ search: "rate limiting" }).map((c) => c.id), ["long"], "the newest message must remain searchable");
+});
+
 test("data survives close + reopen (durability across process restart)", () => {
   const dir = mkdtempSync(join(tmpdir(), "kitten-store-"));
   const dbfile = join(dir, "kitten.db");
@@ -117,4 +139,55 @@ test("data survives close + reopen (durability across process restart)", () => {
   assert.deepEqual(evs.map((e) => e.type), ["conversation.created", "user.message"]);
   assert.equal(s2.getConversation("persist")!.title, "Fix the parser");
   s2.close();
+});
+
+// A store on a real machine can carry a `user_version` this code line never wrote — an older or forked
+// Kitten numbered its migrations differently. The stamp then says "current" while the columns this line
+// needs are absent, and the observed result was that every new conversation failed with
+// "table conversations has no column named provider": the app was dead on the store it had been using.
+test("a store stamped by a foreign migration line is reconciled instead of failing every write", () => {
+  const db = openSqlite(":memory:");
+  // A v1-era schema, stamped far ahead of this line's migration count.
+  db.exec(`
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, project_root TEXT NOT NULL, project_id TEXT NOT NULL,
+      model TEXT NOT NULL, mode TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+      search_text TEXT NOT NULL DEFAULT '', schema_version INTEGER NOT NULL
+    );
+    CREATE TABLE events (
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+      ts INTEGER NOT NULL, type TEXT NOT NULL, run_id TEXT, payload TEXT NOT NULL,
+      schema_version INTEGER NOT NULL, PRIMARY KEY (conversation_id, seq)
+    );
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      request TEXT NOT NULL DEFAULT '', lane TEXT, reasons TEXT NOT NULL DEFAULT '[]',
+      k INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL, finished INTEGER NOT NULL DEFAULT 0,
+      winner INTEGER, summary TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0,
+      files_changed TEXT NOT NULL DEFAULT '[]', usage TEXT NOT NULL DEFAULT '{}', error TEXT,
+      started_at INTEGER NOT NULL, ended_at INTEGER, schema_version INTEGER NOT NULL, snapshot TEXT,
+      redo_snapshot TEXT, model TEXT
+    );
+    PRAGMA user_version = 99;
+  `);
+
+  const missing = pendingRepairs(db);
+  assert.ok(missing.some((repair) => repair.label === "added conversations.provider"), `expected drift to be detected, saw: ${missing.map((r) => r.label).join(", ")}`);
+
+  const store = new ConversationStore(db);
+  assert.equal(pendingRepairs(db).length, 0, "opening the store must leave no drift behind");
+
+  // The failure this guards against was on the very first write, so exercise the real paths.
+  store.createConversation({ id: "drift-1", title: "Recovered", projectRoot: "/proj", projectId: "/proj", model: "ornith", mode: "auto", ts: 1000 });
+  const conversation = store.getConversation("drift-1");
+  assert.equal(conversation?.title, "Recovered");
+  assert.equal(store.listConversations({}).length, 1);
+
+  // A foreign stamp is left alone: this line must not claim a newer store is older than it is.
+  const version = db.prepare("PRAGMA user_version").get() as { user_version: number };
+  assert.equal(version.user_version, 99);
+
+  // Repair is idempotent — a second open is a no-op rather than a duplicate-column error.
+  assert.doesNotThrow(() => new ConversationStore(db));
 });

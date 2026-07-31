@@ -1,12 +1,13 @@
 # 🐱 Kitten
 
-**A reliable, local-first coding agent for local models — terminal UI, local web UI, durable
-conversations, and an adaptive reliability engine.**
+**A reliable, local-first native desktop coding agent for local models — durable conversations,
+sidecar orchestration, and an adaptive reliability engine.**
 
 Kitten runs a coding agent against a model you host locally (LM Studio, llama.cpp, or any
-OpenAI-compatible endpoint). It edits your repo, runs your tools, verifies its own work with real
-execution, isolates risky attempts, and remembers every session. One shared core drives a terminal UI,
-a local web UI, and a headless CLI over one durable SQLite conversation store.
+OpenAI-compatible endpoint). It edits your repo, runs bounded project checks, verifies its own work
+with real execution, isolates risky attempts, and remembers every session. The supported product is a
+browser-free native Windows app with a hidden local engine; the release bundle contains no HTML,
+WebView, terminal, or TUI surface.
 
 > **Alpha / technical preview.** It works end to end; expect rough edges. Built for *local* models — it
 > is honest about the latency and capability that implies, and makes no hosted-agent parity claims.
@@ -18,19 +19,20 @@ a local web UI, and a headless CLI over one durable SQLite conversation store.
 
 ## Quick start
 
-Requires **Node ≥ 22.5** (uses the built-in `node:sqlite` — no native build step, no compiler).
+The supported user path is the packaged native app. Download the latest
+[`Kitten desktop release`](./artifacts/kitten-desktop-final-runtime114.zip), run `Kitten.Setup.exe`,
+and launch **Kitten** from the Start Menu. The installer and app never open a terminal or browser.
+
+For maintainers only, the shared engine can still be built from source with Node 22.5+.
 
 ```sh
 cd cheater-pi
 npm install && npm run build
-export KITTEN_BASE_URL="http://localhost:1234/v1"   # your local model server
-export KITTEN_MAIN_MODEL="ornith-1.0-35b"
-node dist/src/core/kitten.js            # terminal UI
-node dist/src/core/kitten.js web        # local web UI (127.0.0.1)
-node dist/src/core/kitten.js run "fix the off-by-one in parser.py"   # headless, persisted
+dotnet publish ../desktop/Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true
 ```
 
-Installed globally, these are just `kitten`, `kitten web`, and `kitten run "…"`.
+The terminal/web/CLI modules remain maintainer compatibility code and are not part of the native
+release payload or supported user workflow.
 
 ## How it works
 
@@ -40,9 +42,21 @@ Installed globally, these are just `kitten`, `kitten web`, and `kitten run "…"
   execution consensus → finished-but-wrong repair). Easy tasks never pay best-of-N latency.
 - **Durable everything** — conversations, events, and runs persist to `~/.kitten/kitten.db`; close and
   resume in either UI; a crash marks in-flight runs interrupted rather than lying about them.
+- **Runtime recovery** — once a local llama.cpp executable and model paths are configured, Kitten
+  remembers them and attempts a bounded automatic restart when the native app opens; a bad path never
+  prevents the UI from opening, and the setup dialog remains available for repair.
+- **Native onboarding** — Model setup scans common loopback ports for LM Studio, llama.cpp, vLLM, or
+  Ollama-compatible endpoints, then recommends tier-compatible advertised models.
+- **Direct specialist invocation** — type `@security audit the auth boundary` (or any Agent Library
+  role) in the native composer to create a durable bounded child session without opening a dialog.
 - **Real safety** — a floor blocks catastrophic / remote-code-execution / secret-exfiltration commands
   in every lane; an approval policy gates destructive ones; `/undo` rolls back a run's own file changes
   (git-backed) while preserving your other work.
+- **Useful sidecar workers** — the native Agent library includes bounded explore, architect, security,
+  debug, test, release, docs, performance, review, and verify roles. They run as durable child conversations on the
+  2B–9B tier, return inspectable evidence, and cannot write files unless a separately-scoped main
+  worker is explicitly chosen. Read-only plans select the specialist from the task's intent
+  automatically.
 - **No telemetry.** Nothing leaves your machine except calls to your configured model endpoint.
 
 ## Where the strength (and honesty) is
@@ -64,8 +78,9 @@ single-run, and directional** — the only continuously-verified figure is the i
 
 ## Compatibility
 
-`cheater` is a compatibility alias that now opens Kitten; `cheater --pi` runs the legacy Pi-based UI.
-Internals still read `.cheater/` for the legacy path; the canonical data/config home is `~/.kitten`.
+`cheater` is a compatibility alias for the native app launcher. Legacy TUI/web/CLI modules remain
+available only for maintainer tests; the canonical supported surface is the native Kitten app.
+Internals still read `.cheater/` for compatibility; the canonical data/config home is `~/.kitten`.
 
 ## License
 

@@ -1,3 +1,30 @@
+// Commitlet execution — the worker prompt assembly pipeline.
+//
+// `buildCommitletExecutionPrompt(plan, commitlet, ...)` is the single entry point that assembles the
+// FULL worker prompt for a commitlet. It is the load-bearing integration seam between half a dozen
+// subsystems — scout, constraints, prompts, sidecar, rule packs, resampling, and tool exposure — all
+// of which must agree on what the worker sees, what it is allowed to do, and how its output is verified.
+//
+// The pipeline:
+//   1. Mode dispatch — scaffold mode produces a single coherent in-session phase prompt; surgical mode
+//      produces a bounded single-file worker prompt with an edit-then-stop contract.
+//   2. Constraint facts — per-file dependency/import/reference edges from the constraint graph (so the
+//      model knows what else may be affected by a change).
+//   3. Sidecar prefetch — if the clerk prepared a compressed facts/orientation/file-order bundle ahead
+//      of time, use it. The deterministic floor is byte-identical when the sidecar is off.
+//   4. File snippets — symbol-slice (the target function/class, not the import block), ordered by the
+//      sidecar's prioritisation or the natural commitlet file order.
+//   5. Resampling diversity — attempt stance (smallest fix / root-cause / clean rewrite), thinking
+//      level (off/low/medium/high per attempt), and evidence withholding (attempt 3 drops the cheat
+//      sheet so it re-derives from raw failure).
+//   6. Tool exposure — mask the tools the worker can use (write/edit/read/bash constrained to the
+//      commitlet scope). Scaffold workers keep write; surgical workers are edit-only + reviewer guard.
+//   7. Capsule + run-state — build a persistent prompt capsule (for durability/reincarnation), attach
+//      the run's contract/digest/ledgers, and render the final text.
+//
+// Every piece is additive and bounded: remove the sidecar, the resampling, the scaffold — the core
+// prompt still assembles correctly, just with fewer "extras".
+
 import type { BlueprintPlan, WorkPacket } from "../blueprint/types.js";
 import { buildPacketExecutionPrompts } from "../blueprint/executor.js";
 import { fileSnippet } from "../blueprint/contextSketch.js";
@@ -24,7 +51,7 @@ import { appendRunEvent } from "../runstate/runDir.js";
 import { operatingRulesFor } from "../reliability/packetPrompt.js";
 import { inferModelClass } from "../reliability/modelProfile.js";
 import { effectiveMode, isRepairCommitlet } from "./types.js";
-import { isManifestPath } from "../blueprint/scaffold.js";
+import { isManifestPath, installCommandForManifest } from "../blueprint/scaffold.js";
 import type { CheaterConfig } from "../types.js";
 
 export type FreshWorkerMode = "simulated" | "real";
@@ -270,7 +297,8 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
   const files = allPhaseFiles.filter((file) => !stampedPaths.has(file));
   const phaseIndex = plan.commitlets.findIndex((entry) => entry.id === commitlet.id) + 1;
   const total = plan.commitlets.length;
-  const hasManifest = allPhaseFiles.some(isManifestPath);
+  const manifestPath = allPhaseFiles.find(isManifestPath);
+  const hasManifest = !!manifestPath;
   const constraints = (plan.globalConstraints ?? []).slice(0, 6);
   const createBlock = files.length
     ? ["Create these files now (this phase only):", ...files.map((file) => `- ${file}`)]
@@ -280,7 +308,7 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
         "",
         "=== FILES THE HARNESS ALREADY WROTE (do NOT recreate or rewrite these) ===",
         ...stamp.stamped.map((entry) => entry.exportsSummary ? `- ${entry.path} - ${entry.exportsSummary}` : `- ${entry.path}`),
-        "Import from these; author only the files listed above. Need another library? Add it to package.json and re-run `npm install`."
+        "Import from these; author only the files listed above. Need another library? Add it to the project manifest and re-run its install step."
       ]
     : [];
   const prompt = [
@@ -292,7 +320,7 @@ function buildScaffoldPhasePrompt(plan: CommitletPlan, commitlet: Commitlet): Co
     ...createBlock,
     ...stampNote,
     "",
-    hasManifest ? "After the manifest exists, run `npm install` and confirm it exits 0." : "",
+    manifestPath ? `After the manifest exists, run \`${installCommandForManifest(manifestPath)}\` and confirm it exits 0.` : "",
     "Rules:",
     "- BE FAST: do NOT write long planning narration or restate the plan between files - every sentence you generate costs real seconds on a local model. Write each file's code directly and move on.",
     "- Use the write tool to create each new file (never heredocs or echo/cat redirection).",

@@ -80,6 +80,8 @@ export interface RunStarted {
   runId: string;
   request: string;
   lane: Lane;
+  model?: string;
+  agent?: string;
 }
 export interface RunStatusChanged {
   type: "run.status";
@@ -141,6 +143,11 @@ export interface ToolCompleted {
   runId: string;
   callId: string;
   name: string;
+  /**
+   * What the call acted on — a path, a command, a pattern. Optional because stored events predate it.
+   * Without it a UI can only say "read", which tells the user nothing about what was read.
+   */
+  target?: string;
   ok: boolean;
   durationMs: number;
   /** Bounded final output. */
@@ -158,6 +165,7 @@ export interface CandidateCompleted {
   index: number;
   finished: boolean;
   summary: string;
+  usage?: { prompt: number; completion: number; reasoning: number };
 }
 export interface CandidateRejected {
   type: "candidate.rejected";
@@ -234,8 +242,12 @@ export interface RunFailed {
 export interface RunCompleted {
   type: "run.completed";
   runId: string;
+  /** The run produced/adopted work and stopped intentionally (NOT the same as verified). */
   finished: boolean;
+  /** Independent execution evidence confirmed the change (finished && !verified = "checked", §4). */
+  verified: boolean;
   lane: Lane;
+  model?: string;
   summary: string;
   wallMs: number;
   usage: { prompt: number; completion: number; reasoning: number };
@@ -250,6 +262,40 @@ export interface RunUndone {
   skipped: string[];
 }
 
+export interface ToolApprovalResolved {
+  type: "tool.approval_resolved";
+  runId: string;
+  callId: string;
+  allowed: boolean;
+  source: "user" | "auto-deny-cancel";
+}
+
+export interface RunRedone {
+  type: "run.redone";
+  runId: string;
+  restored: string[];
+  deleted: string[];
+  skipped: string[];
+}
+
+export interface TaskStarted {
+  type: "task.started";
+  runId: string;
+  childConversationId: string;
+  agent: string;
+  prompt: string;
+}
+
+export interface TaskCompleted {
+  type: "task.completed";
+  runId: string;
+  childConversationId: string;
+  childRunId: string;
+  status: string;
+  summary: string;
+  usage: { prompt: number; completion: number; reasoning: number };
+}
+
 /** The finish receipt: the honest audit trail of what happened (Goal §4/§9 "honest receipts"). */
 export interface ReceiptFinalized {
   type: "receipt.finalized";
@@ -257,6 +303,94 @@ export interface ReceiptFinalized {
   lines: string[];
   filesChanged: string[];
   verified: boolean;
+}
+
+/** Advisory small-model review persisted after a file-changing run. It never changes the run grade. */
+export interface SidecarPostflight {
+  type: "sidecar.postflight";
+  runId: string;
+  source: "sidecar" | "deterministic";
+  secrets: string[];
+  warnings: string[];
+  evidenceWarnings: string[];
+  recommendedTests: string[];
+  suggestedCommands: string[];
+  risk: "low" | "medium" | "high";
+  riskReasons: string[];
+  generatedTestCases: string[];
+}
+
+/** Advisory failure explanation generated after a failed run; it is never verification evidence. */
+export interface SidecarFailure {
+  type: "sidecar.failure";
+  runId: string;
+  source: "sidecar" | "deterministic";
+  severity: "error" | "warning" | "info";
+  signature: string;
+  likelyCause: string;
+  salientLines: string[];
+}
+
+/**
+ * The Task Compiler's decision, recorded BEFORE the expensive model runs so the contract that shaped
+ * the run is always inspectable. Deliberately carries facts and counts — never an aggregate quality
+ * score, and never the rendered contract prose (the full IR lives in the task_compilations table).
+ */
+export interface TaskCompiled {
+  type: "task.compiled";
+  runId: string;
+  mode: "passthrough" | "enrich" | "compile" | "clarify";
+  family: string;
+  goal: string;
+  /** Why this family and mode — inspectable, not sent to the model. */
+  reason: string;
+  requirementCount: number;
+  assumptionCount: number;
+  evidenceCount: number;
+  ambiguityCounts: Record<string, number>;
+  rawRequestTokens: number;
+  renderedContractTokens: number;
+  repositoryQueries: number;
+  sidecarCalls: number;
+  totalMs: number;
+  /** Stable prefix identity this turn was rendered against. */
+  promptEpoch: string;
+  /** Validation problems that did not block use (an erroring compile is never applied). */
+  warnings: string[];
+}
+
+/** The compiler asked exactly one question instead of guessing at a blocking ambiguity. */
+export interface TaskClarificationRequested {
+  type: "task.clarification_requested";
+  runId: string;
+  question: string;
+  /** The blocking ambiguity that forced the question. */
+  ambiguityId: string;
+  detail: string;
+}
+
+/**
+ * Per-step labels over a run's trajectory (good/unnecessary/mistake/recover), persisted so a failed
+ * run stops being a dead end. Advisory: it never changes the run's grade. `productiveRatio` is the
+ * share of steps that were not mistakes — in the SRFT results this stays high even in failed runs,
+ * which is precisely why discarding a failure wholesale throws away mostly-usable data.
+ */
+export interface RunStepCritique {
+  type: "run.step_critique";
+  runId: string;
+  source: "sidecar" | "deterministic";
+  steps: Array<{ step: number; label: string; why: string }>;
+  productiveRatio: number;
+}
+
+/** A user-approved native verification run, persisted as bounded execution evidence. */
+export interface WorkspaceVerification {
+  type: "workspace.verification";
+  runId: string;
+  passed: boolean;
+  cancelled: boolean;
+  commands: string[];
+  results: Array<{ command: string; passed: boolean; allowed: boolean; exitCode: number | null; timedOut: boolean; durationMs: number; output: string }>;
 }
 
 export type EventPayload =
@@ -290,7 +424,17 @@ export type EventPayload =
   | RunFailed
   | RunCompleted
   | RunUndone
-  | ReceiptFinalized;
+  | RunRedone
+  | ToolApprovalResolved
+  | TaskStarted
+  | TaskCompleted
+  | ReceiptFinalized
+  | SidecarPostflight
+  | SidecarFailure
+  | TaskCompiled
+  | TaskClarificationRequested
+  | RunStepCritique
+  | WorkspaceVerification;
 
 export type EventType = EventPayload["type"];
 

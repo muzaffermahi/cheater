@@ -19,11 +19,13 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { runAgent, type AgentRunParams, type AgentRunResult, type FinishGateState } from "./agent.js";
+import type { Tool } from "./tools.js";
 import type { KittenLLM } from "./llm.js";
 import type { ToolContext, ToolResult } from "./tools.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
 import { loadProjectCommands } from "../reliability/projectCommands.js";
 import { symbolSnippet } from "../reliability/symbolSlice.js";
+import { localTscBin } from "../reliability/typeCheckGate.js";
 import { failureCard, renderCard } from "./sidecar.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures, type WorkedExample } from "./workedExamples.js";
 import { deriveBans, forbiddenScan, renderBanViolation } from "./constraints.js";
@@ -33,6 +35,8 @@ export interface ReliableParams {
   cwd: string;
   llm: KittenLLM;
   model?: string;
+  /** Agent profile instructions layered ahead of the reliability contract. */
+  systemPrompt?: string;
   maxTurns?: number;
   temperature?: number;
   reasoningEffort?: "low" | "medium" | "high";
@@ -46,6 +50,10 @@ export interface ReliableParams {
   experiencePrime?: string;
   /** P1: capture per-token logprobs → self-certainty (owned-engine selection signal). */
   captureConfidence?: boolean;
+  /** Candidates in this round; self-certainty is only captured when there is something to compare. */
+  candidateCount?: number;
+  /** Hard cap on thinking tokens per turn; forwarded to the agent loop. */
+  reasoningBudget?: number;
   /** P2/P5: owned-inference per-sample decode controls (forbidden-token ban, sampler diversity). */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
   /** P2: run the finish-gate forbidden-construct source scan (engine-agnostic fallback for the ban). */
@@ -54,6 +62,14 @@ export interface ReliableParams {
   disableThinking?: boolean;
   /** Safety/approval hook forwarded to the agent loop (destructive-command gate). */
   commandGate?: AgentRunParams["commandGate"];
+  /** Model-facing conversation context (prior turns + repo truth) for multi-turn/resumed runs. */
+  contextPreamble?: string;
+  /** Stream real token deltas (forwarded to the agent loop). */
+  streamDeltas?: boolean;
+  tools?: Tool[];
+  spawnTask?: AgentRunParams["spawnTask"];
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 const CODE_EXT = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
@@ -101,6 +117,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     : `Before finishing, actually run your change once (a quick \`python -c\`/\`node -e\` check) to confirm it works — don't finish on assumption.`;
 
   const systemPrompt = [
+    params.systemPrompt,
     "You are Kitten, a precise coding agent. You have tools: read, write, edit, bash, ls, grep, finish.",
     "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
@@ -124,9 +141,17 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     onEvent: params.onEvent,
     signal: params.signal,
     captureConfidence: params.captureConfidence,
+    candidateCount: params.candidateCount,
+    reasoningBudget: params.reasoningBudget,
     decode: params.decode,
     disableThinking: params.disableThinking,
     commandGate: params.commandGate,
+    contextPreamble: params.contextPreamble,
+    streamDeltas: params.streamDeltas,
+    tools: params.tools,
+    spawnTask: params.spawnTask,
+    allowedFiles: params.allowedFiles,
+    forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
     finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
   });
@@ -134,17 +159,17 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
 }
 
 /** Tier A2: compile-check a just-edited code file; a syntax error is returned so the model fixes it now. */
-function postEditSyntaxGate(call: { name: string; args: Record<string, unknown> }, res: ToolResult, ctx: ToolContext): string | undefined {
+export function postEditSyntaxGate(call: { name: string; args: Record<string, unknown> }, res: ToolResult, ctx: ToolContext): string | undefined {
   if (res.isError) return undefined;
   if (call.name !== "edit" && call.name !== "write") return undefined;
   const path = typeof call.args.path === "string" ? call.args.path : "";
   const ext = extname(path).toLowerCase();
   if (!CODE_EXT.has(ext)) return undefined;
   const full = join(ctx.cwd, path);
+  if (ext === ".ts" || ext === ".tsx" || ext === ".mts" || ext === ".cts") return typeScriptSyntaxGate(ctx.cwd, path, full);
   let check: { cmd: string; args: string[] } | null = null;
   if (ext === ".py") check = { cmd: "python", args: ["-m", "py_compile", full] };
   else if (ext === ".js" || ext === ".mjs" || ext === ".cjs") check = { cmd: "node", args: ["--check", full] };
-  // (.ts/.tsx have no cheap standalone syntax check without tsc; skip — the finish gate still runs.)
   if (!check) return undefined;
   try {
     const r = spawnSync(check.cmd, check.args, { encoding: "utf8", timeout: 20000, windowsHide: true });
@@ -153,6 +178,54 @@ function postEditSyntaxGate(call: { name: string; args: Record<string, unknown> 
       return `SYNTAX CHECK FAILED for ${path}:\n${diag}\nFix this before continuing — the file will not run as written.`;
     }
   } catch { /* checker missing -> skip silently */ }
+  return undefined;
+}
+
+/** tsc reserves TS1xxx for grammar errors; TS2xxx and up are semantic and are not this gate's job. */
+const TS_SYNTAX_ERROR = /error\s+TS1\d{3}:/;
+
+/**
+ * Reduce a single-file tsc run to a model-facing message, or undefined when there is nothing to say.
+ * Pure and exported because this filter is the whole safety argument for running tsc per edit: keep
+ * grammar errors, drop the module-resolution noise that compiling one file out of its project always
+ * produces.
+ */
+export function typeScriptSyntaxDiagnostic(path: string, output: string): string | undefined {
+  const diag = (output ?? "")
+    .split(/\r?\n/)
+    .filter((line) => TS_SYNTAX_ERROR.test(line))
+    .slice(0, 4)
+    .map((line) => line.trim().slice(0, 240));
+  if (!diag.length) return undefined;
+  return `SYNTAX CHECK FAILED for ${path}:\n${diag.join("\n")}\nFix this before continuing — the file will not compile as written.`;
+}
+
+/**
+ * Syntax-check a just-edited TypeScript file.
+ *
+ * This used to be skipped outright ("no cheap standalone check without tsc"), which left the repo's
+ * own primary language as the one hole in the post-edit gate. The check is a single-file `tsc` run,
+ * and two things make it safe to run per edit:
+ *   - It reports ONLY TS1xxx grammar errors. Compiling one file outside its project produces plenty
+ *     of TS2xxx module-resolution noise ("cannot find module './x'") that is an artifact of the
+ *     single-file invocation, not a defect in the edit. Reporting that would send the model chasing
+ *     phantoms — strictly worse than skipping.
+ *   - It only runs when tsc is installed locally, and never blocks when it is missing or times out.
+ *
+ * Measured at ~1s per edit on this repo, against ~0.3s for `py_compile`; the same order as the
+ * checks that were already running. `node --check` was tried first and rejected: it rejects valid
+ * TypeScript (`enum`) and its module detection is inconsistent, so it produced false failures.
+ */
+function typeScriptSyntaxGate(cwd: string, path: string, full: string): string | undefined {
+  const bin = localTscBin(cwd);
+  if (!bin) return undefined; // no local tsc -> honest skip, same rule as the typecheck gate
+  try {
+    // Shell form: the local binary is a .cmd shim on Windows, which spawnSync cannot exec directly.
+    const command = `"${bin}" --noEmit --skipLibCheck --target es2022 --module esnext --moduleResolution bundler "${full}"`;
+    const r = spawnSync(command, { cwd, shell: true, encoding: "utf8", timeout: 20000, windowsHide: true });
+    if (r.signal === "SIGTERM" || r.signal === "SIGKILL") return undefined; // a slow check must never dead-end the model
+    return typeScriptSyntaxDiagnostic(path, `${r.stdout ?? ""}\n${r.stderr ?? ""}`);
+  } catch { /* checker missing/unrunnable -> skip silently */ }
   return undefined;
 }
 

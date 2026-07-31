@@ -48,6 +48,39 @@ test("runAscent orchestrates prime→generate→cascade→verify→adopt and sel
   assert.ok(res.receipts.some((l) => /verifier: winner/.test(l)));
 });
 
+test("attempt indices are globally unique across repair rounds (no cascade/verifier/measure collision)", async () => {
+  // Regression: cloudBurst assigns round-local indices 1..k; a repair round's indices collided with
+  // round 1, collapsing the survivorsByIndex map and misattributing Best@1. A task with worked examples
+  // that every candidate FAILS never breaks early, so both rounds run and their indices must stay unique.
+  const cwd = baseWorkspace();
+  const taskGT = "Implement `f` in impl.py so it doubles its input. Examples: `f(2) -> 4`, `f(3) -> 6`.";
+  const runWrong: RunOne = async (p) => {
+    writeFileSync(join(p.cwd, "impl.py"), "def f(x):\n    return x + 1\n"); // wrong: f(2)=3, fails the examples
+    return { finished: true, summary: "wrong", turns: 1, toolCalls: 1, filesWritten: ["impl.py"], events: [], usage: { prompt: 1, completion: 1, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
+  };
+  let captured: number[] = [];
+  const config: AscentConfig = { llm: fakeLlm, runOne: runWrong, levers: ALL_LEVERS, onVerified: ({ attempts }) => { captured = attempts.map((a) => a.index); } };
+  await runAscent({ task: taskGT, cwd, hardness: { taskKind: "bug_fix" } }, config);
+  assert.ok(captured.length >= 4, `expected two rounds of attempts, got ${captured.length}: [${captured}]`);
+  assert.equal(new Set(captured).size, captured.length, `indices must be globally unique across rounds: [${captured}]`);
+});
+
+test("candidate lifecycle hooks expose durable started/completed/rejected cards", async () => {
+  const cwd = baseWorkspace();
+  const events: Array<{ phase: string; index: number }> = [];
+  const runWrong: RunOne = async (p) => {
+    writeFileSync(join(p.cwd, "impl.py"), "def f(x):\n    return x + 1\n");
+    return { finished: true, summary: "wrong", turns: 1, toolCalls: 1, filesWritten: ["impl.py"], events: [], usage: { prompt: 1, completion: 1, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
+  };
+  await runAscent(
+    { task: "Implement `f` in impl.py. Examples: `f(2)` -> `4`; `f(3)` -> `6`.", cwd, forceSamples: 2, hardness: {} },
+    { llm: fakeLlm, runOne: runWrong, levers: { ...ALL_LEVERS }, onCandidate: ({ phase, attempt }) => { events.push({ phase, index: attempt.index }); } }
+  );
+  assert.ok(events.filter((e) => e.phase === "started").length >= 2, "each generated candidate starts a durable card");
+  assert.ok(events.some((e) => e.phase === "completed"), "candidate completion is emitted after generation");
+  assert.ok(events.some((e) => e.phase === "rejected"), "execution-ineligible candidates are explained as rejected");
+});
+
 test("diversity lever OFF ⇒ a single attempt (k=1), no diverse batch", async () => {
   const cwd = baseWorkspace();
   const res = await runAscent({ task: TASK, cwd, hardness: { taskKind: "bug_fix" } }, { llm: fakeLlm, runOne, levers: { ...NO_LEVERS } });

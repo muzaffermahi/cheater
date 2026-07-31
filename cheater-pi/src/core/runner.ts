@@ -14,6 +14,8 @@ import { runBestOfN } from "./bestofn.js";
 import { runAscent, defaultAscentConfig } from "./ascent.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { changedFilesSince } from "./undo.js";
+import { getAgent } from "./agents.js";
+import { CORE_TOOLS, type Tool } from "./tools.js";
 
 /** Build the default Runner over a KittenLLM (defaults to the local LM Studio tiering). */
 export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT_MODELS))): Runner {
@@ -23,25 +25,45 @@ export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT
   };
 }
 
+function agentConfig(ctx: RunContext, llm: KittenLLM): { systemPrompt?: string; model: string; tools: Tool[] } {
+  const definition = getAgent(ctx.agent ?? "general", ctx.cwd);
+  const model = definition?.model === "sidecar" ? (llm.models.sidecar ?? ctx.model) : ctx.model;
+  const permission = definition?.permission ?? {};
+  const tools = CORE_TOOLS.filter((tool) => {
+    const name = tool.schema.name;
+    if ((name === "edit" || name === "write") && permission.edit === "deny") return false;
+    if (name === "bash" && permission.bash === "deny") return false;
+    if (name === "task" && permission.task === "deny") return false;
+    return true;
+  });
+  return { systemPrompt: definition?.systemPrompt, model, tools };
+}
+
 /** Answer-only lane: one chat, no write tools, stream the reply as assistant deltas. */
 async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   const started = Date.now();
-  const r = await llm.chat({
-    model: ctx.model,
-    messages: [
-      { role: "system", content: "You are Kitten, a precise coding assistant. Answer the question directly and concisely. Do not modify any files." },
-      { role: "user", content: ctx.task },
-    ],
-    signal: ctx.signal,
-  });
-  const text = r.ok ? r.content : `(model error: ${r.error ?? "unknown"})`;
-  ctx.emit({ type: "assistant.final", runId: ctx.runId, text });
+  const profile = agentConfig(ctx, llm);
+  // Merge context into the ONE system message (templates reject a second system message).
+  const sys = (profile.systemPrompt ?? "You are Kitten, a precise coding assistant.") + " Answer the question directly and concisely. Do not modify any files."
+    + (ctx.conversationContext.trim() ? `\n\n${ctx.conversationContext}` : "");
+  const chatParams = { model: ctx.model, messages: [{ role: "system" as const, content: sys }, { role: "user" as const, content: ctx.task }], signal: ctx.signal };
+  // Stream the answer live (coalesced) so a long explanation on a slow local model isn't a frozen wait.
+  let buf = "";
+  const r = typeof llm.chatStream === "function"
+    ? await llm.chatStream(chatParams, (d) => { if (d.content) { buf += d.content; if (buf.length >= 48) { ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf }); buf = ""; } } })
+    : await llm.chat(chatParams);
+  if (buf) ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: buf });
+  // A model error / cancel in the answer lane must terminate as failed/cancelled — not be recorded as a
+  // "completed" run like a successful answer (the coding lanes already fail on error via a throw). The
+  // app's submitMessage maps this throw to run.failed, or run.cancelled when the signal was aborted.
+  if (!r.ok) throw new Error(r.error ? `model error: ${r.error}` : "model error");
+  ctx.emit({ type: "assistant.final", runId: ctx.runId, text: r.content });
   return {
-    finished: r.ok,
-    summary: text.slice(0, 200),
+    finished: true,
+    summary: r.content.slice(0, 200),
     wallMs: Date.now() - started,
     usage: { prompt: r.usage.prompt, completion: r.usage.completion, reasoning: r.usage.reasoning },
-    receiptLines: [`answer-only lane: ${r.ok ? "answered" : "model error"}`],
+    receiptLines: ["answer-only lane: answered", ...(r.formatRescues ? [`format rescues: ${r.formatRescues}`] : [])],
     filesChanged: [],
     verified: false,
   };
@@ -49,17 +71,33 @@ async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
 
 /** Coding lanes: direct/reliable/bon/ascent. Maps AgentEvents → canonical events as they arrive. */
 async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
+  const profile = agentConfig(ctx, llm);
   let toolN = 0;
+  const streamedTurns = new Set<number>();
   const onEvent = (e: AgentEvent): void => {
     switch (e.kind) {
+      case "assistant_delta":
+        streamedTurns.add(e.turn);
+        if (e.detail) ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
+        break;
+      case "reasoning_delta":
+        if (e.detail) ctx.emit({ type: "reasoning.delta", runId: ctx.runId, text: e.detail });
+        break;
       case "assistant":
-        if (e.detail && e.detail !== "(tool call)") ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
+        // Non-streaming fallback: emit the whole turn content as one delta. When this turn already
+        // streamed, skip — the deltas covered it (no duplicate text; Goal §3).
+        if (!streamedTurns.has(e.turn) && e.detail && e.detail !== "(tool call)") ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
         break;
       case "tool": {
         const name = e.detail.split("(")[0].trim() || "tool";
         const ok = !(e.data && (e.data as { error?: boolean }).error);
         const output = e.data && typeof (e.data as { output?: string }).output === "string" ? String((e.data as { output?: string }).output) : "";
-        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: `${ctx.runId}:t${toolN++}`, name, ok, durationMs: 0, output });
+        // The agent already renders `name(brief args) -> ok`; carry the argument through as `target` so a
+        // client can say "read src/parser.ts" instead of just "read".
+        const open = e.detail.indexOf("(");
+        const close = e.detail.lastIndexOf(")");
+        const target = open >= 0 && close > open ? e.detail.slice(open + 1, close).trim() : "";
+        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: `${ctx.runId}:t${toolN++}`, name, ...(target ? { target } : {}), ok, durationMs: 0, output });
         break;
       }
       case "gate_block":
@@ -72,7 +110,7 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     }
   };
 
-  const common = { task: ctx.task, cwd: ctx.cwd, llm, model: ctx.model, onEvent, signal: ctx.signal };
+  const common = { task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, tools: profile.tools, spawnTask: ctx.spawnTask, allowedFiles: ctx.allowedFiles, forbiddenFiles: ctx.forbiddenFiles, onEvent, signal: ctx.signal };
 
   // Route destructive shell commands through the app's approval policy (Goal §8). Catastrophic/RCE/exfil
   // are hard-blocked by the engine's safety floor regardless; this gates merely-destructive ("warn") ones.
@@ -83,13 +121,21 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     return { allowed, feedback: allowed ? undefined : `denied by approval policy: ${assessment.message}` };
   };
 
-  if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent);
+  if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent, profile);
 
+  const preamble = ctx.conversationContext || undefined;
+  // Stream the single-trajectory lanes (direct/reliable). bon/ascent run multiple candidates in parallel
+  // isolated workspaces — interleaving their token streams would be noise, so they don't stream.
   const result = ctx.lane === "bon"
-    ? await runBestOfN({ ...common }, ctx.k)
+    ? await runBestOfN({ ...common, contextPreamble: preamble }, ctx.k, {
+      onSlateEntry: (entry) => {
+        ctx.emit({ type: "candidate.started", runId: ctx.runId, index: entry.attempt });
+        ctx.emit({ type: "candidate.completed", runId: ctx.runId, index: entry.attempt, finished: entry.finished, summary: entry.stopReason });
+      }
+    })
     : ctx.lane === "direct"
-      ? await runAgent({ ...common, commandGate })
-      : await runReliableAgent({ ...common, commandGate });
+      ? await runAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true })
+      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
@@ -102,39 +148,80 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     receiptLines: [
       `${ctx.lane} lane: ${result.stopReason} in ${result.turns} turns (${(result.wallMs / 1000).toFixed(1)}s)`,
       `files: ${result.filesWritten.join(", ") || "none"}`,
+      ...(result.formatRescues ? [`format rescues: ${result.formatRescues} optional structured-output constraint(s) removed after endpoint rejection`] : []),
     ],
     filesChanged: result.filesWritten,
-    verified: result.finished,
+    // The reliable lane's finish gate requires an execution receipt, so a gate-APPROVED reliable finish
+    // is verified. A FORCED finish (rejection budget exhausted → auto-allowed to avoid a loop) obtained
+    // no receipt and must not be verified. The DIRECT lane has NO finish gate — "finished" only means the
+    // model stopped, never verified (§4).
+    verified: ctx.lane === "direct" ? false : (result.finished && !result.forcedFinish),
   };
 }
 
+/**
+ * The winner's own summary is the last thing its agent said — which, after a long run, is often a
+ * transport or context error from a turn that happened AFTER the work was already done and verified.
+ * Reporting that verbatim on a green run is actively misleading: observed live, a from-scratch build
+ * that scored 13/13 on a hidden oracle was summarized as
+ * "model call failed: HTTP 500: Context size has been exceeded."
+ *
+ * So when execution evidence passed, lead with what was actually achieved and keep the error as
+ * trailing context — never drop it, because a run that hit its context ceiling is worth knowing about.
+ */
+function ascentSummary(a: { summary: string; winnerHasExecutionReceipt: boolean }, adopted: boolean): string {
+  const summary = a.summary.trim();
+  if (!adopted) return summary || "no candidate adopted";
+  const terminalError = /^(?:model call failed|HTTP \d{3}\b|request failed|stream error)/i.test(summary);
+  if (!summary) return a.winnerHasExecutionReceipt ? "solved (verified)" : "implemented (not independently verified)";
+  if (terminalError && a.winnerHasExecutionReceipt) {
+    return `solved (verified by execution); a later model call did not complete: ${summary.slice(0, 200)}`;
+  }
+  return summary;
+}
+
 /** Ascent lane: the full pass@k→pass@1 machine. Degrades to reliable if config assembly refuses. */
-async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void): Promise<RunOutcome> {
+async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void, profile: { systemPrompt?: string; model: string }): Promise<RunOutcome> {
   let config;
   try {
     config = defaultAscentConfig(llm, ctx.cwd);
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: ctx.model, onEvent, signal: ctx.signal });
+    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
-      receiptLines: [`ascent→reliable fallback: ${result.stopReason} in ${result.turns} turns`], filesChanged: result.filesWritten, verified: result.finished,
+    receiptLines: [`ascent→reliable fallback: ${result.stopReason} in ${result.turns} turns`, ...(result.formatRescues ? [`format rescues: ${result.formatRescues}`] : [])], filesChanged: result.filesWritten, verified: result.finished && !result.forcedFinish,
     };
   }
+  config.onCandidate = async ({ phase, attempt, reason }) => {
+    if (phase === "started") ctx.emit({ type: "candidate.started", runId: ctx.runId, index: attempt.index });
+    else if (phase === "completed") ctx.emit({ type: "candidate.completed", runId: ctx.runId, index: attempt.index, finished: attempt.result.finished, summary: attempt.result.summary, usage: attempt.result.usage });
+    else ctx.emit({ type: "candidate.rejected", runId: ctx.runId, index: attempt.index, reason: reason ?? "candidate rejected" });
+  };
   const a = await runAscent(
-    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal },
+    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model },
     config
   );
   // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it
   // doesn't self-report changed files. Derive them from git against the pre-run snapshot and surface
   // them as events, so the diff view and /undo cover the Ascent lane too.
-  const filesChanged = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
+  // Prefer git (it distinguishes changed from merely-present), but fall back to what adoption
+  // actually copied. A non-git workspace has no snapshot, and reporting `[]` there made a run that
+  // wrote four correct files claim it changed nothing — which silently disables /undo, empties the
+  // diff view, and skips postflight review.
+  const fromGit = ctx.snapshotRef ? changedFilesSince(ctx.cwd, ctx.snapshotRef) : [];
+  const filesChanged = fromGit.length ? fromGit : a.adoptedFiles;
   for (const f of filesChanged) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
+  // Distinguish FINISHED (a winner was selected + adopted — work was produced and a candidate self-
+  // verified) from VERIFIED (independent execution proof). A correct stateful/class solve with no clean
+  // worked examples adopts a winner but earns no receipt → finished:true, verified:false = "checked",
+  // NOT a red failure (§4: don't collapse these). Measurement (cli.ts --ascent) still uses the receipt.
+  const adopted = a.winner != null;
   return {
-    finished: a.finished,
-    summary: a.summary || (a.finished ? "solved" : "unfinished"),
+    finished: adopted,
+    summary: ascentSummary(a, adopted),
     wallMs: a.wallMs,
     usage: a.usage,
     receiptLines: a.receipts,

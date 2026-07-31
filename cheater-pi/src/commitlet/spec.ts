@@ -13,9 +13,14 @@ export function forgeCommitletSpec(commitlet: Commitlet, taskKind: TaskKind, use
       ? ["Observable behavior must not change.", "Public API and command/tool registrations must stay compatible unless explicitly scoped."]
       : ["Unrelated files and behavior must remain unchanged."],
     edgeCases: isBug ? ["Failure should not be hidden by weakening tests."] : ["Do not overbuild beyond the acceptance criteria."],
-    acceptanceCriteria: commitlet.expectedFilesTouched.length
-      ? commitlet.expectedFilesTouched.map((file) => `${file} is the only expected edit target for this commitlet.`)
-      : [`Commitlet purpose is satisfied: ${commitlet.purpose}.`],
+    // ONE file → "the only" target; MANY → name them jointly. Mapping "is the only edit target" over each
+    // of several files produced mutually-contradictory criteria ("a is the only", "b is the only", …) that
+    // were rendered verbatim into the weak model's worker prompt on the multi-file scaffold path.
+    acceptanceCriteria: commitlet.expectedFilesTouched.length === 1
+      ? [`${commitlet.expectedFilesTouched[0]} is the only expected edit target for this commitlet.`]
+      : commitlet.expectedFilesTouched.length
+        ? [`Expected edit targets for this commitlet: ${commitlet.expectedFilesTouched.join(", ")}.`]
+        : [`Commitlet purpose is satisfied: ${commitlet.purpose}.`],
     temporaryTestsAllowed: isBug,
     permanentTestsAllowed: isBug || /test/i.test(commitlet.scope),
     reproductionCommand: isBug ? commitlet.focusedVerification.find((step) => step.command)?.command : undefined,

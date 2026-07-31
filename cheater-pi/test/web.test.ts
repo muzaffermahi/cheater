@@ -58,6 +58,14 @@ test("web: /api requires the token", async () => {
   await srv.close();
 });
 
+test("web: a non-object JSON body (null) does not crash the handler into a 500", async () => {
+  // Regression: JSON.parse("null") returned null from readJson, which handlers destructured → 500.
+  const { srv, base } = await serve();
+  const res = await fetch(`${base}/api/conversations`, { method: "POST", headers: auth(srv.token), body: "null" });
+  assert.notEqual(res.status, 500, "a null body must be treated as empty, not throw");
+  await srv.close();
+});
+
 test("web: bad Origin is rejected", async () => {
   const { srv, base } = await serve();
   const res = await fetch(`${base}/api/conversations`, { headers: auth(srv.token, { origin: "http://evil.example" }) });

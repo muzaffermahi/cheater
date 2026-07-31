@@ -94,6 +94,16 @@ test("an explicit read-only question stays answer_only even with an action verb 
   assert.notEqual(fix.executionMode, "answer_only");
 });
 
+test("a scoped 'do not modify X' constraint does not suppress a real action verb elsewhere", () => {
+  // Regression: "…and fix it, but do not modify the existing API" routed to answer_only because the
+  // scoped negation tripped the read-only path and hid the "fix" verb.
+  const scoped = routeAutopilot({ cwd: cwd(), message: "Explain why the upload fails and fix it, but do not modify the existing API" });
+  assert.notEqual(scoped.executionMode, "answer_only", "the fix request must reach a code mode");
+  // A POSITIVE "don't forget to fix" (verb not adjacent to the negation) must still route to a fix mode.
+  const dontForget = routeAutopilot({ cwd: cwd(), message: "don't forget to fix the crash in parser.py" });
+  assert.notEqual(dontForget.executionMode, "answer_only");
+});
+
 test("looksLikeNewGoal: a short imperative naming a target is a NEW goal, not an ack", () => {
   // The core of the short-goal-hijack fix: these must NOT be treated as acknowledgements of a
   // prior plan (which re-issued the OLD goal to the model).

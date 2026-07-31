@@ -14,9 +14,15 @@ export type ImpactLabel =
 export function classifyImpact(files: string[], diffText = ""): ImpactLabel[] {
   const labels = new Set<ImpactLabel>();
   if (/^\+.*\bimport\b|^-.*\bimport\b/gm.test(diffText)) labels.add("import_change");
-  if (/^\+.*\b(function|def)\s+\w+\([^)]*\)|^-.*\b(function|def)\s+\w+\([^)]*\)/gm.test(diffText)) labels.add("method_signature_change");
+  // A named callable's param list changing: `function`/`def`, OR a keyword-less TS class method / arrow
+  // (`run(a, b) {`, `const f = (…) =>`) — but NOT control-flow (`if (x) {`) or a bare call-site.
+  if (/^[+-].*\b(function|def)\s+\w+\([^)]*\)/m.test(diffText)
+    || /^[+-]\s*(?:(?:export|async|public|private|protected|static|readonly|get|set)\s+)*(?!if\b|for\b|while\b|switch\b|catch\b|return\b|new\b|await\b)[A-Za-z_$][\w$]*\s*\([^)]*\)\s*(?::[^;={]+)?\s*(?:=>|\{)/m.test(diffText))
+    labels.add("method_signature_change");
   if (/^\+.*\b(class|interface)\s+\w+|^-.*\b(class|interface)\s+\w+/gm.test(diffText)) labels.add("class_declaration_change");
-  if (/registerCommand\(|\/[a-z][\w-]*/i.test(diffText) || files.some((file) => /commands?\.ts$/i.test(file))) labels.add("command_registration_change");
+  // Only a real registration call or a commands file — the old bare `/[a-z]` matched paths/imports/
+  // division (`a/b`, `./mod`), labelling nearly every diff a command-registration change.
+  if (/\b(?:register|add)(?:Slash)?Command\(/i.test(diffText) || files.some((file) => /commands?\.ts$/i.test(file))) labels.add("command_registration_change");
   if (/registerTool\(/i.test(diffText) || files.some((file) => /tools?\.ts$/i.test(file))) labels.add("tool_registration_change");
   if (files.some((file) => /config|settings|pyproject|package\.json/i.test(file))) labels.add("config_change");
   if (files.some((file) => /package-lock|yarn\.lock|pnpm-lock|poetry\.lock|Cargo\.lock/i.test(file))) labels.add("dependency_change");

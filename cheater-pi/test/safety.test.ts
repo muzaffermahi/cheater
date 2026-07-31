@@ -4,7 +4,9 @@ import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAgent } from "../src/core/agent.js";
+import type { KittenLLM, ChatParams, ChatResult } from "../src/core/llm.js";
 import { KittenApp, type Runner } from "../src/core/app.js";
+import { defaultRunner } from "../src/core/runner.js";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 
@@ -29,6 +31,34 @@ test("safety floor: a catastrophic command is hard-blocked even without an appro
   const res = await runAgent({ task: "x", cwd: dir, llm });
   assert.ok(res.events.some((e) => e.kind === "gate_block" && /safety block/.test(e.detail)), "expected a safety block");
   assert.ok(!res.events.some((e) => e.kind === "tool" && /bash/.test(e.detail)), "the command must not have executed");
+});
+
+test("a cancelled LLM call mid-generation stops as 'aborted', not 'error'", async () => {
+  // Regression: on a mid-generation cancel the LLM returns ok:false error:"cancelled", which
+  // /timeout|network/ did not match, so the run was mislabeled stopReason:"error".
+  const dir = mkdtempSync(join(tmpdir(), "kitten-cancel-agent-"));
+  const cancelledLlm = {
+    chat: async () => ({ ok: false, error: "cancelled", content: "", reasoning: "", toolCalls: [], finishReason: "error", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, elapsedMs: 1 }),
+    sidecar: async () => ({ ok: false }), embed: async () => [],
+  } as never;
+  const res = await runAgent({ task: "x", cwd: dir, llm: cancelledLlm });
+  assert.equal(res.stopReason, "aborted");
+  assert.equal(res.finished, false);
+});
+
+test("a finish forced past the rejection budget is flagged forcedFinish (so callers never mark it verified)", async () => {
+  // Regression: after maxFinishRejections the gate is bypassed and finished=true is set unconditionally.
+  // The reliable/bon lanes derived verified:=finished, recording a run whose verification NEVER passed as
+  // verified (a false green). forcedFinish must distinguish a gate-APPROVED finish from a forced one.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-forced-"));
+  const llm = scriptedLlm([{ finish: "done" }]) as never; // the model keeps calling finish every turn
+  const res = await runAgent({
+    task: "x", cwd: dir, llm,
+    finishGate: async () => ({ allowed: false, feedback: "not verified" }), // gate always rejects
+    maxTurns: 8,
+  });
+  assert.equal(res.finished, true, "finish is force-allowed after the budget to avoid an infinite loop");
+  assert.equal(res.forcedFinish, true, "but it is flagged forced (no receipt) so the lane won't record it verified");
 });
 
 test("commandGate: a denied destructive command is blocked and fed back", async () => {
@@ -82,4 +112,64 @@ test("approvalPolicy ask waits for an interactive resolveApproval", async () => 
   a.subscribe((e) => { if (e.type === "tool.approval_required") a.resolveApproval(e.runId, e.callId, true); });
   const run = await a.submitMessage(conv.id, "rm the build dir");
   assert.equal(run.finished, true); // resolved allow → runner saw allowed:true
+});
+
+test("cancel() unblocks a run parked on a pending interactive approval (no deadlock)", async () => {
+  // Regression: cancel() aborted the signal but never resolved the "ask" approval the run was awaiting,
+  // so submitMessage hung forever and the run never reached a terminal state.
+  const a = app("ask");
+  const conv = a.createConversation();
+  a.subscribe((e) => { if (e.type === "tool.approval_required") a.cancel(e.runId); }); // cancel instead of answering
+  const run = await a.submitMessage(conv.id, "rm the build dir"); // must RESOLVE, not hang
+  assert.equal(run.finished, false, "a cancelled run did not finish");
+  assert.ok(a.getEvents(conv.id).some((e) => e.type === "run.cancelled"), "the run reached the terminal cancelled state");
+});
+
+test("an answer-lane model error is recorded as failed, not completed", async () => {
+  // Regression: runAnswer returned finished:false without throwing on a model error, so the app took the
+  // success branch and recorded run.completed — an LLM error looked like a completed run (unlike coding lanes).
+  const failingLlm = {
+    chat: async () => ({ ok: false, error: "boom", content: "", reasoning: "", toolCalls: [], finishReason: "error", usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, elapsedMs: 1 }),
+    sidecar: async () => ({ ok: false }), embed: async () => [],
+  } as never;
+  const store = new ConversationStore(openSqlite(":memory:"));
+  const kapp = new KittenApp({ store, runner: defaultRunner(failingLlm), projectRoot: process.cwd() });
+  const conv = kapp.createConversation({ projectRoot: process.cwd() });
+  await kapp.submitMessage(conv.id, "explain how the tokenizer works"); // routes to the answer lane
+  const events = kapp.getEvents(conv.id);
+  assert.ok(events.some((e) => e.type === "run.failed"), "a model error must terminate as run.failed");
+  assert.ok(!events.some((e) => e.type === "run.completed"), "must NOT be recorded as a completed run");
+});
+
+// Per-token probabilities are not free — llama.cpp reports roughly a 3x generation slowdown with
+// n_probs > 0 — and self-certainty is only ever read to break a tie between candidates. A single
+// candidate has nothing to tie with, so it must not pay the tax.
+test("logprobs are requested only when a run has candidates to be compared against", async () => {
+  const seen: Array<{ logprobs?: boolean; topLogprobs?: number }> = [];
+  const llm = {
+    models: { baseUrl: "fixture://logprob", main: "main-35b" },
+    chat: async (params: ChatParams) => {
+      seen.push({ logprobs: (params as { logprobs?: boolean }).logprobs, topLogprobs: (params as { topLogprobs?: number }).topLogprobs });
+      return { content: "done", reasoning: "", toolCalls: [], finishReason: "stop", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 1 } as ChatResult;
+    },
+  } as unknown as KittenLLM;
+
+  const base = { task: "say done", cwd: process.cwd(), llm, maxTurns: 1, captureConfidence: true };
+
+  await runAgent({ ...base });
+  assert.equal(seen[0].logprobs, false, "an ordinary single run must not pay the logprob tax");
+  assert.equal(seen[0].topLogprobs, undefined);
+
+  seen.length = 0;
+  await runAgent({ ...base, candidateCount: 1 });
+  assert.equal(seen[0].logprobs, false, "one candidate has nothing to be compared against");
+
+  seen.length = 0;
+  await runAgent({ ...base, candidateCount: 3 });
+  assert.equal(seen[0].logprobs, true, "best-of-N still gets its selection signal");
+  assert.equal(seen[0].topLogprobs, 5);
+
+  seen.length = 0;
+  await runAgent({ ...base, captureConfidence: false, candidateCount: 3 });
+  assert.equal(seen[0].logprobs, false, "the lever still turns it off entirely");
 });

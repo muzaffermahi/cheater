@@ -14,6 +14,7 @@
 // verifier-confirmed solve, remember it (A3, disjoint). Every lever is TOGGLEABLE so Part D's ablation
 // can measure each one's marginal Best@1 — and each lever fails gracefully to the path below it.
 
+import { distillAttempt, renderDigests, digestsAreInformative, digestReceiptLine } from "./distill.js";
 import type { KittenLLM } from "./llm.js";
 import type { AgentEvent } from "./agent.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
@@ -72,6 +73,8 @@ export interface AscentConfig {
   /** Measurement hook (D1): awaited with all candidate workspaces + the verdict BEFORE cleanup, so a
    *  rig can oracle-score every candidate (pass@k) not just the winner. */
   onVerified?: (ctx: { attempts: BurstAttempt[]; verdict: { winner: number | null; slate: Array<{ index: number }> } }) => void | Promise<void>;
+  /** Durable candidate cards for the desktop/app event stream. */
+  onCandidate?: (event: { phase: "started" | "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
 }
 
 export interface AscentParams {
@@ -83,8 +86,12 @@ export interface AscentParams {
   forceSamples?: number;
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
+  /** Model-facing conversation context (prior turns + repo truth); every candidate gets the same one. */
+  contextPreamble?: string;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
+  /** Effective model ID for this run. Passed through to cloudBurstGenerate per-call ChatParams. */
+  model?: string;
 }
 
 export interface AscentResult {
@@ -98,7 +105,11 @@ export interface AscentResult {
   rounds: number;
   receipts: string[];
   usage: { prompt: number; completion: number; reasoning: number };
+  formatRescues?: number;
   wallMs: number;
+  /** Files the winner's workspace brought in. The authoritative "what changed" when the workspace is
+   *  not a git repository and there is therefore no snapshot to diff against. */
+  adoptedFiles: string[];
 }
 
 const DEFAULT_EST_TOKENS = 8000;
@@ -259,13 +270,22 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
     if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
     const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime,
+      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
         decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
       plans,
       { concurrency, runOne: config.runOne }
     );
     for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
+    // cloudBurst assigns round-local indices 1..k, but cascade/verifier/measure use `index` as a stable
+    // GLOBAL identity. Without reindexing, a repair round's indices collide with round 1 — collapsing the
+    // survivorsByIndex map (round 2 shadows round 1), adopting the wrong round's workspace, and
+    // misattributing Best@1. Give each attempt a unique index across rounds.
+    const indexBase = allAttempts.length;
+    attempts.forEach((a, j) => { a.index = indexBase + j + 1; });
     allAttempts = allAttempts.concat(attempts);
+    for (const attempt of attempts) {
+      try { await config.onCandidate?.({ phase: "started", attempt }); } catch { /* telemetry-free UI hook */ }
+    }
 
     // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
     // not enough — a candidate can pass its own finish gate yet be wrong on the worked examples, and
@@ -295,7 +315,21 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       }
       // A concrete got≠expected on a real example is the strongest repair signal — lead with it.
       const failReason = gtFailSeed ? `Your previous attempt finished but FAILED the task's own examples:\n${gtFailSeed}` : (errSig ?? "the previous attempt did not finish");
-      repairSeed = [repairDirective(failReason, worst?.plan.stance), webBrief].filter(Boolean).join("\n");
+
+      // PDR (arXiv 2604.16529): condition the next round on a distilled summary of EVERY prior
+      // attempt, not just the one failure that happened to be found first. Two candidates can fail
+      // for two different reasons, and the second reason used to be discarded — which meant the
+      // repair round could walk straight back into it. Reuse is cheaper than another rollout here:
+      // a third candidate costs ~290 s on this hardware, this costs a few hundred prompt tokens.
+      const digests = allAttempts.map((attempt) => distillAttempt(
+        attempt,
+        // Attach ground-truth evidence to the attempt it actually belongs to.
+        attempt === failing && gtFailSeed ? gtFailSeed : undefined,
+      ));
+      const priorEvidence = digestsAreInformative(digests) ? renderDigests(digests) : "";
+      if (priorEvidence) receipts.push(digestReceiptLine(digests));
+
+      repairSeed = [repairDirective(failReason, worst?.plan.stance), priorEvidence, webBrief].filter(Boolean).join("\n\n");
     }
   }
 
@@ -324,8 +358,23 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const verdict = await verifier.verify(candidates);
   receipts.push(...verifierReceiptLines(verdict));
 
+  for (const attempt of allAttempts) {
+    const signal = verdict.slate.find((entry) => entry.index === attempt.index);
+    const participated = survivorsByIndex.has(attempt.index);
+    try {
+      await config.onCandidate?.({
+        phase: participated ? "completed" : "rejected",
+        attempt,
+        reason: participated ? undefined : "removed by cascade before verification",
+      });
+      if (participated && signal && !signal.executionEligible) {
+        await config.onCandidate?.({ phase: "rejected", attempt, reason: signal.receipt.slice(-2).join("; ") || "failed execution eligibility" });
+      }
+    } catch { /* candidate cards are advisory and never change the grade */ }
+  }
+
   const winnerAttempt = verdict.winner ? survivorsByIndex.get(verdict.winner) ?? null : null;
-  if (winnerAttempt) adoptWorkspace(params.cwd, winnerAttempt.workspace);
+  const adoptedFiles = winnerAttempt ? adoptWorkspace(params.cwd, winnerAttempt.workspace) : [];
 
   // A3 — remember a verifier-confirmed solve (disjoint by construction; admit() hard-fails on an eval id).
   if (winnerAttempt && verdict.winnerHasExecutionReceipt && lever(config, "experience") && config.experienceStore && params.taskId) {
@@ -343,14 +392,17 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
 
   receipts.push(...governor.receiptLines());
   const usage = allAttempts.reduce((u, a) => ({ prompt: u.prompt + a.result.usage.prompt, completion: u.completion + a.result.usage.completion, reasoning: u.reasoning + a.result.usage.reasoning }), { prompt: 0, completion: 0, reasoning: 0 });
+  const formatRescues = allAttempts.reduce((total, attempt) => total + (attempt.result.formatRescues ?? 0), 0);
+  if (formatRescues > 0) receipts.push(`format rescues: ${formatRescues} optional structured-output constraint(s) removed after endpoint rejection`);
 
   const result: AscentResult = {
     finished: !!winnerAttempt && verdict.winnerHasExecutionReceipt,
     summary: winnerAttempt?.result.summary ?? "",
+    adoptedFiles,
     winner: verdict.winner,
     selector: verdict.selector,
     winnerHasExecutionReceipt: verdict.winnerHasExecutionReceipt,
-    family, samples, rounds: round, receipts, usage, wallMs: Date.now() - started
+    family, samples, rounds: round, receipts, usage, ...(formatRescues ? { formatRescues } : {}), wallMs: Date.now() - started
   };
 
   // Measurement hook (D1): let a rig oracle-score every candidate workspace before they're removed.

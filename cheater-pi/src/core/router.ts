@@ -66,7 +66,10 @@ export function routeMessage(text: string, input: RouteInput = {}): RouteDecisio
   // paying latency for nothing). The signals that justify coverage + consensus + repair (Goal §3):
   const escalators: string[] = [];
   if (c.risk === "high") escalators.push("high-risk/destructive change");
-  if (c.complexitySignals.length) escalators.push(`complexity: ${c.complexitySignals.join(", ")}`);
+  // TWO or more complexity signals — one lone generic signal ("test"→tests-expected, "config"→config-
+  // change) is not evidence of hardness and would send an ordinary bug fix / test failure through
+  // best-of-N for nothing. `>= 2` matches the "high complexity" threshold the classifier and policy use.
+  if (c.complexitySignals.length >= 2) escalators.push(`multiple complexity signals: ${c.complexitySignals.join(", ")}`);
   if (c.confidence < 0.5) escalators.push("ambiguous request (low classification confidence)");
   if (LARGE_BUILD.test(text)) escalators.push("large/multi-part build (needs decomposition + per-piece verification)");
 

@@ -148,6 +148,13 @@ const RULES: Rule[] = [
 // misfire on genuine questions. "write"/"save"/"generate" already catch the file-output tasks.
 const ACTION_OVERRIDE = /\b(fix|repair|implement|refactor|resolve|build|create|add|enable|support|change|update|modify|remove|delete|wire|register|write|generate|produce|save|store|scaffold|compress|decompress|encode|decode|encrypt|decrypt|compile|install|configure|download|extract)\b/i;
 
+// A verb DIRECTLY inside a negation ("do not modify", "don't touch", "without changing") is a scoped
+// CONSTRAINT, not action intent. Stripping the negated clause before the action/code-intent tests keeps
+// (a) a real verb elsewhere ("…and fix it, but do not modify X" → still a fix) and (b) a read-only
+// question honest ("just tell me…, don't change anything" → not miscounted as a code task). The verb
+// must be adjacent so a POSITIVE "don't forget to fix" (fix is not right after the negation) is untouched.
+const NEG_ACTION = /\b(?:don'?t|do not|does not|doesn'?t|won'?t|will not|cannot|can'?t|never|without|no)\s+(?:chang\w*|edit\w*|modif\w*|touch\w*|alter\w*|updat\w*|fix\w*|break\w*|delet\w*|remov\w*|add\w*|creat\w*|writ\w*|implement\w*|refactor\w*|rewrit\w*|overwrit\w*|replac\w*|migrat\w*)\b/gi;
+
 // Destructive intent, not destructive vocabulary: the verb must target a repo/file/data
 // object (or name an inherently dangerous artifact like a lockfile). Exported so the policy
 // layer's blocked_needs_user gate uses the exact same definition.
@@ -192,11 +199,10 @@ export function classifyAutopilotTask(input: AutopilotInput): AutopilotClassific
   }
   let best: Rule | undefined;
   let score = 0;
-  // A read-only request ("...just tell me, don't change anything") must not be dragged out of
-  // explanation_only just because ACTION_OVERRIDE matched a verb INSIDE the negation ("don't
-  // CHANGE"). When the user explicitly forbids edits, the action verbs are not action intent.
-  const readOnlyIntent = /\b(just tell me|just explain|don'?t (change|edit|modify|touch|fix)|do not (change|edit|modify|touch|fix)|without (chang|edit|modif|touch)|no changes?\b|read[- ]only|explain only)\b/i.test(text);
-  const hasActionIntent = !readOnlyIntent && ACTION_OVERRIDE.test(text);
+  // Strip negated action clauses so a verb INSIDE a negation ("don't CHANGE", "do not MODIFY X") is not
+  // read as action intent — but a real verb OUTSIDE the negation still counts ("…and fix it").
+  const actionable = text.replace(NEG_ACTION, " ");
+  const hasActionIntent = ACTION_OVERRIDE.test(actionable);
 
   for (const rule of RULES) {
     if (rule.kind === "explanation_only" && hasActionIntent) continue;
@@ -214,7 +220,7 @@ export function classifyAutopilotTask(input: AutopilotInput): AutopilotClassific
     // Widen the no-rule-match code-intent net to match ACTION_OVERRIDE's coverage: a bare
     // "swap/port/replace/convert the X" is a code task, not a question, and must not default to
     // answer_only.
-    const codeIntent = /\b(change|update|modify|make|remove|delete|wire|register|swap|port|replace|convert|write|generate|produce|save|store|scaffold|compress|decompress|encode|decode|encrypt|decrypt|compile|install|configure|download|extract)\b/i.test(text);
+    const codeIntent = /\b(change|update|modify|make|remove|delete|wire|register|swap|port|replace|convert|write|generate|produce|save|store|scaffold|compress|decompress|encode|decode|encrypt|decrypt|compile|install|configure|download|extract)\b/i.test(actionable);
     return {
       taskKind: codeIntent ? "feature_addition" : "unknown",
       confidence: codeIntent ? 0.48 : 0.25,

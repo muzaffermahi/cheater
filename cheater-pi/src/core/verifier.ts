@@ -181,12 +181,19 @@ export class Verifier {
           // Fold the self-probe into execution eligibility. For a single-function task the probe is
           // usually the ONLY execution evidence: a candidate that CRASHES on its own probe is broken
           // (drop it); one that runs clean carries a real execution receipt, not the "weak" fallback.
-          const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
-          slate[i].probe = probe;
-          const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, slate[i].groundTruth ?? "n/a", probe].filter((s) => s !== "n/a");
-          slate[i].executionEligible = applied.every((s) => s === "pass");
-          slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
-          slate[i].receipt.push(`self-probe execution: ${probe}`);
+          // A candidate whose MODULE never loaded (outcome null) has NO probe signal — crashes[i] stays 0
+          // there, so folding it as "pass" would falsely credit un-loadable code with a green probe and
+          // mark it strongly execution-eligible. Leave such a candidate's B1 eligibility untouched.
+          if (outcomes[i] == null) {
+            slate[i].receipt.push("self-probe execution: n/a (module did not load)");
+          } else {
+            const probe: Signal = pick.crashes[i] > 0 ? "fail" : "pass";
+            slate[i].probe = probe;
+            const applied = [slate[i].regression, slate[i].reproduction, slate[i].smoke, slate[i].groundTruth ?? "n/a", probe].filter((s) => s !== "n/a");
+            slate[i].executionEligible = applied.every((s) => s === "pass");
+            slate[i].weaklyEligible = false; // a real execution signal now exists for this candidate
+            slate[i].receipt.push(`self-probe execution: ${probe}`);
+          }
         }
       }
     }
@@ -232,13 +239,16 @@ export class Verifier {
   private fuse(slate: CandidateSignals[]): VerifierResult {
     const eligible = slate.filter((s) => s.executionEligible);
     const pool = eligible.length ? eligible : slate;
-    const usedExecution = eligible.length > 0 && eligible.some((s) => !s.weaklyEligible);
 
     // Order: execution consensus first, then ORM, then P1 self-certainty (the owned-engine tiebreaker
     // for the "all candidates agree but are wrong / a thin test can't separate them" case — where
     // consensusRank is tied and there's no ORM, the more DECISIVE generation wins instead of arbitrary
     // index order). Self-certainty is never the sole reason: eligibility (B1 execution) gates the pool.
     const ranked = [...pool].sort((a, b) => {
+      // A candidate with a real execution signal always outranks a merely-finished (weak) one — else a
+      // weakly-eligible candidate could win on index order alone and be applied over a verified one.
+      const we = (a.weaklyEligible ? 1 : 0) - (b.weaklyEligible ? 1 : 0);
+      if (we !== 0) return we;
       const cr = (a.consensusRank ?? 99) - (b.consensusRank ?? 99);
       if (cr !== 0) return cr;
       const orm = (b.ormScore ?? -1) - (a.ormScore ?? -1);
@@ -257,8 +267,10 @@ export class Verifier {
     else if (win.consensusRank !== undefined) selector = "execution+consensus";
     else selector = "execution";
 
+    // The receipt must reflect the WINNER's OWN execution evidence — not merely that some OTHER candidate
+    // had a signal. A weakly-eligible winner (finish-gate fallback) is honestly NOT a green receipt.
     const winnerHasExecutionReceipt = !!win && win.executionEligible && !win.weaklyEligible;
-    return { slate, winner, selector, winnerHasExecutionReceipt: winnerHasExecutionReceipt || (!!win && usedExecution && win.executionEligible) };
+    return { slate, winner, selector, winnerHasExecutionReceipt };
   }
 }
 

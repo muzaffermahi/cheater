@@ -132,6 +132,22 @@ test("a shell redirect into a missing parent directory is caught", () => {
   if (verdict.action === "block") assert.match(verdict.reason, /parent directory/);
 });
 
+test("a create-then-use command chain is allowed (path created earlier in the same command)", () => {
+  // Regression: `echo … > gen.py && python gen.py` blocked because gen.py (must-exist for `python`)
+  // does not exist pre-execution — but the first segment creates it.
+  resetNounGate();
+  const cwd = fixture();
+  assert.equal(nounGateVerdict({ toolName: "bash", input: { command: "echo 'print(1)' > gen.py && python gen.py" }, cwd }).action, "allow");
+});
+
+test("`mkdir -p nested/dir` is allowed (creates its own missing parents); a plain mkdir is still gated", () => {
+  resetNounGate();
+  const cwd = fixture(); // has no build/ dir
+  assert.deepEqual(extractCommandPaths("mkdir -p build/gen").mayBeNew, [], "mkdir -p target is not parent-gated");
+  assert.equal(nounGateVerdict({ toolName: "bash", input: { command: "mkdir -p build/gen" }, cwd }).action, "allow");
+  assert.equal(nounGateVerdict({ toolName: "bash", input: { command: "mkdir build/gen" }, cwd }).action, "block", "a plain mkdir into a missing parent is still gated");
+});
+
 test("a system path is out of scope and allowed", () => {
   resetNounGate();
   const cwd = fixture();

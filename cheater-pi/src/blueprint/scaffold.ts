@@ -5,7 +5,7 @@
 // stack the goal names. There is deliberately NO per-framework template here - Cheater never decides
 // "this is React, use these files"; it only provides the create-mode machinery.
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { extractJsonObject } from "../sidecar/schemas.js";
 
@@ -17,13 +17,47 @@ export const ECOSYSTEM_MANIFESTS = [
 ];
 
 export function repoHasManifest(repoRoot: string): boolean {
-  return ECOSYSTEM_MANIFESTS.some((manifest) => {
-    try { return existsSync(join(repoRoot, manifest)); } catch { return false; }
-  });
+  const hasAt = (dir: string): boolean =>
+    ECOSYSTEM_MANIFESTS.some((manifest) => { try { return existsSync(join(dir, manifest)); } catch { return false; } });
+  if (hasAt(repoRoot)) return true;
+  // A manifest in an immediate subdirectory (a monorepo: frontend/package.json, server/pyproject.toml)
+  // also means the project already exists — don't scaffold over it. Bounded to one level; an empty repo
+  // has no such subdir, so the genuine from-scratch (empty-dir) path is unaffected.
+  try {
+    for (const entry of readdirSync(repoRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
+      if (hasAt(join(repoRoot, entry.name))) return true;
+    }
+  } catch { /* unreadable → treat as no manifest */ }
+  return false;
 }
 
 export function isManifestPath(path: string): boolean {
   return ECOSYSTEM_MANIFESTS.includes(path.split("/").pop() ?? "");
+}
+
+/** The install/dependency-fetch command for a given manifest — so a stack-agnostic scaffold does not
+ *  hardcode `npm install` for a Python/Go/Rust/etc. build (the exact Flask+React case). */
+export function installCommandForManifest(manifestPath: string): string {
+  switch ((manifestPath.split("/").pop() ?? "").toLowerCase()) {
+    case "package.json": return "npm install";
+    case "requirements.txt": return "pip install -r requirements.txt";
+    case "pipfile": return "pipenv install";
+    case "pyproject.toml":
+    case "setup.py": return "pip install -e .";
+    case "cargo.toml": return "cargo build";
+    case "go.mod": return "go mod download";
+    case "gemfile": return "bundle install";
+    case "composer.json": return "composer install";
+    case "pom.xml": return "mvn install";
+    case "build.gradle":
+    case "build.gradle.kts": return "gradle build";
+    case "mix.exs": return "mix deps.get";
+    case "pubspec.yaml": return "flutter pub get";
+    case "deno.json": return "deno cache";
+    case "cmakelists.txt": return "cmake -B build && cmake --build build";
+    default: return "the project's documented install step";
+  }
 }
 
 const CREATE_INTENT = /\b(from scratch|create|build|make|scaffold|bootstrap|generate|new)\b/i;
@@ -35,6 +69,9 @@ const STACK_NOUN = /\b(react|vite|vue|svelte|next\.?js|nuxt|angular|typescript|t
 // An interrogative goal is a QUESTION ("what is the best way to structure a react app?"), never a build,
 // so the verb-less stack+app path must not fire on it.
 const QUESTION_LEAD = /^\s*(what|how|why|when|where|which|who|whose|should|is|are|am|can|could|would|will|does|do|did|explain|tell me|describe|help me understand|compare)\b/i;
+// An EDIT/FIX intent means the goal is about an EXISTING app ("fix the flask routing in my app"), so the
+// verb-less stack+app path must not treat it as a from-scratch build.
+const EDIT_INTENT = /\b(fix|debug|repair|refactor|rename|modif\w+|migrat\w+|improve|optimi[sz]e|adjust|tweak|patch|resolve|update|chang\w+)\b/i;
 
 /**
  * A from-scratch build: no ecosystem manifest present AND the goal reads as "create a new app/project".
@@ -44,7 +81,7 @@ const QUESTION_LEAD = /^\s*(what|how|why|when|where|which|who|whose|should|is|ar
 export function isFromScratchBuild(repoRoot: string, goal: string): boolean {
   if (repoHasManifest(repoRoot)) return false;
   if (CREATE_INTENT.test(goal) && APP_NOUN.test(goal)) return true;
-  if (!QUESTION_LEAD.test(goal) && !goal.includes("?") && STACK_NOUN.test(goal) && APP_NOUN.test(goal)) return true;
+  if (!QUESTION_LEAD.test(goal) && !goal.includes("?") && !EDIT_INTENT.test(goal) && STACK_NOUN.test(goal) && APP_NOUN.test(goal)) return true;
   return false;
 }
 

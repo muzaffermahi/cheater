@@ -8,7 +8,7 @@
 // The reliability harness (contract, grade-in-code, check-first, scout) layers on top of this in
 // agent-run.ts; this file is the minimal, honest driver.
 
-import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob } from "./llm.js";
+import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatResult, type TokenLogprob, type StreamDelta } from "./llm.js";
 import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
@@ -16,7 +16,7 @@ import { aggregateSelfCertainty } from "./selfCertainty.js";
 
 export interface AgentEvent {
   turn: number;
-  kind: "assistant" | "tool" | "gate_block" | "error" | "finish" | "nudge";
+  kind: "assistant" | "assistant_delta" | "reasoning_delta" | "tool" | "gate_block" | "error" | "finish" | "nudge";
   detail: string;
   data?: Record<string, unknown>;
 }
@@ -44,6 +44,9 @@ export interface AgentRunParams {
   /** Owned-engine lever: cap ornith's reasoning depth per turn (it reasons ~130 tok even for a
    *  trivial tool call). "low" trims the reasoning tax for speed; omit for the model default. */
   reasoningEffort?: "low" | "medium" | "high";
+  /** Hard cap on thinking tokens per turn (llama.cpp `reasoning_budget`); 0 disables reasoning. Set
+   *  from task hardness by the caller — see runReliableAgent. */
+  reasoningBudget?: number;
   onEvent?: (e: AgentEvent) => void;
   signal?: AbortSignal;
   /** Reliability hook: after a tool runs, return extra feedback to append to the tool result the
@@ -63,23 +66,41 @@ export interface AgentRunParams {
   /** P1: request per-token logprobs and aggregate self-certainty across the trajectory (owned-engine
    *  selection signal). Opt-in — adds response size, so only the ascent best-of-N path enables it. */
   captureConfidence?: boolean;
+  /** How many candidates this run competes against. Self-certainty is only captured above 1. */
+  candidateCount?: number;
   /** Owned-inference per-sample decode controls (P2 ban, P5 sampler diversity) applied to every turn. */
   decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
+  /** Model-facing conversation context (prior turns + current repo truth), injected as a system block
+   *  after the stable rules and before the current task, so a resumed/multi-turn run informs the model. */
+  contextPreamble?: string;
+  /** Stream the model's generation (real token deltas) when the endpoint supports it, emitting coalesced
+   *  assistant_delta/reasoning_delta events. The reconstructed final ChatResult is identical to chat().
+   *  Off for measurement/tests (they use the non-streaming path). */
+  streamDeltas?: boolean;
   /** Owned-engine thinking control (iter-1 speed lever): on a single-function task ornith writes the
    *  code directly ~2x faster when its chain-of-thought is off — the harness (worked-example gate,
    *  consensus, repair) supplies the correctness, not the model's CoT. Thinking is auto-RE-ENABLED once
    *  the finish gate rejects a "done" (repair genuinely needs reasoning). Native `--jinja` server only. */
   disableThinking?: boolean;
+  /** Main-agent delegation hook; omitted for isolated/read-only workers. */
+  spawnTask?: ToolContext["spawnTask"];
+  allowedFiles?: readonly string[];
+  forbiddenFiles?: readonly string[];
 }
 
 export interface AgentRunResult {
   finished: boolean;
+  /** finished was FORCE-allowed after exhausting the finish-gate rejection budget (no receipt obtained).
+   *  Callers must NOT treat a forced finish as verified. Absent ⇒ not forced. */
+  forcedFinish?: boolean;
   summary: string;
   turns: number;
   toolCalls: number;
   filesWritten: string[];
   events: AgentEvent[];
   usage: { prompt: number; completion: number; reasoning: number };
+  /** Number of times the endpoint rejected structured output and the client used a bounded fallback. */
+  formatRescues?: number;
   wallMs: number;
   stopReason: "finish" | "max_turns" | "error" | "stalled" | "aborted";
   /** P1: self-certainty aggregated over the trajectory (0.5 if not captured). Verifier tiebreaker. */
@@ -106,25 +127,31 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const tools = params.tools ?? CORE_TOOLS;
   const events: AgentEvent[] = [];
   const emit = (e: AgentEvent): void => { events.push(e); params.onEvent?.(e); };
-  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set() };
+  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal, spawnTask: params.spawnTask, allowedFiles: params.allowedFiles, forbiddenFiles: params.forbiddenFiles };
   resetNounGate();
 
   // Ground the model in its real environment. Without this, a small model invents a cwd (observed
   // live: it tried `cd /home/user` and then burned 3 turns fumbling an `rm` at the wrong path) and
   // wastes turns tidying scratch files. Both tanked speed with zero benefit.
   const env = `\n\nEnvironment: your working directory is ${params.cwd}. Every tool (read/write/edit/bash) already runs from there, so use plain relative paths (e.g. \`python foo.py\`) and do NOT cd anywhere — never cd to a guess like /home/user or /app, and you don't need to cd to the working directory either. Scratch files you create while testing may be left in place; do not spend turns deleting them.`;
+  // Conversation context (prior turns + repo truth) is MERGED into the single system message — many
+  // chat templates (Ornith/Qwen included) reject a second system message with "System message must be
+  // at the beginning". It goes after the stable rules + env, before the task.
+  const ctxBlock = params.contextPreamble && params.contextPreamble.trim() ? `\n\n${params.contextPreamble}` : "";
   const messages: ChatMessage[] = [
-    { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env },
+    { role: "system", content: (params.systemPrompt ?? DEFAULT_SYSTEM) + env + ctxBlock },
     { role: "user", content: params.task }
   ];
   const maxTurns = params.maxTurns ?? DEFAULT_MAX_TURNS;
   const usage = { prompt: 0, completion: 0, reasoning: 0 };
   let toolCalls = 0;
+  let formatRescues = 0;
   let finished = false;
   let summary = "";
   let stopReason: AgentRunResult["stopReason"] = "max_turns";
   let emptyStreak = 0;
   let finishRejections = 0;
+  let forcedFinish = false;
   const maxFinishRejections = params.maxFinishRejections ?? 2;
   // Verification-spiral cap: after the model has edited code and then run several PASSING checks, one
   // gentle nudge toward finish. Fires only after thorough verification (never on the ~3-turn median),
@@ -135,19 +162,30 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const bashOk: string[] = [];
   const bashAll: string[] = [];
   const logprobChunks: (TokenLogprob[] | undefined)[] = [];
+  // Self-certainty is a tiebreaker between candidates, so it is only worth its cost when there is
+  // something to tie with. `candidateCount` is 1 for every ordinary run.
+  const captureLogprobs = Boolean(params.captureConfidence) && (params.candidateCount ?? 1) > 1;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
-    const result: ChatResult = await llm.chat({
+    const chatParams = {
       model: params.model,
       messages,
       tools: tools.map((t) => t.schema),
-      toolChoice: "auto",
+      toolChoice: "auto" as const,
       maxTokens: params.maxTokens,
       temperature: params.temperature,
       reasoningEffort: params.reasoningEffort,
-      logprobs: params.captureConfidence,
-      topLogprobs: params.captureConfidence ? 5 : undefined,
+      // The harness decides how long the model may think, because the model consistently over-spends
+      // it. `reasoning_effort` alone is not a reliable control (only "none" dependably bites), so the
+      // budget travels with it and is the thing that actually bounds the tax.
+      reasoningBudget: params.reasoningBudget,
+      // Per-token probabilities are NOT free: llama.cpp reports roughly a 3x generation slowdown with
+      // n_probs > 0, and self-certainty is only ever consulted to break a tie between candidates. So
+      // capture them only when more than one candidate will exist — a single-candidate run has nothing
+      // to compare against and was paying the tax for a number nobody read.
+      logprobs: captureLogprobs,
+      topLogprobs: captureLogprobs ? 5 : undefined,
       logitBias: params.decode?.logitBias,
       topP: params.decode?.topP,
       topK: params.decode?.topK,
@@ -162,15 +200,33 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       // the per-sample directive). Automatic prefix caching does most of this; the flag makes it explicit.
       cachePrompt: true,
       signal: params.signal
-    });
+    };
+    // Real streaming when asked + supported: emit coalesced content/reasoning deltas as they arrive, so
+    // a slow local model shows live progress instead of a frozen pause. The reconstructed result is
+    // identical to the non-streaming path. Tests/measurement (streamDeltas off) take the plain chat path.
+    let result: ChatResult;
+    if (params.streamDeltas && typeof llm.chatStream === "function") {
+      const co = makeDeltaCoalescer(turn, emit);
+      result = await llm.chatStream(chatParams, (d) => co.push(d));
+      co.flush();
+    } else {
+      result = await llm.chat(chatParams);
+    }
     usage.prompt += result.usage.prompt; usage.completion += result.usage.completion; usage.reasoning += result.usage.reasoning;
+    formatRescues += result.formatRescues ?? 0;
     if (params.captureConfidence && result.logprobs?.length) logprobChunks.push(result.logprobs);
 
     if (!result.ok) {
+      // A caller cancellation DURING the in-flight LLM call is a clean stop, not an error — the
+      // top-of-loop abort check only catches a cancel BETWEEN turns, not one mid-generation.
+      if (params.signal?.aborted || result.error === "cancelled") { stopReason = "aborted"; break; }
       emit({ turn, kind: "error", detail: result.error ?? "llm error" });
       // One retry on a transient error, then stop.
       if (turn < maxTurns && /timeout|network/.test(result.error ?? "")) continue;
       stopReason = "error";
+      // Carry the reason out with the run. The summary is what every client shows, and it fell back to
+      // the bare word "error" — a dead run with no diagnosis anywhere the user can see it.
+      summary = `model call failed: ${result.error ?? "unknown error"}`;
       break;
     }
     emit({ turn, kind: "assistant", detail: (result.content || "(tool call)").slice(0, 400), data: { reasoningChars: result.reasoning.length, toolCalls: result.toolCalls.map((t) => t.name) } });
@@ -219,6 +275,11 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
             emit({ turn, kind: "gate_block", detail: `finish rejected: ${gate.feedback ?? ""}`.slice(0, 200) });
             continue;
           }
+        } else if (params.finishGate) {
+          // A finish gate exists but the rejection budget is exhausted: finish is FORCE-allowed to avoid
+          // an infinite loop — it was NOT gate-approved, so no execution receipt was obtained. Mark it so
+          // the caller never records this as verified (§4: finished ≠ verified).
+          forcedFinish = true;
         }
         finished = true;
         summary = proposed;
@@ -246,7 +307,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
           }
         }
       }
-      const res = tool.execute(call.args, ctx);
+      const res = await tool.execute(call.args, ctx);
       if (call.name === "edit" || call.name === "write") { if (!res.isError) hasEdited = true; }
       if (call.name === "bash") {
         const c = String(call.args.command ?? ""); bashAll.push(c);
@@ -271,15 +332,37 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
 
   return {
     finished,
+    forcedFinish,
     summary,
     turns: Math.min(events.filter((e) => e.kind === "assistant").length, maxTurns),
     toolCalls,
     filesWritten: [...ctx.filesWritten],
     events,
     usage,
+    ...(formatRescues ? { formatRescues } : {}),
     wallMs: Date.now() - started,
     stopReason,
     confidence: params.captureConfidence ? aggregateSelfCertainty(logprobChunks) : undefined
+  };
+}
+
+/** Coalesce streamed deltas so we emit a handful of events per turn, not one per token (Goal §3):
+ *  content flushes at ~48 chars, reasoning at ~300 chars (bounded), plus a final flush at turn end. */
+function makeDeltaCoalescer(turn: number, emit: (e: AgentEvent) => void): { push: (d: StreamDelta) => void; flush: () => void } {
+  let content = "", reasoning = "";
+  let reasoningEvents = 0;
+  const MAX_REASONING_EVENTS = 60;
+  const flushContent = (): void => { if (content) { emit({ turn, kind: "assistant_delta", detail: content }); content = ""; } };
+  const flushReasoning = (): void => {
+    if (reasoning && reasoningEvents < MAX_REASONING_EVENTS) { emit({ turn, kind: "reasoning_delta", detail: reasoning }); reasoningEvents++; }
+    reasoning = "";
+  };
+  return {
+    push: (d: StreamDelta): void => {
+      if (d.content) { content += d.content; if (content.length >= 48) flushContent(); }
+      if (d.reasoning) { reasoning += d.reasoning; if (reasoning.length >= 300) flushReasoning(); }
+    },
+    flush: (): void => { flushContent(); flushReasoning(); },
   };
 }
 

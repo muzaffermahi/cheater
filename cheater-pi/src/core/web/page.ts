@@ -36,6 +36,8 @@ export interface PageInit {
   cwd: string;
   /** Kitten version string (shown in the sidebar footer). */
   version: string;
+  /** Current model name (shown in the sidebar). */
+  model?: string;
 }
 
 /**
@@ -54,6 +56,7 @@ export function renderPage(init: PageInit): string {
     '<meta name="color-scheme" content="dark light">',
     '<meta name="referrer" content="no-referrer">',
     "<title>Kitten</title>",
+    '<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐱</text></svg>">',
     "<style>" + CSS + "</style>",
     "<script>window.KITTEN = " + dataScript + ";</script>",
     "</head>",
@@ -221,8 +224,6 @@ button,input,textarea{ font:inherit; color:inherit; }
 .bubble{ min-width:0; overflow-wrap:anywhere; }
 .md-line{ margin:0; }
 .md-line + .md-line{ margin-top:2px; }
-.md-code{ background:var(--code-bg); border:1px solid var(--border); border-radius:10px; padding:10px 12px; overflow-x:auto; margin:6px 0; }
-.md-code code{ font-family:var(--mono); font-size:13px; white-space:pre; }
 .md-inline-code{ font-family:var(--mono); font-size:.88em; background:var(--code-bg); border:1px solid var(--border); border-radius:5px; padding:1px 5px; }
 .reason{ align-self:flex-start; max-width:760px; }
 .reason details{ font-size:12px; color:var(--muted); }
@@ -345,6 +346,115 @@ button,input,textarea{ font:inherit; color:inherit; }
 @media (prefers-reduced-motion: reduce){
   *{ animation:none !important; transition:none !important; scroll-behavior:auto !important; }
 }
+
+/* ── Markdown elements ───────────────────────────────────────────────── */
+.bubble h1{ font-size:1.45em; font-weight:800; margin:12px 0 6px; line-height:1.25; }
+.bubble h2{ font-size:1.2em; font-weight:700; margin:10px 0 5px; line-height:1.3; }
+.bubble h3{ font-size:1.05em; font-weight:700; margin:8px 0 4px; line-height:1.35; }
+.bubble p{ margin:0; }
+.bubble p + p{ margin-top:8px; }
+.bubble ul, .bubble ol{ margin:4px 0; padding-left:22px; }
+.bubble li{ margin:2px 0; }
+.bubble blockquote{
+  margin:6px 0; padding:4px 12px; border-left:3px solid var(--accent);
+  color:var(--muted); background:color-mix(in srgb, var(--accent) 6%, transparent); border-radius:0 6px 6px 0;
+}
+.bubble a{ color:var(--accent); text-decoration:none; }
+.bubble a:hover{ text-decoration:underline; }
+.bubble hr{ border:none; border-top:1px solid var(--border); margin:10px 0; }
+
+/* Code blocks */
+.md-code-wrap{
+  background:var(--code-bg); border:1px solid var(--border); border-radius:8px;
+  margin:8px 0; overflow:hidden; position:relative;
+}
+.md-code-head{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:5px 12px; border-bottom:1px solid var(--border);
+  font-size:11px; color:var(--faint); font-family:var(--mono);
+}
+.md-code-lang{ text-transform:uppercase; letter-spacing:.5px; }
+.md-code-copy{
+  background:var(--bg-2); border:1px solid var(--border-2); color:var(--muted);
+  cursor:pointer; padding:3px 9px; border-radius:5px; font-size:11px;
+}
+.md-code-copy:hover{ color:var(--text); border-color:var(--accent); }
+.md-code-copy.copied{ color:var(--ok); border-color:var(--ok-border); }
+.md-code-wrap pre{
+  margin:0; padding:12px; overflow-x:auto;
+  font-family:var(--mono); font-size:13px; line-height:1.55; white-space:pre;
+}
+.md-code-wrap code{ font-family:inherit; font-size:inherit; }
+.k{ color:var(--accent); }  /* keyword highlighting */
+
+/* Typing indicator */
+.typing-indicator{ display:inline-flex; gap:4px; padding:6px 2px; align-items:center; }
+.typing-dot{
+  width:7px; height:7px; border-radius:50%; background:var(--muted);
+  animation:tdot 1.4s ease-in-out infinite;
+}
+.typing-dot:nth-child(2){ animation-delay:0.2s; }
+.typing-dot:nth-child(3){ animation-delay:0.4s; }
+@keyframes tdot{ 0%,80%,100%{ opacity:.25; transform:scale(.8); } 40%{ opacity:1; transform:scale(1); } }
+
+/* Jump-to-bottom button */
+.jump-btn{
+  position:fixed; bottom:110px; right:22px; z-index:30;
+  width:38px; height:38px; border-radius:50%;
+  background:var(--bg-2); color:var(--text); border:1px solid var(--border-2);
+  cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center;
+  box-shadow:0 4px 16px var(--shadow); transition:opacity .18s, transform .18s;
+}
+.jump-btn:hover{ border-color:var(--accent); transform:translateY(-2px); }
+.jump-btn[hidden]{ display:none; }
+
+/* Inline rename input in conversation row */
+.conv-rename-input{
+  font-size:14px; font-weight:600; font-family:inherit; color:inherit;
+  background:var(--bg-2); border:1px solid var(--accent); border-radius:6px;
+  padding:2px 6px; margin:-2px 0; width:100%; min-width:0;
+}
+
+/* Message timestamp */
+.msg-time{ font-size:10px; color:var(--faint); margin-top:2px; }
+.msg.user .msg-time{ text-align:right; }
+
+/* Offline banner transition */
+.offline{ transition:opacity .25s; }
+
+/* Layout helpers */
+.flex-row{ display:flex; align-items:center; gap:12px; }
+.min-w-0{ min-width:0; }
+
+/* Retry button */
+.retry-btn{
+  align-self:flex-start; background:none; border:1px dashed var(--border-2); color:var(--muted);
+  cursor:pointer; padding:4px 12px; border-radius:8px; font-size:12px; margin-top:4px; opacity:.65;
+}
+.retry-btn:hover{ opacity:1; border-color:var(--accent); color:var(--accent); }
+
+/* Confirmation dialog */
+.confirm-overlay{
+  position:fixed; inset:0; z-index:80; background:rgba(0,0,0,.55);
+  display:flex; align-items:center; justify-content:center;
+}
+.confirm-overlay[hidden]{ display:none; }
+.confirm-box{
+  background:var(--panel-solid); border:1px solid var(--border-2); border-radius:14px;
+  padding:20px 24px; box-shadow:0 12px 40px var(--shadow); max-width:380px; width:90vw;
+  text-align:center;
+}
+.confirm-msg{ font-size:15px; font-weight:600; margin:0 0 16px; }
+.confirm-actions{ display:flex; gap:10px; justify-content:center; }
+.btn-danger{ background:var(--danger-bg); color:var(--danger); border-color:var(--danger-border); }
+
+/* Model badge */
+.model-badge-wrap{ padding:0 14px 8px; }
+.model-badge{
+  display:inline-flex; align-items:center; gap:6px; font-size:11px; color:var(--faint);
+  padding:6px 12px; background:var(--bg-2); border:1px solid var(--border); border-radius:8px;
+}
+.model-badge::before{ content:""; width:7px; height:7px; border-radius:50%; background:var(--accent); }
 `;
 
 // ── Body markup ──────────────────────────────────────────────────────────────────────────────────
@@ -359,13 +469,20 @@ const BODY = `
         <svg viewBox="0 0 48 48" aria-hidden="true"><path fill="currentColor" class="k1" d="M9 6l7 8a16 15 0 0 1 16 0l7-8v14a15 15 0 1 1-37 0z"/><circle cx="18" cy="26" r="3" fill="#0e0a08"/><circle cx="30" cy="26" r="3" fill="#0e0a08"/><path d="M24 31l-3 3h6z" fill="#e7748e"/><path d="M4 30h9M4 34h9M35 30h9M35 34h9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity=".55"/></svg>
         <span>Kitten</span>
       </div>
-      <button id="themeBtn" class="mini-btn" title="Toggle theme" aria-label="Toggle color theme">◐ Theme</button>
+      <button id="themeBtn" class="mini-btn" title="Toggle theme" aria-label="Toggle color theme">
+        <svg id="themeIcon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <circle cx="8" cy="8" r="4"/>
+          <path d="M8 0v2M8 14v2M0 8h2M14 8h2M2.34 2.34l1.42 1.42M12.24 12.24l1.42 1.42M2.34 13.66l1.42-1.42M12.24 3.76l1.42-1.42"/>
+        </svg>
+        <span>Theme</span>
+      </button>
     </div>
     <div class="side-controls">
       <label class="visually-hidden" for="search">Search conversations</label>
       <input id="search" class="search" type="search" placeholder="Search…" autocomplete="off" spellcheck="false">
       <button id="newBtn" class="btn btn-accent" type="button">New</button>
     </div>
+    <div id="modelBadgeWrap" class="model-badge-wrap" hidden><span id="modelBadge" class="model-badge"></span></div>
     <nav class="conv-list-wrap" aria-label="Conversation list">
       <ul id="convList" class="conv-list"></ul>
       <div id="convEmpty" class="empty" hidden>No conversations yet — start one.</div>
@@ -378,9 +495,11 @@ const BODY = `
 
   <main class="main" aria-label="Conversation">
     <div class="main-head">
-      <div class="mh-left" style="display:flex;align-items:center;gap:12px;min-width:0">
-        <button id="menuBtn" class="icon-btn menu-btn" type="button" aria-label="Show conversations">☰</button>
-        <div style="min-width:0">
+      <div class="mh-left flex-row min-w-0">
+        <button id="menuBtn" class="icon-btn menu-btn" type="button" aria-label="Show conversations">
+          <svg width="20" height="16" viewBox="0 0 20 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="2" x2="18" y2="2"/><line x1="2" y1="8" x2="18" y2="8"/><line x1="2" y1="14" x2="18" y2="14"/></svg>
+        </button>
+        <div class="min-w-0">
           <h1 id="convTitle" class="conv-heading">Kitten</h1>
           <div id="routeInfo" class="route-info"></div>
         </div>
@@ -427,6 +546,16 @@ const BODY = `
   </aside>
 </div>
 <div id="toasts" class="toasts" aria-live="assertive"></div>
+<div id="confirmOverlay" class="confirm-overlay" hidden>
+  <div class="confirm-box">
+    <p id="confirmMsg" class="confirm-msg"></p>
+    <div class="confirm-actions">
+      <button id="confirmCancelBtn" class="btn" type="button">Cancel</button>
+      <button id="confirmOkBtn" class="btn btn-danger" type="button">Delete</button>
+    </div>
+  </div>
+</div>
+<button id="jumpBtn" class="jump-btn" title="Jump to bottom" hidden aria-label="Scroll to latest messages">\u2193</button>
 `;
 
 // ── Browser script ─────────────────────────────────────────────────────────────────────────────────
@@ -453,17 +582,19 @@ const SCRIPT = `
   var lastSeq = 0;
   var es = null;
   var reconnectTimer = null;
+  var offlineTimer = null;
   var backoff = 800;
   var stick = true;
   var mascotState = "";
   var mascotGrids = {};
-  var assistantBubbles = {};
-  var reasoningBoxes = {};
+  var openAssistant = null;  // the currently-streaming assistant bubble (null = none open)
+  var openReasoning = null;  // the currently-streaming reasoning box
   var toolCards = {};
   var activeRuns = {};
   var activeRunId = null;
   var changedFiles = {};
   var diffAvailable = false;
+  var lastUserMessage = "";
   var listTimer = null;
 
   var messagesEl, listEl, convEmptyEl, mainEmptyEl, titleEl, routeEl, drawerEl,
@@ -543,6 +674,7 @@ const SCRIPT = `
     function flush(){ if(buf){ parent.appendChild(document.createTextNode(buf)); buf = ""; } }
     while(i < n){
       var ch = text.charAt(i);
+      // inline code
       if(ch === BT){
         var end = text.indexOf(BT, i + 1);
         if(end > i){
@@ -552,6 +684,7 @@ const SCRIPT = `
           i = end + 1; continue;
         }
       }
+      // bold
       if(ch === "*" && text.charAt(i + 1) === "*"){
         var b = text.indexOf("**", i + 2);
         if(b > i){
@@ -560,34 +693,249 @@ const SCRIPT = `
           i = b + 2; continue;
         }
       }
+      // italic
+      if(ch === "*" && text.charAt(i + 1) !== "*"){
+        var em = text.indexOf("*", i + 1);
+        if(em > i){
+          flush();
+          parent.appendChild(txt("em", null, text.slice(i + 1, em)));
+          i = em + 1; continue;
+        }
+      }
+      // link [text](url)
+      if(ch === "["){
+        var closeB = text.indexOf("](", i + 1);
+        if(closeB > i){
+          var closeP = text.indexOf(")", closeB + 2);
+          if(closeP > closeB){
+            flush();
+            var a = mk("a", null);
+            a.textContent = text.slice(i + 1, closeB);
+            a.href = text.slice(closeB + 2, closeP);
+            a.target = "_blank";
+            a.rel = "noopener";
+            parent.appendChild(a);
+            i = closeP + 1; continue;
+          }
+        }
+      }
       buf += ch; i++;
     }
     flush();
   }
+
+  // Simple keyword map for syntax highlighting (language -> array of keywords)
+  var KEYWORDS = {
+    js: ["var","let","const","function","return","if","else","for","while","do","switch","case","break","continue","new","this","class","extends","import","export","default","from","async","await","try","catch","throw","typeof","instanceof","null","undefined","true","false","of","in","yield","delete","void","static","get","set","debugger","with"],
+    ts: ["var","let","const","function","return","if","else","for","while","do","switch","case","break","continue","new","this","class","extends","import","export","default","from","async","await","try","catch","throw","typeof","instanceof","null","undefined","true","false","of","in","string","number","boolean","void","any","never","unknown","interface","type","enum","readonly","keyof","infer","extends","as","is","implements","abstract","private","public","protected","static","get","set","declare","namespace","module","yield","symbol"],
+    python: ["def","return","if","elif","else","for","while","in","not","and","or","is","None","True","False","import","from","as","class","try","except","finally","raise","with","yield","lambda","pass","break","continue","async","await","self","print","del","global","nonlocal","assert","raise"],
+    rust: ["fn","let","mut","const","if","else","for","while","loop","match","return","struct","enum","impl","trait","pub","use","mod","self","super","crate","where","as","in","move","ref","static","dyn","unsafe","async","await","type","true","false","Some","None","Ok","Err","Vec","String","Option","Result","Box"],
+    go: ["func","var","const","if","else","for","range","return","switch","case","default","break","continue","struct","interface","map","chan","select","go","defer","package","import","type","nil","true","false","make","new","append","len","cap","range","fallthrough","goto"],
+    bash: ["if","then","else","elif","fi","for","while","do","done","case","esac","in","function","return","local","export","readonly","declare","source","exit","echo","cd","ls","rm","mv","cp","mkdir","chmod","chown","grep","sed","awk","set","unset","shift","trap","test","true","false","alias","unalias"],
+    json: ["true","false","null"],
+    html: ["html","head","body","div","span","p","a","img","ul","ol","li","table","tr","td","th","form","input","button","select","option","textarea","label","h1","h2","h3","h4","h5","h6","header","footer","nav","main","section","article","aside","link","meta","title","style","script","br","hr","strong","em","code","pre","blockquote"],
+    css: ["color","background","border","margin","padding","font","display","position","width","height","top","right","bottom","left","flex","grid","align","justify","overflow","opacity","transform","transition","animation","z-index","box-shadow","text-align","font-size","font-weight","line-height","border-radius","cursor","pointer","none","block","inline","absolute","relative","fixed","sticky","hidden","auto","center","space-between","flex-start","flex-end","column","row","wrap","nowrap"],
+    sql: ["SELECT","FROM","WHERE","INSERT","UPDATE","DELETE","CREATE","TABLE","DROP","ALTER","INDEX","JOIN","LEFT","RIGHT","INNER","OUTER","ON","AND","OR","NOT","NULL","IS","IN","LIKE","BETWEEN","GROUP","BY","ORDER","ASC","DESC","HAVING","LIMIT","OFFSET","UNION","ALL","DISTINCT","AS","COUNT","SUM","AVG","MIN","MAX","CASE","WHEN","THEN","ELSE","END","EXISTS","SET","VALUES","INTO","PRIMARY","KEY","FOREIGN","REFERENCES","CASCADE","DEFAULT","CHECK","UNIQUE","VIEW","IF","BEGIN","COMMIT","ROLLBACK","TRUNCATE"],
+    c: ["if","else","for","while","do","switch","case","break","continue","return","int","long","float","double","char","void","short","unsigned","signed","struct","union","enum","typedef","sizeof","static","const","extern","volatile","register","auto","goto","NULL","true","false","include","define","ifdef","ifndef","endif","pragma","malloc","free","sizeof"],
+    cpp: ["if","else","for","while","do","switch","case","break","continue","return","int","long","float","double","char","void","bool","auto","short","unsigned","signed","struct","class","union","enum","typedef","sizeof","static","const","extern","volatile","register","goto","nullptr","true","false","public","private","protected","virtual","override","final","template","typename","namespace","using","new","delete","this","try","catch","throw","include","define","ifdef","ifndef","endif","pragma","malloc","free","constexpr","decltype","noexcept","explicit","friend","operator","mutable","std","vector","string","map","set","shared_ptr","unique_ptr","move","forward","static_cast","dynamic_cast","const_cast","reinterpret_cast"],
+    java: ["public","private","protected","class","interface","extends","implements","abstract","final","static","void","return","if","else","for","while","do","switch","case","break","continue","new","this","super","try","catch","finally","throw","throws","import","package","null","true","false","int","long","float","double","boolean","char","byte","short","String","enum","synchronized","volatile","transient","native","strictfp","default","instanceof","assert","var"],
+    ruby: ["def","end","if","unless","else","elsif","while","until","for","do","begin","rescue","ensure","return","yield","class","module","self","super","nil","true","false","and","or","not","alias","undef","defined","next","break","redo","retry","case","when","in","then","raise","require","include","extend","attr_accessor","attr_reader","attr_writer","private","protected","public","lambda","proc","new"]
+  };
+
+  function escapeHTML(s){
+    return s.split("&").join("&amp;").split("<").join("&lt;").split(">").join("&gt;").split('"').join("&quot;");
+  }
+
+  function isWordChar(ch){
+    return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch === "_";
+  }
+
+  function highlightCode(codeText, lang){
+    if(!codeText) return codeText;
+    var kw = (lang && KEYWORDS[lang]) || [];
+    if(!kw.length) return escapeHTML(codeText);
+    var esc = escapeHTML(codeText);
+    var result = "";
+    var i = 0, n = esc.length;
+    var kwSet = {};
+    for(var k = 0; k < kw.length; k++){ kwSet[kw[k]] = true; }
+    while(i < n){
+      var ch = esc.charAt(i);
+      if(isWordChar(ch)){
+        var start = i;
+        while(i < n && isWordChar(esc.charAt(i))){ i++; }
+        var word = esc.slice(start, i);
+        if(kwSet[word]){
+          result += '<span class="k">' + word + '</span>';
+        } else {
+          result += word;
+        }
+      } else {
+        result += ch;
+        i++;
+      }
+    }
+    return result;
+  }
+
   function renderMarkdown(container, raw){
     container.innerHTML = "";
     var text = String(raw == null ? "" : raw);
     text = text.split(CR).join("");
     var lines = text.split(NL);
     var i = 0;
+
+    function makeFenceCodeBlock(startLine){
+      // extract language hint after fence
+      var lang = startLine.slice(3).trim() || "";
+      i++;
+      var codeLines = [];
+      while(i < lines.length && lines[i].slice(0, 3) !== FENCE){ codeLines.push(lines[i]); i++; }
+      if(i < lines.length) i++; // skip closing fence
+      var codeText = codeLines.join(NL);
+
+      var wrap = mk("div", "md-code-wrap");
+      // header bar
+      var head = mk("div", "md-code-head");
+      head.appendChild(txt("span", "md-code-lang", lang || "code"));
+      var copyBtn = mk("button", "md-code-copy");
+      copyBtn.textContent = "Copy";
+      copyBtn.type = "button";
+      (function(btn, rawCode){
+        btn.onclick = function(){
+          try {
+            navigator.clipboard.writeText(rawCode).then(function(){
+              btn.textContent = "Copied!";
+              btn.classList.add("copied");
+              setTimeout(function(){ btn.textContent = "Copy"; btn.classList.remove("copied"); }, 2000);
+            }).catch(function(){ toast("Copy failed"); });
+          } catch(e){ toast("Copy failed"); }
+        };
+      })(copyBtn, codeText);
+      head.appendChild(copyBtn);
+      wrap.appendChild(head);
+      // pre/code
+      var pre = mk("pre", null);
+      var codeEl = mk("code", null);
+      var hl = lang ? highlightCode(codeText, lang) : escapeHTML(codeText);
+      codeEl.innerHTML = hl;
+      pre.appendChild(codeEl);
+      wrap.appendChild(pre);
+      container.appendChild(wrap);
+    }
+
+    function makeParagraph(linesArr){
+      var p = mk("p", "md-line");
+      for(var j = 0; j < linesArr.length; j++){
+        if(j > 0){ p.appendChild(mk("br", null)); }
+        renderInline(p, linesArr[j]);
+      }
+      container.appendChild(p);
+    }
+
+    var para = [];
+
+    function flushPara(){
+      if(para.length){ makeParagraph(para); para = []; }
+    }
+
     while(i < lines.length){
       var line = lines[i];
+
+      // Fenced code block
       if(line.slice(0, 3) === FENCE){
-        i++;
-        var code = [];
-        while(i < lines.length && lines[i].slice(0, 3) !== FENCE){ code.push(lines[i]); i++; }
-        if(i < lines.length) i++;
-        var pre = mk("pre", "md-code");
-        pre.appendChild(txt("code", null, code.join(NL)));
-        container.appendChild(pre);
+        flushPara();
+        makeFenceCodeBlock(line);
         continue;
       }
-      if(line === ""){ i++; continue; }
-      var p = mk("div", "md-line");
-      renderInline(p, line);
-      container.appendChild(p);
+
+      // HR
+      if(line === "---" || line === "***" || line === "___"){
+        flushPara();
+        container.appendChild(mk("hr", null));
+        i++; continue;
+      }
+
+      // Headings
+      if(line.slice(0, 4) === "### "){
+        flushPara();
+        var h3 = mk("h3", null); renderInline(h3, line.slice(4));
+        container.appendChild(h3); i++; continue;
+      }
+      if(line.slice(0, 3) === "## "){
+        flushPara();
+        var h2 = mk("h2", null); renderInline(h2, line.slice(3));
+        container.appendChild(h2); i++; continue;
+      }
+      if(line.slice(0, 2) === "# "){
+        flushPara();
+        var h1 = mk("h1", null); renderInline(h1, line.slice(2));
+        container.appendChild(h1); i++; continue;
+      }
+
+      // Blockquote
+      if(line.charAt(0) === ">"){
+        flushPara();
+        var bq = mk("blockquote", null);
+        var bqLines = [];
+        while(i < lines.length && lines[i].charAt(0) === ">"){
+          var qline = lines[i];
+          if(qline.charAt(1) === " ") qline = qline.slice(2);
+          else qline = qline.slice(1);
+          bqLines.push(qline);
+          i++;
+        }
+        for(var qi = 0; qi < bqLines.length; qi++){
+          if(qi > 0){ bq.appendChild(mk("br", null)); }
+          renderInline(bq, bqLines[qi]);
+        }
+        container.appendChild(bq);
+        continue;
+      }
+
+      // Unordered list
+      if(line.slice(0, 2) === "- " || line.slice(0, 2) === "* "){
+        flushPara();
+        var ul = mk("ul", null);
+        while(i < lines.length && (lines[i].slice(0, 2) === "- " || lines[i].slice(0, 2) === "* ")){
+          var li = mk("li", null);
+          renderInline(li, lines[i].slice(2));
+          ul.appendChild(li);
+          i++;
+        }
+        container.appendChild(ul);
+        continue;
+      }
+
+      // Ordered list
+      var dotIdx = line.indexOf(". ");
+      if(dotIdx >= 1 && dotIdx <= 2 && line.charAt(0) >= "0" && line.charAt(0) <= "9"){
+        flushPara();
+        var ol = mk("ol", null);
+        while(i < lines.length){
+          var d2 = lines[i].indexOf(". ");
+          var ch0 = lines[i].charAt(0);
+          if(!(d2 >= 1 && d2 <= 2 && ch0 >= "0" && ch0 <= "9")) break;
+          var li2 = mk("li", null);
+          renderInline(li2, lines[i].slice(d2 + 2));
+          ol.appendChild(li2);
+          i++;
+        }
+        container.appendChild(ol);
+        continue;
+      }
+
+      // Empty line => paragraph break
+      if(line === ""){
+        flushPara();
+        i++; continue;
+      }
+
+      // Regular text line
+      para.push(line);
       i++;
     }
+    flushPara();
   }
 
   // ── Scrolling ────────────────────────────────────────────────────────────────
@@ -601,33 +949,51 @@ const SCRIPT = `
   function append(node){ messagesEl.appendChild(node); if(stick) scrollToBottom(); }
 
   function addUserMessage(text){
+    lastUserMessage = String(text || "");
     var wrap = mk("div", "msg user");
     wrap.appendChild(txt("div", "role", "You"));
     var bubble = mk("div", "bubble");
     renderMarkdown(bubble, text);
     wrap.appendChild(bubble);
+    wrap.appendChild(txt("div", "msg-time", relTime(Date.now())));
     append(wrap);
   }
-  function assistantBubble(runId){
-    var b = assistantBubbles[runId];
-    if(b) return b;
+  function addRetryButton(){
+    if(!lastUserMessage || !currentId) return;
+    var btn = txt("button", "retry-btn", "\u21bb Retry");
+    btn.type = "button";
+    btn.title = "Resend the last message to regenerate";
+    btn.onclick = function(){
+      api("/api/message", { conversationId: currentId, text: lastUserMessage }).catch(function(){
+        toast("Retry failed");
+      });
+    };
+    append(btn);
+  }
+  function assistantBubble(){
+    if(openAssistant) return openAssistant;
     var wrap = mk("div", "msg assistant");
     wrap.appendChild(txt("div", "role", "Kitten"));
     var bubble = mk("div", "bubble");
+    // typing indicator
+    var dots = mk("span", "typing-indicator");
+    for(var d = 0; d < 3; d++){ dots.appendChild(mk("span", "typing-dot")); }
+    bubble.appendChild(dots);
     wrap.appendChild(bubble);
+    wrap.appendChild(txt("div", "msg-time", relTime(Date.now())));
     append(wrap);
-    b = { wrap: wrap, bubble: bubble, acc: "" };
-    assistantBubbles[runId] = b;
-    return b;
+    openAssistant = { wrap: wrap, bubble: bubble, acc: "" };
+    return openAssistant;
   }
   function appendAssistant(runId, text, isFinal){
-    var b = assistantBubble(runId);
+    var b = assistantBubble();
     b.acc = isFinal ? String(text || "") : (b.acc + String(text || ""));
     renderMarkdown(b.bubble, b.acc);
+    if(isFinal) openAssistant = null; // the final answer closes this assistant segment
     if(stick) scrollToBottom();
   }
   function appendReasoning(runId, text){
-    var box = reasoningBoxes[runId];
+    var box = openReasoning;
     if(!box){
       var wrap = mk("div", "reason");
       var det = mk("details", null);
@@ -637,7 +1003,7 @@ const SCRIPT = `
       wrap.appendChild(det);
       append(wrap);
       box = { pre: pre, acc: "" };
-      reasoningBoxes[runId] = box;
+      openReasoning = box;
     }
     box.acc += String(text || "");
     box.pre.textContent = box.acc;
@@ -687,9 +1053,16 @@ const SCRIPT = `
     var yes = txt("button", "btn btn-approve", "Approve"); yes.type = "button";
     var no = txt("button", "btn btn-deny", "Deny"); no.type = "button";
     function respond(allowed){
-      api("/api/approve", { runId: ev.runId, callId: ev.callId, allowed: allowed }).then(function(){
+      yes.disabled = true; no.disabled = true;
+      yes.textContent = "Sending...";
+      api("/api/approve", { runId: ev.runId, callId: ev.callId, allowed: allowed }).then(function(r){
+        // The server returns {ok:false} when nothing is pending (a stale card replayed from history, or
+        // already answered elsewhere). Don't show a fake "Approved"/"Denied" for a no-op.
+        if(!r || r.ok === false){
+          card.appendChild(txt("div", "approval-result", "No longer pending"));
+          return;
+        }
         card.classList.add(allowed ? "resolved-approve" : "resolved-deny");
-        yes.disabled = true; no.disabled = true;
         card.appendChild(txt("div", "approval-result", allowed ? "Approved" : "Denied"));
       }).catch(function(){ toast("Could not send your approval"); });
     }
@@ -766,6 +1139,10 @@ const SCRIPT = `
     var n = Object.keys(changedFiles).length;
     changesBtnEl.textContent = n ? "Changes (" + n + ")" : "Changes";
   }
+  function updateDiffBtn(){
+    var btn = el("diffBtn");
+    if(btn) btn.hidden = !diffAvailable || !currentId;
+  }
   function showDiff(){
     if(!currentId) return;
     api("/api/diff?conversation=" + encodeURIComponent(currentId)).then(function(res){
@@ -794,6 +1171,10 @@ const SCRIPT = `
     var wasStuck = stick;
     hideMainEmpty();
     var t = ev.type;
+    // Any non-streaming event closes the open assistant/reasoning bubble so the NEXT delta starts a
+    // fresh bubble in chronological position (interleaved with the tool cards), instead of collapsing
+    // all of a run's prose into one bubble rendered above the cards it actually follows.
+    if(t !== "assistant.delta" && t !== "reasoning.delta" && t !== "assistant.final"){ openAssistant = null; openReasoning = null; }
     if(t === "conversation.created"){ if(ev.title) setTitle(ev.title); }
     else if(t === "conversation.renamed"){ setTitle(ev.title); scheduleListRefresh(); }
     else if(t === "conversation.archived"){ scheduleListRefresh(); }
@@ -817,12 +1198,12 @@ const SCRIPT = `
     else if(t === "verification.passed"){ addVerify("ok", "Verified: " + (ev.detail || "")); }
     else if(t === "verification.failed"){ addVerify("fail", "Verification failed: " + (ev.detail || "")); }
     else if(t === "file.changed"){ onFileChanged(ev); }
-    else if(t === "diff.updated"){ diffAvailable = true; }
+    else if(t === "diff.updated"){ diffAvailable = true; updateDiffBtn(); }
     else if(t === "repair.started"){ addNote("repair", "Repair round " + (ev.round || 1)); }
-    else if(t === "run.cancelled"){ onRunEnd(ev.runId); addStatus("warn", "Run cancelled."); }
-    else if(t === "run.interrupted"){ onRunEnd(ev.runId); addStatus("warn", "Run interrupted."); }
-    else if(t === "run.failed"){ onRunEnd(ev.runId); addStatus("danger", "Run failed: " + (ev.error || "unknown error")); }
-    else if(t === "run.completed"){ onRunEnd(ev.runId); }
+    else if(t === "run.cancelled"){ onRunEnd(ev.runId); addStatus("warn", "Run cancelled."); addRetryButton(); }
+    else if(t === "run.interrupted"){ onRunEnd(ev.runId); addStatus("warn", "Run interrupted."); addRetryButton(); }
+    else if(t === "run.failed"){ onRunEnd(ev.runId); addStatus("danger", "Run failed: " + (ev.error || "unknown error")); addRetryButton(); }
+    else if(t === "run.completed"){ onRunEnd(ev.runId); addRetryButton(); }
     else if(t === "run.undone"){ onRunEnd(ev.runId); addStatus("warn", "Reverted " + ((ev.restored || []).length) + " file(s); deleted " + ((ev.deleted || []).length) + "."); afterUndo(ev); }
     else if(t === "receipt.finalized"){ addReceipt(ev); }
 
@@ -871,16 +1252,24 @@ const SCRIPT = `
     }, backoff);
     backoff = Math.min(backoff * 2, 8000);
   }
-  function setOffline(on){ el("offline").hidden = !on; }
+  function setOffline(on){
+    if(offlineTimer){ clearTimeout(offlineTimer); offlineTimer = null; }
+    if(on){
+      offlineTimer = setTimeout(function(){ offlineTimer = null; el("offline").hidden = false; }, 3000);
+    } else {
+      el("offline").hidden = true;
+    }
+  }
 
   // ── Conversation selection / history load ────────────────────────────────────
   function resetMain(){
     messagesEl.innerHTML = "";
-    assistantBubbles = {}; reasoningBoxes = {}; toolCards = {}; activeRuns = {};
+    openAssistant = null; openReasoning = null; toolCards = {}; activeRuns = {};
     activeRunId = null; changedFiles = {}; diffAvailable = false; lastSeq = 0; stick = true;
     routeEl.textContent = "";
     hideRunBanner();
     renderFiles(); updateChangesBadge();
+    updateDiffBtn();
     diffViewEl.innerHTML = "";
   }
   function selectConversation(id){
@@ -973,7 +1362,9 @@ const SCRIPT = `
     ren.onclick = function(e){ e.stopPropagation(); doRename(c); };
     var arc = txt("button", "mini-btn", c.archived ? "Unarchive" : "Archive"); arc.type = "button";
     arc.onclick = function(e){ e.stopPropagation(); doArchive(c); };
-    acts.appendChild(ren); acts.appendChild(arc);
+    var del = txt("button", "mini-btn", "Delete"); del.type = "button"; del.title = "Delete conversation";
+    del.onclick = function(e){ e.stopPropagation(); doDelete(c); };
+    acts.appendChild(ren); acts.appendChild(arc); acts.appendChild(del);
     li.appendChild(main); li.appendChild(acts);
     if(c.id === currentId){ li.classList.add("active"); main.setAttribute("aria-current", "true"); }
     return li;
@@ -987,20 +1378,82 @@ const SCRIPT = `
   }
 
   function doRename(c){
-    var next = window.prompt("Rename conversation", c.title || "");
-    if(next == null) return;
-    next = next.trim();
-    if(!next || next === c.title) return;
-    api("/api/rename", { conversationId: c.id, title: next }).then(function(){
-      if(c.id === currentId) setTitle(next);
-      loadList(el("search").value);
-    }).catch(function(){ toast("Rename failed"); });
+    // Find the conversation list item for this conversation
+    var li = listEl.querySelector('.conv[data-id="' + c.id + '"]');
+    var titleSpan = li ? li.querySelector(".conv-title") : null;
+    if(!titleSpan){
+      // fallback: rename via the main title heading
+      doInlineRenameAtEl(titleEl, c);
+      return;
+    }
+    doInlineRenameAtEl(titleSpan, c);
+  }
+
+  function doInlineRenameAtEl(el, c){
+    if(!el) return;
+    var oldTitle = (c.title || "Untitled").trim();
+    var input = mk("input", "conv-rename-input");
+    input.value = oldTitle;
+    input.setAttribute("aria-label", "Rename conversation");
+    var parent = el.parentNode;
+    parent.replaceChild(input, el);
+    input.focus();
+    input.select();
+    var done = false;
+    function finish(save){
+      if(done) return; done = true;
+      var newTitle = save ? input.value.trim() : oldTitle;
+      if(!newTitle) newTitle = oldTitle;
+      if(newTitle === oldTitle || !save){
+        parent.replaceChild(el, input);
+        if(el === titleEl) el.textContent = oldTitle;
+        return;
+      }
+      api("/api/rename", { conversationId: c.id, title: newTitle }).then(function(){
+        if(c.id === currentId) setTitle(newTitle);
+        var newSpan = txt("span", "conv-title", newTitle);
+        try { parent.replaceChild(newSpan, input); } catch(e){}
+        loadList(el("search").value);
+      }).catch(function(){
+        toast("Rename failed");
+        try { parent.replaceChild(el, input); } catch(e){}
+        if(el === titleEl) el.textContent = oldTitle;
+      });
+    }
+    input.addEventListener("keydown", function(e){
+      if(e.key === "Enter"){ e.preventDefault(); finish(true); }
+      if(e.key === "Escape"){ e.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", function(){ setTimeout(function(){ finish(true); }, 100); });
   }
   function doArchive(c){
     var want = !c.archived;
     api("/api/archive", { conversationId: c.id, archived: want }).then(function(){
       loadList(el("search").value);
     }).catch(function(){ toast("Archive failed"); });
+  }
+  function doDelete(c){
+    showConfirm("Delete this conversation?", function(ok){
+      if(!ok) return;
+      api("/api/archive", { conversationId: c.id, archived: true }).then(function(){
+        loadList(el("search").value);
+        if(currentId === c.id){ showNoneSelected(); }
+      }).catch(function(){ toast("Could not delete the conversation"); });
+    });
+  }
+  function showConfirm(msg, cb){
+    var ov = el("confirmOverlay");
+    el("confirmMsg").textContent = msg;
+    var okBtn = el("confirmOkBtn");
+    var cancelBtn = el("confirmCancelBtn");
+    function cleanup(){
+      ov.hidden = true;
+      okBtn.onclick = null;
+      cancelBtn.onclick = null;
+    }
+    okBtn.onclick = function(){ cleanup(); cb(true); };
+    cancelBtn.onclick = function(){ cleanup(); cb(false); };
+    ov.hidden = false;
   }
   function doNew(){
     api("/api/conversations", {}).then(function(res){
@@ -1060,6 +1513,7 @@ const SCRIPT = `
     var saved = null;
     try { saved = window.localStorage.getItem("kitten-theme"); } catch(e){}
     if(saved === "light" || saved === "dark"){ document.documentElement.setAttribute("data-theme", saved); }
+    updateThemeIcon();
   }
   function cycleTheme(){
     var cur = document.documentElement.getAttribute("data-theme");
@@ -1070,6 +1524,16 @@ const SCRIPT = `
       if(next) window.localStorage.setItem("kitten-theme", next);
       else window.localStorage.removeItem("kitten-theme");
     } catch(e){}
+    updateThemeIcon();
+  }
+  function updateThemeIcon(){
+    var icon = el("themeIcon");
+    if(!icon) return;
+    var cur = document.documentElement.getAttribute("data-theme");
+    var isDark = cur === "dark" || (!cur && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+    icon.innerHTML = isDark
+      ? '<circle cx="8" cy="8" r="4"/><path d="M8 0v2M8 14v2M0 8h2M14 8h2M2.34 2.34l1.42 1.42M12.24 12.24l1.42 1.42M2.34 13.66l1.42-1.42M12.24 3.76l1.42-1.42"/>'
+      : '<circle cx="8" cy="8" r="3"/><path d="M12.5 3.5a6 6 0 1 0-9 9 6.4 6.4 0 0 0 3 0 5.5 5.5 0 0 1 6-9z"/>';
   }
 
   // ── Toasts ───────────────────────────────────────────────────────────────────
@@ -1099,14 +1563,20 @@ const SCRIPT = `
 
   // ── Wiring ───────────────────────────────────────────────────────────────────
   function wire(){
-    messagesEl.addEventListener("scroll", function(){ stick = nearBottom(); });
+    messagesEl.addEventListener("scroll", function(){
+      stick = nearBottom();
+      // jump-to-bottom visibility
+      var jb = el("jumpBtn");
+      if(jb) jb.hidden = stick || messagesEl.scrollHeight <= messagesEl.clientHeight + 48;
+    });
 
     el("newBtn").onclick = doNew;
     el("themeBtn").onclick = cycleTheme;
     el("renameBtn").onclick = function(){
       var c = null;
       for(var i = 0; i < convCache.length; i++){ if(convCache[i].id === currentId){ c = convCache[i]; break; } }
-      if(c) doRename(c); else if(currentId) doRename({ id: currentId, title: titleEl.textContent });
+      if(c) doInlineRenameAtEl(titleEl, c);
+      else if(currentId) doInlineRenameAtEl(titleEl, { id: currentId, title: titleEl.textContent });
     };
     el("undoBtn").onclick = doUndo;
     changesBtnEl.onclick = toggleDrawer;
@@ -1115,6 +1585,10 @@ const SCRIPT = `
     stopBtnEl.onclick = doStop;
     el("menuBtn").onclick = openNav;
     scrimEl.onclick = closeNav;
+
+    // Jump button
+    var jumpBtnEl = el("jumpBtn");
+    if(jumpBtnEl){ jumpBtnEl.onclick = function(){ scrollToBottom(); }; }
 
     var searchEl = el("search");
     var searchTimer = null;
@@ -1132,8 +1606,19 @@ const SCRIPT = `
     });
 
     document.addEventListener("keydown", function(e){
+      var mod = e.ctrlKey || e.metaKey;
+      // Ctrl+N / Cmd+N: new conversation
+      if(mod && !e.shiftKey && !e.altKey && (e.key === "n" || e.key === "N")){ e.preventDefault(); doNew(); return; }
+      // Ctrl+K / Cmd+K: focus search
+      if(mod && !e.shiftKey && !e.altKey && (e.key === "k" || e.key === "K")){ e.preventDefault(); el("search").focus(); return; }
+      // Ctrl+L / Cmd+L: focus input
+      if(mod && !e.shiftKey && !e.altKey && (e.key === "l" || e.key === "L")){ e.preventDefault(); inputEl.focus(); return; }
+      // Escape: stop run > close drawer > close nav
       if(e.key === "Escape"){
-        if(drawerEl.classList.contains("open")) closeDrawer();
+        var co = el("confirmOverlay");
+        if(co && !co.hidden){ e.preventDefault(); el("confirmCancelBtn").click(); return; }
+        if(activeRunId){ e.preventDefault(); doStop(); }
+        else if(drawerEl.classList.contains("open")) closeDrawer();
         else if(appEl.classList.contains("nav-open")) closeNav();
       }
     });
@@ -1156,6 +1641,11 @@ const SCRIPT = `
     el("ver").textContent = KITTEN.version ? "v" + KITTEN.version : "";
     var cwd = KITTEN.cwd || "";
     el("cwd").textContent = cwd; el("cwd").title = cwd;
+    if(KITTEN.model){
+      el("modelBadge").textContent = KITTEN.model;
+      el("modelBadgeWrap").hidden = false;
+    }
+    updateDiffBtn();
     wire();
 
     loadList("").then(function(){

@@ -11,7 +11,7 @@ import type { Commitlet, CommitletHealthBudget, CommitletPlan, CommitletPlanInpu
 import { verificationFromBlueprint, workPacketToAllowedFiles } from "./types.js";
 import { emptyHealthReport } from "./health.js";
 import { globalConstraintsFor } from "../runstate/repoIdentity.js";
-import { isManifestPath, type ScaffoldFile } from "../blueprint/scaffold.js";
+import { isManifestPath, installCommandForManifest, type ScaffoldFile } from "../blueprint/scaffold.js";
 
 export function createCommitletPlan(input: CommitletPlanInput): CommitletPlan {
   const projectTestCommand = defaultVerificationCommand(input.repoRoot);
@@ -195,9 +195,10 @@ export function buildScaffoldCommitlets(files: ScaffoldFile[], userGoal: string,
   const phases = groupScaffoldFilesIntoPhases(files);
   return phases.map((phase, index) => {
     const paths = phase.files.map((file) => file.path);
-    const hasManifest = paths.some(isManifestPath);
+    const manifestPath = paths.find(isManifestPath);
+    const hasManifest = !!manifestPath;
     const hasTest = paths.some((path) => /(^|\/)(test|tests|__tests__)(\/|$)|\.(test|spec)\.[jt]sx?$/i.test(path));
-    const manifestNote = hasManifest ? " and run `npm install`" : "";
+    const manifestNote = manifestPath ? ` and run \`${installCommandForManifest(manifestPath)}\`` : "";
     const base = makeCommitlet({
       id: `c${index + 1}-scaffold-${phase.key}`,
       title: `Create ${phase.label} (${paths.length} file${paths.length === 1 ? "" : "s"})`,
@@ -281,7 +282,7 @@ export function classifyScaffoldFile(path: string): ScaffoldPhase["key"] {
   if (/\.config\.[jt]s$/i.test(base) || /^(tsconfig[\w.-]*\.json|jsconfig\.json|index\.html|\.gitignore|\.npmrc|\.eslintrc[\w.-]*|\.prettierrc[\w.-]*|components\.json)$/i.test(base) || /^\.env/i.test(base)) return "config";
   // The app entry/shell: the wiring hub that imports the rest. Built AFTER features so its imports
   // already exist. (index.html is config, handled above; a subdir barrel index.ts is NOT entry.)
-  if (/^main\.[jt]sx?$/i.test(base) || /^app\.[jt]sx?$/i.test(base) || /^src\/index\.[jt]sx$/i.test(p)) return "entry";
+  if (/^main\.[jt]sx?$/i.test(base) || /^app\.[jt]sx?$/i.test(base) || /^index\.[jt]sx$/i.test(base)) return "entry";
   if (/(^|\/)(components?|pages?|views?|features?|routes?|screens?|widgets?|containers?|sections?|modules?)(\/|$)/i.test(p)) return "features";
   return "foundation";
 }

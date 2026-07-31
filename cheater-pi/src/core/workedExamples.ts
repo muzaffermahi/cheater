@@ -45,8 +45,10 @@ function grabExpected(text: string, from: number): { value: string; end: number 
   const c = text[i];
   if (c === "[" || c === "{" || c === "(") { const end = matchBalanced(text, i); if (end < 0) return null; return { value: text.slice(i, end), end }; }
   if (c === '"' || c === "'") { let j = i + 1; while (j < text.length && text[j] !== c) { if (text[j] === "\\") j++; j++; } return { value: text.slice(i, j + 1), end: j + 1 }; }
-  // bare token: number / True/False/None / identifier, up to a terminator.
-  const m = text.slice(i).match(/^(-?\d+(?:\.\d+)?|True|False|None|-?\w[\w.]*)/);
+  // bare token: number / True/False/None / identifier, up to a terminator. The number branch must cover
+  // scientific notation (1e6) and digit-group underscores (1_000) — otherwise `1e6` captured only `1`
+  // and a correct solution returning 1000000 FALSE-FAILED against the truncated expected value.
+  const m = text.slice(i).match(/^(-?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?|True|False|None|-?\w[\w.]*)/);
   if (m) return { value: m[1], end: i + m[1].length };
   return null;
 }
@@ -59,15 +61,40 @@ function looksLikeLiteral(s: string): boolean {
   return false;
 }
 
+// Python builtins / common noise that appear as `name(` in prose but are never the task's target symbol.
+const CALL_NOISE = new Set([
+  "print", "range", "len", "int", "str", "list", "dict", "set", "tuple", "float", "bool", "type",
+  "repr", "sorted", "sum", "min", "max", "abs", "map", "filter", "zip", "enumerate", "open", "input",
+  "isinstance", "getattr", "setattr", "format", "round", "any", "all", "next", "iter", "super",
+]);
+
+/** Discover call-symbols from `identifier( ... ) <connector> <literal>`-shaped text — used when the
+ *  caller passed no symbols (a contract that missed the function name must not disable ground truth). */
+function discoverCallSymbols(text: string): string[] {
+  const found = new Set<string>();
+  const re = /\b([A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[1];
+    if (CALL_NOISE.has(name)) continue;
+    found.add(name);
+    if (found.size >= 24) break;
+  }
+  return [...found];
+}
+
 /**
  * Extract worked examples `symbol(args) <connector> expected` from the task text for the given symbols.
  * Balanced-bracket aware; only keeps examples whose expected side is a literal. Deduped, bounded.
+ * When `symbols` is empty (contract missed the function), symbols are DISCOVERED from the example shapes
+ * themselves — the per-example validation (a connector + a Python literal, no ellipsis) filters prose.
  */
 export function extractWorkedExamples(task: string, symbols: string[]): WorkedExample[] {
   const text = task ?? "";
   const out: WorkedExample[] = [];
   const seen = new Set<string>();
-  const syms = symbols.filter((s) => /^[A-Za-z_]\w*$/.test(s));
+  let syms = symbols.filter((s) => /^[A-Za-z_]\w*$/.test(s));
+  if (!syms.length) syms = discoverCallSymbols(text);
   if (!syms.length) return out;
   const symRe = new RegExp(`\\b(${syms.map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\s*\\(`, "g");
   let m: RegExpExecArray | null;
@@ -112,6 +139,9 @@ export function extractSetupVars(task: string): string[] {
     const from = m.index + m[0].length;
     const val = grabExpected(text, from - 0);
     if (!val || !looksLikeLiteral(val.value)) continue;
+    // Skip abbreviated setup data (`grid = [[1, ...]]`): `...` runs as Python Ellipsis and would
+    // false-fail a correct solution. Mirrors the same guard in extractWorkedExamples.
+    if (/\.\.\.|…/.test(val.value)) continue;
     if (seen.has(name)) continue;
     seen.add(name);
     out.push(`${name} = ${val.value}`);

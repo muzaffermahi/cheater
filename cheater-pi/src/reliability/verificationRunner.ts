@@ -272,7 +272,7 @@ function runStage(spec: WebappVerificationStageSpec, ctx: StageRunContext): Veri
 function runBuildStage(spec: WebappVerificationStageSpec, ctx: StageRunContext): VerificationStageResult {
   const cmd = ctx.cmds.buildCommand;
   if (!cmd) {
-    return { stage: spec.stage, status: "skipped", summary: "no build command detected", failureClass: "unknown", artifacts: [], signals: {} };
+    return { stage: spec.stage, status: "skipped", summary: "no build command detected", failureClass: "unknown", artifacts: [], signals: { noCommandAvailable: true } };
   }
   const outcome = ctx.runCommand(cmd, { cwd: ctx.cwd, timeoutSeconds: spec.timeoutSeconds });
   const status: VerificationStatus = outcome.timedOut ? "timed_out" : outcome.returncode === 0 ? "ok" : "failed";
@@ -408,7 +408,9 @@ function ranButFoundNoTests(outcome: { returncode: number; stdout: string; stder
 
 function runTestStage(spec: WebappVerificationStageSpec, ctx: StageRunContext, cmd: string | null, label: string): VerificationStageResult {
   if (!cmd) {
-    return { stage: spec.stage, status: "skipped", summary: `no ${label} command detected`, failureClass: "unknown", artifacts: [], signals: {} };
+    // No command exists for this check — mark it so the finish gate's noRunnableCheck path can allow an
+    // honest UNVERIFIED finish (not block forever), rather than a bookkeeping stage faking a green.
+    return { stage: spec.stage, status: "skipped", summary: `no ${label} command detected`, failureClass: "unknown", artifacts: [], signals: { noCommandAvailable: true } };
   }
   const outcome = ctx.runCommand(cmd, { cwd: ctx.cwd, timeoutSeconds: spec.timeoutSeconds });
   if (!outcome.timedOut && ranButFoundNoTests(outcome)) {

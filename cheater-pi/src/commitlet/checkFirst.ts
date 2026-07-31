@@ -350,7 +350,7 @@ export interface ScreenResult {
  * the change and is garbage. The implemented bytes are ALWAYS restored in a finally, so an
  * interruption cannot lose the worker's edits (and the rollback snapshot remains on disk regardless).
  */
-export function runRedGreenScreen(cwd: string, commitlet: Commitlet, runCheck: () => VerificationResult, precomputedGreen?: VerificationResult): ScreenResult {
+export function runRedGreenScreen(cwd: string, commitlet: Commitlet, runCheck: () => VerificationResult, precomputedGreen?: VerificationResult, artifactPaths: string[] = []): ScreenResult {
   // When the grade already ran this exact check green (tier 1 == focused verification), reuse it so
   // the screen costs only the one extra red run - the "free" mutation screen the spec promises.
   const green = precomputedGreen && precomputedGreen.passed ? precomputedGreen : runCheck();
@@ -360,12 +360,22 @@ export function runRedGreenScreen(cwd: string, commitlet: Commitlet, runCheck: (
 
   const rel = commitlet.allowedFiles.filter((file) => file && !file.startsWith("(") && !file.endsWith("/"));
   const savedGreen = new Map<string, Buffer | null>();
+  // Contract output artifacts the check itself WRITES (e.g. the app writes output.json when run) live
+  // OUTSIDE allowedFiles, so the red re-run clobbers them with pre-implementation content and the finally
+  // below would not restore them — leaving a stale deliverable that the finish gate's existence/parse-only
+  // artifact check accepts. Snapshot their green bytes too and restore them alongside the source.
+  const artifacts = [...new Set(artifactPaths.map((p) => p.replace(/\\/g, "/")).filter((p) => p && !p.endsWith("/") && !rel.includes(p)))];
+  const savedArtifacts = new Map<string, Buffer | null>();
   const existedBefore = new Set((point.existedFiles ?? []).map((p) => p.replace(/\\/g, "/")));
   try {
     // 1. Save the implemented (green) bytes so we can put them back.
     for (const r of rel) {
       const abs = join(cwd, r);
       savedGreen.set(r, existsSync(abs) ? readFileSync(abs) : null);
+    }
+    for (const a of artifacts) {
+      const abs = join(cwd, a);
+      savedArtifacts.set(a, existsSync(abs) ? readFileSync(abs) : null);
     }
     // 2. Restore the pre-implementation (red) state from the snapshot.
     for (const r of rel) {
@@ -383,8 +393,8 @@ export function runRedGreenScreen(cwd: string, commitlet: Commitlet, runCheck: (
     const red = runCheck();
     return { screened: true, verdict: classifyRedGreen(red, green), green, red };
   } finally {
-    // 4. ALWAYS restore the implemented bytes.
-    for (const [r, buf] of savedGreen) {
+    // 4. ALWAYS restore the implemented bytes — and the green output artifacts the red run clobbered.
+    for (const [r, buf] of [...savedGreen, ...savedArtifacts]) {
       const abs = join(cwd, r);
       try {
         if (buf === null) {
@@ -514,7 +524,7 @@ export function evaluateCheckFirst(cwd: string, commitlet: Commitlet, opts: Eval
     // Red screen only on the hard/multi-commitlet lane (it costs an extra full check run); on the easy
     // lane we still record the green pass, just without the mutation screen.
     if (CHECK_FIRST.redScreen && opts.synthesisAllowed) {
-      const screen = runRedGreenScreen(cwd, commitlet, runCheck, green0);
+      const screen = runRedGreenScreen(cwd, commitlet, runCheck, green0, opts.contract?.outputPaths ?? []);
       const weak = screen.verdict !== "proven";
       return {
         ran: true,

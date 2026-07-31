@@ -109,6 +109,24 @@ test("self-probe fold: a candidate that crashes on its own probe is execution-IN
   assert.equal(res.winnerHasExecutionReceipt, true, "winner now has a green execution receipt (not weak)");
 });
 
+test("a candidate whose module fails to load is NOT folded as a passing probe (honest audit)", async () => {
+  // Regression: runFnProbes returns null for a module that won't load, leaving crashes[i]=0, so the fold
+  // credited un-loadable code with probe="pass" and marked it strongly execution-eligible.
+  const good1 = ws("g1", "def f(x):\n    return x * 2\n");
+  const good2 = ws("g2", "def f(x):\n    return x * 2\n");
+  const broken = ws("bad", "def f(x):\n    return x *\n"); // syntax error → module never loads
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({ llm: dummyLlm, task: "double", contract, probe: { module: "impl.py", symbol: "f", inputs: [[2], [3], [4]] } });
+  const res = await v.verify([
+    { index: 1, workspace: good1, finished: true, summary: "" },
+    { index: 2, workspace: good2, finished: true, summary: "" },
+    { index: 3, workspace: broken, finished: true, summary: "" },
+  ]);
+  const b = res.slate.find((s) => s.index === 3)!;
+  assert.notEqual(b.probe, "pass", "an un-loadable module must not be folded as a passing probe");
+  assert.notEqual(res.winner, 3, "the broken candidate does not win");
+});
+
 test("ground truth: a candidate that fails the prompt's worked examples is INELIGIBLE and loses", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ver-gt-"));
   const right = join(dir, "right"); mkdirSync(right); writeFileSync(join(right, "solution.py"), "def f(x):\n    return x * 2\n");
@@ -129,6 +147,30 @@ test("ground truth: a candidate that fails the prompt's worked examples is INELI
   assert.equal(r.groundTruth, "pass");
   assert.equal(res.winner, 2, "the ground-truth-correct candidate wins");
   assert.equal(res.winnerHasExecutionReceipt, true);
+});
+
+test("a weakly-eligible candidate never outranks a ground-truth-verified one (no false green)", async () => {
+  // Regression: with no consensus/ORM, fuse tie-broke on index, so a lower-index candidate that only
+  // passed the finish gate (its worked-example module never ran) could WIN and be applied over a
+  // verified one — and was even credited with a green execution receipt because SOME OTHER candidate
+  // had execution evidence. Both are false greens.
+  const dir = mkdtempSync(join(tmpdir(), "ver-weak-"));
+  const weak = join(dir, "weak"); mkdirSync(weak);               // index 1: NO solution.py → examples can't run
+  writeFileSync(join(weak, "notes.txt"), "wrote to the wrong file\n");
+  const strong = join(dir, "strong"); mkdirSync(strong);
+  writeFileSync(join(strong, "solution.py"), "def f(x):\n    return x * 2\n"); // index 2: passes the examples
+  const contract = extractAcceptanceContract("implement f");
+  const v = new Verifier({
+    llm: dummyLlm, task: "double", contract,
+    workedExamples: [{ call: "f(2)", expected: "4" }, { call: "f(3)", expected: "6" }], workedModule: "solution.py"
+  });
+  const res = await v.verify([
+    { index: 1, workspace: weak, finished: true, summary: "" },
+    { index: 2, workspace: strong, finished: true, summary: "" }
+  ]);
+  assert.equal(res.slate.find((s) => s.index === 1)!.weaklyEligible, true, "the module-less candidate is only weakly eligible");
+  assert.equal(res.winner, 2, "the ground-truth-verified candidate wins, not the lower-index weak one");
+  assert.equal(res.winnerHasExecutionReceipt, true, "receipt reflects the winner's OWN evidence");
 });
 
 test("verifierReceiptLines renders the full audit slate", async () => {

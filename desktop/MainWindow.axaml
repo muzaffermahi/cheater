@@ -1,0 +1,172 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Kitten.Desktop.MainWindow"
+        Width="1320" Height="860" MinWidth="960" MinHeight="620"
+        Title="Kitten" Opened="OnOpened" KeyDown="WindowKeyDown">
+
+  <!-- Three regions and a status line. Sessions on the left, the conversation in the middle, what the
+       run produced on the right. Everything else — models, benchmarks, agents, workspace tools,
+       exports — lives in the command palette (Ctrl+K) instead of a wall of buttons. -->
+  <Panel>
+    <Grid RowDefinitions="Auto,*,Auto" ColumnDefinitions="252,*,344">
+
+      <!-- Header -->
+      <Border Grid.Row="0" Grid.ColumnSpan="3" Padding="14,9" Background="{DynamicResource SurfaceBrush}"
+              BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="0,0,0,1">
+        <Grid ColumnDefinitions="Auto,*,Auto">
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="9" VerticalAlignment="Center">
+            <TextBlock Text="Kitten" FontSize="14" FontWeight="SemiBold" VerticalAlignment="Center" />
+            <Border Background="{DynamicResource Surface2Brush}" CornerRadius="4" Padding="6,2" VerticalAlignment="Center">
+              <TextBlock Name="ProjectText" Text="No project" FontSize="11.5" Classes="muted" VerticalAlignment="Center" />
+            </Border>
+          </StackPanel>
+          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+            <Button Content="Open project" Click="OpenProject" Classes="tiny" />
+            <Button Content="Commands  Ctrl+K" Click="ShowCommandPalette" Classes="tiny" />
+          </StackPanel>
+        </Grid>
+      </Border>
+
+      <!-- Sessions -->
+      <Border Grid.Row="1" Grid.Column="0" Padding="12" Background="{DynamicResource SurfaceBrush}"
+              BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="0,0,1,0">
+        <Grid RowDefinitions="Auto,Auto,*">
+          <Button Grid.Row="0" Content="New task" Click="NewTask" Classes="primary" HorizontalAlignment="Stretch" />
+          <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="6" Margin="0,12,0,8">
+            <TextBox Name="ConversationSearch" Watermark="Search" FontSize="12" Padding="8,5" />
+            <Button Grid.Column="1" Content="Find" Click="SearchConversations" Classes="tiny" />
+          </Grid>
+          <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="4">
+              <TextBlock Text="SESSIONS" Classes="label" />
+              <!-- Title ellipsised, recency on the right: several sessions in one project usually open
+                   with the same sentence, so the timestamp is what tells them apart. -->
+              <ListBox Name="ConversationList" SelectionChanged="SelectConversation">
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                      <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis" FontSize="12.5" />
+                      <TextBlock Grid.Column="1" Text="{Binding Age}" FontSize="11" Opacity="0.55" VerticalAlignment="Center" />
+                    </Grid>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+            </StackPanel>
+          </ScrollViewer>
+        </Grid>
+      </Border>
+
+      <!-- Conversation -->
+      <Grid Grid.Row="1" Grid.Column="1" RowDefinitions="*,Auto,Auto" Margin="20,16,20,14">
+        <!-- Bottom-anchored, like a conversation: the newest turn sits next to the composer instead of
+             stranding it under a screen of empty space. -->
+        <ScrollViewer Name="TranscriptScroll" VerticalScrollBarVisibility="Auto">
+          <StackPanel Name="TranscriptHost" VerticalAlignment="Bottom" />
+        </ScrollViewer>
+
+        <!-- An approval is a decision, so it belongs next to the conversation that raised it, not in a
+             side panel. Hidden entirely until one is actually pending. -->
+        <Border Name="ApprovalBar" Grid.Row="1" IsVisible="False" Margin="0,10,0,0" Padding="12,10"
+                CornerRadius="8" Background="{DynamicResource AccentSoftBrush}" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="1">
+          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+            <TextBlock Name="ApprovalText" Text="" TextWrapping="Wrap" VerticalAlignment="Center" />
+            <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+              <Button Name="ApproveButton" Content="Approve" Click="ApproveAction" IsEnabled="False" Classes="primary tiny" />
+              <Button Name="DenyButton" Content="Deny" Click="DenyAction" IsEnabled="False" Classes="tiny" />
+            </StackPanel>
+          </Grid>
+        </Border>
+
+        <StackPanel Grid.Row="2" Spacing="8" Margin="0,12,0,0">
+          <TextBox Name="Prompt" Watermark="Describe what you want Kitten to do…    @agent objective  ·  Ctrl+Enter to run"
+                   AcceptsReturn="True" MinHeight="86" MaxHeight="220" TextWrapping="Wrap" KeyDown="PromptKeyDown" />
+          <Grid ColumnDefinitions="Auto,Auto,*,Auto,Auto">
+            <Button Grid.Column="0" Name="RunButton" Content="Run" Click="Submit" Classes="primary" />
+            <Button Grid.Column="1" Name="CancelButton" Content="Stop" Click="CancelRun" IsEnabled="False" Margin="8,0,0,0" />
+            <TextBlock Grid.Column="2" Name="ComposerHint" Text="" Classes="muted" FontSize="11.5" VerticalAlignment="Center" Margin="12,0" TextTrimming="CharacterEllipsis" />
+            <Button Grid.Column="3" Name="PlanButton" Content="Plan first" Click="PlanAndRun" Classes="ghost" />
+            <Button Grid.Column="4" Name="ImplementButton" Content="Implement plan" Click="ImplementPlan" IsEnabled="False" Classes="ghost" />
+          </Grid>
+        </StackPanel>
+      </Grid>
+
+      <!-- What the run produced -->
+      <Border Grid.Row="1" Grid.Column="2" Padding="14" Background="{DynamicResource SurfaceBrush}"
+              BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="1,0,0,0">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Spacing="18">
+            <StackPanel Spacing="6">
+              <TextBlock Text="RUN" Classes="label" />
+              <TextBlock Name="Activity" Text="No active run" Classes="body" />
+              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
+                <Button Name="UndoButton" Content="Undo" Click="UndoLastRun" IsEnabled="False" Classes="tiny" />
+                <Button Name="RedoButton" Content="Redo" Click="RedoLastRun" IsEnabled="False" Classes="tiny" />
+                <Button Name="ResumeButton" Content="Resume" Click="ResumeInterrupted" IsEnabled="False" Classes="tiny" />
+              </StackPanel>
+            </StackPanel>
+
+            <StackPanel Spacing="6">
+              <TextBlock Text="EVIDENCE" Classes="label" />
+              <TextBlock Name="Evidence" Text="Verified receipts appear here after a run." Classes="body" />
+              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
+                <Button Name="RunChecksButton" Content="Run checks" Click="RunSuggestedChecks" IsEnabled="False" Classes="tiny" />
+                <Button Name="CancelChecksButton" Content="Stop checks" Click="CancelSuggestedChecks" IsEnabled="False" Classes="tiny" />
+              </StackPanel>
+            </StackPanel>
+
+            <StackPanel Spacing="6">
+              <TextBlock Text="CHANGES" Classes="label" />
+              <TextBlock Name="ChangesSummary" Text="No changes in this run." Classes="body" />
+              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
+                <Button Content="Review diff" Click="OpenWorkspaceChanges" Classes="tiny" />
+                <Button Content="Files" Click="OpenWorkspaceExplorer" Classes="tiny" />
+              </StackPanel>
+            </StackPanel>
+
+            <!-- Only shown while a bakeoff is in flight or has a report to open. -->
+            <StackPanel Name="BakeoffSection" Spacing="6" IsVisible="False">
+              <TextBlock Text="MODEL BAKEOFF" Classes="label" />
+              <StackPanel Orientation="Horizontal" Spacing="6">
+                <Button Name="CancelBakeoffButton" Content="Stop" Click="CancelModelBakeoff" IsEnabled="False" Classes="tiny" />
+                <Button Name="ApplyBakeoffButton" Content="Apply winners" Click="ApplyModelBakeoff" IsEnabled="False" Classes="tiny" />
+                <Button Name="ViewBakeoffReportButton" Content="Report" Click="ViewBakeoffReport" IsEnabled="False" Classes="tiny" />
+              </StackPanel>
+            </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+
+      <!-- Status line -->
+      <Border Grid.Row="2" Grid.ColumnSpan="3" Padding="14,6" Background="{DynamicResource SurfaceBrush}"
+              BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="0,1,0,0">
+        <Grid ColumnDefinitions="Auto,Auto,*,Auto">
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="7" VerticalAlignment="Center">
+            <Ellipse Name="ConnectionDot" Width="7" Height="7" Fill="{DynamicResource WarnBrush}" VerticalAlignment="Center" />
+            <TextBlock Name="ConnectionText" Text="Starting engine…" FontSize="11.5" Classes="muted" VerticalAlignment="Center" />
+            <Button Name="RetryEngineButton" Content="Retry" Click="RetryEngine" IsEnabled="False" Classes="ghost tiny" />
+          </StackPanel>
+          <TextBlock Grid.Column="1" Text="·" Classes="muted" FontSize="11.5" Margin="8,0" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="2" Name="ModelText" Text="Models: checking…" FontSize="11.5" Classes="muted"
+                     VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+          <TextBlock Grid.Column="3" Text="Ctrl+K commands   ·   Ctrl+Enter run   ·   Esc stop" FontSize="11" Classes="muted"
+                     Opacity="0.7" VerticalAlignment="Center" />
+        </Grid>
+      </Border>
+    </Grid>
+
+    <!-- Command palette overlay. Populated in code so every action has exactly one definition. -->
+    <Border Name="PaletteOverlay" IsVisible="False" Background="#b8000000">
+      <Border VerticalAlignment="Top" HorizontalAlignment="Center" Margin="0,90,0,0" Width="620"
+              Background="{DynamicResource Surface2Brush}" BorderBrush="{DynamicResource BorderStrongBrush}"
+              BorderThickness="1" CornerRadius="10" Padding="10">
+        <StackPanel Spacing="8">
+          <TextBox Name="PaletteSearch" Watermark="Search commands…" FontSize="14" KeyDown="PaletteKeyDown" />
+          <ScrollViewer MaxHeight="420" VerticalScrollBarVisibility="Auto">
+            <ListBox Name="PaletteList" DoubleTapped="PaletteInvoke" />
+          </ScrollViewer>
+          <TextBlock Text="Enter to run   ·   Esc to close" FontSize="11" Classes="muted" Opacity="0.7" />
+        </StackPanel>
+      </Border>
+    </Border>
+  </Panel>
+</Window>

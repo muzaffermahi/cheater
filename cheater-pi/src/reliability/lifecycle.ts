@@ -501,6 +501,12 @@ export function commandFingerprint(cmd: string): string {
     .trim();
 }
 
+// Stages that constitute real correctness EVIDENCE — a command actually exercised the code. The other
+// stages (prepare_env, collect_artifacts, summarize, start/stop_services, workspace_identity) are ok by
+// construction (bookkeeping/orchestration) and must NOT, on their own, make a run "verified": otherwise a
+// project whose every real test/build stage was skipped reports a green with zero checks executed.
+const EVIDENCE_STAGES = new Set<VerificationStageName>(["build", "smoke", "focused_tests", "full_tests", "scoring", "typecheck"]);
+
 export function isTerminalVerified(results: VerificationStageResult[]): boolean {
   if (!results.length) return false;
   for (const r of results) {
@@ -513,7 +519,9 @@ export function isTerminalVerified(results: VerificationStageResult[]): boolean 
     if (r.advisory) continue;
     return false;
   }
-  return results.some((r) => r.status === "ok");
+  // Require at least one real EVIDENCE stage to have passed — bookkeeping stages that are ok by
+  // construction can never be the sole proof of a verified completion.
+  return results.some((r) => r.status === "ok" && EVIDENCE_STAGES.has(r.stage));
 }
 
 export interface FinishGateVerdict {
@@ -537,7 +545,10 @@ export function ledgerAllowsFinish(ledger: CompletionLedger): FinishGateVerdict 
   const noRunnableCheck =
     s.verification.some((v) => (v.signals as Record<string, unknown> | undefined)?.noCommandAvailable)
     && !s.verification.some((v) => v.status === "failed")
-    && !s.verification.some((v) => v.status === "ok");
+    // Bookkeeping stages (prepare_env/collect_artifacts/summarize) are ok by construction, so require
+    // that no real EVIDENCE stage passed — else a CLI project with every real check skipped would neither
+    // verify nor take this honest path, and would block finish forever.
+    && !s.verification.some((v) => v.status === "ok" && EVIDENCE_STAGES.has(v.stage));
   if (noRunnableCheck) {
     return { allowed: true, reason: "no runnable verification command exists in this project; finishing unverified" };
   }

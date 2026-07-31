@@ -28,6 +28,19 @@ test("skips abbreviated (ellipsis) examples that would false-fail", () => {
   assert.equal(extractWorkedExamples(task, ["query"]).length, 0, "an ellipsis expected is not a real literal");
 });
 
+test("captures scientific-notation and underscored numeric expected values in full (no truncation false-fail)", () => {
+  // Regression: `1e6` captured only `1`, so a correct solution returning 1000000 false-failed.
+  assert.deepEqual(extractWorkedExamples("scale(3) -> 1e6", ["scale"]), [{ call: "scale(3)", expected: "1e6" }]);
+  assert.deepEqual(extractWorkedExamples("avogadro() -> 6.02e23", ["avogadro"]), [{ call: "avogadro()", expected: "6.02e23" }]);
+  assert.deepEqual(extractWorkedExamples("thousand() -> 1_000", ["thousand"]), [{ call: "thousand()", expected: "1_000" }]);
+});
+
+test("extractSetupVars skips abbreviated (ellipsis) setup data (would run as Python Ellipsis and false-fail)", () => {
+  assert.deepEqual(extractSetupVars("grid = [[1, 1], [1, ...]]\ncount(grid) -> 7"), [], "abbreviated setup data is not usable");
+  const ok = extractSetupVars('data = {"a": 1}\nq(data) -> 1');
+  assert.ok(ok.some((v) => v.startsWith("data =")), "a clean setup var is still extracted");
+});
+
 test("extractSetupVars picks up `data = {...}` definitions", () => {
   const task = 'data = {"users": [{"name": "ann"}], "count": 2}\nquery(data, "$.count") -> [2]';
   const vars = extractSetupVars(task);
@@ -60,5 +73,14 @@ test("runExampleTest returns ran:false when the module is missing (no false sign
 
 test("no examples => empty extraction, gate is a no-op", () => {
   assert.deepEqual(extractWorkedExamples("no examples here", ["f"]), []);
-  assert.deepEqual(extractWorkedExamples("f(1)->2", []), [], "no symbols => nothing");
+  // Prose with only builtin calls yields nothing (no worked-example shape survives validation).
+  assert.deepEqual(extractWorkedExamples("call print(x) and len(y) somewhere", []), []);
+});
+
+test("discovers the symbol from the example when the contract missed it (F1 fix)", () => {
+  // A contract that fails to extract the function name must NOT disable ground-truth verification —
+  // the example names its own function. This is the false-'weak'-verdict bug found live on int_to_roman.
+  const ex = extractWorkedExamples("Fix int_to_roman so int_to_roman(4)=='IV' and int_to_roman(9)=='IX'.", []);
+  assert.equal(ex.length, 2);
+  assert.deepEqual(ex.map((e) => e.call), ["int_to_roman(4)", "int_to_roman(9)"]);
 });

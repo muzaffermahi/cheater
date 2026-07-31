@@ -51,6 +51,31 @@ test("contract extraction preserves exact paths, endpoints, ports, commands, and
   assert.ok(summary.length <= 700);
 });
 
+test("an input file sharing a sentence with a write verb is NOT tagged an output path", () => {
+  // Regression: extractOutputPaths tagged every file in any sentence containing an output verb, so a read
+  // INPUT became an output artifact (and could be outputPaths[0], the primary evaluator hint / guard target).
+  const c = extractAcceptanceContract("Read the input from data.csv and write the summary to report.json.");
+  assert.ok(c.files.includes("data.csv") && c.files.includes("report.json"));
+  assert.ok(c.outputPaths.includes("report.json"), "the written file is an output");
+  assert.ok(!c.outputPaths.includes("data.csv"), "the read input file must NOT be tagged an output");
+});
+
+test("symbol extraction ignores prose after a declaration keyword (no garbage symbols)", () => {
+  // Regression: SYMBOL_DECL_RE pushed the raw next token, so "a function that…" → "that", "the type of…" → "of".
+  const c = extractAcceptanceContract("Write a function that parses the file and returns the type of each row.");
+  assert.ok(!c.symbols.includes("that"), "must not extract the English word after 'function'");
+  assert.ok(!c.symbols.includes("of"), "must not extract the English word after 'type'");
+  const c2 = extractAcceptanceContract("Implement def median(xs) in solution.py.");
+  assert.ok(c2.symbols.includes("median"), "a real code-shaped def declaration is still a symbol");
+});
+
+test("a filesystem directory path is not extracted as an HTTP endpoint", () => {
+  // Regression: "/var/tmp/cache" was tagged an endpoint (even the PRIMARY evaluator hint) alongside a real one.
+  const c = extractAcceptanceContract("Store the cache at the path /var/tmp/cache and serve /api/health.");
+  assert.ok(c.endpoints.includes("/api/health"), "the real endpoint is kept");
+  assert.ok(!c.endpoints.includes("/var/tmp/cache"), "a filesystem path is not an endpoint");
+});
+
 test("contract extraction is calm on prose with no literal artifacts", () => {
   const contract = extractAcceptanceContract("Please make the app feel a bit snappier overall.");
   assert.equal(contract.files.length, 0);
@@ -92,6 +117,17 @@ test("mutationsFromCommand classifies installs, deletes, and git operations; rea
   assert.equal(rm[0]?.action, "file_deleted");
   const git = mutationsFromCommand("git reset --hard HEAD~1", "m");
   assert.ok(git.some((entry) => entry.action === "git_operation"));
+});
+
+test("mutationsFromCommand records BOTH truncating (>) and appending (>>) redirects as file_modified", () => {
+  const trunc = mutationsFromCommand("echo hi > out.json", "m");
+  assert.equal(trunc[0]?.action, "file_modified");
+  assert.deepEqual(trunc[0]?.paths, ["out.json"]);
+  // Regression: `>>` appends were silently missed, so an append after a passing check never marked the
+  // earlier validation stale — a stale green could then be repeated as fresh.
+  const append = mutationsFromCommand("cat extra >> out.json", "m");
+  assert.equal(append[0]?.action, "file_modified", ">> append must be recorded as a mutation");
+  assert.deepEqual(append[0]?.paths, ["out.json"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -190,8 +226,10 @@ test("post-success guard protects artifacts and blocks destructive commands over
   assert.equal(guard.isProtected("dist/bundle.js"), true, "directory protection covers children");
   assert.equal(guard.isProtected("src/app.ts"), false);
   assert.equal(guard.assessCommand("rm -rf output.json").verdict, "block");
+  assert.equal(guard.assessCommand("rm -Rf dist").verdict, "block", "capital -Rf (macOS recursive) must block just like -rf");
   assert.equal(guard.assessCommand("git reset --hard").verdict, "block", "broad destruction endangers every protected artifact");
   assert.equal(guard.assessCommand("cat output.json").verdict, "allow", "reading protected output is fine");
+  assert.equal(guard.assessCommand("rm output.json.bak").verdict, "allow", "a different file (output.json.bak) must not match the protected output.json");
   assert.match(guard.warningLine() ?? "", /Protected artifacts exist/);
 });
 

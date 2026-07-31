@@ -304,7 +304,19 @@ export function stampProfile(cwd: string, profile: StackProfile, ctx: TemplateCt
   // which imports ./index.css). Only stamp them when the model did NOT choose its own entry name.
   const hasMainPlanned = plannedBase.has("main.tsx") || plannedBase.has("main.jsx");
   const hasOwnIndexEntry = plannedBase.has("index.tsx") || plannedBase.has("index.jsx");
-  const entryOk = hasMainPlanned || !hasOwnIndexEntry;
+  // The entry set (index.html + main.* + index.css) is stamped with hardcoded CANONICAL cross-links
+  // (index.html → /src/main.*, main.* → ./index.css). If the model relocated any coupled file off its
+  // canonical path (a flat layout, or public/index.html), those links dangle and `vite build` fails on
+  // internally-inconsistent bytes the harness itself wrote. In that case skip stamping the entry group and
+  // let the model author the coupled files coherently.
+  const coupled = new Map(profile.invariantFiles
+    .filter((f) => ["index.html", "main.tsx", "main.jsx", "index.css"].includes(basename(f.path).toLowerCase()))
+    .map((f) => [basename(f.path).toLowerCase(), f.path]));
+  const entryLayoutCanonical = planned.every((p) => {
+    const canon = coupled.get(basename(p).toLowerCase());
+    return !canon || p.replace(/\\/g, "/") === canon;
+  });
+  const entryOk = (hasMainPlanned || !hasOwnIndexEntry) && entryLayoutCanonical;
   const stamped: StampedFile[] = [];
   for (const file of profile.invariantFiles) {
     if (file.group === "styling" && !ctx.usesTailwind) continue;

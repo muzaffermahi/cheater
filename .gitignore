@@ -49,6 +49,16 @@ eval_runs_dirty_check/
 *.tmp
 *.checkpoint
 
+# Native desktop build + release output (rebuilt by scripts/package-desktop*.mjs|ps1)
+artifacts/
+desktop/bin/
+desktop/obj/
+desktop/dist/
+desktop/Installer/bin/
+desktop/Installer/obj/
+.dotnet/
+left_off.txt
+
 # Local config / env / state
 .env
 .cheater/cache/
@@ -72,3 +82,4 @@ cheater-pi/.cheater/
 .cheater/experience/
 .cheater/commitlets/
 *.egg-info/
+runtimes/

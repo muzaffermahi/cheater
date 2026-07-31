@@ -27,8 +27,15 @@ export function hasResolvedScope(allowedFiles: string[]): boolean {
  *  everything else. */
 export function taskInvolvesDependency(commitlet: Pick<Commitlet, "title" | "purpose" | "spec">): boolean {
   const text = `${commitlet.title} ${commitlet.purpose} ${(commitlet.spec?.behaviorMustHold ?? []).join(" ")} ${(commitlet.spec?.acceptanceCriteria ?? []).join(" ")}`.toLowerCase();
+  // An explicit package-manager invocation is unambiguous.
   return /\b(npm (i|install|add)|yarn add|pnpm add|pip install|cargo add|go get|gem install)\b/.test(text)
-    || /\b(add|install|integrate|pull in|bring in)\b[^.]{0,40}\b(dependenc|package|librar|module|crate|gem)\b/.test(text);
+    // The word "dependency"/"dependencies" is unambiguous dependency intent.
+    || /\b(add|install|integrate|need|require|pull in|bring in)\b[^.]{0,40}\bdependenc(?:y|ies)\b/.test(text)
+    // "package"/"crate"/"gem" as the HEAD of its noun phrase — followed by a function word, punctuation,
+    // or end ("add the axios package and use it", "add a package"). This EXCLUDES a product feature where
+    // the word merely modifies another noun ("add package tracking") and the ambiguous "module"/"library"
+    // product phrasings ("the payments module", "a user module") that wrongly demoted the manifest block.
+    || /\b(add|install|integrate|use|pull in|bring in)\b[^.]{0,40}\b(?:package|crate|gem)s?\b(?=\s+(?:and|to|for|in|into|from|which|that|as|when|so|then|is|are|will|would)\b|\s*[.,;:)]|\s*$)/.test(text);
 }
 
 /** Whether a (forward-slash) file path falls under an allowed scope (exact file or `dir/`). */
@@ -104,7 +111,10 @@ export function runDiffGuard(commitlet: Commitlet, input: DiffInput, overrides: 
 }
 
 export function countDiffLines(diffText = ""): number {
-  return diffText.split(/\r?\n/).filter((line) => /^[+-]/.test(line) && !/^\+\+\+|---/.test(line)).length;
+  // Exclude only the two unified-diff HEADERS (`+++ b/…`, `--- a/…`). The `---` alternative must be
+  // anchored: unanchored, it also dropped real content lines that merely contain `---` (Markdown
+  // front-matter, YAML separators, a `"---"` literal), under-counting the diff and inflating health.
+  return diffText.split(/\r?\n/).filter((line) => /^[+-]/.test(line) && !/^(\+\+\+|---)/.test(line)).length;
 }
 
 /** A pure-addition diff = a newly-created file (or a clean append) - a big one is expected, not risky. */

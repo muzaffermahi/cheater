@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { captureSnapshot, restoreSnapshot } from "../src/core/undo.js";
@@ -46,6 +46,46 @@ test("restoreSnapshot: reverts a modified file, deletes a created file, keeps un
   assert.equal(readFileSync(join(dir, "tracked.py"), "utf8"), "original\n");
   assert.equal(existsSync(join(dir, "new.py")), false);
   assert.equal(readFileSync(join(dir, "other.py"), "utf8"), "user dirty edit\n");
+});
+
+test("restoreSnapshot: restores a pre-existing UNTRACKED file the run modified (never deletes it)", () => {
+  // Regression for a data-loss bug: `git stash create` captures only tracked content, so an untracked
+  // file was absent from the snapshot ref and /undo deleted it as if the run had created it.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-undo-untracked-"));
+  gitInit(dir);
+  writeFileSync(join(dir, "tracked.py"), "x\n");
+  gitCommitAll(dir, "init");
+
+  // A pre-existing untracked file the user cares about (never committed).
+  writeFileSync(join(dir, "notes.md"), "MY IMPORTANT NOTES\n");
+
+  const snap = captureSnapshot(dir);
+  assert.ok(snap.preexisting?.includes("notes.md"), "untracked file recorded at capture");
+
+  // The run modifies the untracked file and creates a brand-new file.
+  writeFileSync(join(dir, "notes.md"), "clobbered by the run\n");
+  writeFileSync(join(dir, "new.py"), "created by run\n");
+
+  const res = restoreSnapshot(dir, snap, ["notes.md", "new.py"]);
+  assert.deepEqual(res.restored, ["notes.md"]); // pre-run content written back
+  assert.deepEqual(res.deleted, ["new.py"]);    // truly run-created → removed
+  assert.equal(readFileSync(join(dir, "notes.md"), "utf8"), "MY IMPORTANT NOTES\n"); // NOT deleted, reverted
+  assert.equal(existsSync(join(dir, "new.py")), false);
+});
+
+test("restoreSnapshot: restores a pre-existing UNTRACKED file the run deleted", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-undo-untracked-del-"));
+  gitInit(dir);
+  writeFileSync(join(dir, "tracked.py"), "x\n");
+  gitCommitAll(dir, "init");
+  writeFileSync(join(dir, "data.json"), '{"keep":true}\n');
+
+  const snap = captureSnapshot(dir);
+  rmSync(join(dir, "data.json")); // the run deletes the untracked file
+
+  const res = restoreSnapshot(dir, snap, ["data.json"]);
+  assert.deepEqual(res.restored, ["data.json"]);
+  assert.equal(readFileSync(join(dir, "data.json"), "utf8"), '{"keep":true}\n'); // recreated with pre-run content
 });
 
 test("restoreSnapshot: honest failure outside a git repo", () => {
