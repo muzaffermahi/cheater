@@ -1,9 +1,9 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { postEditSyntaxGate } from "../src/core/reliable.js";
+import { postEditSyntaxGate, pythonImportBaseline, pythonImportRegression } from "../src/core/reliable.js";
 import type { ToolContext } from "../src/core/tools.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
 
@@ -284,4 +284,39 @@ test("the self-call arity gate catches a wrong-arity method call a smoke test wo
   writeFileSync(join(ctx.cwd, "ok.py"), good);
   const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
   assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
+});
+
+
+test("the import invariant catches a rename that broke an existing importer", () => {
+  // The multi-file failure a model cannot see from the file it edited: rename a function, forget the
+  // module that imports it. Neither a syntax check nor a smoke test on the edited file notices.
+  const cwd = mkdtempSync(join(tmpdir(), "kt-import-"));
+  writeFileSync(join(cwd, "core.py"), "def compute_total(items):\n    return sum(items)\n");
+  writeFileSync(join(cwd, "invoice.py"), "from core import compute_total\n\n\ndef build(i):\n    return compute_total(i)\n");
+  const baseline = pythonImportBaseline(cwd);
+  assert.ok(baseline.includes("core") && baseline.includes("invoice"), `baseline should hold both: ${JSON.stringify(baseline)}`);
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "an untouched repo has no regression");
+
+  // Rename in core.py only — invoice.py's import now dangles.
+  writeFileSync(join(cwd, "core.py"), "def compute_subtotal(items):\n    return sum(items)\n");
+  const broken = pythonImportRegression(cwd, baseline);
+  assert.ok(broken, "a broken importer must be reported");
+  assert.match(broken!, /BROKEN modules/);
+  assert.match(broken!, /invoice/);
+
+  // Fixing the caller clears it.
+  writeFileSync(join(cwd, "invoice.py"), "from core import compute_subtotal\n\n\ndef build(i):\n    return compute_subtotal(i)\n");
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "a consistent repo must pass");
+});
+
+test("the import invariant never blames the agent for a repo that was already broken", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kt-import2-"));
+  writeFileSync(join(cwd, "fine.py"), "VALUE = 1\n");
+  writeFileSync(join(cwd, "needs_missing_dep.py"), "import definitely_not_installed_xyz\n");
+  writeFileSync(join(cwd, "already_broken.py"), "from nowhere import thing\n");
+  const baseline = pythonImportBaseline(cwd);
+  assert.ok(baseline.includes("fine"), "a healthy module is recorded");
+  assert.ok(!baseline.includes("needs_missing_dep"), "a module needing an absent package is NOT baselined");
+  assert.ok(!baseline.includes("already_broken"), "a pre-broken module is NOT baselined");
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "pre-existing breakage must never block");
 });

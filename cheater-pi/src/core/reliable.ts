@@ -148,6 +148,10 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     "When the task is done and you've run it, call finish with a one-line summary. Be concise; act instead of narrating."
   ].filter(Boolean).join("\n");
 
+  // Snapshot which modules already import, BEFORE the agent touches anything, so the finish gate can
+  // tell "the agent broke this" from "this was already broken / needs absent packages".
+  const importBaseline = pythonImportBaseline(cwd);
+
   const result = await runAgent({
     task,
     cwd,
@@ -172,7 +176,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     allowedFiles: params.allowedFiles,
     forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification)
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline)
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -304,6 +308,78 @@ function typeScriptSyntaxGate(cwd: string, path: string, full: string): string |
   return undefined;
 }
 
+/**
+ * Which pre-existing Python modules import cleanly right now.
+ *
+ * This is the baseline half of a "don't break what worked" invariant. A multi-file change is the
+ * case where a model most often fixes one file and silently breaks another — rename a function and
+ * forget the importer, move a helper and leave a dangling `from x import y`. Neither a syntax check
+ * nor the model's own smoke test on the file it just edited will notice; the next importer explodes.
+ *
+ * Only modules that ALREADY imported are recorded, so a repo that was broken to begin with, or a
+ * module needing absent third-party packages, can never be blamed on the agent. New files the agent
+ * creates are deliberately not imported here — their correctness is the model's own to demonstrate,
+ * and importing freshly generated code for a gate check is not something to do behind the user's back.
+ */
+export function pythonImportBaseline(cwd: string): string[] {
+  const program = `
+import importlib, json, os, sys, warnings
+warnings.filterwarnings("ignore")
+sys.path.insert(0, os.getcwd())
+SKIP = {"__pycache__", ".git", ".venv", "venv", "node_modules", ".cheater", "build", "dist"}
+mods = []
+for root, dirs, files in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")]
+    for f in files:
+        if not f.endswith(".py") or f.startswith("_accept"):
+            continue
+        rel = os.path.relpath(os.path.join(root, f), ".")
+        parts = rel[:-3].replace("\\\\", "/").split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts or any(not p.isidentifier() for p in parts):
+            continue
+        mods.append(".".join(parts))
+ok = []
+for m in sorted(set(mods)):
+    try:
+        importlib.import_module(m)
+        ok.append(m)
+    except BaseException:
+        pass
+print(json.dumps(ok))
+`;
+  try {
+    const r = spawnSync("python", ["-c", program], { cwd, encoding: "utf8", timeout: 30000, windowsHide: true });
+    if (r.status !== 0) return [];
+    return JSON.parse((r.stdout ?? "[]").trim()) as string[];
+  } catch { return []; }
+}
+
+/** Re-import the baseline modules; returns a model-facing message when one that worked now fails. */
+export function pythonImportRegression(cwd: string, baseline: readonly string[]): string | undefined {
+  if (!baseline.length) return undefined;
+  const program = `
+import importlib, json, sys, os, warnings, traceback
+warnings.filterwarnings("ignore")
+sys.path.insert(0, os.getcwd())
+broken = []
+for m in json.loads(sys.argv[1]):
+    try:
+        importlib.import_module(m)
+    except BaseException as e:
+        broken.append("%s: %s: %s" % (m, type(e).__name__, str(e)[:160]))
+print(json.dumps(broken))
+`;
+  try {
+    const r = spawnSync("python", ["-c", program, JSON.stringify(baseline)], { cwd, encoding: "utf8", timeout: 30000, windowsHide: true });
+    if (r.status !== 0) return undefined;
+    const broken = JSON.parse((r.stdout ?? "[]").trim()) as string[];
+    if (!broken.length) return undefined;
+    return `You have BROKEN modules that imported cleanly before your change:\n${broken.slice(0, 5).map((b) => `  - ${b}`).join("\n")}\nA change is not done while it breaks an existing importer. Fix every caller of anything you renamed or moved, then re-check.`;
+  } catch { return undefined; }
+}
+
 // Does a bash command look like it actually executed the code under change (not a trivial probe)?
 const EXECUTED_RE = /\b(pytest|unittest|python3?\s+\S+\.py|python3?\s+-c|node\s+\S+\.(m|c)?js|node\s+-e|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S+)\b/i;
 
@@ -313,12 +389,24 @@ async function finishGate(
   testCmd: string | null,
   llm: import("./llm.js").KittenLLM,
   worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[]; bans: string[] },
-  onVerification?: (e: VerificationProgress) => void
+  onVerification?: (e: VerificationProgress) => void,
+  importBaseline: readonly string[] = [],
 ): Promise<{ allowed: boolean; feedback?: string }> {
   onVerification?.({
     phase: "started",
     what: testCmd ? `finish gate: ${testCmd}` : worked?.examples.length ? "finish gate: worked examples" : "finish gate: execution receipt",
   });
+  // "Don't break what worked" comes FIRST: a change that leaves an existing importer broken is not
+  // done, whatever else passes. This is the multi-file failure the model cannot see from the one
+  // file it edited.
+  if (importBaseline.length) {
+    const regressed = pythonImportRegression(state.cwd, importBaseline);
+    if (regressed) {
+      onVerification?.({ phase: "evidence", check: "existing modules still import", passed: false, durationMs: 0 });
+      return { allowed: false, feedback: regressed };
+    }
+    onVerification?.({ phase: "evidence", check: `${importBaseline.length} pre-existing module(s) still import`, passed: true, durationMs: 0 });
+  }
   // P2 — forbidden-construct scan FIRST. The oracle rejects a banned construct outright, before any
   // behavior test, so a behaviorally-correct solution that uses `import re` still fails. Catch it here
   // (the engine-agnostic layer; a native engine also hard-bans it at decode).
