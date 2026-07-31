@@ -33,6 +33,8 @@ export interface ConversationRow {
   agent?: string | null;
   parentConversationId?: string | null;
   parentRunId?: string | null;
+  /** The conversation's effort level (fast|balanced|careful|think-hard). Default "balanced". */
+  effort: string;
 }
 
 export interface RunRow {
@@ -73,6 +75,7 @@ export interface CreateConversationInput {
   agent?: string | null;
   parentConversationId?: string | null;
   parentRunId?: string | null;
+  effort?: string;
 }
 
 export interface ListConversationsOptions {
@@ -262,6 +265,10 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
   `,
+  // v6 — the per-conversation effort level (fast|balanced|careful|think-hard).
+  `
+  ALTER TABLE conversations ADD COLUMN effort TEXT NOT NULL DEFAULT 'balanced';
+  `,
 ];
 
 /**
@@ -350,6 +357,7 @@ const REPAIR_COLUMNS: ReadonlyArray<{ table: string; column: string; type: strin
   { table: "conversations", column: "agent", type: "TEXT" },
   { table: "conversations", column: "parent_conversation_id", type: "TEXT" },
   { table: "conversations", column: "parent_run_id", type: "TEXT" },
+  { table: "conversations", column: "effort", type: "TEXT NOT NULL DEFAULT 'balanced'" },
 ];
 
 function tableNames(db: SqlDatabase): Set<string> {
@@ -436,11 +444,11 @@ export class ConversationStore {
   createConversation(input: CreateConversationInput): { conversation: ConversationRow; event: KittenEvent } {
     return transact(this.db, () => {
       this.db.prepare(
-        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id, effort)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         input.id, input.title, input.projectRoot, input.projectId, input.model, input.mode,
-        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null
+        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null, input.effort ?? "balanced"
       );
       const event = this._append(input.id, {
         type: "conversation.created", title: input.title, projectRoot: input.projectRoot,
@@ -479,6 +487,14 @@ export class ConversationStore {
       this.db.prepare("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?").run(title, ts, id);
       return this._append(id, { type: "conversation.renamed", title }, ts);
     });
+  }
+
+  /** Persist the conversation's effort level. A plain column update — no event (the per-run choice
+   *  is already durably recorded on route.selected). */
+  setEffort(id: string, effort: string, ts: number): boolean {
+    if (!this.getConversation(id)) return false;
+    this.db.prepare("UPDATE conversations SET effort = ?, updated_at = ? WHERE id = ?").run(effort, ts, id);
+    return true;
   }
 
   setArchived(id: string, archived: boolean, ts: number): KittenEvent | null {
@@ -730,6 +746,7 @@ function mapConversation(r: Record<string, SqlValue>): ConversationRow {
     agent: r.agent != null ? String(r.agent) : null,
     parentConversationId: r.parent_conversation_id != null ? String(r.parent_conversation_id) : null,
     parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
+    effort: r.effort != null ? String(r.effort) : "balanced",
   };
 }
 

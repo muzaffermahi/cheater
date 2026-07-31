@@ -18,6 +18,9 @@ import {
 import { EVENT_SCHEMA_VERSION, type EventPayload, type KittenEvent, type Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
 import type { HardnessSignal } from "../runtime/computeBudget.js";
+import { effortProfile, resolveEffort, type EffortLevel, type EffortProfile } from "./effort.js";
+import { decomposeCompiledTask } from "./taskCompiler/index.js";
+import { validateTaskPlan } from "./taskGraph.js";
 import { captureSnapshot, captureSnapshotAfter, restoreSnapshot, redoSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 import { ContextBuilder, contextBudgetForWindow } from "./context.js";
 import { TaskGraphController, type TaskGraphPlan, type TaskGraphEvent } from "./taskGraph.js";
@@ -50,6 +53,8 @@ export interface RunContext {
   conversationContext: string;
   /** The router's hardness evidence, threaded so the ascent budget sees what the router saw. */
   hardness: HardnessSignal;
+  /** The resolved effort profile for this run — every compute lever reads its bounds from here. */
+  profile: EffortProfile;
   /** Pre-run git snapshot ref (or null), so a lane that isolates its work (Ascent) can derive the
    *  winner's changed files via git after adoption. */
   snapshotRef: string | null;
@@ -122,6 +127,8 @@ export interface CreateConversationInput {
   /** Default lane for the conversation; "auto" (default) lets the router decide per message. */
   mode?: Lane | "auto";
   agent?: string;
+  /** The conversation's effort level (fast|balanced|careful|think-hard). Default "balanced". */
+  effort?: string;
 }
 
 export interface SubmitOptions {
@@ -129,6 +136,8 @@ export interface SubmitOptions {
   lane?: Lane;
   /** Force the sample count for bon/ascent. */
   k?: number;
+  /** Per-message effort override; falls back to the conversation's stored level. */
+  effort?: string;
   /** Parent/task-plan cancellation signal, linked to the app-owned run controller. */
   signal?: AbortSignal;
   allowedFiles?: readonly string[];
@@ -310,6 +319,7 @@ export class KittenApp {
       model: input.model ?? this.model,
       mode: input.mode ?? "auto",
       agent: input.agent ?? "general",
+      effort: input.effort !== undefined ? resolveEffort(input.effort) : undefined,
       ts: this.now(),
     });
     // Broadcast the creation event the store already appended (seq 1).
@@ -469,11 +479,11 @@ export class KittenApp {
       signal,
       runId: parentRunId,
       repoBrief: parent.projectRoot,
-      // Independent clerical scouts can fan out, while any ready main-model worker
-      // keeps the local GPU/context budget serialized. This makes subagent plans
-      // faster without sending two heavyweight coding turns into one runtime.
-      maxConcurrent: 2,
-      maxConcurrentFor: (ready) => ready.some((node) => node.modelTier === "main") ? 1 : 2,
+      // Independent clerical scouts fan out per the conversation's effort level, while any ready
+      // main-model worker keeps the local GPU/context budget serialized (one heavyweight coding
+      // turn per runtime, whatever the dial says).
+      maxConcurrent: effortProfile(parent.effort).subagentMaxConcurrent,
+      maxConcurrentFor: (ready) => ready.some((node) => node.modelTier === "main") ? 1 : effortProfile(parent.effort).subagentMaxConcurrent,
     });
     this.emitPlanSnapshot(conversationId, parentRunId, "plan settled");
     return settled;
@@ -518,6 +528,11 @@ export class KittenApp {
     this.store.renameConversation(id, title.trim() || "Untitled", this.now());
     const ev = lastEventOfType(this.store, id, "conversation.renamed");
     if (ev) for (const fn of this.listeners) { try { fn(ev); } catch { /* ignore */ } }
+  }
+
+  /** Persist the conversation's effort level (the per-run choice lands on route.selected anyway). */
+  setEffort(id: string, effort: string): boolean {
+    return this.store.setEffort(id, resolveEffort(effort), this.now());
   }
 
   archive(id: string, archived = true): void {
@@ -624,12 +639,74 @@ export class KittenApp {
   }
 
   /** Route, letting a compiled contract supply a lane hint the deterministic router does not have. */
-  private route(text: string, conv: ConversationRow, opts: SubmitOptions, compiled: CompileResult | null): RouteDecision {
+  private route(text: string, conv: ConversationRow, opts: SubmitOptions, compiled: CompileResult | null, effort?: EffortLevel): RouteDecision {
     const explicit = opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode);
-    const decision = routeMessage(text, { lane: explicit, k: opts.k, cwd: conv.projectRoot });
+    const decision = routeMessage(text, { lane: explicit, k: opts.k, cwd: conv.projectRoot, effort });
     const hint = compiled?.task.executionPolicy.laneHint;
     if (explicit || !hint || hint === decision.lane) return decision;
     return { ...decision, lane: hint, reasons: [...decision.reasons, compiled!.task.executionPolicy.laneReason] };
+  }
+
+  // ── Think-hard decomposition ─────────────────────────────────────────────────────────────────
+  /** Derive + persist a bounded DAG from the compiled contract, or null when it declines/fails. */
+  private planDecomposition(conversationId: string, runId: string, compiled: CompileResult): { reason: string; nodeIds: string[] } | null {
+    try {
+      const d = decomposeCompiledTask(compiled.task);
+      if (!d.nodes.length) return null;
+      // Node ids are store-global; prefix with the run so two think-hard runs never collide.
+      const prefixed = d.nodes.map((n) => ({
+        ...n,
+        id: `${runId}-${n.id}`,
+        dependencies: n.dependencies.map((dep) => `${runId}-${dep}`),
+      }));
+      validateTaskPlan({ conversationId, nodes: prefixed });
+      this.createTaskPlan({ conversationId, nodes: prefixed, ts: this.now() }, runId);
+      return { reason: d.reason, nodeIds: prefixed.map((n) => n.id) };
+    } catch {
+      return null; // any planning defect → the ordinary lane run handles the turn
+    }
+  }
+
+  /** Execute a decomposed plan as THE run: step events flow via the task-graph bridge, and the run's
+   *  outcome is synthesized from the settled node rows (integrate node = the verification word). */
+  private async runDecomposedPlan(conversationId: string, runId: string, text: string, conv: ConversationRow, planned: { reason: string; nodeIds: string[] }, controller: AbortController, effort: EffortLevel, hardness: number): Promise<RunRow> {
+    const started = this.now();
+    this.emit(conversationId, { type: "route.selected", runId, lane: "direct", reasons: [`think-hard decomposition: ${planned.reason}`], k: 1, hardness, effort });
+    this.emit(conversationId, { type: "run.started", runId, request: text, lane: "direct", model: conv.model, agent: "task-compiler" });
+    let snapshotRef: string | null = null;
+    try { const snap = captureSnapshot(conv.projectRoot); snapshotRef = snap.ref; this.store.setRunSnapshot(runId, JSON.stringify(snap)); } catch { /* best-effort */ }
+    void snapshotRef;
+    try {
+      const settled = await this.runTaskPlan(conversationId, runId, controller.signal);
+      if (controller.signal.aborted) {
+        this.emit(conversationId, { type: "run.cancelled", runId });
+        return this.store.getRun(runId)!;
+      }
+      const mine = settled.filter((n) => planned.nodeIds.includes(n.id));
+      const integrate = mine.find((n) => n.id.endsWith("-tc-integrate"));
+      const finished = mine.length > 0 && mine.every((n) => n.status === "completed" || n.status === "waiting");
+      const verified = integrate?.status === "completed";
+      const filesChanged = [...new Set(mine.flatMap((n) => n.evidence))].filter((e) => /[\\/.]/.test(e)).slice(0, 64);
+      try { const snap = captureSnapshotAfter(conv.projectRoot); this.store.setRunSnapshotAfter(runId, JSON.stringify(snap)); } catch { /* best-effort */ }
+      const summary = (integrate?.report || mine.map((n) => n.report).find(Boolean) || planned.reason).slice(0, 300);
+      this.emit(conversationId, {
+        type: "run.completed", runId, finished, verified, lane: "direct", model: conv.model,
+        summary, wallMs: this.now() - started, usage: { prompt: 0, completion: 0, reasoning: 0 },
+      });
+      this.emit(conversationId, {
+        type: "receipt.finalized", runId,
+        lines: [
+          `think-hard decomposition: ${planned.reason}`,
+          ...mine.map((n) => `  ${n.id.slice(runId.length + 1)}: ${n.status}${n.report ? ` — ${n.report.slice(0, 140)}` : ""}`),
+        ],
+        filesChanged, verified,
+      });
+      return this.store.getRun(runId)!;
+    } catch (e) {
+      if (controller.signal.aborted) this.emit(conversationId, { type: "run.cancelled", runId });
+      else this.emit(conversationId, { type: "run.failed", runId, error: (e as Error).message.slice(0, 500) });
+      return this.store.getRun(runId)!;
+    }
   }
 
   /** Ask the one blocking question and terminate the turn honestly: an answer, not a change. */
@@ -667,9 +744,16 @@ export class KittenApp {
     const conv = this.store.getConversation(conversationId);
     if (!conv) throw new Error(`submitMessage: unknown conversation ${conversationId}`);
 
+    // The effort dial: a per-message override wins, else the conversation's stored level. The profile
+    // sets the BOUNDS every lever below reads; hardness still makes the per-task decisions.
+    const effort: EffortLevel = resolveEffort(opts.effort ?? conv.effort);
+    const profile = effortProfile(effort);
+
     // Assemble the model-facing conversation context from PRIOR turns BEFORE persisting the new message
     // (so the current request isn't duplicated into its own context). This is what makes resume real.
-    const built = this.context.build(conversationId, conv.projectRoot);
+    // "fast" trims the history budget (a lean turn should not pay a full-window prefill).
+    const built = this.context.build(conversationId, conv.projectRoot,
+      profile.contextWindowFraction < 1 ? { windowTokens: Math.floor(this.context.windowTokens() * profile.contextWindowFraction) } : undefined);
     const sidecarContext = typeof opts.contextPreamble === "string" ? opts.contextPreamble.trim().slice(0, 12_000) : "";
 
     this.emit(conversationId, { type: "user.message", text });
@@ -693,7 +777,7 @@ export class KittenApp {
       return this.requestClarification(conversationId, runId, text, compiled);
     }
 
-    const decision: RouteDecision = this.route(text, conv, opts, compiled);
+    const decision: RouteDecision = this.route(text, conv, opts, compiled, effort);
     // Register the abort controller BEFORE emitting run events, so a synchronous subscriber can cancel
     // the instant the run appears (the run row already exists by the time run.started broadcasts).
     const controller = new AbortController();
@@ -702,7 +786,23 @@ export class KittenApp {
     const externalAbort = externalSignal ? () => controller.abort(externalSignal.reason) : undefined;
     if (externalSignal?.aborted) controller.abort(externalSignal.reason);
     else if (externalAbort && externalSignal) externalSignal.addEventListener("abort", externalAbort, { once: true });
-    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k, hardness: decision.hardness });
+
+    // Think-hard auto-decomposition: a decomposable contract becomes a bounded, per-piece-verified
+    // subagent DAG instead of one long trajectory. Any decline or failure falls through to the
+    // ordinary lane run — plan machinery must never fail the user's turn.
+    if (profile.autoDecompose && !opts.lane && compiled?.validation.ok && decision.lane !== "answer") {
+      const planned = this.planDecomposition(conversationId, runId, compiled);
+      if (planned) {
+        try {
+          return await this.runDecomposedPlan(conversationId, runId, text, conv, planned, controller, effort, decision.hardness);
+        } finally {
+          if (externalSignal && externalAbort) externalSignal.removeEventListener("abort", externalAbort);
+          this.inflight.delete(runId);
+        }
+      }
+    }
+
+    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k, hardness: decision.hardness, effort });
     this.emit(conversationId, { type: "run.started", runId, request: text, lane: decision.lane, model: conv.model, agent: conv.agent ?? "general" });
 
     // Capture a pre-run snapshot for /undo BEFORE the runner mutates anything (cheap; never touches the
@@ -717,6 +817,7 @@ export class KittenApp {
         lane: decision.lane, k: decision.k, model: conv.model, agent: conv.agent ?? "general", signal: controller.signal, allowedFiles: opts.allowedFiles, forbiddenFiles: opts.forbiddenFiles,
         conversationContext,
         hardness: decision.signal,
+        profile,
         snapshotRef,
         emit: (payload) => { this.emit(conversationId, payload); },
         requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),

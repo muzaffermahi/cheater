@@ -16,6 +16,7 @@ import { ConversationStore } from "../src/core/store/conversationStore.js";
 import { openSqlite } from "../src/core/store/db.js";
 import type { KittenLLM, ChatParams, ChatResult } from "../src/core/llm.js";
 import type { EventPayload, KittenEvent } from "../src/core/events.js";
+import { EFFORT_PROFILES } from "../src/core/effort.js";
 
 // ── fakes ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -36,7 +37,7 @@ function scriptedLlm(turns: Array<Partial<ChatResult>>): KittenLLM {
 function runCtx(overrides: Partial<RunContext> & { emit: (p: EventPayload) => void; cwd: string }): RunContext {
   return {
     runId: "runX", conversationId: "convX", task: "task", lane: "direct", k: 1, model: "fake",
-    signal: new AbortController().signal, conversationContext: "", hardness: {}, snapshotRef: null,
+    signal: new AbortController().signal, conversationContext: "", hardness: {}, profile: EFFORT_PROFILES.balanced, snapshotRef: null,
     requestApproval: async () => true,
     ...overrides,
   } as RunContext;

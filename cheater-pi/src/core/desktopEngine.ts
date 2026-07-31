@@ -1537,7 +1537,12 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const requestedModel = typeof p.model === "string" && p.model.trim() ? p.model.trim() : projectSettings.models.main;
         const tierError = modelTierMismatch("main", requestedModel);
         if (tierError) throw new Error(tierError);
-        result = app.createConversation({ title: String(p.title ?? "New conversation"), projectRoot, model: requestedModel, agent: typeof p.agent === "string" ? p.agent : undefined });
+        result = app.createConversation({ title: String(p.title ?? "New conversation"), projectRoot, model: requestedModel, agent: typeof p.agent === "string" ? p.agent : undefined, effort: typeof p.effort === "string" ? p.effort : undefined });
+        break;
+      }
+      case "conversation.set-effort": {
+        const conversationId = String(p.conversationId ?? frame.conversationId);
+        result = { updated: app.setEffort(conversationId, String(p.effort ?? "balanced")) };
         break;
       }
       case "conversation.submit": {
@@ -1564,7 +1569,9 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             }
           }
           if (submitController.signal.aborted) { result = { cancelled: true, phase: "preflight" }; break; }
-          result = await app.submitMessage(conversationId, text, { lane: typeof p.lane === "string" ? p.lane as never : undefined, k: typeof p.k === "number" ? p.k : undefined, contextPreamble, signal: submitController.signal });
+          result = await app.submitMessage(conversationId, text, { lane: typeof p.lane === "string" ? p.lane as never : undefined, k: typeof p.k === "number" ? p.k : undefined, effort: typeof p.effort === "string" ? p.effort : undefined, contextPreamble, signal: submitController.signal });
+          // A per-message effort is also the user's new preference for this conversation.
+          if (typeof p.effort === "string") app.setEffort(conversationId, p.effort);
           if (conversation && /^(?:new task|new conversation)$/i.test(conversation.title.trim())) {
             void automaticSidecarTitle(text, activeRuntime, sidecar).then((title) => { if (title) app.rename(conversationId, title); }).catch(() => { /* title is cosmetic; the run must never depend on it */ });
           }

@@ -74,6 +74,8 @@ export interface AscentConfig {
   cloudBurst?: CloudBurstConfig | null;
   ceiling?: ComputeCeiling;
   levers?: Partial<AscentLevers>;
+  /** Effort dial: repair-round bound (replaces the hardcoded samples<=1?1:2 when set). */
+  maxRepairRounds?: number;
   /** Live progress sink (repair rounds, verification phases). Advisory; never changes the grade. */
   onProgress?: (e: AscentProgress) => void;
   /** Injectable generator (default: cloudBurstGenerate). Tests supply a deterministic one. */
@@ -94,6 +96,10 @@ export interface AscentParams {
   hardness?: HardnessSignal;
   /** Measurement-only (D1): force the sample count to a fixed N, overriding the hardness budget. */
   forceSamples?: number;
+  /** Effort dial: clamp the hardness-budgeted sample count into [kFloor, kCap] (the governor still
+   *  caps downward — ceilings are hard). forceSamples bypasses the clamp (measurement stays exact). */
+  kFloor?: number;
+  kCap?: number;
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
   /** Model-facing conversation context (prior turns + repo truth); every candidate gets the same one. */
@@ -191,6 +197,12 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const governor = new BudgetGovernor(config.ceiling ?? {});
   const estTokens = config.estTokensPerSample ?? DEFAULT_EST_TOKENS;
   let samples = params.forceSamples ?? (lever(config, "diversity") ? Math.max(1, budget.samples) : 1);
+  // Effort clamp (forceSamples = measurement, stays exact): floor then cap, then the governor's hard
+  // downward cap — ceilings always win over floors.
+  if (params.forceSamples === undefined) {
+    if (params.kFloor && params.kFloor > samples) samples = params.kFloor;
+    if (params.kCap && params.kCap < samples) samples = params.kCap;
+  }
   samples = governor.capSamples(samples, estTokens);
   receipts.push(`budget: hardness ${budget.hardness} → k=${samples} (${budget.reason})`);
 
@@ -229,7 +241,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // k=3 (for a majority vote), but the ground-truth eligibility gate + mid-loop repair now filter wrong
   // candidates directly — so k=2 recovers json_query (measured 0/56) at ⅓ less latency than k=3, and a
   // task that stays wrong earns more depth from the repair round anyway. Hard tasks keep their budgeted k.
-  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 2) {
+  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 2 && (params.kCap ?? 2) >= 2) {
     const floored = governor.capSamples(2, estTokens);
     if (floored > samples) { samples = floored; receipts.push(`consensus floor: k→${samples} (self-probe present → select between candidates)`); }
   }
@@ -264,7 +276,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   let allAttempts: BurstAttempt[] = [];
   let repairSeed: string | undefined;
   let round = 0;
-  const maxRounds = lever(config, "diversity") ? (samples <= 1 ? 1 : 2) : 1;
+  const maxRounds = lever(config, "diversity") ? (config.maxRepairRounds ?? (samples <= 1 ? 1 : 2)) : 1;
 
   for (round = 1; round <= maxRounds; round++) {
     if (governor.exhausted()) { receipts.push("budget exhausted → stop generating"); break; }

@@ -61,6 +61,8 @@ export interface ReliableParams {
   extraDirective?: string;
   /** A1 diversity: override/reorder which contract files scout slices first (the localization axis). */
   localizationFiles?: string[];
+  /** Effort dial: how many contract files the scout pre-slices into the first message (default 4). */
+  scoutFiles?: number;
   /** A3 experience: primed approach-shape from similar past solves, injected into the first message. */
   experiencePrime?: string;
   /** P1: capture per-token logprobs → self-certainty (owned-engine selection signal). */
@@ -101,7 +103,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
   // symbol out of each, so the first turn already carries the code to change. The A1 localization axis
   // may reorder the candidate list so a different file leads on different samples.
   const terms = [...contract.symbols, ...task.split(/\s+/).filter((w) => w.length > 4)].slice(0, 12);
-  const candidateFiles = (params.localizationFiles?.length ? params.localizationFiles : contract.files).slice(0, 4);
+  const candidateFiles = (params.localizationFiles?.length ? params.localizationFiles : contract.files).slice(0, Math.max(1, params.scoutFiles ?? 4));
   const briefs: string[] = [];
   for (const file of candidateFiles) {
     if (existsSync(join(cwd, file))) {

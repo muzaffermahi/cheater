@@ -19,6 +19,7 @@
 import type { Lane } from "./events.js";
 import { classifyAutopilotTask } from "../autopilot/classifier.js";
 import { scoreHardness, type HardnessSignal } from "../runtime/computeBudget.js";
+import { EFFORT_PROFILES, type EffortLevel } from "./effort.js";
 
 export interface RouteDecision {
   lane: Lane;
@@ -38,6 +39,9 @@ export interface RouteInput {
   k?: number;
   /** Project root, for the classifier's context (it does not read the filesystem). */
   cwd?: string;
+  /** The user's effort level. Bounds, not decisions: "fast" caps auto-routing at reliable;
+   *  "think-hard" floors non-trivial changes into ascent; the middle levels clamp k. */
+  effort?: EffortLevel;
 }
 
 /** Default k per lane. */
@@ -78,11 +82,32 @@ export function routeMessage(text: string, input: RouteInput = {}): RouteDecisio
   if (LARGE_BUILD.test(text)) escalators.push("large/multi-part build (needs decomposition + per-piece verification)");
 
   const base = `${c.taskKind} (confidence ${c.confidence.toFixed(2)}, risk ${c.risk})`;
+  const profile = input.effort ? EFFORT_PROFILES[input.effort] : null;
+
   if (escalators.length) {
-    const k = Math.max(2, input.k ?? 2);
+    // "fast" caps auto-routing below ascent — but the cap is RECORDED, never silent, so the user can
+    // see the router wanted more and chose speed on their instruction.
+    if (profile?.laneCap && profile.laneCap !== "ascent") {
+      return { lane: profile.laneCap, reasons: [base, ...escalators, `fast effort capped the lane at ${profile.laneCap} (router chose ascent)`], k: 1, hardness, signal };
+    }
+    const k = clampK(Math.max(2, input.k ?? 2), input.k, profile);
     return { lane: "ascent", reasons: [base, ...escalators, `→ Ascent k=${k}`], k, hardness, signal };
+  }
+
+  // "think-hard" floors non-explanation changes into ascent even without escalators — the user asked
+  // for coverage, and coverage means candidates to select between.
+  if (profile?.forceAscent) {
+    const k = clampK(Math.max(profile.kFloor, input.k ?? profile.kFloor), input.k, profile);
+    return { lane: "ascent", reasons: [base, `think-hard effort → Ascent k=${k} (coverage requested)`], k, hardness, signal };
   }
 
   // Ordinary change → the reliable lane (check-first, post-edit gates, finish evidence) at k=1.
   return { lane: "reliable", reasons: [base, "→ reliable k=1 (easy tasks don't pay best-of-N latency)"], k: 1, hardness, signal };
+}
+
+/** Clamp an ascent k into the effort profile's [floor, cap]; an explicit user k is never raised. */
+function clampK(k: number, explicit: number | undefined, profile: { kFloor: number; kCap: number } | null): number {
+  if (!profile) return k;
+  const floored = explicit && explicit > 0 ? k : Math.max(k, profile.kFloor);
+  return Math.min(floored, profile.kCap);
 }

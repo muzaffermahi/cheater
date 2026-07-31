@@ -78,6 +78,11 @@ export class ContextBuilder {
     this.budget = contextBudgetForWindow(windowTokens);
   }
 
+  /** The current window (the server-ceiling truth) — effort fractions are computed against this. */
+  windowTokens(): number {
+    return this.budget.windowTokens;
+  }
+
   /**
    * Build the model-facing context for the NEXT message in `conversationId`. `currentUserText` is the
    * new request (used only to keep the block relevant); it is NOT included — the engine appends it as

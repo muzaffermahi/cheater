@@ -130,7 +130,14 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     }
   };
 
-  const common = { task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, tools: profile.tools, spawnTask: ctx.spawnTask, allowedFiles: ctx.allowedFiles, forbiddenFiles: ctx.forbiddenFiles, onEvent, signal: ctx.signal };
+  // The effort dial's bounds reach the agent loop here: turn cap and thinking budget were previously
+  // never set from the app path (every run got the 40-turn default and the model's own thinking).
+  const common = {
+    task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, tools: profile.tools,
+    spawnTask: ctx.spawnTask, allowedFiles: ctx.allowedFiles, forbiddenFiles: ctx.forbiddenFiles, onEvent, signal: ctx.signal,
+    maxTurns: ctx.profile.maxTurns,
+    reasoningBudget: ctx.profile.reasoningBudget,
+  };
 
   // Route destructive shell commands through the app's approval policy (Goal §8). Catastrophic/RCE/exfil
   // are hard-blocked by the engine's safety floor regardless; this gates merely-destructive ("warn") ones.
@@ -155,7 +162,7 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     })
     : ctx.lane === "direct"
       ? await runAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true })
-      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true, onVerification: verificationSink(ctx) });
+      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true, onVerification: verificationSink(ctx), scoutFiles: ctx.profile.scoutFiles });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
@@ -217,7 +224,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx) });
+    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx), maxTurns: ctx.profile.maxTurns, reasoningBudget: ctx.profile.reasoningBudget, scoutFiles: ctx.profile.scoutFiles });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
@@ -240,8 +247,17 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
       case "verification.failed": ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: e.detail }); break;
     }
   };
+  // The effort profile arms the previously-unset compute ceiling and repair bound, and clamps k.
+  config.ceiling = ctx.profile.ceiling;
+  config.maxRepairRounds = ctx.profile.maxRepairRounds;
   const a = await runAscent(
-    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: ctx.hardness, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model },
+    {
+      task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: ctx.hardness,
+      forceSamples: ctx.k > 1 ? ctx.k : undefined,
+      kFloor: ctx.profile.kFloor, kCap: ctx.profile.kCap,
+      maxTurns: ctx.profile.maxTurns,
+      onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model,
+    },
     config
   );
   // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it
