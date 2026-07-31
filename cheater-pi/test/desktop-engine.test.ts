@@ -81,6 +81,8 @@ test("desktop engine serves health and conversation commands over local IPC", as
     assert.equal(health.ready, true);
     const runtimeEnsure = await call(socket, "runtime-ensure", "runtime.ensure", { projectRoot: process.cwd() });
     assert.equal(runtimeEnsure.configured, false);
+    const compiledMissing = await call(socket, "compiled-missing", "task.compiled-get", { runId: "no-such-run" });
+    assert.equal(compiledMissing, null, "task.compiled-get answers null for an unknown run");
     const conversation = await call(socket, "2", "conversation.create", { title: "IPC test" });
     assert.equal(conversation.title, "IPC test");
     const exported = await call(socket, "export", "conversation.export", { id: conversation.id });
@@ -685,12 +687,17 @@ test("desktop engine starts, probes, and stops a managed local runtime", async (
     const status = await call(socket, "status", "runtime.status");
     assert.equal(status.running, true);
     assert.equal(status.sidecarRunning, true);
+    // The pushed runtime.state stream seeds late joiners through runtime.status.
+    assert.equal(status.state?.phase, "ready", "runtime.status carries the last pushed state");
+    assert.equal(status.state?.model, "fixture-main-live");
+    assert.ok(typeof status.state?.ctxTokens === "number" && status.state.ctxTokens > 0, "ready state reports the launch context size");
     const stopped = await call(socket, "stop", "runtime.stop");
     assert.equal(stopped.stopped, true);
     await new Promise((resolve) => setTimeout(resolve, 250));
     const finalStatus = await call(socket, "final-status", "runtime.status");
     assert.equal(finalStatus.running, false);
     assert.equal(finalStatus.sidecarRunning, false);
+    assert.equal(finalStatus.state?.phase, "stopped", "stop pushes a stopped runtime.state");
   } finally {
     socket.destroy();
     await engine.close();

@@ -43,9 +43,10 @@ test("submitMessage persists the full ordered run and returns a completed run", 
 
   const types = app.getEvents(conv.id).map((e) => e.type);
   // `task.compiled` sits between the user's message and routing: the contract is compiled before the
-  // lane is chosen (so it can inform it) and before the expensive model runs.
+  // lane is chosen (so it can inform it) and before the expensive model runs. `plan.updated` is the
+  // contract's advisory outline (deliverables + checks) for the activity panel.
   assert.deepEqual(types, [
-    "conversation.created", "user.message", "task.compiled", "route.selected", "run.started",
+    "conversation.created", "user.message", "task.compiled", "plan.updated", "route.selected", "run.started",
     "assistant.delta", "tool.completed", "file.changed",
     "run.completed", "receipt.finalized",
   ]);

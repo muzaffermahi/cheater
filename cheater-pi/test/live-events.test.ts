@@ -121,6 +121,63 @@ test("reliable lane: finish gate emits verification.started + passed once an exe
   if (passed?.type === "verification.passed") assert.match(passed.detail, /receipt|passed/i);
 });
 
+// ── E4: the plan surfaces ───────────────────────────────────────────────────────────────────────
+
+test("a task-graph plan emits plan.updated snapshots and ordered step events into the durable stream", async () => {
+  let t = 0; let n = 0;
+  const scripted: Runner = async () => ({ finished: true, summary: "child done", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [], verified: true });
+  const app = new KittenApp({ store: new ConversationStore(openSqlite(":memory:")), runner: scripted, now: () => ++t, newId: (p) => `${p}${n++}`, projectRoot: process.cwd(), model: "m" });
+  const conv = app.createConversation();
+  app.createTaskPlan({
+    conversationId: conv.id,
+    nodes: [
+      { id: "n1", agent: "explore", objective: "survey the repo", workspaceMode: "shared-readonly" },
+      { id: "n2", agent: "explore", objective: "summarize findings", dependencies: ["n1"], workspaceMode: "shared-readonly" },
+    ] as never[],
+  }, "runP");
+  await app.runTaskPlan(conv.id, "runP");
+  const events = app.getEvents(conv.id);
+  const types = events.map((e) => e.type);
+  assert.ok(types.filter((x) => x === "plan.updated").length >= 2, "plan.updated on create + around execution");
+  const stepStarts = events.filter((e) => e.type === "step.started");
+  const stepEnds = events.filter((e) => e.type === "step.completed");
+  assert.equal(stepStarts.length, 2, "both nodes started");
+  assert.equal(stepEnds.length, 2, "both nodes completed");
+  if (stepEnds[0].type === "step.completed") assert.equal(stepEnds[0].status, "completed");
+  // Dependency order: n1 must start before n2.
+  const firstStart = stepStarts[0];
+  if (firstStart.type === "step.started") assert.equal(firstStart.stepId, "n1");
+  // Snapshots carry the DAG shape a renderer needs.
+  const snapshot = events.find((e) => e.type === "plan.updated");
+  if (snapshot?.type === "plan.updated") {
+    assert.equal(snapshot.source, "task-graph");
+    assert.deepEqual(snapshot.steps.map((s) => s.id), ["n1", "n2"]);
+    assert.deepEqual(snapshot.steps[1].dependsOn, ["n1"]);
+  }
+  app.close();
+});
+
+// ── E6: run.status completeness ─────────────────────────────────────────────────────────────────
+
+test("an ask-policy approval emits waiting_approval and returns to running after resolution", async () => {
+  let t = 0; let n = 0;
+  const scripted: Runner = async (ctx: RunContext) => {
+    const allowed = await ctx.requestApproval("c1", "bash", "rm -rf build", "medium");
+    assert.equal(allowed, true);
+    return { finished: true, summary: "ok", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [], verified: false };
+  };
+  const app = new KittenApp({ store: new ConversationStore(openSqlite(":memory:")), runner: scripted, now: () => ++t, newId: (p) => `${p}${n++}`, projectRoot: "/proj", model: "m", approvalPolicy: "ask" });
+  const conv = app.createConversation();
+  app.subscribe((e) => {
+    if (e.type === "tool.approval_required") queueMicrotask(() => app.resolveApproval(e.runId, e.callId, true));
+  });
+  await app.submitMessage(conv.id, "clean the build dir");
+  const statuses = app.getEvents(conv.id).filter((e) => e.type === "run.status");
+  assert.ok(statuses.some((e) => e.type === "run.status" && e.status === "waiting_approval"), "waiting_approval surfaced");
+  assert.ok(statuses.some((e) => e.type === "run.status" && e.status === "running"), "resumed to running after resolution");
+  app.close();
+});
+
 // ── E3: hardness threading ──────────────────────────────────────────────────────────────────────
 
 test("route.selected carries the deterministic hardness score", async () => {

@@ -10,7 +10,15 @@
 // store (the ordering source of truth), and `id` is derived as `${conversationId}:${seq}` so it is
 // stable and reproducible — no randomness, which keeps replay and tests deterministic.
 
-/** Bump when a payload shape changes incompatibly; the store records this per row for migration. */
+/**
+ * Bump ONLY for an incompatible change: renaming/removing/retyping an existing field, or changing a
+ * field's semantics. Adding a new event type or a new OPTIONAL field does NOT bump — renderers are
+ * required to ignore unknown `type`s and tolerate absent optional fields (the desktop shell replays
+ * stored history through the same dispatch as live events, so this is what keeps old sessions
+ * rendering). See docs/engine-events.md for the renderer-facing contract.
+ *
+ * Reserved (declared, no emitter yet — do not build UI against them): `tool.proposed`, `diff.updated`.
+ */
 export const EVENT_SCHEMA_VERSION = 1;
 
 /** A run's lifecycle status (Goal §6 state machine). Transient states become `interrupted` on
@@ -389,6 +397,39 @@ export interface RunStepCritique {
   productiveRatio: number;
 }
 
+/**
+ * The current plan for a run, as a bounded step list. Two sources: the durable task DAG
+ * ("task-graph": real subagent nodes with dependencies + live statuses) and the compiled contract
+ * ("compiled-contract": an advisory outline derived from deliverables + checks, statuses stay
+ * "planned"). Re-emitted on material change; renderers replace, never append.
+ */
+export interface PlanUpdated {
+  type: "plan.updated";
+  runId: string;
+  source: "task-graph" | "compiled-contract";
+  reason?: string;
+  steps: Array<{ id: string; label: string; status: string; dependsOn: string[]; agent?: string }>;
+}
+/** A plan step began executing (task-graph source only). */
+export interface StepStarted {
+  type: "step.started";
+  runId: string;
+  stepId: string;
+  label: string;
+  agent?: string;
+}
+/** A plan step reached a resting state. Failure/blockage folds in via `status`. */
+export interface StepCompleted {
+  type: "step.completed";
+  runId: string;
+  stepId: string;
+  status: "completed" | "waiting" | "failed" | "blocked" | "cancelled";
+  /** Bounded worker report (≤2000 chars). */
+  report?: string;
+  /** Bounded evidence list (≤16 items). */
+  evidence?: string[];
+}
+
 /** A user-approved native verification run, persisted as bounded execution evidence. */
 export interface WorkspaceVerification {
   type: "workspace.verification";
@@ -440,6 +481,9 @@ export type EventPayload =
   | TaskCompiled
   | TaskClarificationRequested
   | RunStepCritique
+  | PlanUpdated
+  | StepStarted
+  | StepCompleted
   | WorkspaceVerification;
 
 export type EventType = EventPayload["type"];

@@ -20,7 +20,7 @@ import { routeMessage, type RouteDecision } from "./router.js";
 import type { HardnessSignal } from "../runtime/computeBudget.js";
 import { captureSnapshot, captureSnapshotAfter, restoreSnapshot, redoSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 import { ContextBuilder, contextBudgetForWindow } from "./context.js";
-import { TaskGraphController, type TaskGraphPlan } from "./taskGraph.js";
+import { TaskGraphController, type TaskGraphPlan, type TaskGraphEvent } from "./taskGraph.js";
 import type { TaskNodeRow } from "./store/conversationStore.js";
 import { exportConversationMarkdown } from "./export.js";
 import { getAgent } from "./agents.js";
@@ -196,6 +196,9 @@ export class KittenApp {
     this.sidecarModel = opts.sidecarModel?.trim() || undefined;
     this.now = opts.now ?? (() => Date.now());
     this.tasks = new TaskGraphController(opts.store, this.now);
+    // Bridge the task graph's own bus into the durable event stream: DAG progress used to live and die
+    // on an in-memory listener set, so no client (or replay) ever saw a subagent step change state.
+    this.tasks.subscribe((e) => this.bridgeTaskGraphEvent(e));
     this.newId = opts.newId ?? defaultIdGen();
     this.approvalPolicy = opts.approvalPolicy ?? "auto-deny";
     this.taskCompiler = opts.taskCompiler ?? "auto";
@@ -256,8 +259,15 @@ export class KittenApp {
     // "ask": register the resolver BEFORE emitting, so a synchronous client answer during the broadcast
     // isn't lost (the same ordering guarantee cancel() relies on).
     const p = new Promise<boolean>((resolve) => { this.pendingApprovals.set(`${runId}:${callId}`, resolve); });
+    this.emit(conversationId, { type: "run.status", runId, status: "waiting_approval", detail: reason.slice(0, 200) });
     this.emit(conversationId, { type: "tool.approval_required", runId, callId, name, reason, risk });
-    return p;
+    return p.then((allowed) => {
+      // The run resumes either way (a denial feeds back to the model as guidance, not a terminal stop).
+      if (this.inflight.has(runId) && !this.inflight.get(runId)!.signal.aborted) {
+        this.emit(conversationId, { type: "run.status", runId, status: "running" });
+      }
+      return allowed;
+    });
   }
 
   /** Release the underlying store (the app owns its lifecycle). */
@@ -372,9 +382,39 @@ export class KittenApp {
     });
   }
 
+  /** Map a TaskGraphEvent onto the canonical step.* events, persisted on the node's conversation. */
+  private bridgeTaskGraphEvent(e: TaskGraphEvent): void {
+    const runId = e.runId ?? "task-plan";
+    try {
+      if (e.type === "task.started") {
+        // resume() re-queues nodes with status "queued" — that is a plan snapshot change, not a step start.
+        if (e.status === "running") this.emit(e.conversationId, { type: "step.started", runId, stepId: e.taskNodeId, label: e.label, agent: e.agent });
+        return;
+      }
+      const status = (["completed", "waiting", "failed", "blocked", "cancelled"] as const).find((s) => s === e.status) ?? "failed";
+      this.emit(e.conversationId, {
+        type: "step.completed", runId, stepId: e.taskNodeId, status,
+        ...(e.report ? { report: e.report.slice(0, 2000) } : {}),
+        ...(e.evidence?.length ? { evidence: e.evidence.slice(0, 16) } : {}),
+      });
+    } catch { /* bridging must never break the graph run */ }
+  }
+
+  /** Emit the current DAG as a plan.updated snapshot (renderers replace, never append). */
+  private emitPlanSnapshot(conversationId: string, runId: string, reason?: string): void {
+    const nodes = this.tasks.list(conversationId);
+    if (!nodes.length) return;
+    this.emit(conversationId, {
+      type: "plan.updated", runId, source: "task-graph", ...(reason ? { reason } : {}),
+      steps: nodes.slice(0, 24).map((n) => ({ id: n.id, label: n.objective.slice(0, 120), status: n.status, dependsOn: n.dependencies, agent: n.agent })),
+    });
+  }
+
   /** Persist a dependency-aware subagent plan. Execution remains owned by the orchestration layer. */
-  createTaskPlan(plan: TaskGraphPlan): TaskNodeRow[] {
-    return this.tasks.createPlan(plan);
+  createTaskPlan(plan: TaskGraphPlan, runId = "task-plan"): TaskNodeRow[] {
+    const rows = this.tasks.createPlan(plan);
+    this.emitPlanSnapshot(plan.conversationId, runId, "plan created");
+    return rows;
   }
 
   /** Resume the incomplete portion of a durable plan; completed nodes remain untouched. */
@@ -391,7 +431,8 @@ export class KittenApp {
   async runTaskPlan(conversationId: string, parentRunId = "task-plan", signal?: AbortSignal): Promise<TaskNodeRow[]> {
     const parent = this.store.getConversation(conversationId);
     if (!parent) throw new Error(`runTaskPlan: unknown conversation ${conversationId}`);
-    return this.tasks.runUntilSettled(conversationId, async (node, capsule, childSignal) => {
+    this.emitPlanSnapshot(conversationId, parentRunId, "plan execution started");
+    const settled = await this.tasks.runUntilSettled(conversationId, async (node, capsule, childSignal) => {
       if (childSignal.aborted) throw new Error("task plan cancelled");
       const prompt = [
         `Work only on this self-contained subtask: ${capsule.objective}`,
@@ -426,6 +467,7 @@ export class KittenApp {
       return { report: child.run.summary, evidence: child.run.filesChanged, verified: child.run.status === "completed" && child.run.verified };
     }, {
       signal,
+      runId: parentRunId,
       repoBrief: parent.projectRoot,
       // Independent clerical scouts can fan out, while any ready main-model worker
       // keeps the local GPU/context budget serialized. This makes subagent plans
@@ -433,6 +475,8 @@ export class KittenApp {
       maxConcurrent: 2,
       maxConcurrentFor: (ready) => ready.some((node) => node.modelTier === "main") ? 1 : 2,
     });
+    this.emitPlanSnapshot(conversationId, parentRunId, "plan settled");
+    return settled;
   }
 
   /** Spawn a durable child conversation and return only after its first run has a terminal receipt. */
@@ -556,6 +600,20 @@ export class KittenApp {
         promptEpoch: epoch.id,
         warnings: result.validation.warnings.map((w) => `${w.code}: ${w.message}`).slice(0, 8),
       });
+      // A lightweight plan outline derived from the contract (deliverables + executable checks), so a
+      // client can show "what Kitten intends to produce" even when no subagent DAG exists. Advisory:
+      // statuses stay "planned"; a task-graph plan later replaces it.
+      const deliverables = result.task.deliverables.slice(0, 6);
+      if (deliverables.length) {
+        const checks = result.task.verification.requiredChecks.filter((c) => c.command).slice(0, 2);
+        this.emit(conversationId, {
+          type: "plan.updated", runId, source: "compiled-contract", reason: "outline from the compiled contract",
+          steps: [
+            ...deliverables.map((d) => ({ id: d.id, label: `${d.kind}: ${d.target}`.slice(0, 120), status: "planned", dependsOn: [] as string[] })),
+            ...checks.map((c) => ({ id: c.id, label: `verify: ${c.command ?? c.claim}`.slice(0, 120), status: "planned", dependsOn: [] as string[] })),
+          ],
+        });
+      }
       // An explicit lane override means the user chose the execution shape themselves; the contract
       // still grounds the prompt, but it must not redirect a lane the user asked for.
       if (explicitLane) result.task.executionPolicy.laneHint = null;

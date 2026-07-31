@@ -50,6 +50,28 @@ export interface DesktopEngineOptions {
   infoPath?: string | null;
   /** How long an unauthenticated connection may stay open before the engine closes it. */
   handshakeTimeoutMs?: number;
+  /** Runtime health watchdog interval. Default 15s; 0 disables (tests/fixtures). */
+  runtimeWatchdogMs?: number;
+}
+
+/**
+ * The pushed model-runtime state (`runtime.state` broadcast). App-global and transient — it is
+ * deliberately NOT persisted in any conversation's event log; late joiners seed from the enriched
+ * `runtime.status` response instead.
+ */
+export interface RuntimeStatePayload {
+  phase: "starting" | "probing" | "ready" | "failed" | "stopped" | "external";
+  endpoint: string;
+  model: string;
+  sidecarModel?: string;
+  /** The server's actual context window for this launch, when known. */
+  ctxTokens?: number;
+  pid?: number | null;
+  /** Something other than the managed process owns the endpoint. */
+  external?: boolean;
+  /** The runtime's own last words on a failed launch (bounded stderr tail). */
+  stderrTail?: string;
+  ts: number;
 }
 
 export interface DesktopEngineHandle {
@@ -632,6 +654,55 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
   };
   const unsubscribe = app.subscribe((e) => broadcast(eventFromKitten(e)));
 
+  // ── runtime.state: the pushed llama.cpp lifecycle ──────────────────────────────────────────────
+  // Broadcast on change only (same channel as bakeoff/download progress: no conversationId, not
+  // persisted). `last` doubles as the late-joiner seed via the enriched runtime.status response.
+  const runtimeState: { last: RuntimeStatePayload | null; launching: boolean } = { last: null, launching: false };
+  const pushRuntimeState = (next: Omit<RuntimeStatePayload, "ts" | "endpoint" | "model"> & { endpoint?: string; model?: string }): void => {
+    const payload: RuntimeStatePayload = {
+      endpoint: next.endpoint ?? runtime.models.baseUrl,
+      model: next.model ?? runtime.models.main,
+      ...(runtime.models.sidecar ? { sidecarModel: runtime.models.sidecar } : {}),
+      ...next,
+      ts: Date.now(),
+    };
+    const key = (s: RuntimeStatePayload): string => `${s.phase}|${s.endpoint}|${s.model}|${s.ctxTokens ?? 0}|${s.pid ?? 0}|${s.external ? 1 : 0}`;
+    if (runtimeState.last && key(runtimeState.last) === key(payload)) { runtimeState.last = payload; return; }
+    runtimeState.last = payload;
+    broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `runtime-${payload.ts.toString(36)}-${payload.phase}`, type: "runtime.state", timestamp: payload.ts, payload: payload as unknown as Record<string, unknown> });
+  };
+
+  // Watchdog: the UI must learn within one interval that llama.cpp died (or came back) even when
+  // nothing else is happening. Edge-triggered with a 2-strike debounce so a llama.cpp that is slow
+  // to answer /models mid-generation never flaps the status line.
+  const watchdogMs = opts.runtimeWatchdogMs ?? 15_000;
+  let watchdogStrikes = 0;
+  let watchdogProbing = false;
+  const watchdog = watchdogMs > 0 ? setInterval(async () => {
+    if (!clients.size || runtimeState.launching || watchdogProbing) return;
+    watchdogProbing = true;
+    try {
+      const probe = await probeEndpoint(runtime.models.baseUrl, 2000);
+      const managedRunning = Boolean(managedRuntime.current?.main && managedRuntime.current.main.process.exitCode === null);
+      if (probe.reachable) {
+        watchdogStrikes = 0;
+        if (!runtimeState.last || runtimeState.last.phase === "failed" || runtimeState.last.phase === "stopped") {
+          pushRuntimeState(managedRunning
+            ? { phase: "ready", pid: managedRuntime.current?.main.process.pid ?? null }
+            : { phase: "external", external: true });
+        }
+      } else if (runtimeState.last && (runtimeState.last.phase === "ready" || runtimeState.last.phase === "external")) {
+        watchdogStrikes++;
+        if (watchdogStrikes >= 2) {
+          watchdogStrikes = 0;
+          pushRuntimeState({ phase: "failed", stderrTail: managedRuntime.current?.main.stderr()?.split(/\r?\n/).filter(Boolean).slice(-8).join("\n") || "endpoint stopped responding" });
+        }
+      }
+    } catch { /* the watchdog itself must never throw */ }
+    finally { watchdogProbing = false; }
+  }, watchdogMs) : null;
+  watchdog?.unref();
+
   // The local socket is reachable by other processes running as this user, and on Windows the
   // default named-pipe ACL is wider still. Nothing is served — not even liveness, and above all not
   // the event stream, which carries prompts, code and diffs — until a connection presents the
@@ -670,7 +741,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           socket.write(encodeFrame(response(id, { authenticated: true, protocolVersion: DESKTOP_PROTOCOL_VERSION, pid: process.pid })));
           continue;
         }
-        void handleCommand(cmd, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
+        void handleCommand(cmd, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, runtimeState, pushRuntimeState, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
       }
     });
     socket.on("close", forget);
@@ -706,11 +777,15 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     && existsSync(settings.managedRuntime.executable) && existsSync(settings.managedRuntime.mainModelPath)) {
     try {
       const existing = await probeEndpoint(runtime.models.baseUrl);
-      if (!existing.reachable) {
+      if (existing.reachable) {
+        pushRuntimeState({ phase: "external", external: true });
+      } else {
         const tierWarnings = modelTierWarnings(runtime.models);
         if (tierWarnings.length) throw new Error(tierWarnings.join("; "));
         const sidecarModelPath = settings.managedRuntime.sidecarModelPath && existsSync(settings.managedRuntime.sidecarModelPath)
           ? settings.managedRuntime.sidecarModelPath : undefined;
+        runtimeState.launching = true;
+        pushRuntimeState({ phase: "starting" });
         const launched = await launchManagedRuntime({
           executable: settings.managedRuntime.executable,
           mainModelPath: settings.managedRuntime.mainModelPath,
@@ -725,10 +800,15 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
         app.setSidecarModel(runtime.models.sidecar);
+        pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
       }
-    } catch {
+    } catch (error) {
       // Startup recovery is opportunistic: the native shell still opens so the user can inspect or
-      // repair the runtime path from Model setup and press Start local runtime explicitly.
+      // repair the runtime path from Model setup and press Start local runtime explicitly. The pushed
+      // failed state is what makes that repairable instead of silent.
+      pushRuntimeState({ phase: "failed", stderrTail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200) });
+    } finally {
+      runtimeState.launching = false;
     }
   }
 
@@ -738,6 +818,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     infoPath,
     async close() {
       unsubscribe();
+      if (watchdog) clearInterval(watchdog);
       sidecar.cancelAll();
       await stopManagedRuntime(managedRuntime);
       for (const controller of submitControllers.values()) controller.abort("engine-closing");
@@ -755,8 +836,8 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
   };
 }
 
-async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, ActiveSidecarWorkflow>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; emit: (type: string, payload: unknown) => void }): Promise<void> {
-  const { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime } = context;
+async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, ActiveSidecarWorkflow>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; runtimeState: { last: RuntimeStatePayload | null; launching: boolean }; pushRuntimeState: (next: Omit<RuntimeStatePayload, "ts" | "endpoint" | "model"> & { endpoint?: string; model?: string }) => void; emit: (type: string, payload: unknown) => void }): Promise<void> {
+  const { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, runtimeState, pushRuntimeState } = context;
   if (frame.protocolVersion !== DESKTOP_PROTOCOL_VERSION) {
     socket.write(encodeFrame(failure(frame.id, `unsupported protocol version ${frame.protocolVersion}`)));
     return;
@@ -997,6 +1078,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           pid: current?.main.process.pid ?? null,
           sidecarRunning: running(current?.sidecar ?? null),
           sidecarPid: current?.sidecar?.process.pid ?? null,
+          // Late-joiner seed for the pushed runtime.state stream (a fresh shell asks once, then listens).
+          state: runtimeState.last,
         };
         break;
       }
@@ -1018,23 +1101,35 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         }
         const existing = await probeEndpoint(active.models.baseUrl);
         if (existing.reachable) {
+          pushRuntimeState({ phase: "external", external: true, endpoint: active.models.baseUrl, model: active.models.main });
           result = { configured: true, running: false, external: true, endpoint: active.models.baseUrl, projectRoot };
           break;
         }
         const sidecarModelPath = projectSettings.managedRuntime.sidecarModelPath && existsSync(projectSettings.managedRuntime.sidecarModelPath)
           ? projectSettings.managedRuntime.sidecarModelPath : undefined;
-        const launched = await launchManagedRuntime({
-          executable, mainModelPath, sidecarModelPath,
-          baseUrl: active.models.baseUrl,
-          sidecarBaseUrl: sidecarModelPath ? active.models.sidecarBaseUrl : undefined,
-          runtimeRoot: projectRoot,
-          probeTimeoutMs: 5_000,
-        }, managedRuntime);
+        runtimeState.launching = true;
+        pushRuntimeState({ phase: "starting", endpoint: active.models.baseUrl, model: active.models.main });
+        let launched: ManagedRuntimeLaunchResult;
+        try {
+          launched = await launchManagedRuntime({
+            executable, mainModelPath, sidecarModelPath,
+            baseUrl: active.models.baseUrl,
+            sidecarBaseUrl: sidecarModelPath ? active.models.sidecarBaseUrl : undefined,
+            runtimeRoot: projectRoot,
+            probeTimeoutMs: 5_000,
+          }, managedRuntime);
+        } catch (error) {
+          pushRuntimeState({ phase: "failed", endpoint: active.models.baseUrl, model: active.models.main, stderrTail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200) });
+          throw error;
+        } finally {
+          runtimeState.launching = false;
+        }
         runtime.models = { ...runtime.models, ...active.models, baseUrl: launched.baseUrl, sidecarBaseUrl: launched.sidecarBaseUrl };
         runtime.llm = new KittenLLM(runtime.models);
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
         app.setSidecarModel(runtime.models.sidecar);
+        pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
         result = { configured: true, running: true, pid: launched.mainProcess.process.pid, sidecarPid: launched.sidecarProcess?.process.pid ?? null, endpoint: launched.baseUrl, sidecarEndpoint: launched.sidecarBaseUrl, projectRoot };
         break;
       }
@@ -1043,6 +1138,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         break;
       case "runtime.stop":
         await stopManagedRuntime(managedRuntime);
+        pushRuntimeState({ phase: "stopped" });
         result = { stopped: true };
         break;
       case "runtime.start": {
@@ -1077,12 +1173,22 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           ...(sidecarBaseUrl ? { sidecarBaseUrl } : {}),
         }, "project", runtimeRoot);
         const bootstrap = typeof p.bootstrapScript === "string" && p.bootstrapScript.trim() ? p.bootstrapScript.trim() : undefined;
-        const launched = await launchManagedRuntime({
-          executable, mainModelPath, sidecarModelPath, baseUrl, sidecarBaseUrl,
-          backend: typeof p.backend === "string" ? p.backend as ManagedRuntimeLaunchRequest["backend"] : undefined,
-          contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined,
-          runtimeRoot, bootstrapScript: bootstrap,
-        }, managedRuntime);
+        runtimeState.launching = true;
+        pushRuntimeState({ phase: "starting", endpoint: baseUrl, model: requestedMainModel ?? configuredRuntimeModels.main });
+        let launched: ManagedRuntimeLaunchResult;
+        try {
+          launched = await launchManagedRuntime({
+            executable, mainModelPath, sidecarModelPath, baseUrl, sidecarBaseUrl,
+            backend: typeof p.backend === "string" ? p.backend as ManagedRuntimeLaunchRequest["backend"] : undefined,
+            contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined,
+            runtimeRoot, bootstrapScript: bootstrap,
+          }, managedRuntime);
+        } catch (error) {
+          pushRuntimeState({ phase: "failed", endpoint: baseUrl, model: requestedMainModel ?? configuredRuntimeModels.main, stderrTail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200) });
+          throw error;
+        } finally {
+          runtimeState.launching = false;
+        }
         runtime.models.sidecarBaseUrl = sidecarBaseUrl;
         // Starting a managed runtime is also a model configuration action. Update the live client
         // immediately so the very next native submission uses the endpoint just started instead of
@@ -1099,6 +1205,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
         app.setSidecarModel(runtime.models.sidecar);
+        pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
         result = { started: true, pid: launched.mainProcess.process.pid, endpoint: baseUrl, sidecarEndpoint: sidecarBaseUrl, sidecarPid: launched.sidecarProcess?.process.pid ?? null, launchPlan: launched.plan, probe: launched.probe, sidecarProbe: launched.sidecarProbe };
         break;
       }
@@ -1288,6 +1395,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         break;
       }
       case "task.list": result = app.listTasks(String(p.conversationId ?? frame.conversationId)); break;
+      case "task.compiled-get": result = app.getCompiledTask(String(p.runId ?? "")); break;
       case "task.plan-suggest": {
         const conversationId = String(p.conversationId ?? frame.conversationId);
         const prompt = String(p.text ?? p.prompt ?? "").trim();
