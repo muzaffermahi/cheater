@@ -74,6 +74,15 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
   const profile = agentConfig(ctx, llm);
   let toolN = 0;
   const streamedTurns = new Set<number>();
+  // Live tool state streams only on the single-trajectory lanes: bon/ascent run k parallel candidates
+  // whose interleaved started/output events would be noise (candidates already get candidate.* cards).
+  const liveToolState = ctx.lane === "direct" || ctx.lane === "reliable";
+  // Pair started↔completed via the agent's per-call number when present; fall back to a local counter
+  // for scripted/legacy AgentEvents that predate `data.call` (they never mix within one run).
+  const callIdOf = (e: AgentEvent): string => {
+    const n = e.data && typeof (e.data as { call?: number }).call === "number" ? (e.data as { call: number }).call : toolN++;
+    return `${ctx.runId}:t${n}`;
+  };
   const onEvent = (e: AgentEvent): void => {
     switch (e.kind) {
       case "assistant_delta":
@@ -88,6 +97,16 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
         // streamed, skip — the deltas covered it (no duplicate text; Goal §3).
         if (!streamedTurns.has(e.turn) && e.detail && e.detail !== "(tool call)") ctx.emit({ type: "assistant.delta", runId: ctx.runId, text: e.detail });
         break;
+      case "tool_start": {
+        if (!liveToolState) break;
+        const data = (e.data ?? {}) as { name?: string; target?: string };
+        const name = String(data.name ?? e.detail.split("(")[0].trim() ?? "tool");
+        ctx.emit({ type: "tool.started", runId: ctx.runId, callId: callIdOf(e), name, ...(data.target ? { target: String(data.target) } : {}) });
+        break;
+      }
+      case "tool_output":
+        if (liveToolState && e.detail) ctx.emit({ type: "tool.output", runId: ctx.runId, callId: callIdOf(e), chunk: e.detail });
+        break;
       case "tool": {
         const name = e.detail.split("(")[0].trim() || "tool";
         const ok = !(e.data && (e.data as { error?: boolean }).error);
@@ -97,7 +116,8 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
         const open = e.detail.indexOf("(");
         const close = e.detail.lastIndexOf(")");
         const target = open >= 0 && close > open ? e.detail.slice(open + 1, close).trim() : "";
-        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: `${ctx.runId}:t${toolN++}`, name, ...(target ? { target } : {}), ok, durationMs: 0, output });
+        const durationMs = e.data && typeof (e.data as { durationMs?: number }).durationMs === "number" ? (e.data as { durationMs: number }).durationMs : 0;
+        ctx.emit({ type: "tool.completed", runId: ctx.runId, callId: callIdOf(e), name, ...(target ? { target } : {}), ok, durationMs, output });
         break;
       }
       case "gate_block":
@@ -135,7 +155,7 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     })
     : ctx.lane === "direct"
       ? await runAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true })
-      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true });
+      : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true, onVerification: verificationSink(ctx) });
 
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
@@ -156,6 +176,15 @@ async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
     // no receipt and must not be verified. The DIRECT lane has NO finish gate — "finished" only means the
     // model stopped, never verified (§4).
     verified: ctx.lane === "direct" ? false : (result.finished && !result.forcedFinish),
+  };
+}
+
+/** Map the reliable lane's finish-gate progress onto canonical verification events. */
+function verificationSink(ctx: RunContext): (e: { phase: "started" | "evidence" | "passed"; what?: string; check?: string; passed?: boolean; durationMs?: number; detail?: string }) => void {
+  return (e) => {
+    if (e.phase === "started") ctx.emit({ type: "verification.started", runId: ctx.runId, what: e.what ?? "verification" });
+    else if (e.phase === "evidence") ctx.emit({ type: "verification.evidence", runId: ctx.runId, check: e.check ?? "check", passed: e.passed ?? false, durationMs: e.durationMs ?? 0 });
+    else ctx.emit({ type: "verification.passed", runId: ctx.runId, detail: e.detail ?? "verified" });
   };
 }
 
@@ -188,7 +217,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined });
+    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx) });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
@@ -200,8 +229,19 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
     else if (phase === "completed") ctx.emit({ type: "candidate.completed", runId: ctx.runId, index: attempt.index, finished: attempt.result.finished, summary: attempt.result.summary, usage: attempt.result.usage });
     else ctx.emit({ type: "candidate.rejected", runId: ctx.runId, index: attempt.index, reason: reason ?? "candidate rejected" });
   };
+  // Live repair/verification progress → canonical events (the ascent machine was previously silent
+  // for its whole multi-minute verify+repair phase — the definition of the black box).
+  config.onProgress = (e) => {
+    switch (e.kind) {
+      case "repair.started": ctx.emit({ type: "repair.started", runId: ctx.runId, round: e.round, seed: e.reason }); break;
+      case "verification.started": ctx.emit({ type: "verification.started", runId: ctx.runId, what: e.what }); break;
+      case "verification.evidence": ctx.emit({ type: "verification.evidence", runId: ctx.runId, check: `#${e.index} ${e.check}`, passed: e.passed, durationMs: e.durationMs }); break;
+      case "verification.passed": ctx.emit({ type: "verification.passed", runId: ctx.runId, detail: e.detail }); break;
+      case "verification.failed": ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: e.detail }); break;
+    }
+  };
   const a = await runAscent(
-    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: {}, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model },
+    { task: ctx.task, cwd: ctx.cwd, taskId: ctx.runId, hardness: ctx.hardness, forceSamples: ctx.k > 1 ? ctx.k : undefined, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model },
     config
   );
   // The Ascent engine runs candidates in isolated workspaces and adopts the winner into cwd, so it

@@ -16,7 +16,7 @@ import { aggregateSelfCertainty } from "./selfCertainty.js";
 
 export interface AgentEvent {
   turn: number;
-  kind: "assistant" | "assistant_delta" | "reasoning_delta" | "tool" | "gate_block" | "error" | "finish" | "nudge";
+  kind: "assistant" | "assistant_delta" | "reasoning_delta" | "tool_start" | "tool_output" | "tool" | "gate_block" | "error" | "finish" | "nudge";
   detail: string;
   data?: Record<string, unknown>;
 }
@@ -127,7 +127,14 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   const tools = params.tools ?? CORE_TOOLS;
   const events: AgentEvent[] = [];
   const emit = (e: AgentEvent): void => { events.push(e); params.onEvent?.(e); };
-  const ctx: ToolContext = { cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal, spawnTask: params.spawnTask, allowedFiles: params.allowedFiles, forbiddenFiles: params.forbiddenFiles };
+  // Live tool identity: `tool_start`/`tool_output`/`tool` events for one execution all carry the same
+  // `call` number so a renderer can pair a spinner with its completion. Set right before execute.
+  let currentCall = 0;
+  let currentTurn = 0;
+  const ctx: ToolContext = {
+    cwd: params.cwd, filesRead: new Set(), filesWritten: new Set(), signal: params.signal, spawnTask: params.spawnTask, allowedFiles: params.allowedFiles, forbiddenFiles: params.forbiddenFiles,
+    onOutput: (chunk) => emit({ turn: currentTurn, kind: "tool_output", detail: chunk, data: { call: currentCall } }),
+  };
   resetNounGate();
 
   // Ground the model in its real environment. Without this, a small model invents a cwd (observed
@@ -307,7 +314,14 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
           }
         }
       }
+      // Every gate has passed — this call WILL execute. Announce it so a UI can show live activity
+      // ("running: bash npm test") instead of a card that materializes only after the fact.
+      currentCall = toolCalls;
+      currentTurn = turn;
+      emit({ turn, kind: "tool_start", detail: `${call.name}(${briefArgs(call.args)})`, data: { call: toolCalls, name: call.name, target: briefArgs(call.args) } });
+      const toolStartedAt = Date.now();
       const res = await tool.execute(call.args, ctx);
+      const toolDurationMs = Date.now() - toolStartedAt;
       if (call.name === "edit" || call.name === "write") { if (!res.isError) hasEdited = true; }
       if (call.name === "bash") {
         const c = String(call.args.command ?? ""); bashAll.push(c);
@@ -319,7 +333,7 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       const extra = await params.postToolHook?.({ name: call.name, args: call.args }, res, ctx);
       if (extra) output += `\n${extra}`;
       messages.push(toolResultTurn(call.id, call.name, output));
-      emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}${extra ? " +diag" : ""}`, data: { error: res.isError, output: output.slice(0, 500) } });
+      emit({ turn, kind: "tool", detail: `${call.name}(${briefArgs(call.args)}) -> ${res.isError ? "ERR" : "ok"}${extra ? " +diag" : ""}`, data: { error: res.isError, output: output.slice(0, 500), call: toolCalls, durationMs: toolDurationMs } });
     }
     if (finished) { stopReason = "finish"; break; }
     // Gentle one-time nudge once the model has run several passing checks post-edit — cap the spiral.

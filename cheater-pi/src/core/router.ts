@@ -18,7 +18,7 @@
 
 import type { Lane } from "./events.js";
 import { classifyAutopilotTask } from "../autopilot/classifier.js";
-import { scoreHardness } from "../runtime/computeBudget.js";
+import { scoreHardness, type HardnessSignal } from "../runtime/computeBudget.js";
 
 export interface RouteDecision {
   lane: Lane;
@@ -26,6 +26,9 @@ export interface RouteDecision {
   k: number;
   /** The deterministic hardness score behind the choice (for receipts/telemetry). */
   hardness: number;
+  /** The raw signal the score came from, so downstream budgets (ascent) see the same evidence the
+   *  router did instead of re-deriving from nothing. */
+  signal: HardnessSignal;
 }
 
 export interface RouteInput {
@@ -50,15 +53,16 @@ const LARGE_BUILD = /\bfrom scratch\b|\b(complete|full|entire)\s+(web ?app|app|a
 
 export function routeMessage(text: string, input: RouteInput = {}): RouteDecision {
   if (input.lane) {
-    return { lane: input.lane, reasons: [`explicit override → ${input.lane}`], k: defaultK(input.lane, input.k), hardness: 0 };
+    return { lane: input.lane, reasons: [`explicit override → ${input.lane}`], k: defaultK(input.lane, input.k), hardness: 0, signal: {} };
   }
 
   const c = classifyAutopilotTask({ message: text, cwd: input.cwd ?? process.cwd() });
-  const hardness = scoreHardness({ taskKind: c.taskKind, risk: c.risk }).hardness;
+  const signal: HardnessSignal = { taskKind: c.taskKind, risk: c.risk };
+  const hardness = scoreHardness(signal).hardness;
 
   // Answer-only: an explanation/orientation request gets no write tools.
   if (c.taskKind === "explanation_only") {
-    return { lane: "answer", reasons: [c.reason || "explanation/orientation, no requested change → answer-only (no write tools)"], k: 1, hardness: 0 };
+    return { lane: "answer", reasons: [c.reason || "explanation/orientation, no requested change → answer-only (no write tools)"], k: 1, hardness: 0, signal: {} };
   }
 
   // Escalate to Ascent ONLY on real, deterministic evidence of hardness/ambiguity/scale — never merely
@@ -76,9 +80,9 @@ export function routeMessage(text: string, input: RouteInput = {}): RouteDecisio
   const base = `${c.taskKind} (confidence ${c.confidence.toFixed(2)}, risk ${c.risk})`;
   if (escalators.length) {
     const k = Math.max(2, input.k ?? 2);
-    return { lane: "ascent", reasons: [base, ...escalators, `→ Ascent k=${k}`], k, hardness };
+    return { lane: "ascent", reasons: [base, ...escalators, `→ Ascent k=${k}`], k, hardness, signal };
   }
 
   // Ordinary change → the reliable lane (check-first, post-edit gates, finish evidence) at k=1.
-  return { lane: "reliable", reasons: [base, "→ reliable k=1 (easy tasks don't pay best-of-N latency)"], k: 1, hardness };
+  return { lane: "reliable", reasons: [base, "→ reliable k=1 (easy tasks don't pay best-of-N latency)"], k: 1, hardness, signal };
 }

@@ -17,6 +17,7 @@ import {
 } from "./store/conversationStore.js";
 import { EVENT_SCHEMA_VERSION, type EventPayload, type KittenEvent, type Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
+import type { HardnessSignal } from "../runtime/computeBudget.js";
 import { captureSnapshot, captureSnapshotAfter, restoreSnapshot, redoSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 import { ContextBuilder, contextBudgetForWindow } from "./context.js";
 import { TaskGraphController, type TaskGraphPlan } from "./taskGraph.js";
@@ -47,6 +48,8 @@ export interface RunContext {
    *  ContextBuilder from durable state. Empty on a brand-new conversation's first turn. Every lane
    *  injects this so a resumed/multi-turn conversation actually informs the model. */
   conversationContext: string;
+  /** The router's hardness evidence, threaded so the ascent budget sees what the router saw. */
+  hardness: HardnessSignal;
   /** Pre-run git snapshot ref (or null), so a lane that isolates its work (Ascent) can derive the
    *  winner's changed files via git after adoption. */
   snapshotRef: string | null;
@@ -641,7 +644,7 @@ export class KittenApp {
     const externalAbort = externalSignal ? () => controller.abort(externalSignal.reason) : undefined;
     if (externalSignal?.aborted) controller.abort(externalSignal.reason);
     else if (externalAbort && externalSignal) externalSignal.addEventListener("abort", externalAbort, { once: true });
-    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k });
+    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k, hardness: decision.hardness });
     this.emit(conversationId, { type: "run.started", runId, request: text, lane: decision.lane, model: conv.model, agent: conv.agent ?? "general" });
 
     // Capture a pre-run snapshot for /undo BEFORE the runner mutates anything (cheap; never touches the
@@ -655,6 +658,7 @@ export class KittenApp {
         runId, conversationId, task: text, cwd: conv.projectRoot,
         lane: decision.lane, k: decision.k, model: conv.model, agent: conv.agent ?? "general", signal: controller.signal, allowedFiles: opts.allowedFiles, forbiddenFiles: opts.forbiddenFiles,
         conversationContext,
+        hardness: decision.signal,
         snapshotRef,
         emit: (payload) => { this.emit(conversationId, payload); },
         requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),

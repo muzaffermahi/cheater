@@ -30,6 +30,21 @@ import { failureCard, renderCard } from "./sidecar.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures, type WorkedExample } from "./workedExamples.js";
 import { deriveBans, forbiddenScan, renderBanViolation } from "./constraints.js";
 
+/** Live progress from the finish gate's real checks, so a UI can show verification as it happens.
+ *  `failed` is deliberately absent: a finish-gate rejection already surfaces as a gate_block →
+ *  verification.failed event, and reporting it twice would double every red line in a client. */
+export interface VerificationProgress {
+  phase: "started" | "evidence" | "passed";
+  /** started: what the gate is about to check. */
+  what?: string;
+  /** evidence: the executed check + its result + how long it took. */
+  check?: string;
+  passed?: boolean;
+  durationMs?: number;
+  /** passed: what the receipt was. */
+  detail?: string;
+}
+
 export interface ReliableParams {
   task: string;
   cwd: string;
@@ -66,6 +81,8 @@ export interface ReliableParams {
   contextPreamble?: string;
   /** Stream real token deltas (forwarded to the agent loop). */
   streamDeltas?: boolean;
+  /** Live verification progress from the finish gate (started / per-check evidence / passed). */
+  onVerification?: (e: VerificationProgress) => void;
   tools?: Tool[];
   spawnTask?: AgentRunParams["spawnTask"];
   allowedFiles?: readonly string[];
@@ -153,7 +170,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     allowedFiles: params.allowedFiles,
     forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] })
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification)
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -237,8 +254,13 @@ async function finishGate(
   state: FinishGateState,
   testCmd: string | null,
   llm: import("./llm.js").KittenLLM,
-  worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[]; bans: string[] }
+  worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[]; bans: string[] },
+  onVerification?: (e: VerificationProgress) => void
 ): Promise<{ allowed: boolean; feedback?: string }> {
+  onVerification?.({
+    phase: "started",
+    what: testCmd ? `finish gate: ${testCmd}` : worked?.examples.length ? "finish gate: worked examples" : "finish gate: execution receipt",
+  });
   // P2 — forbidden-construct scan FIRST. The oracle rejects a banned construct outright, before any
   // behavior test, so a behaviorally-correct solution that uses `import re` still fails. Catch it here
   // (the engine-agnostic layer; a native engine also hard-bans it at decode).
@@ -252,15 +274,20 @@ async function finishGate(
   // Worked-example anchor — ground truth from the task itself. If the code fails the task's own
   // stated I/O, it is not done regardless of any other signal (and the failing case is the repair seed).
   if (worked?.module && worked.examples.length) {
+    const exStarted = Date.now();
     const r = runExampleTest(state.cwd, worked.module, worked.examples, worked.setupVars);
+    if (r.ran) onVerification?.({ phase: "evidence", check: "worked examples (ground truth)", passed: r.failures.length === 0, durationMs: Date.now() - exStarted });
     if (r.ran && r.failures.length) {
       return { allowed: false, feedback: renderExampleFailures(r) + "\nFix the cause and re-check these exact calls before finishing." };
     }
   }
   if (testCmd) {
     // Re-run the project tests as the receipt. Allowed only if they pass now.
+    const testStarted = Date.now();
     const r = spawnSync(testCmd, { cwd: state.cwd, shell: true, encoding: "utf8", timeout: 120000, windowsHide: true });
-    if ((r.status ?? 1) === 0) return { allowed: true };
+    const passed = (r.status ?? 1) === 0;
+    onVerification?.({ phase: "evidence", check: testCmd, passed, durationMs: Date.now() - testStarted });
+    if (passed) { onVerification?.({ phase: "passed", detail: `\`${testCmd}\` passed` }); return { allowed: true }; }
     // The sidecar (qwen-2b, parallel to the GPU) turns the raw failure into a tight card the main
     // model repairs against — grounded repair, not a wall of stderr. Deterministic floor inside.
     const raw = (r.stdout + "\n" + r.stderr).slice(-4000);
@@ -269,7 +296,10 @@ async function finishGate(
   }
   // Held-out: require an execution receipt among the successful bash commands.
   const verified = state.bashOk.some((c) => EXECUTED_RE.test(c) && !/--version|-V\b/.test(c));
-  if (verified) return { allowed: true };
+  if (verified) {
+    onVerification?.({ phase: "passed", detail: "execution receipt present (the change was actually run)" });
+    return { allowed: true };
+  }
   const ran = state.bashAll.length ? ` (you ran: ${state.bashAll.slice(-3).join(" ; ").slice(0, 150)})` : "";
   return { allowed: false, feedback: `You have not verified your change by running it${ran}. Write a small check that exercises the change on the normal case AND edge cases, run it with bash, see it pass, THEN finish.` };
 }

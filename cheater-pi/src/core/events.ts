@@ -73,6 +73,10 @@ export interface RouteSelected {
   reasons: string[];
   /** Planned sample count for bon/ascent (1 otherwise). */
   k: number;
+  /** The deterministic hardness score behind the choice. Optional: stored events predate it. */
+  hardness?: number;
+  /** The user's effort level for this run (fast|balanced|careful|think-hard), when one was set. */
+  effort?: string;
 }
 
 export interface RunStarted {
@@ -130,6 +134,8 @@ export interface ToolStarted {
   runId: string;
   callId: string;
   name: string;
+  /** What the call is acting on — a path, a command, a pattern. Optional: stored events predate it. */
+  target?: string;
 }
 export interface ToolOutput {
   type: "tool.output";

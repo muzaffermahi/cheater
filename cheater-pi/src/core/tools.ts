@@ -29,6 +29,9 @@ export interface ToolContext {
   /** Optional task scope. An empty allow-list means "workspace", otherwise paths must match it. */
   allowedFiles?: readonly string[];
   forbiddenFiles?: readonly string[];
+  /** Live progress sink: a long-running tool (bash) streams bounded output chunks here so a UI can
+   *  show "what is it doing right now". Purely progressive — the final ToolResult stays authoritative. */
+  onOutput?: (chunk: string) => void;
 }
 
 export interface ToolResult {
@@ -308,11 +311,28 @@ export const bashTool: Tool = {
       const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
       let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
       const CAP = 12 * 1024 * 1024;
+      // Live progress: coalesce output into at most 8 bounded chunks per call (flush at ≥1KB or 500ms)
+      // so a chatty build log becomes a handful of progress events, never a firehose. The completion
+      // output below stays authoritative — dropping every streamed chunk loses nothing.
+      const MAX_STREAM_CHUNKS = 8, STREAM_FLUSH_CHARS = 1024, STREAM_FLUSH_MS = 500;
+      let streamed = 0, pending = "";
+      let streamTimer: NodeJS.Timeout | null = null;
+      const flushStream = (): void => {
+        if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+        if (pending && streamed < MAX_STREAM_CHUNKS) { streamed++; ctx.onOutput?.(pending.slice(0, 2048)); }
+        pending = "";
+      };
+      const pushStream = (text: string): void => {
+        if (!ctx.onOutput || streamed >= MAX_STREAM_CHUNKS || !text) return;
+        pending += text;
+        if (pending.length >= STREAM_FLUSH_CHARS) flushStream();
+        else if (!streamTimer) streamTimer = setTimeout(flushStream, STREAM_FLUSH_MS);
+      };
       // Decode via StringDecoder so a multibyte UTF-8 char split across two chunks isn't corrupted into
       // U+FFFD (a plain per-chunk d.toString("utf8") mangles boundary-straddling sequences).
       const decOut = new StringDecoder("utf8"), decErr = new StringDecoder("utf8");
-      const onOut = (d: Buffer): void => { if (out.length < CAP) out += decOut.write(d); };
-      const onErr = (d: Buffer): void => { if (err.length < CAP) err += decErr.write(d); };
+      const onOut = (d: Buffer): void => { if (out.length < CAP) { const s = decOut.write(d); out += s; pushStream(s); } };
+      const onErr = (d: Buffer): void => { if (err.length < CAP) { const s = decErr.write(d); err += s; pushStream(s); } };
       child.stdout?.on("data", onOut);
       child.stderr?.on("data", onErr);
       const timer = setTimeout(() => { killedBy = "timeout"; killTree(child); }, timeoutMs);
@@ -320,6 +340,7 @@ export const bashTool: Tool = {
       ctx.signal?.addEventListener("abort", onAbort, { once: true });
       const done = (code: number | null, signalName: NodeJS.Signals | null): void => {
         clearTimeout(timer);
+        if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; } // completion output is authoritative; no final flush
         ctx.signal?.removeEventListener("abort", onAbort);
         out += decOut.end(); err += decErr.end(); // flush any trailing partial multibyte sequence
         const combined = truncate([out, err].filter(Boolean).join("\n"));
@@ -333,7 +354,7 @@ export const bashTool: Tool = {
         });
       };
       child.on("close", done);
-      child.on("error", (e) => { clearTimeout(timer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
+      child.on("error", (e) => { clearTimeout(timer); if (streamTimer) clearTimeout(streamTimer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
     });
   }
 };

@@ -101,6 +101,9 @@ export interface VerifierOpts {
   setupVars?: string[];
   /** Per-command timeout for execution signals. */
   timeoutMs?: number;
+  /** Live check reporting: each executed signal (repo tests / smoke / ground truth) per candidate, as
+   *  it runs, so a UI can show verification progress instead of a silent multi-minute pause. */
+  onCheck?: (e: { index: number; check: string; passed: boolean; durationMs: number }) => void;
 }
 
 function runCmd(cmd: string, cwd: string, timeoutMs: number): { ok: boolean; out: string } {
@@ -132,14 +135,17 @@ export class Verifier {
       let reproduction: Signal = "n/a", regression: Signal = "n/a", smoke: Signal = "n/a";
 
       if (this.opts.testCommand) {
+        const t0 = Date.now();
         const r = runCmd(this.opts.testCommand, c.workspace, this.timeoutMs);
         regression = r.ok ? "pass" : "fail";
         receipt.push(`repo tests: ${regression}`);
+        this.opts.onCheck?.({ index: c.index, check: `repo tests (${this.opts.testCommand})`, passed: r.ok, durationMs: Date.now() - t0 });
         if (baseRedFailed) { reproduction = r.ok ? "pass" : "fail"; receipt.push(`red-then-green: ${reproduction} (base was red)`); }
       }
 
       if (this.opts.behavioralChecks?.length) {
         let allOk = true;
+        const t0 = Date.now();
         for (const cmd of this.opts.behavioralChecks) {
           if (!/[a-z]/i.test(cmd)) continue;
           const r = runCmd(cmd, c.workspace, this.timeoutMs);
@@ -147,14 +153,20 @@ export class Verifier {
         }
         smoke = allOk ? "pass" : "fail";
         receipt.push(`behavioral smoke: ${smoke}`);
+        this.opts.onCheck?.({ index: c.index, check: "behavioral smoke", passed: allOk, durationMs: Date.now() - t0 });
       }
 
       // GROUND TRUTH — the prompt's own worked examples (real I/O, not model-generated). The strongest
       // execution signal: fail here ⇒ definitely wrong, whatever consensus votes.
       let groundTruth: Signal = "n/a";
       if (this.opts.workedExamples?.length && this.opts.workedModule) {
+        const t0 = Date.now();
         const r = runExampleTest(c.workspace, this.opts.workedModule, this.opts.workedExamples, this.opts.setupVars ?? []);
-        if (r.ran) { groundTruth = r.failures.length ? "fail" : "pass"; receipt.push(`worked examples: ${groundTruth}${r.failures.length ? ` (${r.failures.length} fail)` : ""}`); }
+        if (r.ran) {
+          groundTruth = r.failures.length ? "fail" : "pass";
+          receipt.push(`worked examples: ${groundTruth}${r.failures.length ? ` (${r.failures.length} fail)` : ""}`);
+          this.opts.onCheck?.({ index: c.index, check: "worked examples (ground truth)", passed: !r.failures.length, durationMs: Date.now() - t0 });
+        }
       }
 
       // Eligibility (B1): pass every APPLICABLE signal. If none applied, fall back to the finish gate

@@ -12,7 +12,18 @@
 // When `adaptiveComputeEnabled` is OFF (the default), computeBudget returns the STATIC budget
 // (samples = commitletCandidateSamples, one debug lane), byte-identical to today's behavior.
 
-import type { CheaterConfig } from "../types.js";
+/**
+ * The five knobs computeBudget actually reads. A lean structural type instead of the 261-field legacy
+ * CheaterConfig, so Kitten Core can call this without dragging the dead Pi-era config along — every
+ * existing CheaterConfig caller remains structurally assignable.
+ */
+export interface ComputeBudgetOptions {
+  adaptiveComputeEnabled?: boolean;
+  commitletCandidateSamples?: number;
+  inSessionResampleEnabled?: boolean;
+  adaptiveMaxSamples?: number;
+  adaptiveMaxDebugRounds?: number;
+}
 
 /** The test-time-compute budget for one commitlet. */
 export interface ComputeBudget {
@@ -71,7 +82,7 @@ export function scoreHardness(signal: HardnessSignal): { hardness: number; facto
 /**
  * Compute the test-time-compute budget for a commitlet. OFF path (default) = today's static budget.
  */
-export function computeBudget(signal: HardnessSignal, config: CheaterConfig = {}): ComputeBudget {
+export function computeBudget(signal: HardnessSignal, config: ComputeBudgetOptions = {}): ComputeBudget {
   // Enabling in-session best-of-N must not be a silent no-op: with no explicit sample count (and
   // adaptive compute off), turning ON inSessionResampleEnabled defaults to 3 samples so best-of-N
   // actually runs. An explicit commitletCandidateSamples always wins. (The coupling where you had to

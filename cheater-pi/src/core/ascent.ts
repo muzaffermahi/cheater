@@ -57,6 +57,14 @@ export interface AscentLevers {
 export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true, leanReasoning: false };
 export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false, leanReasoning: false };
 
+/** Live progress from the ascent machine, for the app event stream (repair rounds + verification). */
+export type AscentProgress =
+  | { kind: "repair.started"; round: number; reason: string }
+  | { kind: "verification.started"; what: string }
+  | { kind: "verification.evidence"; index: number; check: string; passed: boolean; durationMs: number }
+  | { kind: "verification.passed"; detail: string }
+  | { kind: "verification.failed"; detail: string };
+
 export interface AscentConfig {
   llm: KittenLLM;
   registry?: EvalRegistry;
@@ -66,6 +74,8 @@ export interface AscentConfig {
   cloudBurst?: CloudBurstConfig | null;
   ceiling?: ComputeCeiling;
   levers?: Partial<AscentLevers>;
+  /** Live progress sink (repair rounds, verification phases). Advisory; never changes the grade. */
+  onProgress?: (e: AscentProgress) => void;
   /** Injectable generator (default: cloudBurstGenerate). Tests supply a deterministic one. */
   runOne?: RunOne;
   /** Rough per-sample token estimate for the budget governor. */
@@ -177,7 +187,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const testCommand = project.focusedTestCommand ?? project.testCommand ?? null;
 
   // C3 — budget: hardness → sample count, capped by the governor's ceiling.
-  const budget = computeBudget(params.hardness ?? {}, { adaptiveComputeEnabled: true } as any);
+  const budget = computeBudget(params.hardness ?? {}, { adaptiveComputeEnabled: true });
   const governor = new BudgetGovernor(config.ceiling ?? {});
   const estTokens = config.estTokensPerSample ?? DEFAULT_EST_TOKENS;
   let samples = params.forceSamples ?? (lever(config, "diversity") ? Math.max(1, budget.samples) : 1);
@@ -330,6 +340,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       if (priorEvidence) receipts.push(digestReceiptLine(digests));
 
       repairSeed = [repairDirective(failReason, worst?.plan.stance), priorEvidence, webBrief].filter(Boolean).join("\n\n");
+      try { config.onProgress?.({ kind: "repair.started", round: round + 1, reason: failReason.slice(0, 300) }); } catch { /* advisory */ }
     }
   }
 
@@ -352,11 +363,21 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     llm: config.llm, task: params.task, contract, testCommand,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
     confidence: lever(config, "confidence"), module: pyModule,
-    workedExamples, workedModule: pyModule, setupVars
+    workedExamples, workedModule: pyModule, setupVars,
+    onCheck: (e) => { try { config.onProgress?.({ kind: "verification.evidence", ...e }); } catch { /* advisory */ } }
   });
   const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
+  try { config.onProgress?.({ kind: "verification.started", what: `verifying ${candidates.length} candidate(s) by execution` }); } catch { /* advisory */ }
   const verdict = await verifier.verify(candidates);
   receipts.push(...verifierReceiptLines(verdict));
+  try {
+    if (verdict.winner != null && verdict.winnerHasExecutionReceipt) {
+      config.onProgress?.({ kind: "verification.passed", detail: `winner: attempt ${verdict.winner} via ${verdict.selector} (green execution receipt)` });
+    } else if (verdict.winner == null) {
+      config.onProgress?.({ kind: "verification.failed", detail: "no candidate was eligible (no execution evidence passed)" });
+    }
+    // winner-without-receipt = "checked, not verified" — neither a pass nor a failure; run.completed says it.
+  } catch { /* advisory */ }
 
   for (const attempt of allAttempts) {
     const signal = verdict.slate.find((entry) => entry.index === attempt.index);
