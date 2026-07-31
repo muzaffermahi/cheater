@@ -147,8 +147,8 @@ test("reliable lane: finish gate emits verification.started + passed once an exe
   const cwd = mkdtempSync(join(tmpdir(), "kitten-live-verify-"));
   writeFileSync(join(cwd, "a.py"), "x = 1\n", "utf8");
   const llm = scriptedLlm([
-    // Run the change (an execution receipt for the held-out finish gate), then finish.
-    { toolCalls: [{ id: "c1", name: "bash", args: { command: "python -c \"print(1)\"" }, raw: "" }] },
+    // Run THE CHANGE — the receipt must exercise a.py, not just any command that exits 0.
+    { toolCalls: [{ id: "c1", name: "bash", args: { command: "python -c \"import a; print(a.x)\"" }, raw: "" }] },
     { toolCalls: [{ id: "c2", name: "finish", args: { summary: "done" }, raw: "" }] },
   ]);
   const emitted: EventPayload[] = [];

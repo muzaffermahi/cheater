@@ -1,4 +1,4 @@
-// Kitten Core — the reliability wrapper. This is what makes Kitten more than a bare tool loop.
+﻿// Kitten Core â€” the reliability wrapper. This is what makes Kitten more than a bare tool loop.
 //
 // It runs the same standalone agent (agent.ts) but layers the deterministic harness the research says
 // helps a WEAK model most, all as code, not prompt-hope:
@@ -9,7 +9,7 @@
 //     broken edit is rejected and re-asked IN THE SAME TURN (SWE-agent: the editor-with-linter is the
 //     single biggest ACI ablation, and it breaks the edit-the-same-broken-snippet death spiral).
 //   - finish gate ("no done without receipts"): the model may not finish until it has actually run a
-//     verification (project tests, or — on a held-out task — a check it wrote and ran). A weak model
+//     verification (project tests, or â€” on a held-out task â€” a check it wrote and ran). A weak model
 //     must not grade itself by opinion.
 //
 // runReliableAgent has the same signature surface as runAgent, so the A/B harness can flip
@@ -31,7 +31,7 @@ import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleF
 import { deriveBans, forbiddenScan, renderBanViolation } from "./constraints.js";
 
 /** Live progress from the finish gate's real checks, so a UI can show verification as it happens.
- *  `failed` is deliberately absent: a finish-gate rejection already surfaces as a gate_block →
+ *  `failed` is deliberately absent: a finish-gate rejection already surfaces as a gate_block â†’
  *  verification.failed event, and reporting it twice would double every red line in a client. */
 export interface VerificationProgress {
   phase: "started" | "evidence" | "passed";
@@ -65,7 +65,7 @@ export interface ReliableParams {
   scoutFiles?: number;
   /** A3 experience: primed approach-shape from similar past solves, injected into the first message. */
   experiencePrime?: string;
-  /** P1: capture per-token logprobs → self-certainty (owned-engine selection signal). */
+  /** P1: capture per-token logprobs â†’ self-certainty (owned-engine selection signal). */
   captureConfidence?: boolean;
   /** Candidates in this round; self-certainty is only captured when there is something to compare. */
   candidateCount?: number;
@@ -117,23 +117,23 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
   if (contract.symbols.length) contractLines.push(`Symbols named in the task: ${contract.symbols.join(", ")}`);
   if (contract.commands.length) contractLines.push(`Commands named in the task: ${contract.commands.join(" | ")}`);
 
-  // Worked-example anchor: the task's own I/O examples are GROUND TRUTH (not model-generated → not
+  // Worked-example anchor: the task's own I/O examples are GROUND TRUTH (not model-generated â†’ not
   // self-flattering). The finish gate refuses "done" while any fail, and they're stated up front so the
   // model targets them. The single py module the examples call is the target file.
   const pyModule = contract.files.find((f) => f.toLowerCase().endsWith(".py")) ?? null;
   const workedExamples = pyModule ? extractWorkedExamples(task, contract.symbols) : [];
   const setupVars = workedExamples.length ? extractSetupVars(task) : [];
   const examplesLine = workedExamples.length
-    ? `\nThe task gives worked examples — these are GROUND TRUTH your code MUST satisfy exactly:\n${workedExamples.slice(0, 6).map((e) => `  ${e.call} == ${e.expected}`).join("\n")}\nAfter writing the code, run these exact calls and confirm each matches before finishing.`
+    ? `\nThe task gives worked examples â€” these are GROUND TRUTH your code MUST satisfy exactly:\n${workedExamples.slice(0, 6).map((e) => `  ${e.call} == ${e.expected}`).join("\n")}\nAfter writing the code, run these exact calls and confirm each matches before finishing.`
     : "";
 
   // Keep the upfront prompt LEAN. A verbose "verify the normal case AND every edge (empty, single,
-  // boundary, ordering)…" mandate primes a small model to over-explore even trivial tasks (observed:
+  // boundary, ordering)â€¦" mandate primes a small model to over-explore even trivial tasks (observed:
   // 9 turns diagnosing a one-line dedup fix). The detailed verify guidance lives in the finish gate and
-  // is injected ONLY if the model tries to finish without having run a check — lean until it matters.
+  // is injected ONLY if the model tries to finish without having run a check â€” lean until it matters.
   const verifyReminder = testCmd
     ? `Before finishing, run the project's tests (\`${testCmd}\`) and see them pass.`
-    : `Before finishing, actually run your change once (a quick \`python -c\`/\`node -e\` check) to confirm it works — don't finish on assumption.`;
+    : `Before finishing, actually run your change once (a quick \`python -c\`/\`node -e\` check) to confirm it works â€” don't finish on assumption.`;
 
   const systemPrompt = [
     params.systemPrompt,
@@ -176,7 +176,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     allowedFiles: params.allowedFiles,
     forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline)
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline, [...contract.files, ...contract.symbols])
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
@@ -198,7 +198,7 @@ export function postEditSyntaxGate(call: { name: string; args: Record<string, un
     const r = spawnSync(check.cmd, check.args, { encoding: "utf8", timeout: 20000, windowsHide: true });
     if (r.status !== 0) {
       const diag = (r.stderr || r.stdout || "").split(/\r?\n/).filter(Boolean).slice(-4).join("\n").slice(0, 400);
-      return `SYNTAX CHECK FAILED for ${path}:\n${diag}\nFix this before continuing — the file will not run as written.`;
+      return `SYNTAX CHECK FAILED for ${path}:\n${diag}\nFix this before continuing â€” the file will not run as written.`;
     }
   } catch { /* checker missing -> skip silently */ }
   if (ext === ".py") return pythonSelfCallGate(path, full);
@@ -209,7 +209,7 @@ export function postEditSyntaxGate(call: { name: string; args: Record<string, un
  * Catch a `self.method(...)` call whose argument count cannot match the method's own definition.
  *
  * Syntax checks pass such code and a smoke test only catches it if the run happens to take that
- * branch — measured live: a model shipped an expression parser whose ONLY bad call site,
+ * branch â€” measured live: a model shipped an expression parser whose ONLY bad call site,
  * `self._consume(")")`, sat on the parenthesis path. Its own verification ran `2 + 3`, never took
  * that branch, and the finish gate accepted the green receipt. `(1+2)*3` then raised TypeError.
  *
@@ -315,7 +315,7 @@ export function typeScriptSyntaxDiagnostic(path: string, output: string): string
     .slice(0, 4)
     .map((line) => line.trim().slice(0, 240));
   if (!diag.length) return undefined;
-  return `SYNTAX CHECK FAILED for ${path}:\n${diag.join("\n")}\nFix this before continuing — the file will not compile as written.`;
+  return `SYNTAX CHECK FAILED for ${path}:\n${diag.join("\n")}\nFix this before continuing â€” the file will not compile as written.`;
 }
 
 /**
@@ -327,7 +327,7 @@ export function typeScriptSyntaxDiagnostic(path: string, output: string): string
  *   - It reports ONLY TS1xxx grammar errors. Compiling one file outside its project produces plenty
  *     of TS2xxx module-resolution noise ("cannot find module './x'") that is an artifact of the
  *     single-file invocation, not a defect in the edit. Reporting that would send the model chasing
- *     phantoms — strictly worse than skipping.
+ *     phantoms â€” strictly worse than skipping.
  *   - It only runs when tsc is installed locally, and never blocks when it is missing or times out.
  *
  * Measured at ~1s per edit on this repo, against ~0.3s for `py_compile`; the same order as the
@@ -351,13 +351,13 @@ function typeScriptSyntaxGate(cwd: string, path: string, full: string): string |
  * Which pre-existing Python modules import cleanly right now.
  *
  * This is the baseline half of a "don't break what worked" invariant. A multi-file change is the
- * case where a model most often fixes one file and silently breaks another — rename a function and
+ * case where a model most often fixes one file and silently breaks another â€” rename a function and
  * forget the importer, move a helper and leave a dangling `from x import y`. Neither a syntax check
  * nor the model's own smoke test on the file it just edited will notice; the next importer explodes.
  *
  * Only modules that ALREADY imported are recorded, so a repo that was broken to begin with, or a
  * module needing absent third-party packages, can never be blamed on the agent. New files the agent
- * creates are deliberately not imported here — their correctness is the model's own to demonstrate,
+ * creates are deliberately not imported here â€” their correctness is the model's own to demonstrate,
  * and importing freshly generated code for a gate check is not something to do behind the user's back.
  */
 export function pythonImportBaseline(cwd: string): string[] {
@@ -422,6 +422,28 @@ print(json.dumps(broken))
 // Does a bash command look like it actually executed the code under change (not a trivial probe)?
 const EXECUTED_RE = /\b(pytest|unittest|python3?\s+\S+\.py|python3?\s+-c|node\s+\S+\.(m|c)?js|node\s+-e|npm\s+(run\s+)?test|go\s+test|cargo\s+test|bash\s+\S+\.sh|\.\/\S+)\b/i;
 
+/**
+ * Is this receipt about the work that was actually done?
+ *
+ * `python -c "print(1)"` matches EXECUTED_RE and proves nothing about the change. A receipt should
+ * name something the run produced â€” a file it wrote, or a module/symbol the task named â€” otherwise
+ * "I ran something" is being mistaken for "I ran MY code". Whole-suite runners (pytest, npm test)
+ * are accepted as-is: they exercise the project by definition.
+ */
+export function receiptTouchesTheWork(command: string, filesWritten: readonly string[], targets: readonly string[]): boolean {
+  if (/\b(pytest|unittest|npm\s+(run\s+)?test|go\s+test|cargo\s+test|tox|make\s+test)\b/i.test(command)) return true;
+  const haystack = command.toLowerCase().replace(/\\/g, "/");
+  const names = [...filesWritten, ...targets]
+    .map((name) => (name ?? "").toLowerCase().replace(/\\/g, "/").split("/").pop() ?? "")
+    .filter(Boolean);
+  // A very short stem ("a" from a.py) would match almost any command, so it cannot be judged. When
+  // NOTHING is judgeable, do not enforce relevance at all — refusing on an unanswerable question
+  // would block a legitimate finish. Same rule as the other gates: only assert what you can prove.
+  const judgeable = names.filter((base) => base.replace(/\.[a-z0-9]+$/i, "").length >= 3);
+  if (!judgeable.length) return true;
+  return judgeable.some((base) => haystack.includes(base) || haystack.includes(base.replace(/\.[a-z0-9]+$/i, "")));
+}
+
 /** Finish gate: refuse "done" without an execution receipt; ground a failure via the sidecar. */
 async function finishGate(
   state: FinishGateState,
@@ -430,6 +452,8 @@ async function finishGate(
   worked?: { module: string | null; examples: WorkedExample[]; setupVars: string[]; bans: string[] },
   onVerification?: (e: VerificationProgress) => void,
   importBaseline: readonly string[] = [],
+  /** Files/symbols the task named â€” a receipt should mention one of these or a file the run wrote. */
+  targets: readonly string[] = [],
 ): Promise<{ allowed: boolean; feedback?: string }> {
   onVerification?.({
     phase: "started",
@@ -446,7 +470,7 @@ async function finishGate(
     }
     onVerification?.({ phase: "evidence", check: `${importBaseline.length} pre-existing module(s) still import`, passed: true, durationMs: 0 });
   }
-  // P2 — forbidden-construct scan FIRST. The oracle rejects a banned construct outright, before any
+  // P2 â€” forbidden-construct scan FIRST. The oracle rejects a banned construct outright, before any
   // behavior test, so a behaviorally-correct solution that uses `import re` still fails. Catch it here
   // (the engine-agnostic layer; a native engine also hard-bans it at decode).
   if (worked?.module && worked.bans?.length) {
@@ -454,9 +478,9 @@ async function finishGate(
       const src = readFileSync(join(state.cwd, worked.module), "utf8");
       const violation = forbiddenScan(src, worked.bans);
       if (violation) return { allowed: false, feedback: renderBanViolation(violation, worked.bans) };
-    } catch { /* module unreadable → let the other gates speak */ }
+    } catch { /* module unreadable â†’ let the other gates speak */ }
   }
-  // Worked-example anchor — ground truth from the task itself. If the code fails the task's own
+  // Worked-example anchor â€” ground truth from the task itself. If the code fails the task's own
   // stated I/O, it is not done regardless of any other signal (and the failing case is the repair seed).
   if (worked?.module && worked.examples.length) {
     const exStarted = Date.now();
@@ -474,16 +498,26 @@ async function finishGate(
     onVerification?.({ phase: "evidence", check: testCmd, passed, durationMs: Date.now() - testStarted });
     if (passed) { onVerification?.({ phase: "passed", detail: `\`${testCmd}\` passed` }); return { allowed: true }; }
     // The sidecar (qwen-2b, parallel to the GPU) turns the raw failure into a tight card the main
-    // model repairs against — grounded repair, not a wall of stderr. Deterministic floor inside.
+    // model repairs against â€” grounded repair, not a wall of stderr. Deterministic floor inside.
     const raw = (r.stdout + "\n" + r.stderr).slice(-4000);
     const { card } = await failureCard(llm, raw);
     return { allowed: false, feedback: `\`${testCmd}\` did not pass.\n${renderCard(card)}\nFix the cause and re-run it before finishing.` };
   }
-  // Held-out: require an execution receipt among the successful bash commands.
-  const verified = state.bashOk.some((c) => EXECUTED_RE.test(c) && !/--version|-V\b/.test(c));
-  if (verified) {
+  // Held-out: require an execution receipt among the successful bash commands â€” and one that is
+  // actually ABOUT the change, not just any command that happened to exit 0.
+  const executed = state.bashOk.filter((c) => EXECUTED_RE.test(c) && !/--version|-V\b/.test(c));
+  const relevant = executed.filter((c) => receiptTouchesTheWork(c, state.filesWritten, targets));
+  if (relevant.length) {
     onVerification?.({ phase: "passed", detail: "execution receipt present (the change was actually run)" });
     return { allowed: true };
+  }
+  if (executed.length) {
+    // Something ran, but nothing that touched the produced code. Say exactly that.
+    const what = state.filesWritten.length ? state.filesWritten.slice(0, 3).join(", ") : "the code you changed";
+    return {
+      allowed: false,
+      feedback: `You ran a command, but none of your successful runs exercised ${what} (you ran: ${executed.slice(-2).join(" ; ").slice(0, 160)}). Run YOUR code â€” import it and call it on the normal case AND the edge cases the task names â€” see it pass, then finish.`,
+    };
   }
   const ran = state.bashAll.length ? ` (you ran: ${state.bashAll.slice(-3).join(" ; ").slice(0, 150)})` : "";
   return { allowed: false, feedback: `You have not verified your change by running it${ran}. Write a small check that exercises the change on the normal case AND edge cases, run it with bash, see it pass, THEN finish.` };
@@ -498,3 +532,5 @@ export function detectLanguage(cwd: string): "python" | "node" | "unknown" {
   } catch { /* ignore */ }
   return "unknown";
 }
+
+

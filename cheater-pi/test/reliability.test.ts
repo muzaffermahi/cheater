@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { postEditSyntaxGate, pythonImportBaseline, pythonImportRegression } from "../src/core/reliable.js";
+import { postEditSyntaxGate, pythonImportBaseline, pythonImportRegression, receiptTouchesTheWork } from "../src/core/reliable.js";
 import type { ToolContext } from "../src/core/tools.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
 
@@ -355,4 +355,31 @@ test("the arity gate also covers module-level functions, and stays quiet when a 
   ].join("\n"));
   const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
   assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
+});
+test("a finish receipt must be about the work, not just any command that exited 0", () => {
+  // `python -c "print(1)"` matches the execution pattern and proves nothing about the change.
+  const written = ["calc.py"];
+  const targets = ["calc.py", "evaluate"];
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', written, targets), false, "an unrelated probe is not a receipt");
+  assert.equal(receiptTouchesTheWork('python -c "import os; os.getcwd()"', written, targets), false);
+  // Anything that names the produced file, its module, or a contract symbol counts.
+  assert.equal(receiptTouchesTheWork('python -c "from calc import evaluate; print(evaluate(\'1+1\'))"', written, targets), true);
+  assert.equal(receiptTouchesTheWork("python calc.py", written, targets), true);
+  assert.equal(receiptTouchesTheWork("python check_calc.py", ["check_calc.py"], []), true);
+  // A whole-project runner exercises the project by definition.
+  assert.equal(receiptTouchesTheWork("pytest -q", [], []), true);
+  assert.equal(receiptTouchesTheWork("npm test", [], []), true);
+  // A stem too short to judge ("a" from a.py) makes the question unanswerable, and the gate abstains
+  // rather than blocking a legitimate finish — see the dedicated abstain test below.
+  assert.equal(receiptTouchesTheWork("python -c \"print(2)\"", ["a.py"], []), true, "unjudgeable -> abstain");
+});
+
+
+test("receipt relevance is not enforced when nothing is judgeable", () => {
+  // A 1-char module stem would match almost any command, so it cannot be judged. Refusing on an
+  // unanswerable question would block a legitimate finish; the gate must abstain instead.
+  assert.equal(receiptTouchesTheWork('python -c "import a; print(a.x)"', [], ["a.py"]), true);
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', [], []), true, "no names at all -> abstain");
+  // But it still bites the moment there IS something judgeable.
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', [], ["calc.py"]), false);
 });
