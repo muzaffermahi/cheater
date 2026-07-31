@@ -25,6 +25,16 @@ The brief: *"The desktop app is the king. One click, an icon, no black box, no h
 3. The **installed** app boots: engine connects, runtime segment green against the live local llama.cpp.
 4. A live run through the installed app shows the whole surface at once: `route: ascent · k=2 · hardness 0 · balanced`, the compiled-contract plan card (`compile · 1 requirement · file: package.json` + Full contract), the elapsed timer, and `ready · ornith-1.0-35b · 8k ctx` — the ctx figure is the server's measured `/props` truth, not the config's wish.
 
+## Round 2 (`18d0102`): user-controlled llama.cpp + no quiet deaths
+
+Driven by two live complaints: the auto launch plan's `--cpu-moe` measured 7 tok/s @ 8k where the user's hand-tuned llama-server did 30 tok/s @ 32k, and a run died silently when the model emitted an oversized `write` tool call that llama.cpp 500'd on (`Failed to parse tool call arguments as JSON … missing closing quote`).
+
+- **Runtime tuning**: `settings.runtimeTuning` (gpuLayers / cpuMoe / flashAttn / kvCacheType / sidecarDevice / extraArgs) — every launch heuristic became an overridable default; extra flags append last and win. Model setup grew a Performance-tuning section with a live `llama-server …` command preview and local-model dropdowns (`model.files`: the configured weights' folders + LM Studio trees). The sidecar defaults to CPU/RAM (`--n-gpu-layers 0`) for real parallelism.
+- **No random stops**: the agent loop retries recoverable model errors in-run (transport 5xx + truncated tool calls, 3 attempts with backoff); the truncated case injects "work in smaller pieces" guidance before retrying. Recovery narrates via `run.status.detail`. Terminal failures render as a red card with a plain-language cause + a one-click Retry; a 90s client-side stall watchdog speaks up when a run goes silent.
+- **Project-first**: sessions grouped under per-project headers; New task with no project opens the folder picker.
+
+Verified: 1075 engine tests, `-warnaserror` shell, snapshots showing the grouped list and a live "model loading (warming)" runtime state; v0.7.1 silently installed over 0.7.0 (registry version updated, shortcuts intact).
+
 ## Honest edges
 
 - The user's `~/.kitten/config.json` still pins `contextWindowTokens: 8192`; auto-sizing engages when that pin is removed (set `"contextWindowTokens": "auto"` or delete the key) **and** the managed runtime launches — an external llama.cpp keeps its own n_ctx, which Kitten now reads and follows instead of guessing.
