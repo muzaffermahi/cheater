@@ -59,6 +59,7 @@ Usage:
   kitten help
 
 run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
+              --effort fast|balanced|careful|think-hard   how much compute the run may spend
               -c, --conversation <id>   continue an existing conversation (headless multi-turn)
 `;
 
@@ -99,6 +100,7 @@ async function cmdRun(rest: string[]): Promise<number> {
   let model: string | undefined;
   let lane: Lane | undefined;
   let k: number | undefined;
+  let effort: string | undefined;
   let json = false;
   let dangerous = false;
   let continueId: string | undefined;
@@ -109,6 +111,7 @@ async function cmdRun(rest: string[]): Promise<number> {
     else if (a === "--model") model = rest[++i];
     else if (a === "--lane") { const l = rest[++i]; if (isLane(l)) lane = l; }
     else if (a === "--k") k = Math.max(1, Number(rest[++i]) || 1);
+    else if (a === "--effort") effort = rest[++i];
     else if (a === "--json") json = true;
     else if (a === "--dangerous" || a === "--yes") dangerous = true;
     else if (a === "--conversation" || a === "-c") continueId = rest[++i];
@@ -149,7 +152,7 @@ async function cmdRun(rest: string[]): Promise<number> {
     conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
   }
   if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id}${continueId ? " (continued)" : ""} · ${cwd}`) + "\n");
-  const run = await app.submitMessage(conv.id, task, { lane, k });
+  const run = await app.submitMessage(conv.id, task, { lane, k, effort });
 
   if (json) {
     process.stdout.write(JSON.stringify({ conversationId: conv.id, run }) + "\n");
