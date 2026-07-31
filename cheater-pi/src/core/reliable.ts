@@ -197,6 +197,62 @@ export function postEditSyntaxGate(call: { name: string; args: Record<string, un
       return `SYNTAX CHECK FAILED for ${path}:\n${diag}\nFix this before continuing — the file will not run as written.`;
     }
   } catch { /* checker missing -> skip silently */ }
+  if (ext === ".py") return pythonSelfCallGate(path, full);
+  return undefined;
+}
+
+/**
+ * Catch a `self.method(...)` call whose argument count cannot match the method's own definition.
+ *
+ * Syntax checks pass such code and a smoke test only catches it if the run happens to take that
+ * branch — measured live: a model shipped an expression parser whose ONLY bad call site,
+ * `self._consume(")")`, sat on the parenthesis path. Its own verification ran `2 + 3`, never took
+ * that branch, and the finish gate accepted the green receipt. `(1+2)*3` then raised TypeError.
+ *
+ * Deterministic and conservative: only methods defined in the SAME class body, no decorators, no
+ * *args/**kwargs. Anything it cannot prove wrong, it leaves alone.
+ */
+function pythonSelfCallGate(path: string, full: string): string | undefined {
+  const program = `
+import ast, sys
+try:
+    tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+except Exception:
+    sys.exit(0)
+problems = []
+for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+    methods = {}
+    for fn in cls.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.decorator_list or fn.args.vararg or fn.args.kwarg:
+            continue          # properties/staticmethods/varargs: not provably wrong
+        pos = len(fn.args.args) + len(fn.args.posonlyargs) - 1          # drop self
+        methods[fn.name] = (pos - len(fn.args.defaults), pos)
+    for node in ast.walk(cls):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if not (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "self"):
+            continue
+        if f.attr not in methods or any(isinstance(a, ast.Starred) for a in node.args) or node.keywords:
+            continue
+        lo, hi = methods[f.attr]
+        n = len(node.args)
+        if n < lo or n > hi:
+            want = str(lo) if lo == hi else "%d-%d" % (lo, hi)
+            problems.append("line %d: self.%s(...) passes %d argument(s) but %s() accepts %s"
+                            % (node.lineno, f.attr, n, f.attr, want))
+if problems:
+    print("\\n".join(problems[:5]))
+    sys.exit(1)
+`;
+  try {
+    const r = spawnSync("python", ["-c", program, full], { encoding: "utf8", timeout: 20000, windowsHide: true });
+    if (r.status === 1 && (r.stdout ?? "").trim()) {
+      return `METHOD CALL CHECK FAILED for ${path}:\n${r.stdout.trim().slice(0, 400)}\nThis will raise TypeError as soon as that line runs. Fix the signature or the call before continuing.`;
+    }
+  } catch { /* no python -> skip silently */ }
   return undefined;
 }
 

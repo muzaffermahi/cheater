@@ -1,6 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { postEditSyntaxGate } from "../src/core/reliable.js";
+import type { ToolContext } from "../src/core/tools.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
+
+function ctxAt(): ToolContext {
+  return { cwd: mkdtempSync(join(tmpdir(), "kt-gate-")), filesRead: new Set(), filesWritten: new Set() };
+}
 import { LoopGovernor } from "../src/reliability/loopGovernor.js";
 import { modelProfile, inferModelClass, inferParamBillions } from "../src/reliability/modelProfile.js";
 import { operatingRulesFor } from "../src/reliability/packetPrompt.js";
@@ -224,4 +233,55 @@ test("reliability benchmark variant E records retrieval gate metrics", () => {
   const results = runReliabilityBenchmark({ cwd: process.cwd(), variant: "E", limit: 2, config: DEFAULT_BLUEPRINT_CONFIG });
   assert.equal(results.length, 2);
   assert.ok(results.every((result) => result.retrievalGateTrusted === true));
+});
+
+test("the self-call arity gate catches a wrong-arity method call a smoke test would miss", async () => {
+  // Live bakeoff finding: a produced expression parser had exactly one bad call site,
+  // `self._consume(")")`, on the parenthesis path. Its own verification ran "2 + 3", never took that
+  // branch, and the finish gate accepted the green receipt. `(1+2)*3` then raised TypeError.
+  const ctx = ctxAt();
+  const bad = [
+    "class P:",
+    "    def _consume(self):",
+    "        return 1",
+    "    def parse(self):",
+    "        return self._consume(')')",
+    "",
+  ].join("\n");
+  writeFileSync(join(ctx.cwd, "calc.py"), bad);
+  const hit = postEditSyntaxGate({ name: "write", args: { path: "calc.py" } }, { output: "", isError: false }, ctx);
+  assert.ok(hit, "a provably-wrong self call must be reported");
+  assert.match(hit!, /METHOD CALL CHECK FAILED/);
+  assert.match(hit!, /_consume/);
+
+  // Everything it cannot PROVE wrong must pass untouched: correct arity, defaults, *args, decorators,
+  // inherited methods, and keyword calls.
+  const good = [
+    "import functools",
+    "class Base:",
+    "    def inherited(self, a, b):",
+    "        return a + b",
+    "class P(Base):",
+    "    def one(self, a):",
+    "        return a",
+    "    def defaulted(self, a, b=2):",
+    "        return a + b",
+    "    def varargs(self, *args):",
+    "        return args",
+    "    @property",
+    "    def prop(self):",
+    "        return 1",
+    "    def go(self):",
+    "        self.one(1)",
+    "        self.defaulted(1)",
+    "        self.defaulted(1, 2)",
+    "        self.varargs(1, 2, 3)",
+    "        self.inherited(1, 2)",
+    "        self.one(a=1)",
+    "        return self.prop",
+    "",
+  ].join("\n");
+  writeFileSync(join(ctx.cwd, "ok.py"), good);
+  const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
+  assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
 });
