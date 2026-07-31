@@ -1,6 +1,9 @@
+using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using System.IO;
@@ -11,7 +14,7 @@ namespace Kitten.Desktop;
 
 public partial class MainWindow : Window
 {
-    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId, long UpdatedAt)
+    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId, long UpdatedAt, string Effort = "balanced")
     {
         public override string ToString()
         {
@@ -38,7 +41,11 @@ public partial class MainWindow : Window
 
     private EngineClient? _engine;
     private readonly TranscriptView _transcript;
+    private readonly ActivityPanel _activity;
     private readonly EngineProcess _engineProcess = new();
+    private string _effort = "balanced";
+    /// <summary>Once a runtime.state push arrives, the poll's own offline verdict stops competing with it.</summary>
+    private bool _runtimeStatePushed;
     private readonly List<ConversationItem> _conversationItems = new();
     private string? _conversationId;
     private string _conversationSearch = "";
@@ -65,6 +72,7 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _transcript = new TranscriptView(TranscriptHost, TranscriptScroll);
+        _activity = new ActivityPanel(RunMeta, RouteLine, PlanCard, PlanGoal, PlanContract, PlanSteps, PlanDetailButton, CurrentToolLine, VerificationLine);
     }
 
     private async void OnOpened(object? sender, EventArgs e)
@@ -138,7 +146,8 @@ public partial class MainWindow : Window
                 item.TryGetProperty("projectRoot", out var root) ? root.GetString() ?? "" : "",
                 item.TryGetProperty("agent", out var agent) ? agent.GetString() ?? "general" : "general",
                 item.TryGetProperty("parentConversationId", out var parent) && parent.ValueKind == JsonValueKind.String ? parent.GetString() : null,
-                item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0));
+                item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0,
+                item.TryGetProperty("effort", out var effort) && effort.ValueKind == JsonValueKind.String ? effort.GetString() ?? "balanced" : "balanced"));
         }
         ConversationList.ItemsSource = null;
         ConversationList.ItemsSource = _conversationItems;
@@ -180,7 +189,12 @@ public partial class MainWindow : Window
                 line.Add($"{contextTokens / 1000}k ctx");
                 detail.Add($"History budget: ~{historyBudget:n0} of {contextTokens:n0} context tokens");
             }
-            var recommendation = await _engine.CallAsync("model.recommend");
+            // The three independent IPC calls run concurrently — serially they added ~3 probe timeouts
+            // to every conversation activation.
+            var recommendationTask = _engine.CallAsync("model.recommend");
+            var runtimeTask = _engine.CallAsync("runtime.status");
+            var probeTask = _engine.CallAsync("model.probe", new { projectRoot });
+            var recommendation = await recommendationTask;
             if (recommendation is { } guidance && guidance.ValueKind == JsonValueKind.Object && guidance.TryGetProperty("summary", out var summary))
                 detail.Add(summary.GetString() ?? "");
             if (recommendation is { } bakeoffGuidance && bakeoffGuidance.ValueKind == JsonValueKind.Object && bakeoffGuidance.TryGetProperty("latestBakeoff", out var latestBakeoff) && latestBakeoff.ValueKind == JsonValueKind.Object && latestBakeoff.TryGetProperty("recommendations", out var latestRecommendations) && latestRecommendations.ValueKind == JsonValueKind.Array && latestRecommendations.GetArrayLength() > 0)
@@ -194,13 +208,27 @@ public partial class MainWindow : Window
                 });
                 detail.Add($"Last bakeoff: {string.Join(", ", winners)}");
             }
-            var runtime = await _engine.CallAsync("runtime.status");
-            if (runtime is { } runtimeValue && runtimeValue.ValueKind == JsonValueKind.Object && runtimeValue.TryGetProperty("running", out var running))
-                detail.Add($"Managed runtime: {(running.GetBoolean() ? "running" : "stopped")}");
-            var probe = await _engine.CallAsync("model.probe", new { projectRoot });
+            var runtime = await runtimeTask;
+            if (runtime is { } runtimeValue && runtimeValue.ValueKind == JsonValueKind.Object)
+            {
+                if (runtimeValue.TryGetProperty("running", out var running))
+                    detail.Add($"Managed runtime: {(running.GetBoolean() ? "running" : "stopped")}");
+                // Late-joiner seed for the pushed runtime.state stream: a fresh shell learns the current
+                // llama.cpp phase from the status response instead of waiting for the next transition.
+                if (runtimeValue.TryGetProperty("state", out var seededState) && seededState.ValueKind == JsonValueKind.Object)
+                    ApplyRuntimeState(seededState);
+            }
+            var probe = await probeTask;
             var offline = probe is { } probeValue && probeValue.ValueKind == JsonValueKind.Object && probeValue.TryGetProperty("reachable", out var reachable) && !reachable.GetBoolean();
-            // An unreachable endpoint is the one model fact that has to be visible without hovering.
-            if (offline) line.Add("endpoint offline — open Model settings");
+            // An unreachable endpoint is the one model fact that has to be visible without hovering —
+            // unless the pushed runtime.state already owns that story (push and poll must not fight).
+            if (offline && !_runtimeStatePushed) line.Add("endpoint offline — open Model settings");
+            if (!_runtimeStatePushed)
+            {
+                RuntimeDot.Fill = (IBrush?)Application.Current?.FindResource(offline ? "ErrBrush" : "OkBrush") ?? RuntimeDot.Fill;
+                RuntimeText.Text = offline ? "model offline" : $"ready · {main}";
+                RuntimeActionButton.IsVisible = offline;
+            }
             ModelText.Text = string.Join("  ·  ", line);
             ToolTip.SetTip(ModelText, string.Join("\n", detail.Where(entry => !string.IsNullOrWhiteSpace(entry))));
         }
@@ -1666,6 +1694,8 @@ public partial class MainWindow : Window
             UndoButton.IsEnabled = false;
             RedoButton.IsEnabled = false;
             ResetApproval();
+            _activity.Reset();
+            SetEffortControl(item.Effort);
             var events = await _engine.CallAsync("conversation.events", new { id = item.Id });
             Evidence.Text = "Verified receipts will appear here.";
             RenderHistory(events);
@@ -1726,6 +1756,16 @@ public partial class MainWindow : Window
                     if (!streamedRuns.Contains(runId)) { text.Append("Kitten: "); streamedRuns.Add(runId); }
                     if (frame.TryGetProperty("text", out var delta)) text.Append(delta.GetString() ?? "");
                     break;
+                case "task.compiled":
+                    {
+                        // The contract that shaped the run is part of the story a replayed session tells.
+                        var compiledGoal = frame.TryGetProperty("goal", out var compiledGoalValue) ? compiledGoalValue.GetString() ?? "" : "";
+                        var compiledMode = frame.TryGetProperty("mode", out var compiledModeValue) ? compiledModeValue.GetString() ?? "" : "";
+                        var compiledRequirements = frame.TryGetProperty("requirementCount", out var compiledReqValue) && compiledReqValue.ValueKind == JsonValueKind.Number ? compiledReqValue.GetInt32() : 0;
+                        if (!string.IsNullOrWhiteSpace(compiledGoal) && compiledMode is not ("passthrough" or ""))
+                            text.Append($"Task contract ({compiledMode}, {compiledRequirements} requirement{(compiledRequirements == 1 ? "" : "s")}): {compiledGoal}\n\n");
+                        break;
+                    }
                 case "tool.completed":
                     // Replayed history has to show the work, not just the conclusion.
                     text.Append(TranscriptView.ToolLine(
@@ -1894,6 +1934,12 @@ public partial class MainWindow : Window
                 else Activity.Text = $"Bakeoff {phase}: {role} {model} — {taskId} {taskIndex}/{taskTotal} running...";
                 return;
             }
+            // runtime.state is app-global (no conversationId): the pushed llama.cpp lifecycle.
+            if (type == "runtime.state" && progressPayload.ValueKind == JsonValueKind.Object)
+            {
+                ApplyRuntimeState(progressPayload);
+                return;
+            }
             var eventConversation = frame.TryGetProperty("conversationId", out var conversation) ? conversation.GetString() : null;
             if (eventConversation is not null && eventConversation != _conversationId) return;
             var payload = frame.TryGetProperty("payload", out var payloadValue) ? payloadValue : default;
@@ -1945,6 +1991,64 @@ public partial class MainWindow : Window
                     CancelChecksButton.IsEnabled = false;
                     RunChecksButton.IsEnabled = _suggestedCommands.Length > 0;
                     break;
+                case "route.selected":
+                    _activity.SetRoute(
+                        payload.TryGetProperty("lane", out var routeLane) ? routeLane.GetString() ?? "?" : "?",
+                        payload.TryGetProperty("k", out var routeK) && routeK.ValueKind == JsonValueKind.Number ? routeK.GetInt32() : 1,
+                        payload.TryGetProperty("hardness", out var routeHardness) && routeHardness.ValueKind == JsonValueKind.Number ? routeHardness.GetDouble() : null,
+                        payload.TryGetProperty("effort", out var routeEffort) ? routeEffort.GetString() : null);
+                    break;
+                case "task.compiled":
+                    {
+                        var goal = payload.TryGetProperty("goal", out var goalValue) ? goalValue.GetString() ?? "" : "";
+                        var requirements = payload.TryGetProperty("requirementCount", out var reqValue) && reqValue.ValueKind == JsonValueKind.Number ? reqValue.GetInt32() : 0;
+                        var assumptions = payload.TryGetProperty("assumptionCount", out var assumeValue) && assumeValue.ValueKind == JsonValueKind.Number ? assumeValue.GetInt32() : 0;
+                        var mode = payload.TryGetProperty("mode", out var modeValue) ? modeValue.GetString() ?? "" : "";
+                        var compiledWarnings = ReadStringArray(payload, "warnings");
+                        var contractLine = $"{mode} · {requirements} requirement{(requirements == 1 ? "" : "s")} · {assumptions} assumption{(assumptions == 1 ? "" : "s")}{(compiledWarnings.Length > 0 ? $" · {compiledWarnings.Length} warning(s)" : "")}";
+                        if (runId is not null && !string.IsNullOrWhiteSpace(goal)) _activity.SetCompiled(runId, goal, contractLine);
+                        break;
+                    }
+                case "plan.updated":
+                    if (payload.TryGetProperty("steps", out var planSteps) && planSteps.ValueKind == JsonValueKind.Array)
+                    {
+                        var rows = planSteps.EnumerateArray().Select(step => (
+                            step.TryGetProperty("id", out var stepId) ? stepId.GetString() ?? "" : "",
+                            step.TryGetProperty("label", out var stepLabel) ? stepLabel.GetString() ?? "" : "",
+                            step.TryGetProperty("status", out var stepStatus) ? stepStatus.GetString() ?? "planned" : "planned"
+                        )).Where(row => row.Item1.Length > 0).ToList();
+                        _activity.SetPlanSteps(rows);
+                    }
+                    break;
+                case "step.started":
+                    if (payload.TryGetProperty("stepId", out var startedStep)) _activity.StepChanged(startedStep.GetString() ?? "", "running");
+                    if (payload.TryGetProperty("label", out var startedLabel)) Activity.Text = $"Step: {startedLabel.GetString()}";
+                    break;
+                case "step.completed":
+                    if (payload.TryGetProperty("stepId", out var doneStep)) _activity.StepChanged(doneStep.GetString() ?? "", payload.TryGetProperty("status", out var doneStatus) ? doneStatus.GetString() ?? "completed" : "completed");
+                    break;
+                case "run.status":
+                    {
+                        var runStatus = payload.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : null;
+                        if (runStatus == "waiting_approval") Activity.Text = "Waiting for your approval";
+                        else if (runStatus == "cancelling") Activity.Text = "Stopping…";
+                        else if (runStatus == "running" && _activeRunId is not null) Activity.Text = "Running…";
+                        break;
+                    }
+                case "repair.started":
+                    {
+                        var repairRound = payload.TryGetProperty("round", out var roundValue) && roundValue.ValueKind == JsonValueKind.Number ? roundValue.GetInt32() : 0;
+                        var repairSeed = payload.TryGetProperty("seed", out var seedValue) ? seedValue.GetString() ?? "" : "";
+                        _activity.RepairStarted(repairRound, repairSeed);
+                        Activity.Text = $"Repairing (round {repairRound}) — verification found a gap";
+                        break;
+                    }
+                case "verification.evidence":
+                    _activity.VerificationEvidence(
+                        payload.TryGetProperty("check", out var checkValue) ? checkValue.GetString() ?? "check" : "check",
+                        payload.TryGetProperty("passed", out var passedEvidence) && passedEvidence.ValueKind == JsonValueKind.True,
+                        payload.TryGetProperty("durationMs", out var evidenceMs) && evidenceMs.ValueKind == JsonValueKind.Number ? evidenceMs.GetInt64() : 0);
+                    break;
                 case "run.started":
                     _activeRunId = runId;
                     ResumeButton.IsEnabled = false;
@@ -1952,6 +2056,7 @@ public partial class MainWindow : Window
                     _activeRunFiles.Clear();
                     _activeRunAdded = 0;
                     _activeRunRemoved = 0;
+                    _activity.RunStarted();
                     Activity.Text = runId is null ? "Run started" : $"Run {ShortId(runId)} started";
                     // The panels describe THIS run. Leaving the previous run's receipt and file count on
                     // screen while a new one is in flight reads as if they belong to it.
@@ -1987,17 +2092,35 @@ public partial class MainWindow : Window
                     if (payload.TryGetProperty("filesChanged", out var receiptFiles) && receiptFiles.ValueKind == JsonValueKind.Array)
                         foreach (var file in receiptFiles.EnumerateArray()) if (file.ValueKind == JsonValueKind.String) _activeRunFiles.Add(file.GetString() ?? "");
                     break;
-                case "tool.started": Activity.Text = payload.TryGetProperty("name", out var tool) ? $"Using {tool.GetString()}" : "Running tool"; break;
-                case "tool.completed":
-                    // The step lands in the transcript the moment it finishes, so the conversation shows
-                    // the actual work — which files were read, what was edited, which command ran.
-                    _transcript.AddTool(
-                        payload.TryGetProperty("name", out var doneName) ? doneName.GetString() ?? "tool" : "tool",
-                        payload.TryGetProperty("target", out var doneTarget) ? doneTarget.GetString() ?? "" : "",
-                        !payload.TryGetProperty("ok", out var doneOk) || doneOk.ValueKind != JsonValueKind.False,
-                        payload.TryGetProperty("durationMs", out var doneMs) && doneMs.ValueKind == JsonValueKind.Number ? doneMs.GetInt64() : 0,
-                        payload.TryGetProperty("output", out var doneOutput) ? doneOutput.GetString() ?? "" : "");
+                case "tool.started":
+                    {
+                        var toolName = payload.TryGetProperty("name", out var tool) ? tool.GetString() ?? "tool" : "tool";
+                        var toolTarget = payload.TryGetProperty("target", out var targetValue) ? targetValue.GetString() ?? "" : "";
+                        var callId = payload.TryGetProperty("callId", out var callIdValue) ? callIdValue.GetString() : null;
+                        if (callId is not null) _transcript.BeginTool(callId, toolName, toolTarget);
+                        _activity.ToolStarted(toolName, toolTarget);
+                        Activity.Text = string.IsNullOrWhiteSpace(toolTarget) ? $"Using {toolName}" : $"Using {toolName}: {toolTarget}";
+                        break;
+                    }
+                case "tool.output":
+                    if (payload.TryGetProperty("callId", out var chunkCall) && payload.TryGetProperty("chunk", out var chunkValue))
+                        _transcript.AppendToolOutput(chunkCall.GetString() ?? "", chunkValue.GetString() ?? "");
                     break;
+                case "tool.completed":
+                    {
+                        // A live card resolves in place; anything else (replay, legacy engines, parallel
+                        // candidates) lands as the classic after-the-fact step.
+                        var doneName = payload.TryGetProperty("name", out var doneNameValue) ? doneNameValue.GetString() ?? "tool" : "tool";
+                        var doneTarget = payload.TryGetProperty("target", out var doneTargetValue) ? doneTargetValue.GetString() ?? "" : "";
+                        var doneOkFlag = !payload.TryGetProperty("ok", out var doneOk) || doneOk.ValueKind != JsonValueKind.False;
+                        var doneDuration = payload.TryGetProperty("durationMs", out var doneMs) && doneMs.ValueKind == JsonValueKind.Number ? doneMs.GetInt64() : 0;
+                        var doneOutput = payload.TryGetProperty("output", out var doneOutputValue) ? doneOutputValue.GetString() ?? "" : "";
+                        var doneCallId = payload.TryGetProperty("callId", out var doneCallValue) ? doneCallValue.GetString() : null;
+                        if (doneCallId is null || !_transcript.CompleteTool(doneCallId, doneOkFlag, doneDuration, doneOutput))
+                            _transcript.AddTool(doneName, doneTarget, doneOkFlag, doneDuration, doneOutput);
+                        _activity.ToolFinished();
+                        break;
+                    }
                 case "task.started": Activity.Text = payload.TryGetProperty("agent", out var taskAgent) ? $"Sidecar subagent started: {taskAgent.GetString()}" : "Subagent started"; break;
                 case "task.completed": Activity.Text = payload.TryGetProperty("status", out var taskStatus) ? $"Subagent completed: {taskStatus.GetString()}" : "Subagent completed"; break;
                 case "task.blocked": Activity.Text = payload.TryGetProperty("report", out var taskReport) ? $"Subagent blocked: {taskReport.GetString()}" : "Subagent blocked"; break;
@@ -2010,9 +2133,18 @@ public partial class MainWindow : Window
                     Activity.Text = "Waiting for your approval";
                     break;
                 case "tool.approval_resolved": ResetApproval(); break;
-                case "verification.started": Activity.Text = "Verifying the result"; break;
-                case "verification.passed": Evidence.Text = "Verification passed; evidence recorded."; break;
-                case "verification.failed": Evidence.Text = "Verification failed; Kitten will keep the run honest."; break;
+                case "verification.started":
+                    Activity.Text = "Verifying the result";
+                    _activity.VerificationStarted(payload.TryGetProperty("what", out var verifyWhat) ? verifyWhat.GetString() ?? "verification" : "verification");
+                    break;
+                case "verification.passed":
+                    _activity.VerificationPassed(payload.TryGetProperty("detail", out var passedDetail) ? passedDetail.GetString() ?? "verified" : "verified");
+                    Evidence.Text = "Verification passed; evidence recorded.";
+                    break;
+                case "verification.failed":
+                    _activity.VerificationFailed(payload.TryGetProperty("detail", out var failedDetail) ? failedDetail.GetString() ?? "verification failed" : "verification failed");
+                    Evidence.Text = "Verification failed; Kitten will keep the run honest.";
+                    break;
                 case "run.completed":
                     var finished = payload.TryGetProperty("finished", out var finishedValue) && finishedValue.ValueKind == JsonValueKind.True;
                     var verified = payload.TryGetProperty("verified", out var verifiedValue) && verifiedValue.ValueKind == JsonValueKind.True;
@@ -2031,6 +2163,8 @@ public partial class MainWindow : Window
                     _lastCompletedRunId = runId;
                     _activeRunId = null;
                     _canResumeInterrupted = false;
+                    _activity.RunEnded();
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
                     SetRunControls(false);
                     UndoButton.IsEnabled = _lastCompletedRunId is not null;
@@ -2043,24 +2177,158 @@ public partial class MainWindow : Window
                         : $"Run failed: {failureMessage}";
                     Evidence.Text = Activity.Text;
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
                     SetRunControls(false);
                     break;
                 case "run.cancelled":
                     Activity.Text = "Run cancelled";
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
                     SetRunControls(false);
                     break;
                 case "run.interrupted":
                     Activity.Text = "Run interrupted; it can be resumed safely";
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _transcript.AbandonOpenTools();
                     _canResumeInterrupted = true;
                     ResumeButton.IsEnabled = true;
                     SetRunControls(false);
                     break;
             }
         });
+    }
+
+    /// <summary>Render a pushed runtime.state: the llama.cpp lifecycle, no polling required.</summary>
+    private void ApplyRuntimeState(JsonElement payload)
+    {
+        _runtimeStatePushed = true;
+        var phase = payload.TryGetProperty("phase", out var phaseValue) ? phaseValue.GetString() ?? "stopped" : "stopped";
+        var model = payload.TryGetProperty("model", out var modelValue) ? modelValue.GetString() ?? "model" : "model";
+        var ctx = payload.TryGetProperty("ctxTokens", out var ctxValue) && ctxValue.ValueKind == JsonValueKind.Number ? ctxValue.GetInt32() : 0;
+        var stderrTail = payload.TryGetProperty("stderrTail", out var stderrValue) ? stderrValue.GetString() ?? "" : "";
+        var sidecar = payload.TryGetProperty("sidecarModel", out var sidecarValue) && sidecarValue.ValueKind == JsonValueKind.String ? sidecarValue.GetString() : null;
+        var warnings = ReadStringArray(payload, "warnings");
+        var ok = (IBrush?)Application.Current?.FindResource("OkBrush") ?? Brushes.Green;
+        var warn = (IBrush?)Application.Current?.FindResource("WarnBrush") ?? Brushes.Orange;
+        var err = (IBrush?)Application.Current?.FindResource("ErrBrush") ?? Brushes.Red;
+        var faint = (IBrush?)Application.Current?.FindResource("FaintBrush") ?? Brushes.Gray;
+        switch (phase)
+        {
+            case "starting":
+            case "probing":
+                RuntimeDot.Fill = warn;
+                RuntimeText.Text = $"model loading — {model} (warming)";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "ready":
+            case "external":
+                RuntimeDot.Fill = ok;
+                RuntimeText.Text = $"ready · {model}{(ctx > 0 ? $" · {ctx / 1024}k ctx" : "")}{(string.IsNullOrWhiteSpace(sidecar) ? "" : " · sidecar")}{(phase == "external" ? " (external)" : "")}";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "stopped":
+                RuntimeDot.Fill = faint;
+                RuntimeText.Text = "model offline";
+                RuntimeActionButton.Content = "Start runtime";
+                RuntimeActionButton.IsVisible = true;
+                break;
+            default: // failed
+                RuntimeDot.Fill = err;
+                var firstLine = stderrTail.Replace("\r\n", "\n").Split('\n').FirstOrDefault(line => line.Trim().Length > 0)?.Trim() ?? "no reason reported";
+                RuntimeText.Text = $"runtime failed — {(firstLine.Length > 80 ? firstLine[..80] + "…" : firstLine)}";
+                RuntimeActionButton.Content = "Retry runtime";
+                RuntimeActionButton.IsVisible = true;
+                break;
+        }
+        var tip = new List<string> { $"Phase: {phase}", $"Model: {model}" };
+        if (ctx > 0) tip.Add($"Server context: {ctx:n0} tokens");
+        if (!string.IsNullOrWhiteSpace(sidecar)) tip.Add($"Sidecar: {sidecar}");
+        tip.AddRange(warnings);
+        if (!string.IsNullOrWhiteSpace(stderrTail)) tip.Add($"Runtime said:\n{stderrTail}");
+        ToolTip.SetTip(RuntimeText, string.Join("\n", tip));
+    }
+
+    /// <summary>One-click runtime start from the status bar; unconfigured setups land in Model setup.</summary>
+    private async void StartRuntime(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null) return;
+        RuntimeActionButton.IsEnabled = false;
+        try
+        {
+            var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
+            var result = await _engine.CallAsync("runtime.ensure", new { projectRoot });
+            if (result is { } value && value.ValueKind == JsonValueKind.Object && value.TryGetProperty("configured", out var configured) && configured.ValueKind == JsonValueKind.False)
+            {
+                Activity.Text = "No managed runtime is configured yet — set the executable and model in Model settings.";
+                ConfigureModels(sender, e);
+            }
+        }
+        catch (Exception ex) { Activity.Text = $"Runtime start failed: {ex.Message}"; }
+        finally { RuntimeActionButton.IsEnabled = true; }
+    }
+
+    /// <summary>The effort dial. Mutual exclusion by hand — four ToggleButtons, one checked.</summary>
+    private async void EffortClicked(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton clicked || clicked.Tag is not string level) return;
+        SetEffortControl(level);
+        SetComposerHint(level switch
+        {
+            "fast" => "Fast: single pass, light verification — quickest",
+            "careful" => "Careful: more candidates and repair rounds, deeper verification",
+            "think-hard" => "Think Hard: multiple candidates, subagents, web search — up to ~45 min",
+            _ => "Balanced: standard routing and verification",
+        });
+        if (_engine is not null && _conversationId is not null)
+        {
+            try { await _engine.CallAsync("conversation.set-effort", new { conversationId = _conversationId, effort = level }); }
+            catch { /* the level still applies to the next submit */ }
+        }
+    }
+
+    private void SetEffortControl(string level)
+    {
+        _effort = level is "fast" or "balanced" or "careful" or "think-hard" ? level : "balanced";
+        EffortFast.IsChecked = _effort == "fast";
+        EffortBalanced.IsChecked = _effort == "balanced";
+        EffortCareful.IsChecked = _effort == "careful";
+        EffortHard.IsChecked = _effort == "think-hard";
+    }
+
+    /// <summary>Fetch and show the full compiled contract for the plan card's run.</summary>
+    private async void ShowCompiledContract(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null || _activity.CompiledRunId is null) return;
+        try
+        {
+            var record = await _engine.CallAsync("task.compiled-get", new { runId = _activity.CompiledRunId });
+            if (record is not { } value || value.ValueKind != JsonValueKind.Object) { Activity.Text = "No compiled contract is stored for this run."; return; }
+            var rendered = value.TryGetProperty("rendered", out var renderedValue) ? renderedValue.GetString() ?? "" : "";
+            var ir = value.TryGetProperty("ir", out var irValue) ? irValue.GetString() ?? "" : "";
+            var body = string.IsNullOrWhiteSpace(rendered) ? ir : rendered;
+            var close = new Button { Content = "Close" };
+            var text = new TextBox { Text = body, IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.NoWrap, FontFamily = "Consolas", MinHeight = 420 };
+            var scroll = new ScrollViewer { Content = text, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
+            var dialog = new Window
+            {
+                Title = "Task contract",
+                Width = 860,
+                Height = 640,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
+                Content = new DockPanel { Margin = new Avalonia.Thickness(18), Children = { close, scroll } },
+            };
+            DockPanel.SetDock(close, Dock.Bottom);
+            close.Margin = new Avalonia.Thickness(0, 12, 0, 0);
+            close.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right;
+            close.Click += (_, _) => dialog.Close();
+            await dialog.ShowDialog(this);
+        }
+        catch (Exception ex) { Activity.Text = $"Could not load the contract: {ex.Message}"; }
     }
 
     private static string ShortId(string id) => id[..Math.Min(8, id.Length)];
@@ -2149,7 +2417,7 @@ public partial class MainWindow : Window
         SetRunControls(true);
         try
         {
-            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text });
+            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text, effort = _effort });
             if (result is { } completed && completed.ValueKind == JsonValueKind.Object)
             {
                 if (completed.TryGetProperty("cancelled", out var cancelled) && cancelled.ValueKind == JsonValueKind.True) Activity.Text = "Run cancelled before the model started.";
@@ -2211,7 +2479,7 @@ public partial class MainWindow : Window
         SetRunControls(true);
         try
         {
-            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text = "Continue the interrupted task from the last durable state. Re-check the workspace and report what remains before making changes." });
+            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text = "Continue the interrupted task from the last durable state. Re-check the workspace and report what remains before making changes.", effort = _effort });
             if (result is { } completed && completed.ValueKind == JsonValueKind.Object)
             {
                 if (completed.TryGetProperty("cancelled", out var cancelled) && cancelled.ValueKind == JsonValueKind.True) Activity.Text = "Resume cancelled before the model started.";
