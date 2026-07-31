@@ -175,7 +175,11 @@ test("desktop engine exposes a redacted diagnostics bundle for the native app", 
     const bundle = await call(socket, "support", "support.bundle");
     assert.equal(typeof bundle.content, "string");
     assert.match(bundle.content, /=== Kitten Support Bundle ===/);
-    assert.match(bundle.content, /Engine: openai-proxy/);
+    // Engine detection PROBES the configured endpoint, so pinning the value made this test depend on
+    // whether a local llama.cpp happened to be running — it passed only on a machine with nothing on
+    // :1234 and failed the moment one was started. Assert the bundle reports a known engine, not
+    // which one the developer's machine is serving right now.
+    assert.match(bundle.content, /Engine: (?:llamacpp|openai-proxy|unknown)\b/);
   } finally {
     socket.destroy();
     await engine.close();
