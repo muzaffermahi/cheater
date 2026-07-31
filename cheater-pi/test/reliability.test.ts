@@ -320,3 +320,39 @@ test("the import invariant never blames the agent for a repo that was already br
   assert.ok(!baseline.includes("already_broken"), "a pre-broken module is NOT baselined");
   assert.equal(pythonImportRegression(cwd, baseline), undefined, "pre-existing breakage must never block");
 });
+test("the arity gate also covers module-level functions, and stays quiet when a name could be shadowed", () => {
+  const ctx = ctxAt();
+  // The free-function twin of the method bug: def summary(rows, column) called with one argument.
+  writeFileSync(join(ctx.cwd, "stats.py"), [
+    "def summary(rows, column):",
+    "    return (rows, column)",
+    "",
+    "def report(rows):",
+    "    return summary(rows)",
+    "",
+  ].join("\n"));
+  const hit = postEditSyntaxGate({ name: "write", args: { path: "stats.py" } }, { output: "", isError: false }, ctx);
+  assert.ok(hit, "a provably-wrong module-level call must be reported");
+  assert.match(hit!, /summary\(\.\.\.\) passes 1 argument/);
+
+  // Must stay silent wherever the name might not resolve to that definition, or the call is fine.
+  writeFileSync(join(ctx.cwd, "ok.py"), [
+    "from os.path import join",              // imported name of its own
+    "",
+    "def helper(a, b=2):",
+    "    return a + b",
+    "",
+    "def shadowed(a):",
+    "    return a",
+    "",
+    "def use():",
+    "    shadowed = lambda *a: a",           // locally rebound -> never flagged
+    "    shadowed(1, 2, 3)",
+    "    helper(1)",
+    "    helper(1, 2)",
+    "    return join('a', 'b')",
+    "",
+  ].join("\n"));
+  const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
+  assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
+});

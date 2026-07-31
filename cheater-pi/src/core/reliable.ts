@@ -224,6 +224,45 @@ try:
 except Exception:
     sys.exit(0)
 problems = []
+
+# --- module-level functions -------------------------------------------------------------------
+# Same idea as the self-call check below, one scope out: def summary(rows, column) called as
+# summary(rows). Any name that is ALSO imported or assigned anywhere in the file is skipped, because
+# then the call might not resolve to this definition at all.
+shadowed = set()
+for n in ast.walk(tree):
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        for a in n.names:
+            shadowed.add((a.asname or a.name).split(".")[0])
+    elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+        shadowed.add(n.id)
+    elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for a in list(n.args.args) + list(n.args.posonlyargs) + list(n.args.kwonlyargs):
+            shadowed.add(a.arg)
+top = {}
+for fn in tree.body:
+    if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    if fn.decorator_list or fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs:
+        continue
+    pos = len(fn.args.args) + len(fn.args.posonlyargs)
+    top[fn.name] = (pos - len(fn.args.defaults), pos)
+for node in ast.walk(tree):
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+        continue
+    name = node.func.id
+    if name not in top or name in shadowed or node.keywords:
+        continue
+    if any(isinstance(a, ast.Starred) for a in node.args):
+        continue
+    lo, hi = top[name]
+    n = len(node.args)
+    if n < lo or n > hi:
+        want = str(lo) if lo == hi else "%d-%d" % (lo, hi)
+        problems.append("line %d: %s(...) passes %d argument(s) but %s() accepts %s"
+                        % (node.lineno, name, n, name, want))
+
+# --- methods ------------------------------------------------------------------------------------
 for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
     methods = {}
     for fn in cls.body:
