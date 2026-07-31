@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { buildLaunchPlan, classifyEndpoint, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables } from "../src/core/modelRuntime.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { autoSizeContextTokens, buildLaunchPlan, classifyEndpoint, CTX_LADDER, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables, kvBytesPerToken, readGgufKvMeta } from "../src/core/modelRuntime.js";
 
 test("runtime classification recognizes common local endpoints", () => {
   assert.equal(classifyEndpoint("http://127.0.0.1:11434"), "ollama");
@@ -10,10 +13,80 @@ test("runtime classification recognizes common local endpoints", () => {
 });
 
 test("managed launch plan keeps sidecar residency explicit", () => {
-  const plan = buildLaunchPlan({ mainModel: "main.gguf", sidecarModel: "small.gguf", backend: "cuda", sidecarMode: "co-resident" });
+  const plan = buildLaunchPlan({ mainModel: "main.gguf", sidecarModel: "small.gguf", backend: "cuda", sidecarMode: "co-resident", contextTokens: 16384 });
   assert.deepEqual(plan.args.slice(0, 6), ["--model", "main.gguf", "--ctx-size", "16384", "--jinja", "--cont-batching"]);
+  assert.equal(plan.contextSource, "explicit");
   assert.ok(plan.args.includes("--model-draft"));
   assert.equal(plan.parallelSlots, 2);
+});
+
+// ── context auto-sizing (E7) ────────────────────────────────────────────────────────────────────
+
+/** A minimal valid GGUF v3 header carrying exactly the KV-geometry metadata the reader wants. */
+function writeSyntheticGguf(path: string, arch = "llama", blocks = 48, heads = 40, kvHeads = 8, embed = 5120): void {
+  const parts: Buffer[] = [];
+  const u32 = (v: number): Buffer => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
+  const u64 = (v: number): Buffer => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+  const str = (s: string): Buffer => Buffer.concat([u64(s.length), Buffer.from(s, "utf8")]);
+  const kvString = (key: string, value: string): Buffer => Buffer.concat([str(key), u32(8), str(value)]);
+  const kvU32 = (key: string, value: number): Buffer => Buffer.concat([str(key), u32(4), u32(value)]);
+  parts.push(Buffer.from("GGUF", "ascii"), u32(3), u64(0), u64(5));
+  parts.push(kvString("general.architecture", arch));
+  parts.push(kvU32(`${arch}.block_count`, blocks));
+  parts.push(kvU32(`${arch}.attention.head_count`, heads));
+  parts.push(kvU32(`${arch}.attention.head_count_kv`, kvHeads));
+  parts.push(kvU32(`${arch}.embedding_length`, embed));
+  writeFileSync(path, Buffer.concat(parts));
+}
+
+test("readGgufKvMeta parses a real header and kvBytesPerToken prices q8_0 correctly", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-gguf-"));
+  const path = join(dir, "m.gguf");
+  writeSyntheticGguf(path);
+  const meta = readGgufKvMeta(path);
+  assert.ok(meta, "header parsed");
+  assert.equal(meta!.architecture, "llama");
+  assert.equal(meta!.blockCount, 48);
+  assert.equal(meta!.headCountKv, 8);
+  // headDim = 5120/40 = 128; 2 · 48 · 128 · 8 · 1.0625 = 104448 bytes/token
+  assert.equal(Math.round(kvBytesPerToken(meta!)), 104448);
+  // Garbage in → null out, never a throw.
+  const bad = join(dir, "bad.gguf");
+  writeFileSync(bad, Buffer.from("not a gguf at all"));
+  assert.equal(readGgufKvMeta(bad), null);
+  assert.equal(readGgufKvMeta(join(dir, "missing.gguf")), null);
+});
+
+test("autoSizeContextTokens picks the largest ladder rung the free VRAM affords", () => {
+  // The measured box: 8 GB card, 24.7 GB MoE → cpu-moe residency, heuristic pricing (no gguf file).
+  const moe = autoSizeContextTokens({ modelBytes: 24.7e9, vramBytes: 8e9 });
+  assert.equal(moe.contextTokens, 16384, moe.reason);
+  // Same box but with the real GGUF geometry (cheaper per token) → one rung higher.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-gguf-size-"));
+  const path = join(dir, "m.gguf");
+  writeSyntheticGguf(path);
+  const withMeta = autoSizeContextTokens({ modelPath: path, modelBytes: 24.7e9, vramBytes: 8e9 });
+  assert.equal(withMeta.contextTokens, 24576, withMeta.reason);
+  assert.match(withMeta.reason, /GGUF geometry/);
+  // A 24 GB card with a fully-resident 20 GB model: little free → floor rung, never below.
+  const tight = autoSizeContextTokens({ modelBytes: 20e9, vramBytes: 24e9 });
+  assert.ok((CTX_LADDER as readonly number[]).includes(tight.contextTokens));
+  // No VRAM reading at all → the conservative default, honestly labeled.
+  const blind = autoSizeContextTokens({ modelBytes: 24.7e9 });
+  assert.equal(blind.contextTokens, 16384);
+  assert.match(blind.reason, /no VRAM/);
+});
+
+test("buildLaunchPlan auto-sizes when no context is pinned, and says so", () => {
+  const auto = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9 });
+  assert.equal(auto.contextSource, "auto");
+  assert.equal(auto.contextTokens, 16384);
+  assert.ok(auto.warnings.some((w) => /ctx auto-sized/.test(w)), "the sizing reason is in the warnings");
+  const i = auto.args.indexOf("--ctx-size");
+  assert.equal(auto.args[i + 1], "16384");
+  const pinned = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, contextTokens: 8192 });
+  assert.equal(pinned.contextSource, "explicit");
+  assert.equal(pinned.contextTokens, 8192);
 });
 
 test("hardware discovery is bounded and returns honest backend metadata", () => {

@@ -74,6 +74,27 @@ export function writeCachedCapabilities(caps: Capabilities): void {
   saveCache(entries);
 }
 
+/**
+ * The cheap slice of the capability probe: just the server's actual n_ctx from GET /props. One HTTP
+ * round-trip (probeCapabilities runs four extra model calls — seconds against a cold 35B), so this
+ * is safe to call right after every runtime launch to reconcile the harness budget with the truth.
+ */
+export async function probeContextSize(baseUrl: string, apiKey?: string): Promise<number | null> {
+  try {
+    const rootUrl = baseUrl.replace(/\/+$/, "").replace(/\/v1$/i, "");
+    const res = await fetch(rootUrl + "/props", {
+      headers: { authorization: `Bearer ${apiKey ?? "lm-studio"}` },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!res.ok) return null;
+    const props = await res.json() as { default_generation_settings?: { n_ctx?: unknown }; n_ctx?: unknown };
+    const nested = props.default_generation_settings?.n_ctx;
+    if (typeof nested === "number" && nested > 0) return nested;
+    if (typeof props.n_ctx === "number" && props.n_ctx > 0) return props.n_ctx;
+    return null;
+  } catch { return null; }
+}
+
 export async function probeCapabilities(llm: KittenLLM, model: string): Promise<Capabilities> {
   const baseUrl = llm.models.baseUrl;
   const cached = readCachedCapabilities(baseUrl, model);

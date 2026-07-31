@@ -10,12 +10,12 @@ import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { kittenHome, storePath } from "./paths.js";
 import { DEFAULT_MODELS, KittenLLM, tierSidecar, type KittenModels } from "./llm.js";
-import { loadKittenSettings, saveKittenSettings, type SettingsUpdate } from "./settings.js";
+import { loadKittenSettings, saveKittenSettings, type KittenSettings, type SettingsUpdate } from "./settings.js";
 import { DESKTOP_PROTOCOL_VERSION, encodeFrame, FrameDecoder, type DesktopCommand, type DesktopEvent, type DesktopResponse } from "./desktopProtocol.js";
 import type { KittenEvent } from "./events.js";
 import { WorkspaceIndex } from "./workspaceIndex.js";
 import { inspectWorkspaceChanges } from "./workspaceChanges.js";
-import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints } from "./modelRuntime.js";
+import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, CTX_LADDER } from "./modelRuntime.js";
 import { SidecarControlPlane } from "./sidecarControlPlane.js";
 import { SidecarAssist } from "./sidecarAssist.js";
 import { runCatalogJob, SIDECAR_JOB_TYPES, SIDECAR_WORKFLOWS, isSidecarJobType, sidecarWorkflow, type SidecarJobType } from "./sidecarJobs.js";
@@ -26,7 +26,7 @@ import { discoverModels, estimateModelB, inspectModelHealth, validateModel } fro
 import { benchmarkCodingBattery, benchmarkModel, benchmarkModelBattery, benchmarkModelBakeoff, benchmarkProjectBattery, latestModelBakeoffSummary, listModelBakeoffs, saveCodingBenchmarkBattery, saveModelBakeoff, saveModelBenchmarkBattery, saveProjectBenchmarkBattery } from "./modelBenchmark.js";
 import { profileSummary, recommendModelProfiles } from "./modelProfiles.js";
 import { runWorkspaceVerification } from "./workspaceVerification.js";
-import { probeCapabilities, readCachedCapabilities } from "./capabilities.js";
+import { probeCapabilities, probeContextSize, readCachedCapabilities } from "./capabilities.js";
 import { gatherSupportInfo } from "./support.js";
 
 export interface DesktopEngineOptions {
@@ -71,6 +71,8 @@ export interface RuntimeStatePayload {
   external?: boolean;
   /** The runtime's own last words on a failed launch (bounded stderr tail). */
   stderrTail?: string;
+  /** Non-fatal advisories (e.g. a pinned context exceeding the server's real n_ctx). */
+  warnings?: string[];
   ts: number;
 }
 
@@ -268,9 +270,32 @@ async function stopManagedRuntime(holder: { current: ManagedRuntimeHandle | null
   holder.current = null;
 }
 
+/** "auto" means the launch plan sizes n_ctx from the machine; a pinned number reaches the server. */
+function explicitContextTokens(settings: KittenSettings): number | undefined {
+  return typeof settings.contextWindowTokens === "number" && settings.contextWindowTokens > 0 ? settings.contextWindowTokens : undefined;
+}
+
+const OOM_STDERR = /out of memory|failed to allocate|cuda\S*\s*alloc|ggml_backend_\S*_buffer/i;
+
 /** Start one managed llama.cpp process (and optionally its dedicated sidecar) with one shared
- * validation/probe path. Manual runtime.start and startup auto-recovery must not drift apart. */
+ * validation/probe path. Manual runtime.start and startup auto-recovery must not drift apart.
+ * With an auto-sized context, one OOM step-down retry at the next-lower ladder rung: a mis-estimate
+ * costs one retry, never a dead runtime with a hex dump. */
 async function launchManagedRuntime(request: ManagedRuntimeLaunchRequest, holder: ManagedRuntimeHolder): Promise<ManagedRuntimeLaunchResult> {
+  try {
+    return await launchManagedRuntimeOnce(request, holder);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (request.contextTokens === undefined && OOM_STDERR.test(message)) {
+      const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath });
+      const idx = (CTX_LADDER as readonly number[]).indexOf(plan.contextTokens);
+      if (idx > 0) return await launchManagedRuntimeOnce({ ...request, contextTokens: CTX_LADDER[idx - 1] }, holder);
+    }
+    throw error;
+  }
+}
+
+async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, holder: ManagedRuntimeHolder): Promise<ManagedRuntimeLaunchResult> {
   if (!request.executable || !existsSync(request.executable)) throw new Error("managed runtime executable does not exist");
   if (!request.mainModelPath || !existsSync(request.mainModelPath)) throw new Error("managed main model path does not exist");
   const sidecarBaseUrl = request.sidecarModelPath
@@ -295,7 +320,9 @@ async function launchManagedRuntime(request: ManagedRuntimeLaunchRequest, holder
   try {
     mainProcess = spawnManagedRuntime(request.executable, args, request.runtimeRoot);
     if (request.sidecarModelPath && sidecarEndpoint) {
-      const sidecarPlan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.sidecarModelPath, contextTokens: request.contextTokens });
+      // The clerical 2B sidecar gets a fixed modest window — auto-sizing it with the main model
+      // already resident would double-count the same VRAM.
+      const sidecarPlan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.sidecarModelPath, contextTokens: request.contextTokens ?? 8192 });
       const sidecarArgs = [...sidecarPlan.args, "--host", sidecarEndpoint.host, "--port", String(sidecarEndpoint.port)];
       if (request.bootstrapScript) sidecarArgs.unshift(request.bootstrapScript);
       sidecarProcess = spawnManagedRuntime(request.executable, sidecarArgs, request.runtimeRoot);
@@ -586,6 +613,8 @@ function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
   for (const key of ["baseUrl", "sidecarBaseUrl", "mainModel", "sidecarModel", "embedModel", "runtimeExecutable", "mainModelPath", "sidecarModelPath"] as const) if (typeof raw[key] === "string" && raw[key].trim()) update[key] = raw[key].trim();
   if (raw.approvalPolicy === "ask" || raw.approvalPolicy === "auto-allow" || raw.approvalPolicy === "auto-deny") update.approvalPolicy = raw.approvalPolicy;
   if (typeof raw.contextWindowTokens === "number" && Number.isFinite(raw.contextWindowTokens) && raw.contextWindowTokens > 0) update.contextWindowTokens = Math.floor(raw.contextWindowTokens);
+  else if (raw.contextWindowTokens === "auto") update.contextWindowTokens = "auto";
+  if (raw.taskCompiler === "off" || raw.taskCompiler === "auto" || raw.taskCompiler === "force") update.taskCompiler = raw.taskCompiler;
   if (!Object.keys(update).length) throw new Error("settings.update contained no valid non-secret settings");
   // Settings are a durable source of truth, so reject a known-size model that would
   // put either lane outside Kitten's supported contract. Unknown-size IDs remain
@@ -616,7 +645,9 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     projectRoot: opts.projectRoot ?? process.cwd(),
     model: runtime.models.main,
     sidecarModel: runtime.models.sidecar,
-    contextWindowTokens: settings.contextWindowTokens,
+    // "auto": interim harness value until a launched/probed server reports its true n_ctx (the
+    // reconcile in pushRuntimeState overwrites this with the measured number).
+    contextWindowTokens: typeof settings.contextWindowTokens === "number" ? settings.contextWindowTokens : 16384,
     approvalPolicy: settings.approvalPolicy,
     taskCompiler: settings.taskCompiler,
     sidecarAssist: new SidecarAssist({
@@ -670,6 +701,28 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     if (runtimeState.last && key(runtimeState.last) === key(payload)) { runtimeState.last = payload; return; }
     runtimeState.last = payload;
     broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `runtime-${payload.ts.toString(36)}-${payload.phase}`, type: "runtime.state", timestamp: payload.ts, payload: payload as unknown as Record<string, unknown> });
+    // Close the context loop: once an endpoint is live, read its ACTUAL n_ctx from /props and let the
+    // harness budget follow the server instead of the configured wish (llama.cpp may clamp --ctx-size
+    // to the model's training window, and an external LM Studio was never ours to size). Re-pushing
+    // with the probed value is loop-safe: an unchanged ctx hits the identical-key early return above.
+    if (payload.phase === "ready" || payload.phase === "external") {
+      const endpoint = payload.endpoint;
+      const timer = setTimeout(async () => {
+        try {
+          const probed = await probeContextSize(endpoint, runtime.models.apiKey);
+          if (!probed || probed <= 0) return;
+          app.setContextWindowTokens(probed);
+          if (!runtimeState.last || (runtimeState.last.phase !== "ready" && runtimeState.last.phase !== "external")) return;
+          const pinned = explicitContextTokens(settingsFor(opts));
+          pushRuntimeState({
+            phase: runtimeState.last.phase, pid: runtimeState.last.pid ?? null, external: runtimeState.last.external,
+            endpoint, ctxTokens: probed,
+            ...(pinned && pinned > probed ? { warnings: [`contextWindowTokens ${pinned} exceeds the server's n_ctx ${probed}; the harness budget follows the server`] } : {}),
+          });
+        } catch { /* the plan value stands */ }
+      }, 50);
+      timer.unref();
+    }
   };
 
   // Watchdog: the UI must learn within one interval that llama.cpp died (or came back) even when
@@ -792,6 +845,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           sidecarModelPath,
           baseUrl: runtime.models.baseUrl,
           sidecarBaseUrl: sidecarModelPath ? runtime.models.sidecarBaseUrl : undefined,
+          contextTokens: explicitContextTokens(settings),
           runtimeRoot: opts.projectRoot ?? process.cwd(),
           probeTimeoutMs: 5_000,
         }, managedRuntime);
@@ -857,6 +911,9 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           managedRuntime: current.managedRuntime,
           approvalPolicy: current.approvalPolicy,
           contextWindowTokens: current.contextWindowTokens,
+          /** The server's measured n_ctx for the current launch, when a runtime is up. */
+          effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
+          taskCompiler: current.taskCompiler,
           warnings: [...current.warnings, ...modelTierWarnings(active.models)],
         };
         break;
@@ -881,12 +938,16 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         app.setApprovalPolicy(fresh.approvalPolicy);
         app.setDefaultModel(runtime.models.main);
         app.setSidecarModel(runtime.models.sidecar);
-        app.setContextWindowTokens(fresh.contextWindowTokens);
+        // "auto" keeps the harness on the live server's measured n_ctx (or the interim default).
+        app.setContextWindowTokens(typeof fresh.contextWindowTokens === "number" ? fresh.contextWindowTokens : runtimeState.last?.ctxTokens ?? 16384);
+        app.setTaskCompiler(fresh.taskCompiler);
         result = {
           models: { baseUrl: runtime.models.baseUrl, sidecarBaseUrl: runtime.models.sidecarBaseUrl, main: runtime.models.main, sidecar: runtime.models.sidecar, embed: runtime.models.embed },
           managedRuntime: fresh.managedRuntime,
           approvalPolicy: fresh.approvalPolicy,
           contextWindowTokens: fresh.contextWindowTokens,
+          effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
+          taskCompiler: fresh.taskCompiler,
           warnings: [...fresh.warnings, ...modelTierWarnings(runtime.models)],
         };
         break;
@@ -1115,6 +1176,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             executable, mainModelPath, sidecarModelPath,
             baseUrl: active.models.baseUrl,
             sidecarBaseUrl: sidecarModelPath ? active.models.sidecarBaseUrl : undefined,
+            contextTokens: explicitContextTokens(projectSettings),
             runtimeRoot: projectRoot,
             probeTimeoutMs: 5_000,
           }, managedRuntime);
@@ -1180,7 +1242,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           launched = await launchManagedRuntime({
             executable, mainModelPath, sidecarModelPath, baseUrl, sidecarBaseUrl,
             backend: typeof p.backend === "string" ? p.backend as ManagedRuntimeLaunchRequest["backend"] : undefined,
-            contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined,
+            contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : explicitContextTokens(settingsFor(opts, runtimeRoot)),
             runtimeRoot, bootstrapScript: bootstrap,
           }, managedRuntime);
         } catch (error) {

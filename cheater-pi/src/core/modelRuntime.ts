@@ -3,7 +3,7 @@
 // files, and produce a safe launch plan without opening a terminal or mutating user configuration.
 
 import { createHash } from "node:crypto";
-import { existsSync, statSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, statSync, readFileSync, mkdirSync, openSync, readSync, closeSync } from "node:fs";
 import { basename, extname } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { cpus, totalmem } from "node:os";
@@ -43,10 +43,155 @@ export interface RuntimeLaunchPlan {
   mainModel: string;
   sidecarModel?: string;
   contextTokens: number;
+  /** Whether the caller pinned the context size or the plan sized it from the machine. */
+  contextSource: "explicit" | "auto";
   parallelSlots: number;
   sidecarMode: "separate-device" | "co-resident" | "cpu" | "contended" | "disabled";
   args: string[];
   warnings: string[];
+}
+
+// ── Context auto-sizing ─────────────────────────────────────────────────────────────────────────
+// The old behavior was `contextTokens ?? 16384` — a constant wish with no relationship to the
+// machine. These helpers size n_ctx from what is actually true: the model's KV geometry (read from
+// its own GGUF header) and the VRAM the weights leave free.
+
+/** The KV geometry needed to price one token of context, from the model's own GGUF header. */
+export interface GgufKvMeta {
+  architecture: string;
+  blockCount: number;
+  headCount: number;
+  headCountKv: number;
+  embeddingLength: number;
+}
+
+/** Discrete n_ctx choices, smallest first. A ladder (not a continuum) keeps sizes predictable and
+ *  cache-friendly across launches. */
+export const CTX_LADDER = [8192, 16384, 24576, 32768, 49152, 65536, 98304, 131072] as const;
+
+const GGUF_TYPE_SIZES: Record<number, number> = { 0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8 };
+
+/**
+ * Read the KV-relevant metadata from a GGUF v2/v3 header. Bounded: parses only what fits in the
+ * first 4 MB (llama.cpp writers put general.* and the architecture params ahead of the tokenizer
+ * arrays, so the needed keys are found long before the bound). Returns null on ANY anomaly —
+ * callers fall back to a documented heuristic, never to a crash.
+ */
+export function readGgufKvMeta(path: string): GgufKvMeta | null {
+  let buf: Buffer;
+  try {
+    const fd = openSync(path, "r");
+    try {
+      buf = Buffer.alloc(4 * 1024 * 1024);
+      const read = readSync(fd, buf, 0, buf.length, 0);
+      buf = buf.subarray(0, read);
+    } finally { closeSync(fd); }
+  } catch { return null; }
+  try {
+    if (buf.length < 24 || buf.readUInt32LE(0) !== 0x46554747) return null; // "GGUF"
+    const version = buf.readUInt32LE(4);
+    if (version < 2 || version > 3) return null;
+    const kvCount = Number(buf.readBigUInt64LE(16));
+    let off = 24;
+    const wanted = new Map<string, number>();
+    let architecture = "";
+    const need = (): string[] => architecture
+      ? [`${architecture}.block_count`, `${architecture}.attention.head_count`, `${architecture}.attention.head_count_kv`, `${architecture}.embedding_length`]
+      : [];
+    const readString = (): string | null => {
+      if (off + 8 > buf.length) return null;
+      const len = Number(buf.readBigUInt64LE(off)); off += 8;
+      if (len < 0 || off + len > buf.length) return null;
+      const s = buf.toString("utf8", off, off + len); off += len;
+      return s;
+    };
+    for (let i = 0; i < kvCount; i++) {
+      const key = readString();
+      if (key === null || off + 4 > buf.length) return finish();
+      const type = buf.readUInt32LE(off); off += 4;
+      if (type === 8) { // string
+        const v = readString();
+        if (v === null) return finish();
+        if (key === "general.architecture") architecture = v;
+      } else if (type === 9) { // array: elem type + count, then elements
+        if (off + 12 > buf.length) return finish();
+        const elemType = buf.readUInt32LE(off); off += 4;
+        const count = Number(buf.readBigUInt64LE(off)); off += 8;
+        if (elemType === 8 || elemType === 9) {
+          // A string/nested array (the tokenizer) — walking it element-by-element inside the bound
+          // is pointless; everything we need appears before it. Stop here with what we have.
+          return finish();
+        }
+        const size = GGUF_TYPE_SIZES[elemType];
+        if (!size) return finish();
+        off += size * count;
+        if (off > buf.length) return finish();
+      } else {
+        const size = GGUF_TYPE_SIZES[type];
+        if (!size || off + size > buf.length) return finish();
+        let value = 0;
+        if (type === 4) value = buf.readUInt32LE(off);
+        else if (type === 5) value = buf.readInt32LE(off);
+        else if (type === 10) value = Number(buf.readBigUInt64LE(off));
+        else if (type === 11) value = Number(buf.readBigInt64LE(off));
+        else if (type === 0) value = buf.readUInt8(off);
+        else if (type === 2) value = buf.readUInt16LE(off);
+        off += size;
+        if (need().includes(key)) wanted.set(key, value);
+      }
+      if (architecture && need().every((k) => wanted.has(k))) return finish();
+    }
+    return finish();
+
+    function finish(): GgufKvMeta | null {
+      if (!architecture) return null;
+      const keys = need();
+      if (!keys.every((k) => Number(wanted.get(k)) > 0)) return null;
+      return {
+        architecture,
+        blockCount: wanted.get(keys[0])!,
+        headCount: wanted.get(keys[1])!,
+        headCountKv: wanted.get(keys[2])!,
+        embeddingLength: wanted.get(keys[3])!,
+      };
+    }
+  } catch { return null; }
+}
+
+/** Bytes of KV cache per context token. K and V each store headDim·kvHeads per layer; q8_0 carries a
+ *  1/16 scale overhead over its 1 byte/element. */
+export function kvBytesPerToken(meta: GgufKvMeta, cacheType: "q8_0" | "f16" = "q8_0"): number {
+  const headDim = meta.embeddingLength / meta.headCount;
+  const perElement = cacheType === "q8_0" ? 1.0625 : 2;
+  return 2 * meta.blockCount * headDim * meta.headCountKv * perElement;
+}
+
+/**
+ * Pick the largest ladder rung whose KV cache fits the VRAM the weights leave free. Every input is
+ * optional — each missing fact degrades to a conservative documented guess, and the reason string
+ * always says which path was taken (it lands in the launch plan warnings).
+ */
+export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: number; vramBytes?: number; reserveBytes?: number }): { contextTokens: number; reason: string } {
+  const { modelBytes, vramBytes } = input;
+  if (!vramBytes || vramBytes <= 0) {
+    return { contextTokens: 16384, reason: "ctx auto-sized to 16384: no VRAM reading (conservative default)" };
+  }
+  const meta = input.modelPath ? readGgufKvMeta(input.modelPath) : null;
+  // Heuristic fallback when the header is unreadable: a large MoE ~35B lands near 160 KiB/token at
+  // q8_0; a mid-size dense model nearer 96 KiB. A guess, and labeled as one.
+  const perToken = meta ? kvBytesPerToken(meta) : (modelBytes && modelBytes > 20e9 ? 160 * 1024 : 96 * 1024);
+  const residentWeights = modelBytes === undefined ? vramBytes * 0.5
+    : modelBytes > vramBytes * 0.8 ? vramBytes * 0.45 // cpu-moe: only attention + dense stay resident (mirrors the launch-plan branch)
+    : modelBytes;
+  const reserve = input.reserveBytes ?? 1.5e9;
+  const free = vramBytes - residentWeights - reserve;
+  let contextTokens: number = CTX_LADDER[0];
+  for (const rung of CTX_LADDER) if (rung * perToken <= free) contextTokens = rung;
+  const source = meta ? `GGUF geometry (${meta.architecture}: ${Math.round(perToken / 1024)} KiB/token)` : `heuristic ${Math.round(perToken / 1024)} KiB/token (GGUF header unreadable)`;
+  return {
+    contextTokens,
+    reason: `ctx auto-sized to ${contextTokens}: ${source}, ${(Math.max(0, free) / 1e9).toFixed(1)} GB free after weights+reserve`,
+  };
 }
 
 export function inspectModel(path: string, expectedSha256?: string): ModelArtifact {
@@ -180,20 +325,31 @@ export function buildLaunchPlan(input: {
   vramBytes?: number;
 }): RuntimeLaunchPlan {
   const runtime = input.runtime ?? "managed-llama-cpp";
-  const backend = input.backend ?? detectHardware().gpus.find((gpu) => gpu.backend !== "unknown")?.backend ?? "cpu";
-  const contextTokens = Math.max(2048, Math.min(262144, Math.floor(input.contextTokens ?? 16384)));
+  const hardware = input.backend && input.vramBytes !== undefined ? null : detectHardware();
+  const backend = input.backend ?? hardware?.gpus.find((gpu) => gpu.backend !== "unknown")?.backend ?? "cpu";
   const sidecarMode = input.sidecarModel ? (input.sidecarMode ?? "cpu") : "disabled";
   const warnings: string[] = [];
+
+  // The machine facts drive both the context size and the offload strategy, so measure them first.
+  const vramBytes = input.vramBytes ?? hardware?.gpus.find((gpu) => gpu.backend === backend)?.vramBytes;
+  const modelBytes = input.modelBytes ?? (existsSync(input.mainModel) ? statSync(input.mainModel).size : undefined);
+
+  // No pinned context ⇒ size it from the machine instead of wishing for 16384. An explicit number
+  // (settings pin, per-run request) is honored exactly as before.
+  const contextSource: RuntimeLaunchPlan["contextSource"] = input.contextTokens === undefined ? "auto" : "explicit";
+  let contextTokens: number;
+  if (contextSource === "auto") {
+    const sized = autoSizeContextTokens({ modelPath: input.mainModel, modelBytes, vramBytes });
+    contextTokens = sized.contextTokens;
+    warnings.push(sized.reason);
+  } else {
+    contextTokens = Math.max(2048, Math.min(262144, Math.floor(input.contextTokens!)));
+  }
+
   if (backend === "unknown") warnings.push("GPU backend was not identified; the runtime will use its safe fallback.");
   if (sidecarMode === "contended") warnings.push("The sidecar shares the main device and will yield during user-blocking generation.");
-  if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, parallelSlots: 1, sidecarMode, args: [], warnings };
+  if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: 1, sidecarMode, args: [], warnings };
   const args = ["--model", input.mainModel, "--ctx-size", String(contextTokens), "--jinja", "--cont-batching"];
-
-  // Four flags were not a launch plan. Everything below is a consequence of the machine actually in
-  // front of us: a quantized MoE whose weights are several times the VRAM, so the experts stream from
-  // system RAM and the scarce resource is VRAM for attention + KV, not compute.
-  const vramBytes = input.vramBytes ?? detectHardware().gpus.find((gpu) => gpu.backend === backend)?.vramBytes;
-  const modelBytes = input.modelBytes ?? (existsSync(input.mainModel) ? statSync(input.mainModel).size : undefined);
 
   if (backend !== "cpu") {
     // Offload every layer that fits; llama.cpp clamps a too-large count to the layers that exist.
@@ -250,7 +406,7 @@ export function buildLaunchPlan(input: {
   }
 
   if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
-  return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };
+  return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };
 }
 
 /** Spawn a managed runtime without inheriting a console window or arbitrary environment secrets. */

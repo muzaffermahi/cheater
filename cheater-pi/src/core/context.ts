@@ -82,8 +82,13 @@ export class ContextBuilder {
    * Build the model-facing context for the NEXT message in `conversationId`. `currentUserText` is the
    * new request (used only to keep the block relevant); it is NOT included — the engine appends it as
    * the task. `cwd` lets us fold in current repo truth.
+   *
+   * `override.windowTokens` computes THIS call's budget without mutating the shared instance —
+   * that is what makes concurrent task-plan children (each at its own effort) safe. The instance
+   * budget remains the server-ceiling truth set by setWindowTokens.
    */
-  build(conversationId: string, cwd: string): BuiltContext {
+  build(conversationId: string, cwd: string, override?: { windowTokens?: number }): BuiltContext {
+    const budget = override?.windowTokens && override.windowTokens > 0 ? contextBudgetForWindow(override.windowTokens) : this.budget;
     const events = this.store.readEvents(conversationId);
     const runs = this.store.listRuns(conversationId);
     const turns = this.digestTurns(events, runs);
@@ -102,8 +107,8 @@ export class ContextBuilder {
 
     // Render newest-relevant turns first into the budget, then restore chronological order.
     const budgetTokens = Math.min(
-      this.budget.maxPreambleTokens,
-      Math.max(400, this.budget.windowTokens - this.budget.reserveTokens),
+      budget.maxPreambleTokens,
+      Math.max(400, budget.windowTokens - budget.reserveTokens),
     );
     const rendered: string[] = [];
     let used = approxTokens(header) + approxTokens(footer) + approxTokens(capsule);

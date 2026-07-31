@@ -99,3 +99,33 @@ test("managed runtime paths persist without storing an API key", () => {
     sidecarModelPath: "C:\\models\\sidecar.gguf",
   });
 });
+
+test("contextWindowTokens defaults to auto, accepts auto in file/env, and pins still work", () => {
+  // KITTEN_HOME isolation: without it, the developer's real ~/.kitten/config.json (which pins a
+  // context) leaks into "no config => auto".
+  withEnv({ KITTEN_CONTEXT_TOKENS: undefined, KITTEN_HOME: mkdtempSync(join(tmpdir(), "kitten-cfg-home-")) }, () => {
+    const bare = loadKittenSettings(mkdtempSync(join(tmpdir(), "kitten-cfg-bare-")));
+    assert.equal(bare.contextWindowTokens, "auto", "no config => auto");
+    const pinned = loadKittenSettings(projectWith({ contextWindowTokens: 8192 }));
+    assert.equal(pinned.contextWindowTokens, 8192, "a numeric pin is preserved");
+    const auto = loadKittenSettings(projectWith({ contextWindowTokens: "auto" }));
+    assert.equal(auto.contextWindowTokens, "auto");
+    const junk = loadKittenSettings(projectWith({ contextWindowTokens: -3 }));
+    assert.equal(junk.contextWindowTokens, "auto");
+    assert.ok(junk.warnings.some((w) => /contextWindowTokens/.test(w)), "junk warns instead of silently defaulting");
+  });
+  withEnv({ KITTEN_CONTEXT_TOKENS: "auto", KITTEN_HOME: mkdtempSync(join(tmpdir(), "kitten-cfg-home2-")) }, () => {
+    const s = loadKittenSettings(projectWith({ contextWindowTokens: 8192 }));
+    assert.equal(s.contextWindowTokens, "auto", "env auto overrides a file pin");
+  });
+});
+
+test("saveKittenSettings round-trips the auto sentinel", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-cfg-save-"));
+  withEnv({ KITTEN_CONTEXT_TOKENS: undefined, KITTEN_HOME: mkdtempSync(join(tmpdir(), "kitten-cfg-home3-")) }, () => {
+    saveKittenSettings({ contextWindowTokens: 8192 }, "project", dir);
+    assert.equal(loadKittenSettings(dir).contextWindowTokens, 8192);
+    saveKittenSettings({ contextWindowTokens: "auto" }, "project", dir);
+    assert.equal(loadKittenSettings(dir).contextWindowTokens, "auto");
+  });
+});

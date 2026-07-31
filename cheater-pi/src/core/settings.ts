@@ -27,7 +27,9 @@ export interface KittenSettings {
   models: KittenModels;
   managedRuntime: ManagedRuntimeSettings;
   approvalPolicy: ApprovalPolicy;
-  contextWindowTokens: number;
+  /** "auto" (the default) sizes the server context from the machine (VRAM + GGUF geometry) at
+   *  launch; a number is an explicit pin that reaches the server verbatim. */
+  contextWindowTokens: number | "auto";
   /** How the Task Compiler participates in the request path. Default "auto". */
   taskCompiler: TaskCompilerFlag;
   /** Config files that were merged (for `kitten doctor` transparency). */
@@ -43,7 +45,7 @@ export interface SettingsUpdate {
   sidecarModel?: string;
   embedModel?: string;
   approvalPolicy?: ApprovalPolicy;
-  contextWindowTokens?: number;
+  contextWindowTokens?: number | "auto";
   runtimeExecutable?: string;
   mainModelPath?: string;
   sidecarModelPath?: string;
@@ -59,7 +61,7 @@ const KNOWN_KEYS = new Set([
 
 interface RawConfig {
   baseUrl?: string; sidecarBaseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
-  approvalPolicy?: string; contextWindowTokens?: number;
+  approvalPolicy?: string; contextWindowTokens?: number | string;
   runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
   taskCompiler?: string;
 }
@@ -113,12 +115,15 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
     if (!v.trim()) { warnings.push(`${name} is set but empty — ignored (using config/default)`); return undefined; }
     return v;
   };
-  let envContextTokens: number | undefined;
+  let envContextTokens: number | "auto" | undefined;
   const rawCtx = process.env.KITTEN_CONTEXT_TOKENS;
   if (rawCtx !== undefined && rawCtx.trim()) {
-    const n = Number(rawCtx);
-    if (Number.isFinite(n) && n > 0) envContextTokens = n;
-    else warnings.push(`KITTEN_CONTEXT_TOKENS "${rawCtx}" is not a positive number — ignored (using config/default)`);
+    if (rawCtx.trim().toLowerCase() === "auto") envContextTokens = "auto";
+    else {
+      const n = Number(rawCtx);
+      if (Number.isFinite(n) && n > 0) envContextTokens = n;
+      else warnings.push(`KITTEN_CONTEXT_TOKENS "${rawCtx}" is not a positive number or "auto" — ignored (using config/default)`);
+    }
   }
   const env = {
     baseUrl: envStr("KITTEN_BASE_URL"),
@@ -156,7 +161,13 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
   const approvalPolicy: ApprovalPolicy = rawPolicy === "ask" || rawPolicy === "auto-allow" || rawPolicy === "auto-deny" ? rawPolicy : "ask";
   if (rawPolicy && rawPolicy !== approvalPolicy) warnings.push(`approvalPolicy "${rawPolicy}" is not one of ask|auto-allow|auto-deny — using "ask"`);
 
-  const contextWindowTokens = Number(pick("contextWindowTokens")) > 0 ? Number(pick("contextWindowTokens")) : 16384;
+  // "auto" is the default: the launch plan sizes n_ctx from the machine, and the probed truth flows
+  // back into the harness budget. A pinned number (the old behavior) still wins everywhere.
+  const rawWindow = pick("contextWindowTokens");
+  const contextWindowTokens: number | "auto" =
+    rawWindow === "auto" || rawWindow === undefined ? "auto"
+      : Number(rawWindow) > 0 ? Number(rawWindow)
+      : (warnings.push(`contextWindowTokens "${String(rawWindow)}" is not a positive number or "auto" — using "auto"`), "auto");
 
   const rawCompiler = pick("taskCompiler");
   const taskCompiler: TaskCompilerFlag = rawCompiler === "off" || rawCompiler === "auto" || rawCompiler === "force" ? rawCompiler : "auto";
