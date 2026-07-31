@@ -15,7 +15,7 @@ import { DESKTOP_PROTOCOL_VERSION, encodeFrame, FrameDecoder, type DesktopComman
 import type { KittenEvent } from "./events.js";
 import { WorkspaceIndex } from "./workspaceIndex.js";
 import { inspectWorkspaceChanges } from "./workspaceChanges.js";
-import { buildLaunchPlan, detectHardware, probeEndpoint, inspectModel, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, listModelFiles, CTX_LADDER, type RuntimeTuning } from "./modelRuntime.js";
+import { buildLaunchPlan, cleanRuntimeLog, detectHardware, detectServerFlags, probeEndpoint, inspectModel, runtimeFailureReason, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, listModelFiles, CTX_LADDER, type RuntimeTuning } from "./modelRuntime.js";
 import { SidecarControlPlane } from "./sidecarControlPlane.js";
 import { SidecarAssist } from "./sidecarAssist.js";
 import { runCatalogJob, SIDECAR_JOB_TYPES, SIDECAR_WORKFLOWS, isSidecarJobType, sidecarWorkflow, type SidecarJobType } from "./sidecarJobs.js";
@@ -60,7 +60,8 @@ export interface DesktopEngineOptions {
  * `runtime.status` response instead.
  */
 export interface RuntimeStatePayload {
-  phase: "starting" | "probing" | "ready" | "failed" | "stopped" | "external";
+  /** `loading` = the server is alive and reading weights (llama.cpp answers 503 meanwhile). */
+  phase: "starting" | "probing" | "loading" | "ready" | "failed" | "stopped" | "external";
   endpoint: string;
   model: string;
   sidecarModel?: string;
@@ -73,6 +74,10 @@ export interface RuntimeStatePayload {
   stderrTail?: string;
   /** Non-fatal advisories (e.g. a pinned context exceeding the server's real n_ctx). */
   warnings?: string[];
+  /** How long the current start/load has been running, for an honest "still loading (1m 20s)". */
+  elapsedMs?: number;
+  /** The runtime's own recent output, ANSI-cleaned — never a raw escape dump. */
+  log?: string;
   ts: number;
 }
 
@@ -215,11 +220,35 @@ function endpointHostPort(baseUrl: string): { host: string; port: number } {
   return { host: url.hostname || "127.0.0.1", port };
 }
 
-async function waitForEndpoint(baseUrl: string, timeoutMs = 15_000): Promise<Awaited<ReturnType<typeof probeEndpoint>>> {
-  const deadline = Date.now() + timeoutMs;
+/**
+ * Wait for a runtime to come up, with two rules the old 5-second version got wrong:
+ *   • A server that answers 503 "Loading model" is WORKING, not broken — a 25 GB Q5_K_M takes
+ *     minutes to read off disk, and the old loop declared failure and killed it. While the endpoint
+ *     reports loading, the deadline is extended: only a dead process or a hard timeout stops us.
+ *   • If the process EXITS, stop instantly instead of waiting out the clock for a corpse.
+ */
+async function waitForEndpoint(
+  baseUrl: string,
+  timeoutMs = 15_000,
+  opts: { alive?: () => boolean; onProgress?: (info: { elapsedMs: number; loading: boolean; detail?: string }) => void; loadingTimeoutMs?: number } = {},
+): Promise<Awaited<ReturnType<typeof probeEndpoint>>> {
+  const started = Date.now();
+  const loadingBudget = opts.loadingTimeoutMs ?? 20 * 60_000; // a very large model on a slow disk
+  let deadline = started + timeoutMs;
   let last = await probeEndpoint(baseUrl);
+  let announced = 0;
   while (!last.reachable && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
+    if (opts.alive && !opts.alive()) break; // the process died; no point waiting for its endpoint
+    if (last.loading) {
+      // Loading is progress: keep going up to the (much larger) loading budget.
+      deadline = Math.max(deadline, Math.min(started + loadingBudget, Date.now() + 60_000));
+    }
+    const elapsed = Date.now() - started;
+    if (opts.onProgress && elapsed - announced >= 2000) {
+      announced = elapsed;
+      opts.onProgress({ elapsedMs: elapsed, loading: Boolean(last.loading), detail: last.error });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
     last = await probeEndpoint(baseUrl);
   }
   return last;
@@ -244,6 +273,8 @@ interface ManagedRuntimeLaunchRequest {
   runtimeRoot: string;
   bootstrapScript?: string;
   probeTimeoutMs?: number;
+  /** Live launch progress (loading elapsed, the server's own last words) for the UI. */
+  onProgress?: (info: { phase: "starting" | "loading"; elapsedMs: number; detail?: string; log?: string }) => void;
 }
 
 interface ManagedRuntimeLaunchResult {
@@ -312,7 +343,9 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
     : undefined;
   const endpoint = endpointHostPort(request.baseUrl);
   const sidecarEndpoint = sidecarBaseUrl ? endpointHostPort(sidecarBaseUrl) : undefined;
-  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, contextTokens: request.contextTokens, tuning: request.tuning });
+  // Ask the binary what it supports before composing a command for it.
+  const capability = detectServerFlags(request.executable);
+  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, contextTokens: request.contextTokens, tuning: request.tuning, supportedFlags: capability.flags, supportedFlagsHelp: capability.helpText });
   const args = [...plan.args, "--host", endpoint.host, "--port", String(endpoint.port)];
   if (request.bootstrapScript) {
     if (!existsSync(request.bootstrapScript)) throw new Error("managed runtime bootstrap script does not exist");
@@ -332,6 +365,7 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
       const sidecarPlan = buildLaunchPlan({
         runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.sidecarModelPath, contextTokens: request.contextTokens ?? 8192,
         tuning: sidecarOnCpu ? { gpuLayers: 0, cpuMoe: "off", flashAttn: "off" } : undefined,
+        supportedFlags: capability.flags, supportedFlagsHelp: capability.helpText,
       });
       const sidecarArgs = [...sidecarPlan.args, "--host", sidecarEndpoint.host, "--port", String(sidecarEndpoint.port)];
       if (request.bootstrapScript) sidecarArgs.unshift(request.bootstrapScript);
@@ -343,16 +377,23 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
     throw error;
   }
   holder.current = { main: mainProcess, sidecar: sidecarProcess };
-  const probe = await waitForEndpoint(request.baseUrl, request.probeTimeoutMs ?? 15_000);
-  const sidecarProbe = sidecarBaseUrl ? await waitForEndpoint(sidecarBaseUrl, request.probeTimeoutMs ?? 15_000) : undefined;
+  const alive = (child: ManagedRuntimeProcess | null): boolean => Boolean(child && child.process.exitCode === null && !child.process.killed);
+  // Weight loading is the long pole, and it is PROGRESS, not failure: wait patiently, report the wait.
+  const probe = await waitForEndpoint(request.baseUrl, request.probeTimeoutMs ?? 15_000, {
+    alive: () => alive(mainProcess),
+    onProgress: (info) => request.onProgress?.({ phase: info.loading ? "loading" : "starting", elapsedMs: info.elapsedMs, detail: info.detail, log: cleanRuntimeLog(mainProcess?.stderr() ?? "", 6) }),
+  });
+  const sidecarProbe = sidecarBaseUrl
+    ? await waitForEndpoint(sidecarBaseUrl, request.probeTimeoutMs ?? 15_000, { alive: () => alive(sidecarProcess) })
+    : undefined;
   if (!probe.reachable || (sidecarProbe && !sidecarProbe.reachable)) {
+    const said = [mainProcess?.stderr(), sidecarProcess?.stderr()].filter((text): text is string => Boolean(text && text.trim())).join("\n");
     await stopManagedRuntime(holder);
     // The runtime almost always says why it refused to start — a missing directory, a rejected flag,
-    // out of memory. Report its own last words instead of only our timeout.
-    const said = [mainProcess?.stderr(), sidecarProcess?.stderr()].filter((text): text is string => Boolean(text && text.trim()));
+    // out of memory. Report ITS OWN last words, cleaned of ANSI/escape noise, not a raw dump.
     const detail = probe.reachable ? (sidecarProbe?.error ?? "sidecar endpoint probe failed") : (probe.error ?? "endpoint probe failed");
-    const reason = said.length ? `${detail}\n${said.join("\n").split(/\r?\n/).filter(Boolean).slice(-8).join("\n")}` : detail;
-    throw new Error(`managed runtime did not become reachable: ${reason}`);
+    const reason = runtimeFailureReason(said);
+    throw new Error(`managed runtime did not become reachable (${detail})${reason ? `: ${reason}` : ""}`);
   }
   return { mainProcess, sidecarProcess, baseUrl: request.baseUrl, sidecarBaseUrl, plan, probe, sidecarProbe };
 }
@@ -716,7 +757,8 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
       ...next,
       ts: Date.now(),
     };
-    const key = (s: RuntimeStatePayload): string => `${s.phase}|${s.endpoint}|${s.model}|${s.ctxTokens ?? 0}|${s.pid ?? 0}|${s.external ? 1 : 0}`;
+    // A loading tick carries a changing elapsed time, so it must not be deduped away.
+    const key = (s: RuntimeStatePayload): string => `${s.phase}|${s.endpoint}|${s.model}|${s.ctxTokens ?? 0}|${s.pid ?? 0}|${s.external ? 1 : 0}|${s.phase === "loading" ? s.elapsedMs ?? 0 : 0}`;
     if (runtimeState.last && key(runtimeState.last) === key(payload)) { runtimeState.last = payload; return; }
     runtimeState.last = payload;
     broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `runtime-${payload.ts.toString(36)}-${payload.phase}`, type: "runtime.state", timestamp: payload.ts, payload: payload as unknown as Record<string, unknown> });
@@ -868,7 +910,8 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           tuning: settings.runtimeTuning,
           sidecarDevice: settings.runtimeTuning.sidecarDevice,
           runtimeRoot: opts.projectRoot ?? process.cwd(),
-          probeTimeoutMs: 5_000,
+          probeTimeoutMs: 30_000,
+          onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", elapsedMs: info.elapsedMs, log: info.log }),
         }, managedRuntime);
         runtime.models = { ...runtime.models, baseUrl: launched.baseUrl, sidecarBaseUrl: launched.sidecarBaseUrl };
         runtime.llm = new KittenLLM(runtime.models);
@@ -1221,7 +1264,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             tuning: projectSettings.runtimeTuning,
             sidecarDevice: projectSettings.runtimeTuning.sidecarDevice,
             runtimeRoot: projectRoot,
-            probeTimeoutMs: 5_000,
+            probeTimeoutMs: 30_000,
+            onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", endpoint: active.models.baseUrl, model: active.models.main, elapsedMs: info.elapsedMs, log: info.log }),
           }, managedRuntime);
         } catch (error) {
           pushRuntimeState({ phase: "failed", endpoint: active.models.baseUrl, model: active.models.main, stderrTail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200) });
@@ -1241,6 +1285,27 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
       case "runtime.discover":
         result = { executables: discoverRuntimeExecutables() };
         break;
+      case "runtime.log": {
+        // The runtime's own output, cleaned — the UI shows THIS instead of inventing an explanation.
+        const current = managedRuntime.current;
+        result = {
+          main: cleanRuntimeLog(current?.main.stderr() ?? "", Math.max(10, Math.min(400, Number(p.maxLines ?? 200)))),
+          sidecar: cleanRuntimeLog(current?.sidecar?.stderr() ?? "", 60),
+          running: Boolean(current?.main && current.main.process.exitCode === null),
+          state: runtimeState.last,
+        };
+        break;
+      }
+      case "runtime.capabilities": {
+        // What flags this llama-server build actually advertises: the UI greys out what it cannot do
+        // and stops pretending a flag exists when the binary has never heard of it.
+        const capRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const exe = typeof p.executable === "string" && p.executable.trim() ? p.executable.trim() : settingsFor(opts, capRoot).managedRuntime.executable;
+        if (!exe || !existsSync(exe)) { result = { available: false, flags: [], reason: "no runtime executable configured" }; break; }
+        const detected = detectServerFlags(exe);
+        result = { available: detected.flags.size > 0, executable: exe, flags: [...detected.flags].sort(), helpText: detected.helpText.slice(0, 20_000) };
+        break;
+      }
       case "runtime.stop":
         await stopManagedRuntime(managedRuntime);
         pushRuntimeState({ phase: "stopped" });
@@ -1289,6 +1354,8 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
             tuning: settingsFor(opts, runtimeRoot).runtimeTuning,
             sidecarDevice: settingsFor(opts, runtimeRoot).runtimeTuning.sidecarDevice,
             runtimeRoot, bootstrapScript: bootstrap,
+            probeTimeoutMs: 30_000,
+            onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", endpoint: baseUrl, model: requestedMainModel ?? configuredRuntimeModels.main, elapsedMs: info.elapsedMs, log: info.log }),
           }, managedRuntime);
         } catch (error) {
           pushRuntimeState({ phase: "failed", endpoint: baseUrl, model: requestedMainModel ?? configuredRuntimeModels.main, stderrTail: error instanceof Error ? error.message.slice(0, 1200) : String(error).slice(0, 1200) });

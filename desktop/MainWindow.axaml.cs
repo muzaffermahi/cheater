@@ -1665,7 +1665,7 @@ public partial class MainWindow : Window
                 runtimeStatus.Text = reachable ? "Managed runtime is running and responding." : "Runtime started, but its endpoint did not respond.";
                 await RefreshModelStatusAsync();
             }
-            catch (Exception ex) { runtimeStatus.Text = $"Runtime start failed: {ex.Message}"; }
+            catch (Exception ex) { runtimeStatus.Text = $"Runtime start failed: {SummariseEngineError(ex.Message)}"; }
             finally { startRuntime.IsEnabled = true; }
         };
         stopRuntime.Click += async (_, _) =>
@@ -2464,12 +2464,21 @@ public partial class MainWindow : Window
         var warn = (IBrush?)Application.Current?.FindResource("WarnBrush") ?? Brushes.Orange;
         var err = (IBrush?)Application.Current?.FindResource("ErrBrush") ?? Brushes.Red;
         var faint = (IBrush?)Application.Current?.FindResource("FaintBrush") ?? Brushes.Gray;
+        var elapsedMs = payload.TryGetProperty("elapsedMs", out var elapsedValue) && elapsedValue.ValueKind == JsonValueKind.Number ? elapsedValue.GetInt64() : 0;
+        var liveLog = payload.TryGetProperty("log", out var logValue) ? logValue.GetString() ?? "" : "";
         switch (phase)
         {
             case "starting":
             case "probing":
                 RuntimeDot.Fill = warn;
-                RuntimeText.Text = $"model loading — {model} (warming)";
+                RuntimeText.Text = $"starting {model}{(elapsedMs > 0 ? $" ({elapsedMs / 1000}s)" : "")}";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "loading":
+                // Loading is PROGRESS, and it is slow for a big model — say so with a timer instead of
+                // leaving the user to guess whether it hung.
+                RuntimeDot.Fill = warn;
+                RuntimeText.Text = $"loading {model} into memory — {elapsedMs / 1000}s (large models take minutes)";
                 RuntimeActionButton.IsVisible = false;
                 break;
             case "ready":
@@ -2486,18 +2495,53 @@ public partial class MainWindow : Window
                 break;
             default: // failed
                 RuntimeDot.Fill = err;
-                var firstLine = stderrTail.Replace("\r\n", "\n").Split('\n').FirstOrDefault(line => line.Trim().Length > 0)?.Trim() ?? "no reason reported";
+                var reason = CleanRuntimeText(stderrTail);
+                var firstLine = reason.Split('\n').FirstOrDefault(line => line.Trim().Length > 0)?.Trim() ?? "no reason reported";
                 RuntimeText.Text = $"runtime failed — {(firstLine.Length > 80 ? firstLine[..80] + "…" : firstLine)}";
                 RuntimeActionButton.Content = "Retry runtime";
                 RuntimeActionButton.IsVisible = true;
+                // The panel gets a READABLE summary and a pointer to the full log — never a raw dump.
+                Activity.Text = $"The local model runtime failed to start.\n{firstLine}\n\nOpen Runtime… in the status bar for the server's full log and the launch command.";
                 break;
         }
         var tip = new List<string> { $"Phase: {phase}", $"Model: {model}" };
         if (ctx > 0) tip.Add($"Server context: {ctx:n0} tokens");
         if (!string.IsNullOrWhiteSpace(sidecar)) tip.Add($"Sidecar: {sidecar}");
         tip.AddRange(warnings);
-        if (!string.IsNullOrWhiteSpace(stderrTail)) tip.Add($"Runtime said:\n{stderrTail}");
+        var cleanedTail = CleanRuntimeText(string.IsNullOrWhiteSpace(stderrTail) ? liveLog : stderrTail);
+        if (!string.IsNullOrWhiteSpace(cleanedTail)) tip.Add($"Runtime said:\n{cleanedTail}");
         ToolTip.SetTip(RuntimeText, string.Join("\n", tip));
+    }
+
+    /// <summary>
+    /// Make runtime output human-readable: unescape the JSON-transported newlines and strip ANSI
+    /// colour. Without this the failure panel showed literal `[34m0.00.080` garbage.
+    /// </summary>
+    private static string CleanRuntimeText(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var text = raw
+            .Replace("\\u001b", "").Replace("\\x1b", "")
+            .Replace("\\r\\n", "\n").Replace("\\n", "\n").Replace("\\t", " ").Replace("\\\"", "\"");
+        text = System.Text.RegularExpressions.Regex.Replace(text, "\\[[0-9;]*[A-Za-z]", "");
+        var lines = text.Replace("\r\n", "\n").Split('\n')
+            .Select(line => System.Text.RegularExpressions.Regex.Replace(line, @"^\s*\d+\.\d{2}\.\d{3}\s*", "").TrimEnd())
+            .Where(line => line.Trim().Length > 0)
+            .ToList();
+        // Lead with the line that explains the failure, not the banner noise before it.
+        var salient = lines.LastOrDefault(line => System.Text.RegularExpressions.Regex.IsMatch(line, "error|failed|cannot|unable|unknown argument|invalid|out of memory|not found", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            && !System.Text.RegularExpressions.Regex.IsMatch(line, "^\\s*(?:W|warn|DEPRECATED)", System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+        if (salient is not null) { lines.Remove(salient); lines.Insert(0, salient); }
+        return string.Join("\n", lines.Take(12));
+    }
+
+    /// <summary>The runtime control room: live state, the server's own log, the editable command.</summary>
+    private async void ShowRuntimePanel(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null) { Activity.Text = "The engine is not connected yet."; return; }
+        var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
+        await new RuntimePanel(_engine, this, projectRoot).ShowAsync();
+        await RefreshModelStatusAsync();
     }
 
     /// <summary>One-click runtime start from the status bar; unconfigured setups land in Model setup.</summary>
@@ -2515,8 +2559,32 @@ public partial class MainWindow : Window
                 ConfigureModels(sender, e);
             }
         }
-        catch (Exception ex) { Activity.Text = $"Runtime start failed: {ex.Message}"; }
+        // The engine error arrives as a JSON envelope wrapping the server's escaped stderr. Showing
+        // that verbatim is what filled the panel with `[34m` garbage — summarise instead, and
+        // point at the Runtime window where the full, cleaned log lives.
+        catch (Exception ex) { Activity.Text = $"The runtime did not start.\n{SummariseEngineError(ex.Message)}\n\nOpen Runtime… in the status bar for the full server log."; }
         finally { RuntimeActionButton.IsEnabled = true; }
+    }
+
+    /// <summary>Pull the human sentence out of an engine error envelope (JSON + escaped stderr).</summary>
+    private static string SummariseEngineError(string raw)
+    {
+        var message = raw;
+        try
+        {
+            // Engine failures arrive as {"code":"…","message":"…"}; the message is the part worth showing.
+            var braceIndex = raw.IndexOf('{');
+            if (braceIndex >= 0)
+            {
+                using var doc = JsonDocument.Parse(raw[braceIndex..]);
+                if (doc.RootElement.TryGetProperty("message", out var inner) && inner.ValueKind == JsonValueKind.String) message = inner.GetString() ?? raw;
+                else if (doc.RootElement.TryGetProperty("error", out var errorValue) && errorValue.ValueKind == JsonValueKind.Object
+                    && errorValue.TryGetProperty("message", out var errorMessage) && errorMessage.ValueKind == JsonValueKind.String) message = errorMessage.GetString() ?? raw;
+            }
+        }
+        catch { /* not JSON — use it as-is */ }
+        var cleaned = CleanRuntimeText(message);
+        return string.IsNullOrWhiteSpace(cleaned) ? message : string.Join("\n", cleaned.Split('\n').Take(4));
     }
 
     /// <summary>The effort dial. Mutual exclusion by hand — four ToggleButtons, one checked.</summary>

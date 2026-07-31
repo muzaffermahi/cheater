@@ -27,6 +27,12 @@ export interface EndpointProbe {
   models: string[];
   latencyMs: number;
   error?: string;
+  /**
+   * The server ANSWERED but is still loading weights (llama.cpp replies 503 "Loading model" for the
+   * whole time it reads a large GGUF). This is the difference between "starting" and "broken": a
+   * 25 GB Q5_K_M can take minutes, and treating it as unreachable kills the model mid-load.
+   */
+  loading?: boolean;
 }
 
 export interface HardwareProfile {
@@ -63,6 +69,8 @@ export interface GgufKvMeta {
   headCount: number;
   headCountKv: number;
   embeddingLength: number;
+  /** The model's own trained context length, when the header declares it. */
+  contextLength?: number;
 }
 
 /** Discrete n_ctx choices, smallest first. A ladder (not a continuum) keeps sizes predictable and
@@ -96,7 +104,7 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
     const wanted = new Map<string, number>();
     let architecture = "";
     const need = (): string[] => architecture
-      ? [`${architecture}.block_count`, `${architecture}.attention.head_count`, `${architecture}.attention.head_count_kv`, `${architecture}.embedding_length`]
+      ? [`${architecture}.block_count`, `${architecture}.attention.head_count`, `${architecture}.attention.head_count_kv`, `${architecture}.embedding_length`, `${architecture}.context_length`]
       : [];
     const readString = (): string | null => {
       if (off + 8 > buf.length) return null;
@@ -146,13 +154,16 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
     function finish(): GgufKvMeta | null {
       if (!architecture) return null;
       const keys = need();
-      if (!keys.every((k) => Number(wanted.get(k)) > 0)) return null;
+      // context_length (the last key) is a BONUS: absent headers must still yield KV geometry.
+      if (!keys.slice(0, 4).every((k) => Number(wanted.get(k)) > 0)) return null;
+      const contextLength = Number(wanted.get(keys[4]));
       return {
         architecture,
         blockCount: wanted.get(keys[0])!,
         headCount: wanted.get(keys[1])!,
         headCountKv: wanted.get(keys[2])!,
         embeddingLength: wanted.get(keys[3])!,
+        ...(Number.isFinite(contextLength) && contextLength > 0 ? { contextLength } : {}),
       };
     }
   } catch { return null; }
@@ -189,10 +200,17 @@ export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: 
   const free = vramBytes - residentWeights - reserve;
   let contextTokens: number = CTX_LADDER[0];
   for (const rung of CTX_LADDER) if (rung * perToken <= free) contextTokens = rung;
+  // Never ask for more context than the model was TRAINED for: llama.cpp will either refuse or
+  // silently rope-extend into gibberish, and either way it wastes the KV memory we just budgeted.
+  let trainedNote = "";
+  if (meta?.contextLength && contextTokens > meta.contextLength) {
+    contextTokens = Math.max(CTX_LADDER[0], Math.min(contextTokens, meta.contextLength));
+    trainedNote = `, clamped to the model's trained ${meta.contextLength}`;
+  }
   const source = meta ? `GGUF geometry (${meta.architecture}: ${Math.round(perToken / 1024)} KiB/token)` : `heuristic ${Math.round(perToken / 1024)} KiB/token (GGUF header unreadable)`;
   return {
     contextTokens,
-    reason: `ctx auto-sized to ${contextTokens}: ${source}, ${(Math.max(0, free) / 1e9).toFixed(1)} GB free after weights+reserve`,
+    reason: `ctx auto-sized to ${contextTokens}: ${source}, ${(Math.max(0, free) / 1e9).toFixed(1)} GB free after weights+reserve${trainedNote}`,
   };
 }
 
@@ -228,11 +246,46 @@ export async function probeEndpoint(baseUrl: string, timeoutMs = 2500): Promise<
   const root = baseUrl.replace(/\/+$/, "");
   try {
     const response = await fetch(`${root}/models`, { signal: AbortSignal.timeout(timeoutMs) });
-    if (!response.ok) return { baseUrl, kind: classifyEndpoint(baseUrl), reachable: false, models: [], latencyMs: Date.now() - started, error: `HTTP ${response.status}` };
+    if (!response.ok) {
+      // 503 (and some builds' 500 "Loading model") means the process is ALIVE and reading weights.
+      // Reporting that as unreachable is what used to make Kitten shoot a perfectly healthy 35B in
+      // the head five seconds into a two-minute load.
+      let detail = "";
+      try { detail = (await response.text()).slice(0, 400); } catch { /* body optional */ }
+      const loading = response.status === 503 || /loading|not (?:yet )?ready|warming/i.test(detail);
+      return { baseUrl, kind: classifyEndpoint(baseUrl), reachable: false, loading, models: [], latencyMs: Date.now() - started, error: `HTTP ${response.status}${loading ? " (loading model)" : ""}` };
+    }
     const body = await response.json() as { data?: Array<{ id?: string }> };
     return { baseUrl, kind: classifyEndpoint(baseUrl), reachable: true, models: (body.data ?? []).map((m) => String(m.id ?? "")).filter(Boolean), latencyMs: Date.now() - started };
   } catch (e) {
     return { baseUrl, kind: classifyEndpoint(baseUrl), reachable: false, models: [], latencyMs: Date.now() - started, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+// ── llama-server flag compatibility ─────────────────────────────────────────────────────────────
+// llama.cpp renames and deprecates flags constantly (`--no-mmap` → `--load-mode`, `--flash-attn`
+// gaining an on/off value, `--spec-type` not existing in older builds). Emitting a flag the user's
+// build does not know is how a launch dies with a wall of deprecation noise. So ask the binary what
+// it supports, once, and only ever emit flags it actually has.
+
+const flagCache = new Map<string, { mtimeMs: number; flags: Set<string>; helpText: string }>();
+
+/** Every `--flag` the executable advertises in `--help`. Empty set ⇒ unknown (emit everything). */
+export function detectServerFlags(executable: string): { flags: Set<string>; helpText: string } {
+  try {
+    const stat = statSync(executable);
+    const cached = flagCache.get(executable);
+    if (cached && cached.mtimeMs === stat.mtimeMs) return { flags: cached.flags, helpText: cached.helpText };
+    const result = execFileSync(executable, ["--help"], { encoding: "utf8", timeout: 10_000, windowsHide: true, stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 });
+    const helpText = String(result ?? "");
+    const flags = new Set<string>();
+    for (const match of helpText.matchAll(/(--[a-z0-9][a-z0-9-]*)/gi)) flags.add(match[1].toLowerCase());
+    flagCache.set(executable, { mtimeMs: stat.mtimeMs, flags, helpText });
+    return { flags, helpText };
+  } catch {
+    // Some builds exit non-zero on --help, or write it to stderr; both land here. An empty set means
+    // "unknown", and the plan then emits its normal flags rather than crippling itself.
+    return { flags: new Set<string>(), helpText: "" };
   }
 }
 
@@ -343,6 +396,10 @@ export function buildLaunchPlan(input: {
   promptCacheMiB?: number;
   /** Prompt-lookup speculation. `"ngram"` (default) drafts from the context; `"off"` disables it. */
   speculation?: "ngram" | "off";
+  /** Flags the target binary advertises in --help. Empty/absent ⇒ unknown, emit everything. */
+  supportedFlags?: Set<string>;
+  /** The raw --help text, used to tell a valued flag from a bare boolean across llama.cpp versions. */
+  supportedFlagsHelp?: string;
   /** Overrides for tests; production measures the real file and the real device. */
   modelBytes?: number;
   vramBytes?: number;
@@ -375,24 +432,44 @@ export function buildLaunchPlan(input: {
   if (backend === "unknown") warnings.push("GPU backend was not identified; the runtime will use its safe fallback.");
   if (sidecarMode === "contended") warnings.push("The sidecar shares the main device and will yield during user-blocking generation.");
   if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: 1, sidecarMode, args: [], warnings };
-  const args = ["--model", input.mainModel, "--ctx-size", String(contextTokens), "--jinja", "--cont-batching"];
+
+  // Only emit flags this binary actually advertises. llama.cpp renames and deprecates constantly, and
+  // a flag the build does not know turns a good launch into a wall of deprecation noise.
+  const known = input.supportedFlags && input.supportedFlags.size > 0 ? input.supportedFlags : null;
+  const supports = (flag: string): boolean => !known || known.has(flag);
+  const args: string[] = [];
+  const push = (flag: string, ...values: string[]): void => {
+    if (!supports(flag)) { warnings.push(`skipped ${flag}: this llama-server build does not advertise it`); return; }
+    args.push(flag, ...values);
+  };
+  args.push("--model", input.mainModel, "--ctx-size", String(contextTokens));
+  push("--jinja");
+  push("--cont-batching");
 
   // GPU offload: "auto" offloads everything that fits (llama.cpp clamps 999 to the real layer
   // count); an explicit number is the user's call — including 0 for a pure-CPU load.
   const gpuLayers = tuning.gpuLayers !== undefined && tuning.gpuLayers !== "auto" ? Math.max(0, Math.floor(tuning.gpuLayers)) : null;
   if (gpuLayers !== null) {
-    args.push("--n-gpu-layers", String(gpuLayers));
+    push("--n-gpu-layers", String(gpuLayers));
   } else if (backend !== "cpu") {
-    args.push("--n-gpu-layers", "999");
+    push("--n-gpu-layers", "999");
   }
-  // Attention on GPU is where flash-attention pays; auto = on for any GPU backend.
+  // Attention on GPU is where flash-attention pays; auto = on for any GPU backend. Newer builds take
+  // an on/off/auto VALUE, older ones are a bare boolean — emit whichever this build documents.
   const flashOn = tuning.flashAttn === "on" || (tuning.flashAttn !== "off" && backend !== "cpu" && gpuLayers !== 0);
-  if (flashOn) args.push("--flash-attn", "on");
+  if (flashOn) {
+    // Newer builds document `--flash-attn [on|off|auto]`; older ones are a bare boolean. Emitting a
+    // value the build does not expect is a launch failure, so read its own help text.
+    const valued = /--flash-attn[ =]+(?:\[?on\|off|\{?on,)/i.test(input.supportedFlagsHelp ?? "") || (input.supportedFlagsHelp ?? "").includes("--flash-attn on");
+    if (valued || !input.supportedFlagsHelp) push("--flash-attn", "on");
+    else push("--flash-attn");
+  }
 
   // KV quantization is a CAPACITY lever here, not a quality one: q8_0 is the safe default and roughly
   // halves the cache, which is the difference between a usable context and an OOM on 8 GB. The user
   // can pin f16 (quality/default) or q4_0 (capacity) — q4 is never chosen automatically.
-  args.push("--cache-type-k", kvCacheType, "--cache-type-v", kvCacheType);
+  push("--cache-type-k", kvCacheType);
+  push("--cache-type-v", kvCacheType);
 
   // The expert tensors are the bulk of a MoE and the part that does not fit. Pushing them to CPU keeps
   // attention and the dense path resident instead of letting the driver thrash. This is also the
@@ -401,23 +478,29 @@ export function buildLaunchPlan(input: {
   const wantCpuMoe = tuning.cpuMoe === "on"
     || (tuning.cpuMoe !== "off" && backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8);
   if (wantCpuMoe && backend !== "cpu") {
-    // llama.cpp itself warns that CPU tensor overrides with mmap enabled are slower, so take its advice.
-    args.push("--cpu-moe", "--no-mmap");
+    push("--cpu-moe");
+    // llama.cpp itself warns that CPU tensor overrides with mmap enabled are slower, so take its
+    // advice — but `--no-mmap` is DEPRECATED in favour of `--load-mode`, and a build can advertise
+    // BOTH (which is how a launch ends up buried in deprecation noise). Prefer the modern spelling
+    // where it exists; `none` is its "no special loading mode" value, i.e. the old --no-mmap.
+    // (The value matters: a wrong one makes llama-server print its usage and exit — verified live.)
+    if (known?.has("--load-mode")) args.push("--load-mode", "none");
+    else if (supports("--no-mmap")) args.push("--no-mmap");
     if (tuning.cpuMoe !== "on") warnings.push(`The model is ${((modelBytes ?? 0) / 1e9).toFixed(1)} GB against ${((vramBytes ?? 0) / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth. Override with cpuMoe:"off" if your own tuning beats this.`);
   }
 
   // Prefix reuse is the largest latency lever on this hardware, and none of it is on by default:
   // a similarity threshold so a near-identical prompt lands on the warm slot, a prompt-cache pool, and
   // a disk path so a reopened conversation can restore instead of re-paying a 16k prefill.
-  args.push("--slot-prompt-similarity", "0.25");
-  if (input.slotSavePath) {
+  push("--slot-prompt-similarity", "0.25");
+  if (input.slotSavePath && supports("--slot-save-path")) {
     // The server will not start if this directory does not exist, and because the managed spawn
     // discards stderr the only symptom was "the runtime never became reachable" — a silent failure
     // with no reason anywhere. Create it here so the flag is always safe to pass.
     try { mkdirSync(input.slotSavePath, { recursive: true }); args.push("--slot-save-path", input.slotSavePath); }
     catch { warnings.push(`KV slots cannot be persisted: ${input.slotSavePath} is not writable. Resume will re-prefill instead of restoring.`); }
   }
-  if (input.promptCacheMiB && input.promptCacheMiB > 0) args.push("--cache-ram", String(Math.floor(input.promptCacheMiB)));
+  if (input.promptCacheMiB && input.promptCacheMiB > 0) push("--cache-ram", String(Math.floor(input.promptCacheMiB)));
 
   // Prompt-lookup (n-gram) speculation. Decode here is memory-bandwidth-bound, not compute-bound —
   // 24.7 GB of weights stream past an 8 GB card for every token — so verifying several drafted tokens
@@ -437,10 +520,10 @@ export function buildLaunchPlan(input: {
   // there was 1.9 GB of 31.7 GB free — no headroom to run both. To measure, stop the live server and
   // compare tokens/s with and without `--spec-type ngram-mod` on a realistic edit prompt.
   if (input.speculation !== "off") {
-    args.push("--spec-type", "ngram-mod");
+    push("--spec-type", "ngram-mod");
   }
 
-  if (input.sidecarModel && sidecarMode === "co-resident") args.push("--model-draft", input.sidecarModel);
+  if (input.sidecarModel && sidecarMode === "co-resident") push("--model-draft", input.sidecarModel);
 
   // User extra flags go LAST so they win over every heuristic above (llama.cpp takes the final value
   // of a repeated flag). This is the escape hatch for anything the structured fields don't cover.
@@ -507,6 +590,44 @@ export function listModelFiles(seedPaths: ReadonlyArray<string | undefined> = []
   return out
     .filter((f) => { const key = f.path.toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; })
     .sort((a, b) => a.dir.localeCompare(b.dir) || b.bytes - a.bytes);
+}
+
+/**
+ * Turn raw llama-server stderr into something a human can read: strip ANSI colour, unescape the
+ * literal `\n`/`` sequences that survive a JSON round-trip, drop the timestamp/verbosity
+ * prefixes, and collapse blank runs. The unprocessed form is what turned a failure card into a wall
+ * of `[34m0.00.080` noise.
+ */
+export function cleanRuntimeLog(raw: string, maxLines = 40): string {
+  if (!raw) return "";
+  const unescaped = raw
+    .replace(/\\u001b|\\x1b/g, "")
+    .replace(/\\r\\n|\\n/g, "\n")
+    .replace(/\\t/g, " ")
+    .replace(/\\"/g, "\"");
+  const lines = unescaped
+    // eslint-disable-next-line no-control-regex
+    .replace(/\[[0-9;]*[A-Za-z]/g, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\d+\.\d{2}\.\d{3}\s*/, "").trimEnd())
+    .filter((line) => line.trim().length > 0);
+  const deduped: string[] = [];
+  for (const line of lines) if (deduped[deduped.length - 1] !== line) deduped.push(line);
+  return deduped.slice(-maxLines).join("\n");
+}
+
+/**
+ * The one line of a runtime log that explains a failure, in the server's own words. Prefers explicit
+ * error/failure lines over the banner noise that precedes them.
+ */
+export function runtimeFailureReason(raw: string): string {
+  const cleaned = cleanRuntimeLog(raw, 200);
+  if (!cleaned) return "";
+  const lines = cleaned.split("\n");
+  const salient = [...lines].reverse().find((line) =>
+    /error|failed|cannot|unable|unknown argument|invalid|out of memory|no such file|not found|unrecognized/i.test(line)
+    && !/^\s*(?:W|warn|DEPRECATED)/i.test(line));
+  return (salient ?? lines[lines.length - 1] ?? "").slice(0, 300);
 }
 
 /** Spawn a managed runtime without inheriting a console window or arbitrary environment secrets. */

@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { autoSizeContextTokens, buildLaunchPlan, classifyEndpoint, CTX_LADDER, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables, kvBytesPerToken, listModelFiles, readGgufKvMeta, splitExtraArgs } from "../src/core/modelRuntime.js";
+import { autoSizeContextTokens, buildLaunchPlan, classifyEndpoint, cleanRuntimeLog, CTX_LADDER, detectHardware, discoverLocalEndpoints, discoverRuntimeExecutables, kvBytesPerToken, listModelFiles, probeEndpoint, readGgufKvMeta, runtimeFailureReason, splitExtraArgs } from "../src/core/modelRuntime.js";
 
 test("runtime classification recognizes common local endpoints", () => {
   assert.equal(classifyEndpoint("http://127.0.0.1:11434"), "ollama");
@@ -148,6 +148,49 @@ test("tuning overrides beat every heuristic: cpuMoe off, explicit gpu layers, f1
   assert.ok(!cpuLoad.args.includes("--flash-attn"), "auto flash-attn stays off for a 0-layer load");
 });
 
+test("the plan only emits flags the target build advertises, and prefers --load-mode over deprecated --no-mmap", () => {
+  // A modern build: has both spellings. The deprecated one must NOT be used (that is the wall of
+  // "DEPRECATED: --mmap and --no-mmap" noise a real launch drowned in).
+  const modern = new Set(["--model", "--ctx-size", "--jinja", "--cont-batching", "--n-gpu-layers", "--flash-attn", "--cache-type-k", "--cache-type-v", "--cpu-moe", "--no-mmap", "--load-mode", "--slot-prompt-similarity", "--spec-type"]);
+  const plan = buildLaunchPlan({
+    mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, contextTokens: 32768,
+    supportedFlags: modern, supportedFlagsHelp: "-fa, --flash-attn [on|off|auto] set Flash Attention use",
+  });
+  assert.ok(plan.args.includes("--cpu-moe"));
+  assert.ok(!plan.args.includes("--no-mmap"), "the deprecated spelling is avoided when --load-mode exists");
+  // `none` is llama.cpp's documented "no special loading mode" — the modern spelling of --no-mmap.
+  // A wrong value here makes llama-server print usage and exit, which a live launch proved.
+  assert.deepEqual(plan.args.slice(plan.args.indexOf("--load-mode"), plan.args.indexOf("--load-mode") + 2), ["--load-mode", "none"]);
+  assert.deepEqual(plan.args.slice(plan.args.indexOf("--flash-attn"), plan.args.indexOf("--flash-attn") + 2), ["--flash-attn", "on"], "valued form for a build documenting [on|off|auto]");
+
+  // An older/minimal build: unknown flags are skipped with an explicit warning rather than emitted.
+  const minimal = new Set(["--model", "--ctx-size", "--n-gpu-layers", "--no-mmap", "--cpu-moe"]);
+  const lean = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, contextTokens: 8192, supportedFlags: minimal });
+  assert.ok(!lean.args.includes("--spec-type"), "a flag this build lacks is never passed");
+  assert.ok(!lean.args.includes("--cache-type-k"));
+  assert.ok(!lean.args.includes("--jinja"));
+  assert.ok(lean.args.includes("--no-mmap"), "the old spelling is still used where it is the only one");
+  assert.ok(lean.warnings.some((w) => /skipped --spec-type/.test(w)), "skips are reported, not silent");
+
+  // Unknown capability (probe failed) ⇒ behave exactly as before.
+  const blind = buildLaunchPlan({ mainModel: "m.gguf", backend: "cuda", vramBytes: 8e9, modelBytes: 24.7e9, contextTokens: 8192 });
+  assert.ok(blind.args.includes("--spec-type"));
+  assert.ok(blind.args.includes("--jinja"));
+});
+
+test("cleanRuntimeLog unescapes and strips ANSI; runtimeFailureReason finds the real error", () => {
+  // Exactly the shape that filled the failure panel with garbage.
+  const raw = "\\u001b[34m0.00.080.619\\u001b[0m \\u001b[35mW DEPRECATED: --mmap and --no-mmap are deprecated\\n\\u001b[0m\\u001b[32ml \\u001b[0msrv    load_model: loading model 'ornith.gguf'\\nerror: failed to allocate buffer";
+  const cleaned = cleanRuntimeLog(raw);
+  assert.ok(!cleaned.includes("\\u001b"), "escape sequences gone");
+  assert.ok(!cleaned.includes("[34m"), "ANSI codes gone");
+  assert.ok(cleaned.includes("load_model: loading model"), "the real content survives");
+  assert.ok(cleaned.includes("\n"), "literal \\n became a real newline");
+  // The deprecation WARNING must not be mistaken for the failure; the allocation error is the reason.
+  assert.match(runtimeFailureReason(raw), /failed to allocate buffer/);
+  assert.equal(cleanRuntimeLog(""), "");
+});
+
 test("splitExtraArgs tokenizes with quotes and bounds", () => {
   assert.deepEqual(splitExtraArgs('--threads 12 --override-tensor "exps=CPU" --lora \'my file.gguf\''), ["--threads", "12", "--override-tensor", "exps=CPU", "--lora", "my file.gguf"]);
   assert.deepEqual(splitExtraArgs("   "), []);
@@ -171,6 +214,42 @@ test("listModelFiles finds ggufs beside the configured weights and in extra dirs
   // Largest-first within a directory: the quant someone downloaded on purpose leads.
   const inRoot = files.filter((f) => f.dir === root);
   assert.equal(inRoot[0].name, "ornith-35b-q4.gguf");
+});
+
+test("a 503 'loading model' is reported as LOADING, not as an unreachable endpoint", async () => {
+  // The live failure: llama.cpp answers 503 for the whole time it reads a 25GB GGUF. Treating that
+  // as unreachable is what made Kitten kill a healthy model five seconds into a two-minute load.
+  let phase: "loading" | "ready" = "loading";
+  const server = createServer((req, res) => {
+    if (phase === "loading") {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: 503, message: "Loading model" } }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "ornith-1.0-35b" }] }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const url = `http://127.0.0.1:${address.port}/v1`;
+    const loading = await probeEndpoint(url, 1500);
+    assert.equal(loading.reachable, false, "not servable yet");
+    assert.equal(loading.loading, true, "but recognisably ALIVE and loading");
+    assert.match(loading.error ?? "", /loading model/i);
+    phase = "ready";
+    const ready = await probeEndpoint(url, 1500);
+    assert.equal(ready.reachable, true);
+    assert.equal(ready.loading, undefined);
+    assert.deepEqual(ready.models, ["ornith-1.0-35b"]);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test("a genuinely dead endpoint is still reported as unreachable and NOT loading", async () => {
+  const dead = await probeEndpoint("http://127.0.0.1:1/v1", 400);
+  assert.equal(dead.reachable, false);
+  assert.ok(!dead.loading, "a refused connection must never look like a loading model");
 });
 
 test("the launch plan enables prompt-lookup speculation, and can turn it off", () => {

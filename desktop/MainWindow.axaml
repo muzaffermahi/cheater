@@ -177,6 +177,7 @@
             <Ellipse Name="RuntimeDot" Width="7" Height="7" Fill="{DynamicResource WarnBrush}" VerticalAlignment="Center" />
             <TextBlock Name="RuntimeText" Text="model: checking…" FontSize="11.5" Classes="muted" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
             <Button Name="RuntimeActionButton" Content="Start runtime" Click="StartRuntime" IsVisible="False" Classes="ghost tiny" />
+            <Button Content="Runtime…" Click="ShowRuntimePanel" Classes="ghost tiny" />
           </StackPanel>
           <TextBlock Grid.Column="3" Text="·" Classes="muted" FontSize="11.5" Margin="8,0" VerticalAlignment="Center" />
           <TextBlock Grid.Column="4" Name="ModelText" Text="Models: checking…" FontSize="11.5" Classes="muted"
