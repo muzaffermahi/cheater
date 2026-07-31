@@ -16,16 +16,22 @@ import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { changedFilesSince } from "./undo.js";
 import { getAgent } from "./agents.js";
 import { CORE_TOOLS, type Tool } from "./tools.js";
+import { makeWebTools, type WebAccessMode } from "./webTools.js";
+
+export interface RunnerOpts {
+  /** Web tool reach (settings.webAccess). Default "open" — the product default the user chose. */
+  webAccess?: WebAccessMode;
+}
 
 /** Build the default Runner over a KittenLLM (defaults to the local LM Studio tiering). */
-export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT_MODELS))): Runner {
+export function defaultRunner(llm: KittenLLM = new KittenLLM(tierSidecar(DEFAULT_MODELS)), opts: RunnerOpts = {}): Runner {
   return async (ctx: RunContext): Promise<RunOutcome> => {
     if (ctx.lane === "answer") return runAnswer(ctx, llm);
-    return runCoding(ctx, llm);
+    return runCoding(ctx, llm, opts);
   };
 }
 
-function agentConfig(ctx: RunContext, llm: KittenLLM): { systemPrompt?: string; model: string; tools: Tool[] } {
+function agentConfig(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {}): { systemPrompt?: string; model: string; tools: Tool[] } {
   const definition = getAgent(ctx.agent ?? "general", ctx.cwd);
   const model = definition?.model === "sidecar" ? (llm.models.sidecar ?? ctx.model) : ctx.model;
   const permission = definition?.permission ?? {};
@@ -36,7 +42,14 @@ function agentConfig(ctx: RunContext, llm: KittenLLM): { systemPrompt?: string; 
     if (name === "task" && permission.task === "deny") return false;
     return true;
   });
-  return { systemPrompt: definition?.systemPrompt, model, tools };
+  // Web tools: triple-gated — settings reach, effort profile, agent permission. Subagents default
+  // deny (a bounded worker must stay bounded); the primary agent defaults allow.
+  const webAccess = opts.webAccess ?? "open";
+  const webPermission = permission.web ?? (definition?.mode === "subagent" ? "deny" : "allow");
+  const web = webAccess !== "off" && ctx.profile.webEnabled && webPermission !== "deny"
+    ? makeWebTools({ mode: webAccess })
+    : [];
+  return { systemPrompt: definition?.systemPrompt, model, tools: [...tools, ...web] };
 }
 
 /** Answer-only lane: one chat, no write tools, stream the reply as assistant deltas. */
@@ -70,8 +83,8 @@ async function runAnswer(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
 }
 
 /** Coding lanes: direct/reliable/bon/ascent. Maps AgentEvents → canonical events as they arrive. */
-async function runCoding(ctx: RunContext, llm: KittenLLM): Promise<RunOutcome> {
-  const profile = agentConfig(ctx, llm);
+async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {}): Promise<RunOutcome> {
+  const profile = agentConfig(ctx, llm, opts);
   let toolN = 0;
   const streamedTurns = new Set<number>();
   // Live tool state streams only on the single-trajectory lanes: bon/ascent run k parallel candidates

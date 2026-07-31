@@ -109,9 +109,21 @@ try {
 
   socket.write(frame({ protocolVersion: 1, id: "native-smoke-health", type: "health" }));
   const response = await readFrame(socket);
-  socket.destroy();
   if (!response?.ok || response?.result?.ready !== true) throw new Error(`engine health response was not ready: ${JSON.stringify(response)}`);
-  console.log(`Native engine IPC smoke passed (pid ${response.result.pid}, runtime ${basename(runtime)}, handshake enforced)`);
+
+  // The desktop-king verbs the shell depends on must exist in the shipped payload: runtime.status
+  // (with its pushed-state seed field present) and the lazy compiled-contract read.
+  socket.write(frame({ protocolVersion: 1, id: "native-smoke-runtime", type: "runtime.status" }));
+  const runtimeStatus = await readFrame(socket);
+  if (!runtimeStatus?.ok || typeof runtimeStatus.result?.running !== "boolean" || !("state" in runtimeStatus.result)) {
+    throw new Error(`runtime.status is missing the pushed-state contract: ${JSON.stringify(runtimeStatus)}`);
+  }
+  socket.write(frame({ protocolVersion: 1, id: "native-smoke-compiled", type: "task.compiled-get", payload: { runId: "smoke-none" } }));
+  const compiled = await readFrame(socket);
+  if (!compiled?.ok || compiled.result !== null) throw new Error(`task.compiled-get contract broken: ${JSON.stringify(compiled)}`);
+
+  socket.destroy();
+  console.log(`Native engine IPC smoke passed (pid ${response.result.pid}, runtime ${basename(runtime)}, handshake enforced, desktop-king verbs present)`);
 } catch (error) {
   const detail = stderr.trim();
   throw new Error(`${error instanceof Error ? error.message : String(error)}${detail ? `\n${detail}` : ""}`);

@@ -32,6 +32,9 @@ export interface KittenSettings {
   contextWindowTokens: number | "auto";
   /** How the Task Compiler participates in the request path. Default "auto". */
   taskCompiler: TaskCompilerFlag;
+  /** Web tool reach: "open" (any http(s) site behind the SSRF floor — the default), "allowlist"
+   *  (reference-doc hosts only), or "off". */
+  webAccess: "allowlist" | "open" | "off";
   /** Config files that were merged (for `kitten doctor` transparency). */
   sources: string[];
   /** Non-fatal problems (unknown keys, unreadable files) to surface in doctor. */
@@ -50,20 +53,21 @@ export interface SettingsUpdate {
   mainModelPath?: string;
   sidecarModelPath?: string;
   taskCompiler?: TaskCompilerFlag;
+  webAccess?: "allowlist" | "open" | "off";
 }
 
 const KNOWN_KEYS = new Set([
   "baseUrl", "sidecarBaseUrl", "mainModel", "sidecarModel", "embedModel", "apiKey",
   "approvalPolicy", "contextWindowTokens",
   "runtimeExecutable", "mainModelPath", "sidecarModelPath",
-  "taskCompiler",
+  "taskCompiler", "webAccess",
 ]);
 
 interface RawConfig {
   baseUrl?: string; sidecarBaseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
   approvalPolicy?: string; contextWindowTokens?: number | string;
   runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
-  taskCompiler?: string;
+  taskCompiler?: string; webAccess?: string;
 }
 
 function readConfig(path: string, warnings: string[]): RawConfig | null {
@@ -138,6 +142,7 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
     mainModelPath: undefined,
     sidecarModelPath: undefined,
     taskCompiler: envStr("KITTEN_TASK_COMPILER"),
+    webAccess: envStr("KITTEN_WEB_ACCESS"),
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
@@ -173,7 +178,11 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
   const taskCompiler: TaskCompilerFlag = rawCompiler === "off" || rawCompiler === "auto" || rawCompiler === "force" ? rawCompiler : "auto";
   if (rawCompiler && rawCompiler !== taskCompiler) warnings.push(`taskCompiler "${rawCompiler}" is not one of off|auto|force — using "auto"`);
 
-  return { models, managedRuntime, approvalPolicy, contextWindowTokens, taskCompiler, sources, warnings };
+  const rawWeb = pick("webAccess");
+  const webAccess: KittenSettings["webAccess"] = rawWeb === "allowlist" || rawWeb === "open" || rawWeb === "off" ? rawWeb : "open";
+  if (rawWeb && rawWeb !== webAccess) warnings.push(`webAccess "${rawWeb}" is not one of allowlist|open|off — using "open"`);
+
+  return { models, managedRuntime, approvalPolicy, contextWindowTokens, taskCompiler, webAccess, sources, warnings };
 }
 
 /** Persist non-secret app settings atomically. API keys remain environment/config-file only. */

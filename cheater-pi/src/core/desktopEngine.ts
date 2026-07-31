@@ -615,6 +615,7 @@ function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
   if (typeof raw.contextWindowTokens === "number" && Number.isFinite(raw.contextWindowTokens) && raw.contextWindowTokens > 0) update.contextWindowTokens = Math.floor(raw.contextWindowTokens);
   else if (raw.contextWindowTokens === "auto") update.contextWindowTokens = "auto";
   if (raw.taskCompiler === "off" || raw.taskCompiler === "auto" || raw.taskCompiler === "force") update.taskCompiler = raw.taskCompiler;
+  if (raw.webAccess === "allowlist" || raw.webAccess === "open" || raw.webAccess === "off") update.webAccess = raw.webAccess;
   if (!Object.keys(update).length) throw new Error("settings.update contained no valid non-secret settings");
   // Settings are a durable source of truth, so reject a known-size model that would
   // put either lane outside Kitten's supported contract. Unknown-size IDs remain
@@ -640,7 +641,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     store,
     runner: opts.runner ?? ((ctx) => {
       const projectRoot = appRef?.getConversation(ctx.conversationId)?.projectRoot ?? opts.projectRoot ?? process.cwd();
-      return defaultRunner(runtimeForProject(projectRoot, runtime, opts).llm)(ctx);
+      return defaultRunner(runtimeForProject(projectRoot, runtime, opts).llm, { webAccess: loadKittenSettings(projectRoot).webAccess })(ctx);
     }),
     projectRoot: opts.projectRoot ?? process.cwd(),
     model: runtime.models.main,
@@ -914,6 +915,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           /** The server's measured n_ctx for the current launch, when a runtime is up. */
           effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
           taskCompiler: current.taskCompiler,
+          webAccess: current.webAccess,
           warnings: [...current.warnings, ...modelTierWarnings(active.models)],
         };
         break;
@@ -948,6 +950,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           contextWindowTokens: fresh.contextWindowTokens,
           effectiveContextTokens: runtimeState.last?.ctxTokens ?? null,
           taskCompiler: fresh.taskCompiler,
+          webAccess: fresh.webAccess,
           warnings: [...fresh.warnings, ...modelTierWarnings(runtime.models)],
         };
         break;
