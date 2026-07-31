@@ -1,9 +1,10 @@
-import test from "node:test";
+﻿import test from "node:test";
+// (bakeoff regression) An interactive command must hit EOF instead of hanging on an open stdin.
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
+import { bashTool, interactiveCommandRefusal, editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
 
 function ctxAt(): ToolContext {
   return { cwd: mkdtempSync(join(tmpdir(), "kt-tools-")), filesRead: new Set(), filesWritten: new Set() };
@@ -30,7 +31,7 @@ test("edit matches leniently when whitespace differs", async () => {
 
 test("edit matches leniently on a CRLF file (Windows line endings)", async () => {
   // Regression: findLenient rejoined lines with "\n" and indexOf'd that against the raw text, so on a
-  // \r\n file it never matched — the lenient rescue was dead on the primary platform.
+  // \r\n file it never matched â€” the lenient rescue was dead on the primary platform.
   const ctx = ctxAt();
   writeFileSync(join(ctx.cwd, "m.py"), "def f():\r\n        return 1\r\n"); // CRLF, 8-space indent
   const r = await editTool.execute({ path: "m.py", search: "    return 1", replace: "    return 2" }, ctx); // 4-space
@@ -40,7 +41,7 @@ test("edit matches leniently on a CRLF file (Windows line endings)", async () =>
 
 test("edit refuses an ambiguous lenient match (2+ normalized regions) instead of guessing", async () => {
   // Regression: findLenient applied the FIRST normalized match, unlike the exact path which errors on
-  // multiple matches — so it could silently edit the wrong one of two similar blocks.
+  // multiple matches â€” so it could silently edit the wrong one of two similar blocks.
   const ctx = ctxAt();
   writeFileSync(join(ctx.cwd, "m.py"), "if a:\n    x = 1\n    return x\nif b:\n        x = 1\n        return x\n");
   const before = readFileSync(join(ctx.cwd, "m.py"), "utf8");
@@ -177,3 +178,30 @@ test("globToRegExp keeps * inside one segment", () => {
   assert.equal(globToRegExp("a?.ts").test("ab.ts"), true);
   assert.equal(globToRegExp("a?.ts").test("abc.ts"), false);
 });
+
+
+test("a bare interactive command is refused instantly with the fix, not left to hang", async () => {
+  // Live bakeoff finding: the model ran bare `python`. With no terminal attached it blocks until the
+  // timeout — and on Python 3.14 it hangs even with stdin redirected from NUL — so three of them ate
+  // six minutes of one task. Refusing costs milliseconds and tells the model exactly what to do.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-stdin-"));
+  const c: ToolContext = { cwd, filesRead: new Set(), filesWritten: new Set() };
+  const started = Date.now();
+  const res = await bashTool.execute({ command: "python", timeout_seconds: 30 }, c);
+  assert.ok(Date.now() - started < 3000, "must refuse immediately, not wait for the timeout");
+  assert.equal(res.isError, true);
+  assert.match(res.output, /interactive session/);
+  assert.match(res.output, /python -c/, "the refusal must carry the correction");
+  for (const bare of ["node", "  vim  ", "sqlite3", "cat", "C:\\Python314\\python.exe"]) {
+    assert.ok(interactiveCommandRefusal(bare), `${bare} should be refused`);
+  }
+  // Real commands must be untouched — including the piped/redirected/argument forms.
+  for (const real of ['python -c "print(1)"', "python script.py", "echo hi | python", "cat file.txt",
+                      "node -e \"console.log(1)\"", "npm test", "python < input.txt", "pytest -q"]) {
+    assert.equal(interactiveCommandRefusal(real), null, `${real} must NOT be refused`);
+  }
+  const good = await bashTool.execute({ command: 'python -c "print(6*7)"', timeout_seconds: 60 }, c);
+  assert.equal(good.isError, false, `a normal python -c must still run: ${good.output.slice(0, 200)}`);
+  assert.match(good.output, /42/);
+});
+

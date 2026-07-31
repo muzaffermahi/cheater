@@ -286,6 +286,43 @@ function nearestLines(text: string, search: string): string {
 
 // --- bash -----------------------------------------------------------------------------------
 
+/**
+ * Commands that, invoked bare, drop into an interactive REPL and read from a terminal forever.
+ *
+ * A model reaches for these more often than you would expect — `python` to "just check something",
+ * `node` to poke at a value. With no terminal on the other end they block until the timeout, and on
+ * this machine Python 3.14's REPL hangs even with stdin redirected from NUL. Measured live: three
+ * bare `python` calls burned six minutes inside a single task and taught the model nothing.
+ *
+ * So refuse instantly with the fix. A one-line correction the model can act on beats a two-minute
+ * silence every time. Only the BARE form is refused: `python -c "..."`, `python script.py`, and
+ * anything piped or redirected are all real commands and run untouched.
+ */
+const INTERACTIVE_BARE = new Set([
+  "python", "python3", "py", "node", "irb", "ghci", "julia", "scala", "R",
+  "sqlite3", "mysql", "psql", "mongo", "redis-cli", "ftp", "telnet",
+  "vi", "vim", "nano", "emacs", "less", "more", "top", "htop", "cat", "head", "sort",
+]);
+
+/** The guidance for a bare interactive command, or null when the command is fine to run. */
+export function interactiveCommandRefusal(command: string): string | null {
+  const trimmed = (command ?? "").trim();
+  // Anything with a pipe, redirect, or chain has a real stdin/purpose — leave it alone.
+  if (/[|<>&;]/.test(trimmed)) return null;
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length !== 1) return null;
+  const base = parts[0].replace(/^.*[\\/]/, "").replace(/\.exe$/i, "").toLowerCase();
+  if (!INTERACTIVE_BARE.has(base) && !INTERACTIVE_BARE.has(parts[0])) return null;
+  const hint = base === "python" || base === "python3" || base === "py"
+    ? 'run the code non-interactively instead, e.g. python -c "import mod; print(mod.f(1))" or python script.py'
+    : base === "node"
+      ? 'run the code non-interactively instead, e.g. node -e "console.log(require(\'./mod\').f(1))" or node script.js'
+      : base === "cat" || base === "head" || base === "sort"
+        ? "give it a file argument (it is waiting on standard input)"
+        : "pass the command/query as an argument instead of opening the interactive session";
+  return `blocked: \`${trimmed}\` opens an interactive session with no terminal attached, so it would hang until the timeout — ${hint}.`;
+}
+
 export const bashTool: Tool = {
   schema: {
     name: "bash",
@@ -299,6 +336,9 @@ export const bashTool: Tool = {
   execute(args, ctx): Promise<ToolResult> {
     const command = String(args.command ?? "");
     if (!command.trim()) return Promise.resolve({ output: "bash: empty command", isError: true });
+    // Refuse a hang before paying for it, with the correction inline.
+    const refusal = interactiveCommandRefusal(command);
+    if (refusal) return Promise.resolve({ output: refusal, isError: true, meta: { interactive: true } });
     // A non-numeric timeout_seconds (the model can emit "5 minutes"; args aren't schema-coerced) would
     // make Number(...) NaN → setTimeout(NaN) ≈ 0ms → the command is killed instantly and falsely reported
     // as timed out. Fall back to the 120s default for anything that doesn't parse to a finite number.
@@ -308,7 +348,12 @@ export const bashTool: Tool = {
       // Already-cancelled: don't even start.
       if (ctx.signal?.aborted) { resolve({ output: `$ ${command}\n[cancelled before start]`, isError: true, meta: { cancelled: true } }); return; }
       // detached on POSIX so we can signal the whole process GROUP; on Windows we taskkill the tree.
-      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
+      // stdin is CLOSED, not an open pipe. A model reaches for an interactive tool more often than
+      // you would think (`python` with no script, `node`, `cat`, a pager, `ssh`), and with an open
+      // stdin every one of those blocks until the timeout expires — measured live: three bare
+      // `python` REPLs burned six minutes of a single task. With stdin at EOF they exit at once,
+      // and the model gets an immediate, honest result it can act on.
+      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
       let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
       const CAP = 12 * 1024 * 1024;
       // Live progress: coalesce output into at most 8 bounded chunks per call (flush at ≥1KB or 500ms)
