@@ -360,6 +360,43 @@ function truncate(s: string): string {
 
 const SKIP_DIRS = new Set([".git", "node_modules", ".cheater", "dist", "build", "__pycache__", ".venv", "venv", ".next", "out", "coverage", "target", ".pytest_cache"]);
 
+/** A grep that silently stops at its ceiling teaches the model the repo is smaller than it is. */
+const GREP_MAX_HITS = 400;
+const GLOB_MAX_HITS = 400;
+
+/**
+ * Translate a shell-style glob into an anchored RegExp over root-relative POSIX paths.
+ * `**` crosses directory separators, `*` and `?` do not — the usual contract, so a model that has
+ * seen any other tool gets what it expects.
+ */
+export function globToRegExp(pattern: string): RegExp {
+  let source = "";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        // `**/` must also match zero directories, so `**/*.ts` finds a root-level file.
+        if (pattern[i + 2] === "/") { source += "(?:.*/)?"; i += 2; continue; }
+        source += ".*"; i += 1; continue;
+      }
+      source += "[^/]*";
+      continue;
+    }
+    if (ch === "?") { source += "[^/]"; continue; }
+    source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${source}$`, CASE_INSENSITIVE_PATHS ? "i" : "");
+}
+
+/**
+ * Does a file match the pattern? A pattern containing `/` is judged against the whole root-relative
+ * path; a bare one (`*.ts`) is judged against the basename at any depth. Forcing a globstar prefix
+ * for the common case would just be a trap for a weak model.
+ */
+function globMatches(re: RegExp, hasSlash: boolean, relativePath: string, name: string): boolean {
+  return re.test(hasSlash ? relativePath : name);
+}
+
 export const lsTool: Tool = {
   schema: {
     name: "ls",
@@ -402,29 +439,84 @@ export const grepTool: Tool = {
     if (!pattern) return { output: "grep: missing pattern", isError: true };
     let re: RegExp;
     try { re = new RegExp(pattern); } catch (e) { return { output: `grep: bad pattern: ${(e as Error).message}`, isError: true }; }
-    const globRe = args.glob ? new RegExp("^" + String(args.glob).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$") : null;
+    const globPattern = args.glob ? String(args.glob) : "";
+    const globRe = globPattern ? globToRegExp(globPattern) : null;
+    const globHasSlash = globPattern.includes("/");
     const root = abs(ctx, String(args.path ?? "."));
     const hits: string[] = [];
+    let truncated = false;
     const walk = (dir: string, depth: number): void => {
-      if (depth > 8 || hits.length > 100) return;
+      if (depth > 8 || truncated) return;
       let entries: import("node:fs").Dirent[];
       try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
+        if (truncated) return;
         if (SKIP_DIRS.has(e.name)) continue;
         const full = join(dir, e.name);
         if (e.isDirectory()) { walk(full, depth + 1); continue; }
-        if (globRe && !globRe.test(e.name)) continue;
+        if (globRe && !globMatches(globRe, globHasSlash, rel(ctx, full), e.name)) continue;
         try {
           if (statSync(full).size > 1024 * 1024) continue;
           const content = readFileSync(full, "utf8");
-          content.split(/\r?\n/).forEach((line, i) => {
-            if (hits.length <= 100 && re.test(line)) hits.push(`${rel(ctx, full)}:${i + 1}: ${line.trim().slice(0, 200)}`);
-          });
+          const lines = content.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i += 1) {
+            if (hits.length >= GREP_MAX_HITS) { truncated = true; return; }
+            if (re.test(lines[i])) hits.push(`${rel(ctx, full)}:${i + 1}: ${lines[i].trim().slice(0, 200)}`);
+          }
         } catch { /* binary/unreadable */ }
       }
     };
     walk(root, 0);
-    return { output: hits.length ? hits.join("\n") : `(no matches for /${pattern}/)`, isError: false, meta: { count: hits.length } };
+    if (!hits.length) return { output: `(no matches for /${pattern}/)`, isError: false, meta: { count: 0, truncated: false } };
+    // Say so explicitly: a model that assumes it saw every match will "fix" one call site of three.
+    const notice = truncated ? `\n(truncated at ${GREP_MAX_HITS} matches - narrow the pattern or pass path/glob to see the rest)` : "";
+    return { output: hits.join("\n") + notice, isError: false, meta: { count: hits.length, truncated } };
+  }
+};
+
+export const globTool: Tool = {
+  schema: {
+    name: "glob",
+    description: "Find files by name pattern, e.g. '**/*.test.ts' or 'Dockerfile'. Returns project-relative paths. Use this to locate files; use grep to search their contents.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "glob pattern; ** crosses directories, * and ? do not" },
+        path: { type: "string", description: "optional subdir to search under (default '.')" }
+      },
+      required: ["pattern"]
+    }
+  },
+  execute(args, ctx) {
+    const pattern = String(args.pattern ?? "").trim();
+    if (!pattern) return { output: "glob: missing pattern", isError: true };
+    const start = String(args.path ?? ".");
+    const denied = scopeError(ctx, start);
+    if (denied) return { output: `glob: ${denied}`, isError: true };
+    const root = abs(ctx, start);
+    if (!existsSync(root)) return { output: `glob: not found: ${start}`, isError: true };
+    let re: RegExp;
+    try { re = globToRegExp(pattern); } catch (e) { return { output: `glob: bad pattern: ${(e as Error).message}`, isError: true }; }
+    const hasSlash = pattern.includes("/");
+    const matches: string[] = [];
+    let truncated = false;
+    const walk = (dir: string, depth: number): void => {
+      if (depth > 12 || truncated) return;
+      let entries: import("node:fs").Dirent[];
+      try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (truncated) return;
+        if (SKIP_DIRS.has(e.name)) continue;
+        const full = join(dir, e.name);
+        if (e.isDirectory()) { walk(full, depth + 1); continue; }
+        if (matches.length >= GLOB_MAX_HITS) { truncated = true; return; }
+        if (globMatches(re, hasSlash, rel(ctx, full), e.name)) matches.push(rel(ctx, full));
+      }
+    };
+    walk(root, 0);
+    if (!matches.length) return { output: `(no files match ${pattern})`, isError: false, meta: { count: 0, truncated: false } };
+    const notice = truncated ? `\n(truncated at ${GLOB_MAX_HITS} files - narrow the pattern or pass path to see the rest)` : "";
+    return { output: matches.join("\n") + notice, isError: false, meta: { count: matches.length, truncated } };
   }
 };
 
@@ -469,7 +561,7 @@ export const taskTool: Tool = {
   }
 };
 
-export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, grepTool, taskTool, finishTool];
+export const CORE_TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool, lsTool, globTool, grepTool, taskTool, finishTool];
 
 export function toolByName(name: string): Tool | undefined {
   return CORE_TOOLS.find((t) => t.schema.name === name);

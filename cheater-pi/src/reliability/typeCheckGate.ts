@@ -41,6 +41,15 @@ function localBin(cwd: string, name: string): string | null {
   return null;
 }
 
+/**
+ * The locally installed `tsc`, or null. Exported so the per-edit syntax gate reuses the same rule
+ * this gate enforces: only a binary that is actually installed here, so "command not found" can
+ * never masquerade as a type error and nothing triggers an implicit network install.
+ */
+export function localTscBin(cwd: string): string | null {
+  return localBin(cwd, "tsc");
+}
+
 /** Detect a runnable typecheck command for this repo, preferring a locally installed binary. */
 export function detectTypecheckCommand(cwd: string): { command: string; kind: string } | null {
   if (existsSync(join(cwd, "tsconfig.json"))) {
