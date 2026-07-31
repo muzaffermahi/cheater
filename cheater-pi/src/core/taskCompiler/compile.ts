@@ -126,6 +126,12 @@ function synthesizeRequirements(
   for (const text of literals.explicitConstraints) {
     requirements.push({ id: nextRequirementId(), text, strength: "must", source: "user" });
   }
+  // A bulleted spec is an obligation list, and it is how most people actually write one. These are
+  // the user's own words, copied — the same standard the obligation sentences above are held to.
+  for (const text of literals.specBullets) {
+    if (requirements.some((r) => r.text === text)) continue;
+    requirements.push({ id: nextRequirementId(), text, strength: "must", source: "user" });
+  }
   // A stated outcome with no explicit obligation sentence is still a `must`: the user asked for it.
   if (!requirements.length && literals.statedOutcome) {
     requirements.push({ id: nextRequirementId(), text: literals.statedOutcome, strength: "must", source: "user" });

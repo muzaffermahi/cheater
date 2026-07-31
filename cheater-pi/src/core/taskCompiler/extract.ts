@@ -22,6 +22,15 @@ export interface LiteralExtraction {
   requestedTechnologies: string[];
   /** Sentences carrying an explicit obligation ("must", "should", "needs to"). */
   explicitConstraints: string[];
+  /**
+   * Items of a bulleted/numbered specification list.
+   *
+   * People write requirements as a list far more often than as prose containing the word "must" —
+   * `- add(self, text) -> int — returns the new id` is an obligation, and reading only the header
+   * sentence ("`todo.py` must expose:") threw the actual contract away. Measured on the bakeoff
+   * battery: prompts stating 5-8 obligations compiled down to 1-2 requirements.
+   */
+  specBullets: string[];
   /** Explicit prohibitions ("do not", "never", "without changing"). */
   prohibitions: string[];
   /** Compatibility demands ("keep X working", "backward compatible", "without breaking"). */
@@ -138,6 +147,25 @@ export function extractLiterals(request: string): LiteralExtraction {
     12,
   );
 
+  // A LIST is how a specification is usually written. Only treat it as one when there are at least
+  // two items (a lone bullet is prose) and the item carries content, and never re-record something
+  // already captured as an obligation, prohibition or compatibility demand.
+  const bulletLines = text
+    .split("\n")
+    .map((line) => line.match(/^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$/))
+    .filter((m): m is RegExpMatchArray => Boolean(m))
+    .map((m) => m[1].trim())
+    .filter((line) => line.length >= 12);
+  const specBullets = bulletLines.length >= 2
+    ? dedupe(
+      bulletLines.filter((line) =>
+        !prohibitions.some((p) => line.includes(p))
+        && !explicitConstraints.some((c) => c.includes(line) || line.includes(c))
+        && !COMPATIBILITY_RE.test(line)),
+      12,
+    )
+    : [];
+
   const endpoints = dedupe([...contract.endpoints, ...extractTrailingKeywordEndpoints(text, contract.files)], 8);
 
   return {
@@ -151,6 +179,7 @@ export function extractLiterals(request: string): LiteralExtraction {
     },
     requestedTechnologies: dedupe(requestedTechnologies, 8),
     explicitConstraints,
+    specBullets,
     prohibitions,
     compatibility: dedupe(parts.filter((s) => COMPATIBILITY_RE.test(s)), 6),
     examples: extractExamples(text),
