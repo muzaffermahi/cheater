@@ -32,7 +32,7 @@ import { generateFnProbes } from "./synthtest.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
-import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
+import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, checkpointCandidates, clearCheckpoints, CHECKPOINT_DIR, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
 import { EvalRegistry, defaultRegistry } from "./disjointness.js";
 
 /** Which levers are ON. Part D3 flips these one at a time to measure each lever's marginal Best@1. */
@@ -314,6 +314,11 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     // stopping here would just hand the verifier a slate of wrong answers to pick the least-bad from.
     // Keep a repair round in reserve for exactly this: finished-but-wrong seeds a grounded resample.
     const finished = attempts.filter((a) => a.result.finished);
+    // Survive an interrupt with something to show for the time. Until the winner is adopted (far
+    // below), every candidate lives in an isolated workspace and `cwd` is untouched — so a kill here
+    // leaves the user with nothing, which is exactly what json_patch did after fifteen minutes.
+    const checkpointed = checkpointCandidates(params.cwd, finished, round);
+    if (checkpointed.length) receipts.push(`round ${round}: ${checkpointed.length} candidate(s) checkpointed to ${CHECKPOINT_DIR}/`);
     if (finished.some((a) => passesGroundTruth(a.workspace))) break;
     if (finished.length && workedExamples.length) receipts.push(`round ${round}: ${finished.length} finished but none pass the worked examples → repair`);
     if (round < maxRounds) {
@@ -407,6 +412,11 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   }
 
   const winnerAttempt = verdict.winner ? survivorsByIndex.get(verdict.winner) ?? null : null;
+  // Clear the interrupt checkpoints BEFORE adopting: adoptWorkspace clears cwd and copies the
+  // winner in, and a stale `.kitten-candidates/` left behind would be both litter and a liability
+  // (the next run's checkpoint would be indistinguishable from this run's). A run that reaches this
+  // line no longer needs them — the winner is about to land in cwd for real.
+  if (winnerAttempt) clearCheckpoints(params.cwd);
   const adoptedFiles = winnerAttempt ? adoptWorkspace(params.cwd, winnerAttempt.workspace) : [];
 
   // A3 — remember a verifier-confirmed solve (disjoint by construction; admit() hard-fails on an eval id).
