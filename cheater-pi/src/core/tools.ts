@@ -60,6 +60,54 @@ function rel(ctx: ToolContext, p: string): string {
 
 /** Windows and macOS compare paths case-insensitively; a scope check that does not would be bypassable. */
 const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
+
+/**
+ * A POSIX shell for the `bash` tool on Windows, or null to fall back to cmd.exe.
+ *
+ * `spawn(cmd, { shell: true })` resolves to %COMSPEC% on Windows, so every `ls`, `pwd`, `cat` and
+ * `grep` the model types comes back "is not recognized as an internal or external command". Models
+ * are trained overwhelmingly on POSIX; on the bakeoff's mini_sql task two consecutive orientation
+ * commands failed that way and the run never recovered its footing. Windows is this product's
+ * primary platform, so that is a self-inflicted tax on every run.
+ *
+ * Git for Windows ships a real bash and is already a dependency of anyone using a coding agent.
+ *
+ * `C:\Windows\System32\bash.exe` and the WindowsApps stub are DELIBERATELY excluded: those launch
+ * WSL, a different filesystem namespace where the workspace path (`C:\Users\...`) does not exist and
+ * `cwd` would be meaningless. Silently running the model's commands in the wrong filesystem is far
+ * worse than cmd.exe.
+ */
+export function resolvePosixShell(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (process.platform !== "win32") return null;      // spawn's own shell is already POSIX
+  const usable = (p: string | undefined): p is string => {
+    if (!p) return false;
+    const norm = p.replace(/\\/g, "/").toLowerCase();
+    if (norm.includes("/system32/") || norm.includes("/windowsapps/")) return false;  // WSL, not bash
+    return existsSync(p);
+  };
+  const override = env.KITTEN_SHELL?.trim();
+  if (override) return usable(override) ? override : null;   // explicit and wrong: don't guess past it
+  // Derive from the git on PATH, so a non-default install location still works.
+  const candidates: string[] = [];
+  try {
+    const execPath = spawnSync("git", ["--exec-path"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+    const root = execPath.stdout?.trim().replace(/\\/g, "/").replace(/\/mingw\d+\/libexec\/git-core\/?$/i, "");
+    if (root) candidates.push(`${root}/bin/bash.exe`, `${root}/usr/bin/bash.exe`);
+  } catch { /* git absent — fall through to the well-known locations */ }
+  candidates.push(
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+    "C:/Program Files (x86)/Git/bin/bash.exe",
+  );
+  return candidates.find(usable) ?? null;
+}
+
+/** Resolved once per process — the git probe spawns, and `bash` is called constantly. */
+let posixShellCache: string | null | undefined;
+function bashShellOption(): string | true {
+  if (posixShellCache === undefined) posixShellCache = resolvePosixShell();
+  return posixShellCache ?? true;
+}
 function fold(value: string): string {
   return CASE_INSENSITIVE_PATHS ? value.toLowerCase() : value;
 }
@@ -353,7 +401,7 @@ export const bashTool: Tool = {
       // stdin every one of those blocks until the timeout expires — measured live: three bare
       // `python` REPLs burned six minutes of a single task. With stdin at EOF they exit at once,
       // and the model gets an immediate, honest result it can act on.
-      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
+      const child = spawn(command, { cwd: ctx.cwd, shell: bashShellOption(), windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
       let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
       const CAP = 12 * 1024 * 1024;
       // Live progress: coalesce output into at most 8 bounded chunks per call (flush at ≥1KB or 500ms)

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { bashTool, interactiveCommandRefusal, editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
+import { bashTool, interactiveCommandRefusal, resolvePosixShell, editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
 
 function ctxAt(): ToolContext {
   return { cwd: mkdtempSync(join(tmpdir(), "kt-tools-")), filesRead: new Set(), filesWritten: new Set() };
@@ -203,5 +203,49 @@ test("a bare interactive command is refused instantly with the fix, not left to 
   const good = await bashTool.execute({ command: 'python -c "print(6*7)"', timeout_seconds: 60 }, c);
   assert.equal(good.isError, false, `a normal python -c must still run: ${good.output.slice(0, 200)}`);
   assert.match(good.output, /42/);
+});
+
+test("the bash tool never resolves its shell to WSL", () => {
+  // The dangerous near-miss. C:\Windows\System32\bash.exe and the WindowsApps stub are WSL
+  // launchers: they run in a different filesystem namespace where the workspace path does not
+  // exist, so `cwd` is meaningless and the model's edits would land somewhere nobody is looking.
+  // Silently running in the wrong filesystem is strictly worse than the cmd.exe problem this
+  // resolver exists to fix, so those paths must never be chosen — even when named explicitly.
+  for (const wsl of ["C:\\Windows\\System32\\bash.exe",
+                     "C:/Windows/System32/bash.exe",
+                     "C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe"]) {
+    assert.equal(resolvePosixShell({ KITTEN_SHELL: wsl } as NodeJS.ProcessEnv), null,
+      `${wsl} is WSL and must be refused`);
+  }
+  // A KITTEN_SHELL that simply does not exist falls back to cmd.exe rather than guessing past it.
+  assert.equal(resolvePosixShell({ KITTEN_SHELL: "C:/nope/bash.exe" } as NodeJS.ProcessEnv), null);
+});
+
+test("on Windows the bash tool runs POSIX commands the model actually types", async (t) => {
+  // The regression this exists to prevent: `spawn(cmd, {shell:true})` uses %COMSPEC%, so `ls` and
+  // `pwd` come back "is not recognized as an internal or external command". Measured live on the
+  // bakeoff's mini_sql task, which burned two turns on exactly this before giving up on orienting
+  // itself. Skipped where no POSIX shell is installed — the fallback to cmd.exe is intentional.
+  if (process.platform === "win32" && !resolvePosixShell()) {
+    t.skip("no Git bash on this machine; cmd.exe fallback is the documented behaviour");
+    return;
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-posix-"));
+  writeFileSync(join(cwd, "marker.txt"), "hello\n");
+  const c: ToolContext = { cwd, filesRead: new Set(), filesWritten: new Set() };
+
+  const ls = await bashTool.execute({ command: "ls", timeout_seconds: 30 }, c);
+  assert.equal(ls.isError, false, `ls must work: ${ls.output.slice(0, 200)}`);
+  assert.match(ls.output, /marker\.txt/);
+  assert.doesNotMatch(ls.output, /not recognized as an internal or external command/);
+
+  const pwd = await bashTool.execute({ command: "pwd && cat marker.txt", timeout_seconds: 30 }, c);
+  assert.equal(pwd.isError, false, `pwd && cat must work: ${pwd.output.slice(0, 200)}`);
+  assert.match(pwd.output, /hello/);
+
+  // Windows toolchain commands must keep working — this must not trade one broken shell for another.
+  const py = await bashTool.execute({ command: 'python -c "print(6*7)"', timeout_seconds: 60 }, c);
+  assert.equal(py.isError, false, `python must still run under the POSIX shell: ${py.output.slice(0, 200)}`);
+  assert.match(py.output, /42/);
 });
 
