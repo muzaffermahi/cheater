@@ -114,8 +114,25 @@ export function resolveEffort(value: unknown): EffortLevel {
   return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value) ? value as EffortLevel : "balanced";
 }
 
-export function effortProfile(value: unknown): EffortProfile {
-  return EFFORT_PROFILES[resolveEffort(value)];
+/**
+ * Resolve the profile, honouring an explicit wall-clock override.
+ *
+ * The four levels are spaced for interactive use (3 / 10 / 20 / 45 min), which leaves no way to fit
+ * a run inside an *external* deadline that falls between them. Terminal-Bench is the case that
+ * forced this: it kills the agent at 900 s, so `balanced` (600 s) wastes 300 s of usable budget on
+ * every task while `careful` (1200 s) overshoots and gets killed with nothing written at all.
+ *
+ * `KITTEN_CEILING_MS` sets the wall-clock ceiling directly and leaves every other lever of the
+ * chosen level alone. Anything non-positive or unparseable is ignored rather than treated as zero —
+ * a ceiling of 0 would abort instantly, the same trap as `reasoningBudget: 0` disabling thinking.
+ */
+export function effortProfile(value: unknown, env: NodeJS.ProcessEnv = process.env): EffortProfile {
+  const base = EFFORT_PROFILES[resolveEffort(value)];
+  const raw = env.KITTEN_CEILING_MS?.trim();
+  if (!raw) return base;
+  const ms = Number(raw);
+  if (!Number.isFinite(ms) || ms <= 0) return base;
+  return { ...base, ceiling: { ...base.ceiling, maxWallMs: ms } };
 }
 
 /** One-line human description per level (surfaced as a hint next to the control). */

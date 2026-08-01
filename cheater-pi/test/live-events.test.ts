@@ -345,3 +345,28 @@ test("a tool call rejected for bad arguments names the reason, and oversized pay
   assert.ok(toolReply, "the model must be told why");
   assert.match(toolReply, /smaller pieces/, "an oversized payload gets advice it can act on, not 'use valid JSON'");
 });
+
+test("KITTEN_CEILING_MS overrides the wall clock without disturbing the rest of the profile", async () => {
+  // Terminal-Bench kills the agent at 900s. The stock levels are 3/10/20/45 min, so `balanced`
+  // wastes 300s of usable budget on every task while `careful` overshoots and is killed with
+  // nothing written. An external deadline that falls between the levels needs a direct override.
+  const { effortProfile, EFFORT_PROFILES } = await import("../src/core/effort.js");
+
+  const overridden = effortProfile("balanced", { KITTEN_CEILING_MS: "840000" } as NodeJS.ProcessEnv);
+  assert.equal(overridden.ceiling.maxWallMs, 840_000);
+  assert.equal(overridden.ceiling.maxTokens, EFFORT_PROFILES.balanced.ceiling.maxTokens,
+    "only the wall clock moves; the token ceiling is untouched");
+  assert.equal(overridden.maxTurns, EFFORT_PROFILES.balanced.maxTurns);
+  assert.equal(overridden.kCap, EFFORT_PROFILES.balanced.kCap);
+
+  // Nothing set: the profile is returned exactly as declared.
+  assert.equal(effortProfile("balanced", {} as NodeJS.ProcessEnv).ceiling.maxWallMs,
+    EFFORT_PROFILES.balanced.ceiling.maxWallMs);
+
+  // Garbage and non-positive values are IGNORED, never taken literally. A ceiling of 0 would abort
+  // the run instantly -- the same trap as reasoningBudget 0 silently disabling thinking.
+  for (const bad of ["0", "-5", "abc", "", "   "]) {
+    assert.equal(effortProfile("balanced", { KITTEN_CEILING_MS: bad } as NodeJS.ProcessEnv).ceiling.maxWallMs,
+      EFFORT_PROFILES.balanced.ceiling.maxWallMs, `KITTEN_CEILING_MS=${JSON.stringify(bad)} must be ignored`);
+  }
+});
