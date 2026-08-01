@@ -446,8 +446,26 @@ export const bashTool: Tool = {
           meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName },
         });
       };
-      child.on("close", done);
-      child.on("error", (e) => { clearTimeout(timer); if (streamTimer) clearTimeout(streamTimer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
+      // "close" waits for every stdio pipe to drain, which is right for a normal finish: it
+      // guarantees the full output. But once we have DELIBERATELY killed the tree it becomes a trap.
+      // Under the POSIX shell, `bash -c "node -e ..."` runs the real work in a GRANDCHILD; killing
+      // bash leaves that grandchild holding the stdout pipe open, so "close" does not fire until it
+      // exits on its own — a cancel that should take milliseconds took the command's full 10s.
+      // After a kill, the child we spawned is gone and its own exit is the honest signal to report.
+      let settled = false;
+      const settle = (code: number | null, signalName: NodeJS.Signals | null): void => {
+        if (settled) return;
+        settled = true;
+        done(code, signalName);
+      };
+      child.on("close", settle);
+      child.on("exit", (code, signalName) => {
+        if (killedBy === null) return;        // normal finish: let "close" deliver the complete output
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        settle(code, signalName);
+      });
+      child.on("error", (e) => { clearTimeout(timer); if (streamTimer) clearTimeout(streamTimer); ctx.signal?.removeEventListener("abort", onAbort); if (!settled) { settled = true; resolve({ output: `bash: ${e.message}`, isError: true }); } });
     });
   }
 };

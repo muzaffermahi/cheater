@@ -562,3 +562,37 @@ test("prompt epoch changes when and only when the stable prefix changes", () => 
     "tool ORDER is part of the bytes — reordering must not claim compatibility");
   assert.equal(normalizePathForPrompt("src\\core\\app.ts"), "src/core/app.ts");
 });
+
+test("a change request that names no file is a change, not an investigation", () => {
+  // Observed live on Terminal-Bench (sanitize-git-repo). The request asks to find API keys, replace
+  // them with placeholders, and "ensure that the sensitive values are not present afterwards" -- an
+  // unambiguous mutation. It named no path, so the last-resort fallback called it read-only, the
+  // compiler forced the ANSWER lane (which carries no tools at all), and the model ended up typing
+  // <tool_call> blocks into prose. Zero files changed, zero score. "Names no file" is not the same
+  // as "asks for no change".
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-family-"));
+  const sanitize = classifyFamily(
+    'Please help sanitize my github repository "dclm" of all API keys. Please find and remove all '
+    + "such information and replace it with placeholder values. Please ensure that the sensitive "
+    + "values are not present in the repository after the sanitization.",
+    extractLiterals('Please help sanitize my github repository "dclm" of all API keys. Please find '
+      + "and remove all such information and replace it with placeholder values. Please ensure that "
+      + "the sensitive values are not present in the repository after the sanitization."),
+    cwd,
+  );
+  assert.notEqual(sanitize.family, "repository_investigation",
+    `a sanitize-and-replace request must not be read-only (got: ${sanitize.reason})`);
+
+  for (const req of ["clean up the build output", "make the tests pass", "remove the debug logging"]) {
+    const d = classifyFamily(req, extractLiterals(req), cwd);
+    assert.notEqual(d.family, "repository_investigation", `"${req}" asks for a change (got: ${d.reason})`);
+  }
+
+  // The other half: genuine questions must STAY investigations, or every explanation request starts
+  // editing files.
+  for (const req of ["Where is the retry budget enforced?", "How does the router pick a lane?",
+                     "Explain the finish gate.", "list the modules that import the store"]) {
+    const d = classifyFamily(req, extractLiterals(req), cwd);
+    assert.equal(d.family, "repository_investigation", `"${req}" is a question (got: ${d.family}/${d.reason})`);
+  }
+});
