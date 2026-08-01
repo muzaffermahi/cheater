@@ -153,9 +153,10 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
 
   // The effort dial's bounds reach the agent loop here: turn cap and thinking budget were previously
   // never set from the app path (every run got the 40-turn default and the model's own thinking).
+  const deadline = startEffortDeadline(ctx);
   const common = {
     task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, tools: profile.tools,
-    spawnTask: ctx.spawnTask, allowedFiles: ctx.allowedFiles, forbiddenFiles: ctx.forbiddenFiles, onEvent, signal: ctx.signal,
+    spawnTask: ctx.spawnTask, allowedFiles: ctx.allowedFiles, forbiddenFiles: ctx.forbiddenFiles, onEvent, signal: deadline.signal,
     maxTurns: ctx.profile.maxTurns,
     reasoningBudget: ctx.profile.reasoningBudget,
   };
@@ -185,8 +186,16 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
       ? await runAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true })
       : await runReliableAgent({ ...common, commandGate, contextPreamble: preamble, streamDeltas: true, onVerification: verificationSink(ctx), scoutFiles: ctx.profile.scoutFiles });
 
+  deadline.dispose();
+
   // Surface changed files as file.changed events (winner provenance is trivial here — single trajectory).
   for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
+
+  // A run stopped by its own ceiling must SAY so. Silently returning a half-finished result reads as
+  // "the model gave up", and the user has no way to know that raising the effort dial is the fix.
+  if (deadline.expired()) {
+    ctx.emit({ type: "run.status", runId: ctx.runId, status: "running", detail: `stopped at the ${ctx.profile.level} effort ceiling` });
+  }
 
   return {
     finished: result.finished,
@@ -194,6 +203,7 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
     wallMs: result.wallMs,
     usage: result.usage,
     receiptLines: [
+      ...(deadline.expired() ? [`stopped at the ${ctx.profile.level} effort ceiling (${Math.round((ctx.profile.ceiling?.maxWallMs ?? 0) / 1000)}s) — raise the effort dial for more time`] : []),
       `${ctx.lane} lane: ${result.stopReason} in ${result.turns} turns (${(result.wallMs / 1000).toFixed(1)}s)`,
       `files: ${result.filesWritten.join(", ") || "none"}`,
       ...(result.formatRescues ? [`format rescues: ${result.formatRescues} optional structured-output constraint(s) removed after endpoint rejection`] : []),
@@ -204,6 +214,43 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
     // no receipt and must not be verified. The DIRECT lane has NO finish gate — "finished" only means the
     // model stopped, never verified (§4).
     verified: ctx.lane === "direct" ? false : (result.finished && !result.forcedFinish),
+  };
+}
+
+/**
+ * Arm the effort profile's wall-clock ceiling as a real deadline for whichever lane runs.
+ *
+ * Before this, "Fast ≈ 3 min … Think Hard ≈ 45 min" was a promise the engine could not keep. Two
+ * separate reasons, and both had to go:
+ *
+ *  1. `config.ceiling` was only ever set on the **ascent** branch, so a reliable or direct run had no
+ *     wall-clock bound at all — only `maxTurns`.
+ *  2. Even on ascent it was not a deadline. The BudgetGovernor records cost *after* a batch of
+ *     attempts resolves and checks `exhausted()` only *between* rounds, so nothing samples the clock
+ *     while a candidate is in flight. One long candidate simply overruns.
+ *
+ * A timer-backed AbortSignal fixes both: it fires wherever the run happens to be, and the lanes
+ * already unwind cleanly on abort. `AbortSignal.any` keeps the user's own cancel working.
+ *
+ * The two causes must stay distinguishable — a run that hit its own ceiling is a very different
+ * report from one the user stopped — so `expired` records which fired.
+ */
+function startEffortDeadline(ctx: RunContext): { signal: AbortSignal; expired: () => boolean; dispose: () => void } {
+  const ms = ctx.profile.ceiling?.maxWallMs;
+  if (!ms || !Number.isFinite(ms) || ms <= 0) {
+    return { signal: ctx.signal ?? new AbortController().signal, expired: () => false, dispose: () => { /* nothing armed */ } };
+  }
+  const controller = new AbortController();
+  let fired = false;
+  const timer = setTimeout(() => {
+    fired = true;
+    controller.abort(new Error(`effort ceiling reached (${Math.round(ms / 1000)}s)`));
+  }, ms);
+  timer.unref?.();   // a pending ceiling must never hold the process open
+  return {
+    signal: ctx.signal ? AbortSignal.any([ctx.signal, controller.signal]) : controller.signal,
+    expired: () => fired,
+    dispose: () => clearTimeout(timer),
   };
 }
 
@@ -239,13 +286,17 @@ function ascentSummary(a: { summary: string; winnerHasExecutionReceipt: boolean 
 
 /** Ascent lane: the full pass@k→pass@1 machine. Degrades to reliable if config assembly refuses. */
 async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void, profile: { systemPrompt?: string; model: string }): Promise<RunOutcome> {
+  // Ascent receives config.ceiling, but the governor only consults it BETWEEN rounds -- a single
+  // long candidate or repair loop overruns it entirely. The deadline signal is what actually bounds
+  // elapsed time, so this lane arms it too.
+  const deadline = startEffortDeadline(ctx);
   let config;
   try {
     config = defaultAscentConfig(llm, ctx.cwd);
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx), maxTurns: ctx.profile.maxTurns, reasoningBudget: ctx.profile.reasoningBudget, scoutFiles: ctx.profile.scoutFiles });
+    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: deadline.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx), maxTurns: ctx.profile.maxTurns, reasoningBudget: ctx.profile.reasoningBudget, scoutFiles: ctx.profile.scoutFiles });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,
@@ -277,7 +328,7 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
       forceSamples: ctx.k > 1 ? ctx.k : undefined,
       kFloor: ctx.profile.kFloor, kCap: ctx.profile.kCap,
       maxTurns: ctx.profile.maxTurns,
-      onEvent, signal: ctx.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model,
+      onEvent, signal: deadline.signal, contextPreamble: ctx.conversationContext || undefined, model: profile.model,
     },
     config
   );
@@ -296,12 +347,19 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   // worked examples adopts a winner but earns no receipt → finished:true, verified:false = "checked",
   // NOT a red failure (§4: don't collapse these). Measurement (cli.ts --ascent) still uses the receipt.
   const adopted = a.winner != null;
+  deadline.dispose();
+  if (deadline.expired()) {
+    ctx.emit({ type: "run.status", runId: ctx.runId, status: "running", detail: `stopped at the ${ctx.profile.level} effort ceiling` });
+  }
   return {
     finished: adopted,
     summary: ascentSummary(a, adopted),
     wallMs: a.wallMs,
     usage: a.usage,
-    receiptLines: a.receipts,
+    receiptLines: [
+      ...(deadline.expired() ? [`stopped at the ${ctx.profile.level} effort ceiling (${Math.round((ctx.profile.ceiling?.maxWallMs ?? 0) / 1000)}s) — raise the effort dial for more time`] : []),
+      ...a.receipts,
+    ],
     filesChanged,
     verified: a.winnerHasExecutionReceipt,
   };

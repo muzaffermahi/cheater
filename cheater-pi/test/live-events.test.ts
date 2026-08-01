@@ -236,3 +236,73 @@ test("route.selected carries the deterministic hardness score", async () => {
   assert.ok(route && route.type === "route.selected");
   assert.ok(typeof route.hardness === "number", "hardness recorded on route.selected");
 });
+
+// ── E12b: the effort ceiling is a real deadline ─────────────────────────────────────────────────
+
+test("a run that overruns its effort ceiling is stopped, and says so", async () => {
+  // The dial promised "Fast ≈ 3 min ... Think Hard ≈ 45 min" and could not keep it. config.ceiling
+  // was set only on the ascent branch, and even there the governor checks the clock only BETWEEN
+  // rounds — so nothing bounded a candidate in flight. template_engine ran 900s under Balanced
+  // (a 10 min ceiling) and had to be killed from outside, losing everything it had.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-deadline-"));
+  writeFileSync(join(cwd, "marker.txt"), "content the model keeps re-reading\n");
+  let calls = 0;
+  // A model that never stops asking for another turn: without a deadline this runs to maxTurns.
+  const neverFinishes = {
+    chat: async (p: ChatParams): Promise<ChatResult> => {
+      await new Promise((r) => setTimeout(r, 25));
+      // Mirror the real client: an aborted call comes back as a failure result, it does not throw.
+      if (p.signal?.aborted) {
+        return { content: "", reasoning: "", toolCalls: [], finishReason: "error",
+                 usage: { prompt: 0, completion: 0, reasoning: 0, total: 0 }, ok: false, error: "cancelled", elapsedMs: 1 };
+      }
+      // Keep calling a tool: bare content twice in a row trips the stall detector, which would end
+      // the run before the deadline and prove nothing about the ceiling.
+      calls += 1;
+      return { content: "", reasoning: "", toolCalls: [{ id: `c${calls}`, name: "read", args: { path: "marker.txt" }, raw: "" }],
+               finishReason: "tool_calls", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 25 };
+    },
+    models: { main: "fake" },
+  } as unknown as KittenLLM;
+
+  const events: EventPayload[] = [];
+  const profile = { ...EFFORT_PROFILES.fast, level: "fast" as const, maxTurns: 500, ceiling: { maxWallMs: 300 } };
+  const started = Date.now();
+  const outcome = await defaultRunner(neverFinishes)(runCtx({
+    cwd, lane: "direct", profile, emit: (p) => events.push(p),
+  }));
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 8000, `the ceiling must actually stop the run, took ${elapsed}ms`);
+  assert.ok(outcome.receiptLines.some((l) => /effort ceiling/i.test(l)),
+    `the receipt must explain WHY it stopped, got: ${JSON.stringify(outcome.receiptLines)}`);
+  assert.ok(outcome.receiptLines.some((l) => /raise the effort dial/i.test(l)),
+    "and must tell the user the lever that fixes it");
+  assert.ok(events.some((e) => e.type === "run.status" && /effort ceiling/i.test(e.detail ?? "")),
+    "the UI must be told too, not just the receipt");
+});
+
+test("a run inside its ceiling is untouched by the deadline", async () => {
+  // The other half: arming a timer must not perturb a normal run, and must not leave the process
+  // held open by a pending timer.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-deadline-ok-"));
+  const quick = scriptedLlm([{ toolCalls: [{ id: "f1", name: "finish", args: { summary: "done" }, raw: "" }] }]);
+  const profile = { ...EFFORT_PROFILES.balanced, ceiling: { maxWallMs: 60_000 } };
+  const outcome = await defaultRunner(quick)(runCtx({
+    cwd, lane: "direct", profile, emit: () => { /* ignore */ },
+  }));
+  assert.equal(outcome.finished, true);
+  assert.ok(!outcome.receiptLines.some((l) => /effort ceiling/i.test(l)),
+    "a run that finished in time must not be reported as ceilinged");
+});
+
+test("a profile with no wall-clock ceiling still runs", async () => {
+  // Defensive: ceiling is optional in the type, and a 0/absent value must mean "unbounded", never
+  // "abort immediately" — the same class of bug as reasoningBudget:0 disabling thinking.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-deadline-none-"));
+  const profile = { ...EFFORT_PROFILES.balanced, ceiling: { maxWallMs: 0 } };
+  const outcome = await defaultRunner(scriptedLlm([{ toolCalls: [{ id: "f1", name: "finish", args: { summary: "done" }, raw: "" }] }]))(runCtx({
+    cwd, lane: "direct", profile, emit: () => { /* ignore */ },
+  }));
+  assert.equal(outcome.finished, true, "maxWallMs 0 must mean unbounded, not instant abort");
+});
