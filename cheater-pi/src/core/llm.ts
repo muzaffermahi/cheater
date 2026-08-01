@@ -195,8 +195,19 @@ function endpointKey(value: string): string {
 
 function retryableRuntimeStatus(status: number): boolean {
   // Local runtimes commonly answer 503 while loading a large GGUF or swapping a model slot.
-  // Retry only transient gateway/load statuses; a 4xx configuration error must surface immediately.
-  return status === 408 || status === 425 || status === 429 || status === 502 || status === 503 || status === 504;
+  //
+  // 500 belongs here too, and its absence cost a whole run in the bakeoff: llama.cpp answers 500
+  // when *its own* tool-call parser chokes on the arguments string the model just produced —
+  // "Failed to parse tool call arguments as JSON ... invalid string: missing closing quote" — which
+  // happens on a long, escape-heavy payload such as a Python file whose docstring is full of
+  // quotes. Nothing about that is permanent: the retry re-samples, the model emits a different
+  // string, and it parses. Treating it as fatal threw away 513 s of correct work and looked, from
+  // the outside, like the model randomly stopping.
+  //
+  // A 4xx configuration error must still surface immediately, and a genuinely broken server costs
+  // only the two extra attempts and their sub-second backoff.
+  return status === 408 || status === 425 || status === 429
+    || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 function retryDelayMs(attempt: number, response: Response): number {
