@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { CheaterConfig } from "./types.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "./blueprint/config.js";
 
-export const VERSION = "0.7.0";
+export const VERSION = "0.7.3";
 
 export const DEFAULT_CONFIG: CheaterConfig = {
   ...DEFAULT_BLUEPRINT_CONFIG,

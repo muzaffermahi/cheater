@@ -1,6 +1,6 @@
 {
   "name": "@cheater/cheater-pi",
-  "version": "0.7.0",
+  "version": "0.7.3",
   "description": "Kitten — a reliable native desktop coding agent for local models, with durable conversations, sidecar orchestration, and an adaptive reliability engine.",
   "type": "module",
   "bin": {
