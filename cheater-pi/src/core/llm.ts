@@ -194,20 +194,29 @@ function endpointKey(value: string): string {
 }
 
 function retryableRuntimeStatus(status: number): boolean {
-  // Local runtimes commonly answer 503 while loading a large GGUF or swapping a model slot.
-  //
-  // 500 belongs here too, and its absence cost a whole run in the bakeoff: llama.cpp answers 500
-  // when *its own* tool-call parser chokes on the arguments string the model just produced —
-  // "Failed to parse tool call arguments as JSON ... invalid string: missing closing quote" — which
-  // happens on a long, escape-heavy payload such as a Python file whose docstring is full of
-  // quotes. Nothing about that is permanent: the retry re-samples, the model emits a different
-  // string, and it parses. Treating it as fatal threw away 513 s of correct work and looked, from
-  // the outside, like the model randomly stopping.
-  //
-  // A 4xx configuration error must still surface immediately, and a genuinely broken server costs
-  // only the two extra attempts and their sub-second backoff.
+  // Local runtimes commonly answer 503 while loading a large GGUF or swapping a model slot, and 500
+  // for their own transient trouble (a failed slot, a GC pause). Retrying those here is cheap and
+  // usually works. A 4xx configuration error must surface immediately.
   return status === 408 || status === 425 || status === 429
     || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+/**
+ * A 500 whose body says the server could not parse the model's OWN tool call.
+ *
+ * Retrying this at the transport layer is the wrong move, and measurably so: the request is
+ * byte-identical, so the model regenerates the same oversized `write`, and llama.cpp's parser breaks
+ * in the same place. On a local 35B that is ~2 minutes per wasted attempt. The bakeoff's mini_sql
+ * spent 513 s on exactly this before giving up.
+ *
+ * The agent loop already handles the case properly one level up: it retries WITH guidance telling
+ * the model to split the write across smaller calls (agent.ts, `truncatedToolCall`). Failing fast
+ * here is what lets that guided retry happen instead of burning the budget on identical resends.
+ */
+function isToolCallParseFailure(status: number, body: string): boolean {
+  if (status !== 500 || !body) return false;
+  return /parse.{0,40}tool.?call|tool.?call.{0,40}parse/i.test(body)
+    || (/parse_error|parse error/i.test(body) && /invalid string|missing closing|unterminated/i.test(body));
 }
 
 function retryDelayMs(attempt: number, response: Response): number {
@@ -327,10 +336,16 @@ export class KittenLLM {
     if (!release) { clearTimeout(timer); return failure(params.signal?.aborted ? "cancelled" : "timeout", started); }
     try {
       let res: Response | undefined;
+      let bodyText: string | undefined;   // consumed while deciding whether to retry
       for (let attempt = 0; attempt < 3; attempt++) {
         res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+        bodyText = undefined;
         if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
-        await res.text().catch(() => "");
+        bodyText = await res.text().catch(() => "");
+        // An identical resend cannot fix the server failing to parse the model's own tool call —
+        // only the agent loop's guided retry can. Surface it now rather than spending two more full
+        // generations reproducing it.
+        if (isToolCallParseFailure(res.status, bodyText ?? "")) break;
         if (!await waitForRetry(retryDelayMs(attempt, res), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
       }
       if (!res) return failure("network: no response", started);
@@ -344,7 +359,7 @@ export class KittenLLM {
         }
       }
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
+        const text = bodyText ?? await res.text().catch(() => "");
         return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
       }
       const json: any = await res.json();
@@ -396,10 +411,16 @@ export class KittenLLM {
     const acc = new StreamAccumulator();
     try {
       let res: Response | undefined;
+      let bodyText: string | undefined;   // consumed while deciding whether to retry
       for (let attempt = 0; attempt < 3; attempt++) {
         res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
+        bodyText = undefined;
         if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
-        await res.text().catch(() => "");
+        bodyText = await res.text().catch(() => "");
+        // An identical resend cannot fix the server failing to parse the model's own tool call —
+        // only the agent loop's guided retry can. Surface it now rather than spending two more full
+        // generations reproducing it.
+        if (isToolCallParseFailure(res.status, bodyText ?? "")) break;
         if (!await waitForRetry(retryDelayMs(attempt, res), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
       }
       if (!res) return failure("network: no response", started);
@@ -413,7 +434,7 @@ export class KittenLLM {
         }
       }
       if (!res.ok) {
-        const text = await res.text().catch(() => "");
+        const text = bodyText ?? await res.text().catch(() => "");
         return failure(`HTTP ${res.status}: ${text.slice(0, 300)}`, started);
       }
       if (!res.body) return failure("no response body for stream", started);

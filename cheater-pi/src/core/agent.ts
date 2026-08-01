@@ -283,8 +283,23 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         continue;
       }
       if (call.argError) {
-        messages.push(toolResultTurn(call.id, call.name, `error: ${call.argError}. Re-emit the call with valid JSON arguments.`));
-        emit({ turn, kind: "tool", detail: `bad args for ${call.name}`, data: { error: true } });
+        // A giant single-call payload is the usual cause: a whole source file inlined into the
+        // arguments string, its quotes and newlines escaped, is exactly what breaks a tool-call
+        // parser mid-string. Saying "re-emit with valid JSON" to a model that just produced 12 KB of
+        // valid-looking JSON is useless advice; telling it to split the write is actionable.
+        const rawSize = call.raw?.length ?? 0;
+        const oversized = rawSize >= 4000;
+        const advice = oversized
+          ? ` The arguments were ${Math.round(rawSize / 1024)} KB, which is large enough that the parser can fail mid-string. Write the file in smaller pieces instead: create it with the first section, then append the rest with follow-up edits.`
+          : " Re-emit the call with valid JSON arguments.";
+        messages.push(toolResultTurn(call.id, call.name, `error: ${call.argError}.${advice}`));
+        // The UI used to receive exactly "bad args for write" — no argument, no reason. Neither the
+        // model nor the person watching could act on that.
+        emit({
+          turn, kind: "tool",
+          detail: `bad args for ${call.name}: ${call.argError.slice(0, 200)}${oversized ? ` (${Math.round(rawSize / 1024)} KB payload)` : ""}`,
+          data: { error: true, argError: call.argError, argBytes: rawSize },
+        });
         continue;
       }
       // Pre-execution noun/path firewall (Phase 2): a phantom exec/edit path is corrected in one turn.

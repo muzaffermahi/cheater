@@ -57,16 +57,14 @@ test("chat retries transient local-runtime loading responses within the request 
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
-test("chat survives a runtime that 500s on its own tool-call parse", async () => {
-  // Verbatim from the bakeoff: llama.cpp answered 500 because *its* parser broke on the arguments
-  // string the model produced for a large file write. Before this was retryable, one such response
-  // ended the run and discarded 513 s of work — the "model randomly stops" report.
+test("a transient 500 from a local runtime is retried, not fatal", async () => {
+  // 500 used to be absent from the retryable set entirely, so any of them killed the run outright.
   let calls = 0;
   const server = createServer((_req, res) => {
     calls += 1;
     if (calls === 1) {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { code: 500, message: "Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 12863: syntax error while parsing value - invalid string: missing closing quote" } }));
+      res.writeHead(500, { "content-type": "text/plain" });
+      res.end("slot unavailable");
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
@@ -76,10 +74,34 @@ test("chat survives a runtime that 500s on its own tool-call parse", async () =>
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("fixture server did not bind");
   const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${address.port}/v1`, main: "main-35b" });
-  const result = await llm.chat({ messages: [{ role: "user", content: "write a big file" }], timeoutMs: 2000 });
+  const result = await llm.chat({ messages: [{ role: "user", content: "hello" }], timeoutMs: 2000 });
   assert.equal(result.ok, true);
   assert.equal(result.content, "recovered");
   assert.equal(calls, 2);
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+});
+
+test("a tool-call parse 500 fails FAST so the agent's guided retry can fix it", async () => {
+  // Verbatim from the bakeoff's mini_sql: llama.cpp 500s because *its* parser broke on the arguments
+  // string the model produced for a ~12KB write. Resending is byte-identical, so the model
+  // regenerates the same oversized call and it breaks in the same place — ~2 minutes per wasted
+  // attempt on a local 35B. The fix for THIS failure lives one level up, in the agent loop, which
+  // retries with "write it in smaller pieces". Blind transport retries only delay that.
+  let calls = 0;
+  const server = createServer((_req, res) => {
+    calls += 1;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: 500, message: "Failed to parse tool call arguments as JSON: [json.exception.parse_error.101] parse error at line 1, column 12863: syntax error while parsing value - invalid string: missing closing quote" } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("fixture server did not bind");
+  const llm = new KittenLLM({ baseUrl: `http://127.0.0.1:${address.port}/v1`, main: "main-35b" });
+  const result = await llm.chat({ messages: [{ role: "user", content: "write a big file" }], timeoutMs: 4000 });
+  assert.equal(result.ok, false);
+  assert.equal(calls, 1, "identical resends cannot fix a parse failure — do not pay for them");
+  assert.match(result.error ?? "", /parse tool call arguments/,
+    "the reason must reach the agent loop, which matches on it to add the smaller-pieces guidance");
   await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 

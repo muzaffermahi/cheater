@@ -306,3 +306,42 @@ test("a profile with no wall-clock ceiling still runs", async () => {
   }));
   assert.equal(outcome.finished, true, "maxWallMs 0 must mean unbounded, not instant abort");
 });
+
+// ── a rejected tool call must say WHICH argument and WHY ────────────────────────────────────────
+
+test("a tool call rejected for bad arguments names the reason, and oversized payloads get real advice", async () => {
+  // From the bakeoff's mini_sql run: llama.cpp's own parser broke on a ~12KB write payload, and all
+  // the transcript said was "bad args for write". The model cannot correct what it cannot see, and
+  // neither can the person watching. Worse, the stock advice ("re-emit with valid JSON") is useless
+  // to a model that just emitted 12KB of valid-looking JSON — the actionable fix is to split it.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-badargs-"));
+  const huge = "x".repeat(9000);
+  const events: AgentEvent[] = [];
+  const sent: string[] = [];
+  const llm = {
+    chat: async (p: ChatParams): Promise<ChatResult> => {
+      for (const m of p.messages) if (m.role === "tool") sent.push(String(m.content ?? ""));
+      if (sent.length === 0) {
+        return { content: "", reasoning: "", finishReason: "tool_calls", ok: true, elapsedMs: 1,
+                 usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 },
+                 toolCalls: [{ id: "c1", name: "write", args: {}, argError: "invalid JSON args: Unterminated string in JSON at position 8999", raw: huge }] };
+      }
+      return { content: "", reasoning: "", finishReason: "stop", ok: true, elapsedMs: 1,
+               usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 },
+               toolCalls: [{ id: "f1", name: "finish", args: { summary: "gave up" }, raw: "" }] };
+    },
+    models: { main: "fake" },
+  } as unknown as KittenLLM;
+
+  await runAgent({ task: "write a big file", cwd, llm, model: "fake", onEvent: (e) => events.push(e), maxTurns: 4 });
+
+  const rejection = events.find((e) => e.kind === "tool" && e.detail.startsWith("bad args"));
+  assert.ok(rejection, "the rejection must still be reported");
+  assert.match(rejection.detail, /invalid JSON args/, "the event must carry the parser's actual reason");
+  assert.match(rejection.detail, /KB payload/, "and flag that the payload was oversized");
+  assert.equal((rejection.data as { argBytes?: number }).argBytes, huge.length);
+
+  const toolReply = sent.find((s) => /invalid JSON args/.test(s));
+  assert.ok(toolReply, "the model must be told why");
+  assert.match(toolReply, /smaller pieces/, "an oversized payload gets advice it can act on, not 'use valid JSON'");
+});
