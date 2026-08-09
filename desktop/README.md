@@ -51,7 +51,7 @@ complete payload, writes `release.json`, creates a portable ZIP, and emits a SHA
 contains a native GUI `Kitten.Setup.exe` that installs to `%LOCALAPPDATA%\\Kitten` and creates a Start Menu
 shortcut. The user does not need Node, a browser, a terminal, or PowerShell.
 
-The native setup dialog can import a verified catalog JSON, select main/sidecar entries, and download
+Settings → Local runtime can import a verified catalog JSON, select main/sidecar entries, and download
 them into a user-selected folder with visible progress. The engine also exposes `model.download`,
 `workspace.*`, `sidecar.*`, `agent.list`, `task.*`, and conversation/run commands through the versioned
 local protocol. Model downloads write a `.part` file, resume with HTTP Range when possible, verify
@@ -64,13 +64,27 @@ When both tiers share one endpoint, Kitten serializes their requests per endpoin
 project/runtime clients) and still allows cancellation while a request is queued; separate endpoints
 remain concurrent.
 
-The same setup dialog can start and stop managed local llama.cpp-compatible runtimes. It validates the
-executable and model files, builds the hardware-aware launch plan, starts the main and optional sidecar
-children hidden on separate OpenAI-compatible endpoints, waits for both `/models` probes, and tears the
-children down with the app. No terminal command or
-browser window is required. The selected runtime executable and model paths are persisted in the
-project's `.kitten/config.json`, so reopening the project does not force another file hunt.
-The setup screen can also discover an already-installed `llama-server` on PATH without opening a shell.
+Settings is a panel inside the window, not a pop-up: the groups sit in a rail on the left (Models,
+Local runtime, Performance, Advanced, Behaviour, Runtime & logs) and the selected group's controls open
+on the right, over one Save. It is reached from the **Settings** button in the header, from Ctrl+K, and
+from the status line; Escape closes it.
+
+The **Local runtime** page asks for one thing: the weights. Kitten finds the `llama-server` binary
+itself -- beside the app, among the backends LM Studio has downloaded, and on PATH -- reads the picked
+`.gguf` header for its architecture, layer count and trained context, derives the model id from the
+file name, and serves it under that id with `--alias`. It starts and stops the managed runtime,
+validating both files, building the hardware-aware launch plan, starting the main and optional sidecar
+children hidden on separate OpenAI-compatible endpoints, waiting for both `/models` probes, and tearing
+the children down with the app. No terminal command or browser window is required. The runtime
+executable and model paths are persisted in the project's `.kitten/config.json`.
+
+The **Performance** page is the full llama.cpp control surface, at LM Studio parity: context size, GPU
+offload layers, flash attention, KV cache type and whether the cache is offloaded to the GPU, CPU
+threads, batch and micro-batch size, model load mode (mmap/mlock), main GPU and tensor split -- and the
+mixture-of-experts split, which is the one that matters most on a card too small for the weights.
+Rather than the all-or-nothing `--cpu-moe`, Kitten emits `--n-cpu-moe N`: the experts of the first N
+layers run on the CPU and the rest stay resident. N is a slider against the model's real layer count,
+with a **Use the suggested split** button that computes the fewest layers that make the rest fit.
 
 The model panel is laid out as compact native rows so every setup, health, probe, and bakeoff action
 remains reachable in the narrow, scrollable workspace sidebar. It also provides hardware-aware guidance for the
@@ -87,8 +101,11 @@ After review, **Apply bakeoff winners** explicitly selects the top responding ca
 project settings; it requires confirmation and never changes files or silently swaps a model. Known
 parameter counts are tier-guarded: a 2B candidate cannot be selected as the main model, and a 35B+
 candidate cannot be selected as the sidecar without an explicit diagnostic override.
-The model setup dialog itself scrolls inside the native window, so runtime paths, catalog actions,
-and the final Save/Cancel controls remain reachable at normal display scaling. Transient local-runtime
+The **Advanced** page shows the exact arguments this machine's `llama-server` would receive, including
+any flag the installed build does not advertise and would skip. A hand-edited command can be *pinned*,
+and a pinned command REPLACES the generated one rather than being appended to it -- the earlier
+behaviour appended it as extra flags, so every argument appeared twice, the duplication compounded on
+each save, and no tuning field could win against the stale copy at the end. Transient local-runtime
 load responses (HTTP 503/429 and equivalent gateway statuses) are retried
 inside the request timeout, so a large model becoming ready does not immediately appear as a failed
 task.

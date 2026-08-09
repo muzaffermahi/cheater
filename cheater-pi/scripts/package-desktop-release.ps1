@@ -11,10 +11,14 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $packageRoot = Resolve-Path (Join-Path $scriptRoot "..")
-$publishPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $Publish))
-$outPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $Out))
-$nodePath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $NodeExe))
-$setupPath = [System.IO.Path]::GetFullPath((Join-Path $packageRoot $SetupExe))
+function Resolve-PackagePath([string]$Value) {
+  if ([System.IO.Path]::IsPathRooted($Value)) { return [System.IO.Path]::GetFullPath($Value) }
+  return [System.IO.Path]::GetFullPath((Join-Path $packageRoot $Value))
+}
+$publishPath = Resolve-PackagePath $Publish
+$outPath = Resolve-PackagePath $Out
+$nodePath = Resolve-PackagePath $NodeExe
+$setupPath = Resolve-PackagePath $SetupExe
 
 if (-not (Test-Path -LiteralPath $publishPath -PathType Container)) { throw "Desktop publish directory does not exist: $publishPath" }
 if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw "Bundled node.exe does not exist: $nodePath" }

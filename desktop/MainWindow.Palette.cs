@@ -48,7 +48,7 @@ public partial class MainWindow
             new("Undo last run", "Workspace", "roll back to the run's git snapshot", () => Run(UndoLastRun)),
             new("Redo last undo", "Workspace", "re-apply what undo removed", () => Run(RedoLastRun)),
 
-            new("Model settings", "Models", "endpoints, main/sidecar pair, managed runtime", () => Run(ConfigureModels)),
+            new("Settings", "Models", "weights, llama.cpp tuning, behaviour, runtime log", () => Run(ConfigureModels)),
             new("Check models", "Models", "what the endpoint advertises", () => Run(CheckModels)),
             new("Validate models", "Models", "prove the configured pair responds", () => Run(ValidateModels)),
             new("Model health", "Models", "responding, slow/loading, or unavailable", () => Run(ModelHealth)),
@@ -78,8 +78,21 @@ public partial class MainWindow
     /// Submit a real task for `--snapshot --task "…"`. This is the one path that cannot be reviewed from
     /// replayed history: streaming into the open card, tool steps arriving live, Stop becoming available.
     /// </summary>
-    internal void SubmitForSnapshot(string text)
+    internal async void SubmitForSnapshot(string text)
     {
+        Prompt.Text = text;
+        // Wait for BOTH the engine and an active conversation. The fixed four-second delay this used
+        // to rely on was shorter than a cold engine start and shorter still than the conversation
+        // activation that follows it, and Submit silently returns without either — so every captured
+        // frame showed an idle window with the prompt still sitting in the composer, which is the one
+        // state this flag exists to NOT capture.
+        for (var attempt = 0; attempt < 240 && (_engine is null || string.IsNullOrWhiteSpace(_conversationId)); attempt++) await Task.Delay(500);
+        if (_engine is not null && string.IsNullOrWhiteSpace(_conversationId))
+        {
+            // No session to land in: make one rather than capturing nothing.
+            NewTask(this, new RoutedEventArgs());
+            for (var attempt = 0; attempt < 40 && string.IsNullOrWhiteSpace(_conversationId); attempt++) await Task.Delay(500);
+        }
         Prompt.Text = text;
         Submit(this, new RoutedEventArgs());
     }
@@ -89,6 +102,14 @@ public partial class MainWindow
     internal void OpenViewForSnapshot(string view)
     {
         if (_paletteCommands.Count == 0) BuildPalette();
+        // "settings/Performance" opens one settings page. Settings is six screens behind one command,
+        // and a flag that exists so every screen is reviewable has to be able to reach all of them.
+        var slash = view.IndexOf('/');
+        if (slash > 0 && view[..slash].Equals("settings", StringComparison.OrdinalIgnoreCase))
+        {
+            ShowSettings(view[(slash + 1)..].Replace('-', ' '));
+            return;
+        }
         var wanted = view.Replace('-', ' ').Trim();
         var command = _paletteCommands.FirstOrDefault(entry => entry.Title.StartsWith(wanted, StringComparison.OrdinalIgnoreCase))
             ?? _paletteCommands.FirstOrDefault(entry => entry.Title.Contains(wanted, StringComparison.OrdinalIgnoreCase));
@@ -174,6 +195,14 @@ public partial class MainWindow
         if (e.Key == Key.Escape && PaletteOverlay.IsVisible)
         {
             ClosePalette();
+            e.Handled = true;
+            return;
+        }
+        // Settings covers the work area, so Escape has to get out of it — the same way it gets out of
+        // the palette. It is checked second so an open palette on top of settings closes first.
+        if (e.Key == Key.Escape && SettingsHost.IsVisible)
+        {
+            HideSettings();
             e.Handled = true;
         }
     }
@@ -361,7 +390,8 @@ public partial class MainWindow
 
     private void SetChangesSummary(int files, int added, int removed)
     {
-        if (files == 0) { ChangesSummary.Text = "No changes in this run."; return; }
+        // Nothing changed is not news. The section disappears rather than announcing an absence.
+        if (files == 0) { ChangesSummary.Text = ""; return; }
         var counted = files == 1 ? "1 file touched" : $"{files} files touched";
         // Replayed history knows which files changed but not the line deltas; do not print "+0 / -0".
         ChangesSummary.Text = added == 0 && removed == 0 ? counted : $"{counted}  ·  +{added} / -{removed} lines";

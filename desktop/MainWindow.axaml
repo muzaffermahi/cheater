@@ -23,6 +23,8 @@
           </StackPanel>
           <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
             <Button Content="Open project" Click="OpenProject" Classes="tiny" />
+            <Button Name="ContextButton" Content="Activity" Click="ToggleContextDrawer" Classes="tiny" ToolTip.Tip="Show activity, plan, and changes" />
+            <Button Name="SettingsButton" Content="Settings" Click="ToggleSettings" Classes="tiny" />
             <Button Content="Commands  Ctrl+K" Click="ShowCommandPalette" Classes="tiny" />
           </StackPanel>
         </Grid>
@@ -37,22 +39,29 @@
             <TextBox Name="ConversationSearch" Watermark="Search" FontSize="12" Padding="8,5" />
             <Button Grid.Column="1" Content="Find" Click="SearchConversations" Classes="tiny" />
           </Grid>
+          <!-- Sessions, grouped by the folder they work in. A project row and a session row used to
+               render through the same template, so a folder name looked exactly like a task and the
+               grouping was unreadable. They are now visibly different things: the folder is a quiet
+               header with its path underneath, the session is an indented row with its own recency. -->
           <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
-            <StackPanel Spacing="4">
-              <TextBlock Text="SESSIONS" Classes="label" />
-              <!-- Title ellipsised, recency on the right: several sessions in one project usually open
-                   with the same sentence, so the timestamp is what tells them apart. -->
-              <ListBox Name="ConversationList" SelectionChanged="SelectConversation">
-                <ListBox.ItemTemplate>
-                  <DataTemplate>
-                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
-                      <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis" FontSize="12.5" />
-                      <TextBlock Grid.Column="1" Text="{Binding Age}" FontSize="11" Opacity="0.55" VerticalAlignment="Center" />
-                    </Grid>
-                  </DataTemplate>
-                </ListBox.ItemTemplate>
-              </ListBox>
-            </StackPanel>
+            <ListBox Name="ConversationList" SelectionChanged="SelectConversation">
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="7">
+                    <!-- Project header: folder icon + name, and the path it actually points at. -->
+                    <TextBlock Text="📁" FontSize="11" IsVisible="{Binding IsProject}" VerticalAlignment="Center" />
+                    <StackPanel Grid.Column="1" IsVisible="{Binding IsProject}" Spacing="0">
+                      <TextBlock Text="{Binding Display}" FontSize="11.5" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Text="{Binding Detail}" FontSize="10" Opacity="0.45" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                    <!-- Session row: indented under its project, title + recency. -->
+                    <TextBlock Grid.Column="1" IsVisible="{Binding IsSession}" Text="{Binding Display}"
+                               Margin="12,0,0,0" TextTrimming="CharacterEllipsis" FontSize="12.5" VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="2" Text="{Binding Age}" FontSize="10.5" Opacity="0.5" VerticalAlignment="Center" />
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
           </ScrollViewer>
         </Grid>
       </Border>
@@ -79,8 +88,13 @@
         </Border>
 
         <StackPanel Grid.Row="2" Spacing="8" Margin="0,12,0,0">
-          <TextBox Name="Prompt" Watermark="Describe what you want Kitten to do…    @agent objective  ·  Ctrl+Enter to run"
-                   AcceptsReturn="True" MinHeight="86" MaxHeight="220" TextWrapping="Wrap" KeyDown="PromptKeyDown" />
+          <!-- The mascot lives beside the composer, because that is where the eye already is while
+               waiting for an answer — a 26px cat in the far side pane is easy to miss entirely. -->
+          <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10">
+            <ContentControl Grid.Column="0" Name="MascotHost" VerticalAlignment="Center" />
+            <TextBox Grid.Column="1" Name="Prompt" Watermark="What should Kitten do?"
+                     AcceptsReturn="True" MinHeight="86" MaxHeight="220" TextWrapping="Wrap" KeyDown="PromptKeyDown" />
+          </Grid>
           <Grid ColumnDefinitions="Auto,Auto,Auto,*,Auto,Auto">
             <Button Grid.Column="0" Name="RunButton" Content="Run" Click="Submit" Classes="primary" />
             <Button Grid.Column="1" Name="CancelButton" Content="Stop" Click="CancelRun" IsEnabled="False" Margin="8,0,0,0" />
@@ -99,58 +113,62 @@
         </StackPanel>
       </Grid>
 
-      <!-- What the run produced -->
-      <Border Grid.Row="1" Grid.Column="2" Padding="14" Background="{DynamicResource SurfaceBrush}"
+      <!-- Who is working, and what came out of it. Every block here hides itself until it has
+           something true to say: a panel full of "nothing yet" placeholders is noise that teaches
+           people to stop reading it. -->
+      <Border Name="ContextDrawer" Grid.Row="1" Grid.Column="2" Padding="14" Background="{DynamicResource SurfaceBrush}" IsVisible="False"
               BorderBrush="{DynamicResource BorderBrush2}" BorderThickness="1,0,0,0">
         <ScrollViewer VerticalScrollBarVisibility="Auto">
-          <StackPanel Spacing="18">
-            <StackPanel Spacing="6">
-              <Grid ColumnDefinitions="*,Auto">
-                <TextBlock Text="RUN" Classes="label" />
-                <TextBlock Grid.Column="1" Name="RunMeta" Text="" FontSize="11" Classes="muted" />
-              </Grid>
-              <TextBlock Name="Activity" Text="No active run" Classes="body" />
-              <TextBlock Name="RouteLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextWrapping="Wrap" />
-              <!-- The live plan: goal + contract summary + step list with statuses. Hidden until a run
-                   compiles a contract or spawns a task DAG. -->
-              <Border Name="PlanCard" IsVisible="False" Padding="9,8" CornerRadius="6" Background="{DynamicResource Surface2Brush}">
-                <StackPanel Spacing="4">
-                  <TextBlock Name="PlanGoal" Text="" FontSize="12" TextWrapping="Wrap" />
-                  <TextBlock Name="PlanContract" Text="" Classes="muted" FontSize="11" TextWrapping="Wrap" />
-                  <StackPanel Name="PlanSteps" Spacing="2" />
-                  <Button Name="PlanDetailButton" Content="Full contract" Click="ShowCompiledContract" IsVisible="False" Classes="ghost tiny" HorizontalAlignment="Left" />
-                </StackPanel>
-              </Border>
-              <TextBlock Name="CurrentToolLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextTrimming="CharacterEllipsis" />
-              <TextBlock Name="VerificationLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextWrapping="Wrap" />
-              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
-                <Button Name="UndoButton" Content="Undo" Click="UndoLastRun" IsEnabled="False" Classes="tiny" />
-                <Button Name="RedoButton" Content="Redo" Click="RedoLastRun" IsEnabled="False" Classes="tiny" />
-                <Button Name="ResumeButton" Content="Resume" Click="ResumeInterrupted" IsEnabled="False" Classes="tiny" />
-                <Button Name="RetryRunButton" Content="Retry" Click="RetryFailedRun" IsEnabled="False" Classes="tiny" />
-              </StackPanel>
-            </StackPanel>
+          <StackPanel Spacing="14">
+            <!-- The live surface: a ring that turns only while work is genuinely in flight, and one
+                 row per worker (main model, sidecar, each subagent). Built in code by WorkPanel. -->
+            <ContentControl Name="WorkHost" />
 
-            <StackPanel Spacing="6">
+            <TextBlock Name="Activity" Text="" Classes="body" IsVisible="False" TextWrapping="Wrap" />
+            <TextBlock Name="RunMeta" Text="" FontSize="11" Classes="muted" IsVisible="False" />
+            <TextBlock Name="RouteLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextWrapping="Wrap" />
+            <TextBlock Name="CurrentToolLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextTrimming="CharacterEllipsis" />
+
+            <!-- The live plan: goal + contract summary + step list with statuses. -->
+            <Border Name="PlanCard" IsVisible="False" Padding="10,9" CornerRadius="7" Background="{DynamicResource Surface2Brush}">
+              <StackPanel Spacing="5">
+                <TextBlock Name="PlanGoal" Text="" FontSize="12" TextWrapping="Wrap" />
+                <TextBlock Name="PlanContract" Text="" Classes="muted" FontSize="11" TextWrapping="Wrap" />
+                <StackPanel Name="PlanSteps" Spacing="2" />
+                <Button Name="PlanDetailButton" Content="Contract" Click="ShowCompiledContract" IsVisible="False" Classes="ghost tiny" HorizontalAlignment="Left" />
+              </StackPanel>
+            </Border>
+
+            <TextBlock Name="VerificationLine" Text="" Classes="muted" FontSize="11.5" IsVisible="False" TextWrapping="Wrap" />
+
+            <StackPanel Name="EvidenceSection" Spacing="5" IsVisible="False">
               <TextBlock Text="EVIDENCE" Classes="label" />
-              <TextBlock Name="Evidence" Text="Verified receipts appear here after a run." Classes="body" />
-              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
+              <TextBlock Name="Evidence" Text="" Classes="body" />
+              <StackPanel Orientation="Horizontal" Spacing="6">
                 <Button Name="RunChecksButton" Content="Run checks" Click="RunSuggestedChecks" IsEnabled="False" Classes="tiny" />
-                <Button Name="CancelChecksButton" Content="Stop checks" Click="CancelSuggestedChecks" IsEnabled="False" Classes="tiny" />
+                <Button Name="CancelChecksButton" Content="Stop" Click="CancelSuggestedChecks" IsEnabled="False" Classes="tiny" />
               </StackPanel>
             </StackPanel>
 
-            <StackPanel Spacing="6">
+            <StackPanel Name="ChangesSection" Spacing="5" IsVisible="False">
               <TextBlock Text="CHANGES" Classes="label" />
-              <TextBlock Name="ChangesSummary" Text="No changes in this run." Classes="body" />
-              <StackPanel Orientation="Horizontal" Spacing="6" Margin="0,4,0,0">
+              <TextBlock Name="ChangesSummary" Text="" Classes="body" />
+              <StackPanel Orientation="Horizontal" Spacing="6">
                 <Button Content="Review diff" Click="OpenWorkspaceChanges" Classes="tiny" />
                 <Button Content="Files" Click="OpenWorkspaceExplorer" Classes="tiny" />
               </StackPanel>
             </StackPanel>
 
+            <!-- Run actions appear only once one of them can actually do something. -->
+            <StackPanel Name="RunActions" Orientation="Horizontal" Spacing="6" IsVisible="False">
+              <Button Name="UndoButton" Content="Undo" Click="UndoLastRun" IsEnabled="False" Classes="tiny" />
+              <Button Name="RedoButton" Content="Redo" Click="RedoLastRun" IsEnabled="False" Classes="tiny" />
+              <Button Name="ResumeButton" Content="Resume" Click="ResumeInterrupted" IsEnabled="False" Classes="tiny" />
+              <Button Name="RetryRunButton" Content="Retry" Click="RetryFailedRun" IsEnabled="False" Classes="tiny" />
+            </StackPanel>
+
             <!-- Only shown while a bakeoff is in flight or has a report to open. -->
-            <StackPanel Name="BakeoffSection" Spacing="6" IsVisible="False">
+            <StackPanel Name="BakeoffSection" Spacing="5" IsVisible="False">
               <TextBlock Text="MODEL BAKEOFF" Classes="label" />
               <StackPanel Orientation="Horizontal" Spacing="6">
                 <Button Name="CancelBakeoffButton" Content="Stop" Click="CancelModelBakeoff" IsEnabled="False" Classes="tiny" />
@@ -161,6 +179,11 @@
           </StackPanel>
         </ScrollViewer>
       </Border>
+
+      <!-- Settings. A place, not a pop-up: it takes the work area, keeps the header and status line
+           visible, and its own left rail names the groups. Populated in code (SettingsView). -->
+      <Border Name="SettingsHost" Grid.Row="1" Grid.ColumnSpan="3" IsVisible="False"
+              Background="{DynamicResource BaseBrush}" />
 
       <!-- Status line -->
       <Border Grid.Row="2" Grid.ColumnSpan="3" Padding="14,6" Background="{DynamicResource SurfaceBrush}"
@@ -177,13 +200,13 @@
             <Ellipse Name="RuntimeDot" Width="7" Height="7" Fill="{DynamicResource WarnBrush}" VerticalAlignment="Center" />
             <TextBlock Name="RuntimeText" Text="model: checking…" FontSize="11.5" Classes="muted" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="380" />
             <Button Name="RuntimeActionButton" Content="Start runtime" Click="StartRuntime" IsVisible="False" Classes="ghost tiny" />
-            <Button Content="Runtime…" Click="ShowRuntimePanel" Classes="ghost tiny" />
+            <Button Content="Runtime log" Click="ShowRuntimePanel" Classes="ghost tiny" />
           </StackPanel>
           <TextBlock Grid.Column="3" Text="·" Classes="muted" FontSize="11.5" Margin="8,0" VerticalAlignment="Center" />
           <TextBlock Grid.Column="4" Name="ModelText" Text="Models: checking…" FontSize="11.5" Classes="muted"
                      VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-          <TextBlock Grid.Column="5" Text="Ctrl+K commands   ·   Ctrl+Enter run   ·   Esc stop" FontSize="11" Classes="muted"
-                     Opacity="0.7" VerticalAlignment="Center" />
+          <TextBlock Grid.Column="5" Text="Ctrl+K   ·   Ctrl+Enter   ·   Esc" FontSize="10.5" Classes="muted"
+                     Opacity="0.45" VerticalAlignment="Center" />
         </Grid>
       </Border>
     </Grid>

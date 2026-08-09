@@ -9,6 +9,9 @@ public sealed class EngineProcess : IDisposable
     public void Start(string? projectRoot = null)
     {
         if (_process is { HasExited: false }) return;
+        // An engine that died without cleaning up leaves its token file behind. Clear it before the
+        // new one starts, or a client can read the dead engine's secret and present it to this one.
+        EngineClient.ClearStaleInfo();
         var engineRoot = Path.Combine(AppContext.BaseDirectory, "engine");
         var executable = Path.Combine(engineRoot, "kitten-desktop-engine.exe");
         var info = File.Exists(executable)

@@ -28,6 +28,10 @@ public sealed class TranscriptView
     private string _streamingText = "";
     private bool _thinking;
     private Border? _streamingBorder;
+    private Border? _reasoningPanel;
+    private SelectableTextBlock? _reasoningBody;
+    private TextBlock? _reasoningToggle;
+    private readonly System.Text.StringBuilder _reasoningText = new();
 
     /// <summary>Live tool cards keyed by callId: a spinner while running, swapped for ✓/✗ on completion.</summary>
     private sealed class ToolCardHandle
@@ -299,15 +303,92 @@ public sealed class TranscriptView
         _streamingBorder = card.border;
         _streamingText = "";
         _thinking = false;
+        _reasoningText.Clear();
+        _reasoningBody = null;
+        _reasoningPanel = null;
+        _reasoningToggle = null;
         // Seed the card as thinking straight away. A local 35B can take half a minute to produce its
         // first token, and an empty card for that long looks like the app has stalled.
         MarkThinking();
+    }
+
+    /// <summary>
+    /// The model's reasoning, as it arrives. This used to be discarded — the code literally said "the
+    /// reasoning itself is never shown" — so a reasoning model spent the first minute of every turn
+    /// behind the word "thinking…" while the one thing that would tell you whether it understood the
+    /// task was being thrown away. It is the model's actual work; it belongs on screen.
+    ///
+    /// It opens expanded while it streams, because that is when it is worth watching, and collapses
+    /// itself once the answer starts, because by then the answer is the thing you want.
+    /// </summary>
+    public void AppendReasoning(string delta)
+    {
+        if (string.IsNullOrEmpty(delta)) return;
+        if (_streamingCard is null) BeginAssistant("Kitten");
+        if (_streamingCard is null) return;
+        _reasoningText.Append(delta);
+        if (_reasoningPanel is null)
+        {
+            // Clear the "thinking…" placeholder: the real thing is about to replace it.
+            if (_thinking && _streamingBody is not null) { _streamingBody.Text = ""; _thinking = false; }
+
+            _reasoningToggle = new TextBlock
+            {
+                Text = "▾  thinking", FontSize = 11, Foreground = Faint, Cursor = new Avalonia.Input.Cursor(Avalonia.Input.StandardCursorType.Hand),
+            };
+            _reasoningBody = new SelectableTextBlock
+            {
+                Text = "", FontSize = 11.5, FontFamily = Mono, Foreground = Faint,
+                TextWrapping = TextWrapping.Wrap, LineHeight = 17,
+            };
+            var scroller = new ScrollViewer
+            {
+                MaxHeight = 190, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Content = _reasoningBody,
+            };
+            _reasoningPanel = new Border
+            {
+                Margin = new Thickness(0, 0, 0, 8), Padding = new Thickness(10, 7), CornerRadius = new CornerRadius(6),
+                Background = new SolidColorBrush(Color.Parse("#0e0e12")),
+                BorderBrush = new SolidColorBrush(Color.Parse("#1e1e26")), BorderThickness = new Thickness(1),
+                Child = new StackPanel { Spacing = 5, Children = { _reasoningToggle, scroller } },
+            };
+            var expanded = true;
+            _reasoningToggle.PointerPressed += (_, _) =>
+            {
+                expanded = !expanded;
+                scroller.IsVisible = expanded;
+                _reasoningToggle.Text = (expanded ? "▾  thinking" : "▸  thinking") + ReasoningCount();
+            };
+            _streamingCard.Children.Insert(0, _reasoningPanel);
+        }
+        if (_reasoningBody is not null)
+        {
+            _reasoningBody.Text = _reasoningText.ToString();
+            if (_reasoningToggle?.Text is { } label && label.StartsWith('▾')) _reasoningToggle.Text = "▾  thinking" + ReasoningCount();
+        }
+        ScrollToEnd();
+    }
+
+    private string ReasoningCount()
+    {
+        // Words, not tokens: the shell cannot tokenise, and a made-up token count would be a lie.
+        var words = _reasoningText.ToString().Split(' ', '\n').Count(part => part.Length > 0);
+        return words > 0 ? $"  ·  {words:n0} words" : "";
+    }
+
+    /// <summary>Collapse the reasoning once real output starts — it has served its purpose by then.</summary>
+    private void CollapseReasoning()
+    {
+        if (_reasoningPanel?.Child is not StackPanel panel || _reasoningToggle is null) return;
+        foreach (var child in panel.Children) if (child is ScrollViewer viewer) viewer.IsVisible = false;
+        _reasoningToggle.Text = "▸  thinking" + ReasoningCount();
     }
 
     public void AppendAssistant(string delta)
     {
         if (string.IsNullOrEmpty(delta)) return;
         if (_streamingBody is null) BeginAssistant("Kitten");
+        if (_streamingText.Length == 0) CollapseReasoning();
         _streamingText += delta;
         if (_streamingBody is not null)
         {
@@ -326,7 +407,7 @@ public sealed class TranscriptView
     /// </summary>
     public void MarkThinking()
     {
-        if (_thinking || _streamingText.Length > 0 || _streamingBody is null) return;
+        if (_thinking || _streamingText.Length > 0 || _streamingBody is null || _reasoningPanel is not null) return;
         _thinking = true;
         _streamingBody.Text = "thinking…";
         _streamingBody.Foreground = Faint;
@@ -342,7 +423,8 @@ public sealed class TranscriptView
         var text = string.IsNullOrWhiteSpace(finalText) ? _streamingText : finalText!;
         // A turn that only called tools produces no prose. Drop the card rather than leaving an empty
         // one — or worse, one still reading "thinking…" after the turn is over.
-        if (string.IsNullOrWhiteSpace(text) && _streamingBorder is not null)
+        // A card carrying reasoning is never empty: the thinking IS content worth keeping.
+        if (string.IsNullOrWhiteSpace(text) && _reasoningText.Length == 0 && _streamingBorder is not null)
         {
             _host.Children.Remove(_streamingBorder);
             _streamingBorder = null;
@@ -352,15 +434,23 @@ public sealed class TranscriptView
             _thinking = false;
             return;
         }
+        CollapseReasoning();
         if (_streamingCard is not null)
         {
+            // Re-render the prose, but keep the collapsed reasoning at the top of the card.
+            var keptReasoning = _reasoningPanel;
             _streamingCard.Children.Clear();
+            if (keptReasoning is not null) _streamingCard.Children.Add(keptReasoning);
             foreach (var block in RenderBody(text)) _streamingCard.Children.Add(block);
         }
         _streamingBody = null;
         _streamingCard = null;
         _streamingText = "";
         _thinking = false;
+        _reasoningPanel = null;
+        _reasoningBody = null;
+        _reasoningToggle = null;
+        _reasoningText.Clear();
         ScrollToEnd();
     }
 
