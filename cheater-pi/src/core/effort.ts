@@ -7,8 +7,9 @@
 // it starts failing. Only "think-hard" actively forces coverage (ascent, decomposition, web).
 //
 // Wall-clock honesty (measured on the dev box, ornith-35B on an 8 GB card): one ascent candidate is
-// roughly 3–5 min; k=2 with verification measured ~10 min end-to-end. The ceilings below are HARD
-// bounds enforced by the BudgetGovernor — think-hard finishes with what it has at 45 min.
+// Token budgets still bound runaway multi-candidate work, but there is deliberately NO wall-clock
+// ceiling. A local model may spend longer than ten minutes prefilling or reasoning; elapsed time is
+// not evidence that the task should be killed.
 
 import type { Lane } from "./events.js";
 import type { ComputeCeiling } from "./budget.js";
@@ -59,7 +60,11 @@ export const EFFORT_PROFILES: Record<EffortLevel, EffortProfile> = {
     autoDecompose: false,
     scoutFiles: 2,
     webEnabled: false,
-    ceiling: { maxTokens: 60_000, maxWallMs: 3 * 60_000 },
+    // Three minutes was a hard stop, not a useful fast target: the observed Fast run spent its
+    // opening ten turns on Windows cwd probes and was killed at exactly 180s before its first write.
+    // Keep Fast bounded, but give one local generation enough time to recover from a cold/prefill
+    // stall and finish a real small build. Balanced remains the next escalation level.
+    ceiling: { maxTokens: 60_000 },
     contextWindowFraction: 0.5,
   },
   balanced: {
@@ -74,7 +79,7 @@ export const EFFORT_PROFILES: Record<EffortLevel, EffortProfile> = {
     autoDecompose: false,
     scoutFiles: 4,
     webEnabled: true,
-    ceiling: { maxTokens: 250_000, maxWallMs: 10 * 60_000 },
+    ceiling: { maxTokens: 250_000 },
     contextWindowFraction: 1,
   },
   careful: {
@@ -89,7 +94,7 @@ export const EFFORT_PROFILES: Record<EffortLevel, EffortProfile> = {
     autoDecompose: false,
     scoutFiles: 4,
     webEnabled: true,
-    ceiling: { maxTokens: 500_000, maxWallMs: 20 * 60_000 },
+    ceiling: { maxTokens: 500_000 },
     contextWindowFraction: 1,
   },
   "think-hard": {
@@ -99,12 +104,12 @@ export const EFFORT_PROFILES: Record<EffortLevel, EffortProfile> = {
     kFloor: 3, kCap: 4,
     maxRepairRounds: 4,
     maxTurns: 80,
-    reasoningBudget: undefined, // model default = unlimited thinking
+    reasoningBudget: undefined, // model default = unlimited thinking; role profiles apply an explicit ceiling when selected
     subagentMaxConcurrent: 3,
     autoDecompose: true,
     scoutFiles: 6,
     webEnabled: true,
-    ceiling: { maxTokens: 1_200_000, maxWallMs: 45 * 60_000 },
+    ceiling: { maxTokens: 1_200_000 },
     contextWindowFraction: 1,
   },
 };
@@ -115,24 +120,13 @@ export function resolveEffort(value: unknown): EffortLevel {
 }
 
 /**
- * Resolve the profile, honouring an explicit wall-clock override.
- *
- * The four levels are spaced for interactive use (3 / 10 / 20 / 45 min), which leaves no way to fit
- * a run inside an *external* deadline that falls between them. Terminal-Bench is the case that
- * forced this: it kills the agent at 900 s, so `balanced` (600 s) wastes 300 s of usable budget on
- * every task while `careful` (1200 s) overshoots and gets killed with nothing written at all.
- *
- * `KITTEN_CEILING_MS` sets the wall-clock ceiling directly and leaves every other lever of the
- * chosen level alone. Anything non-positive or unparseable is ignored rather than treated as zero —
- * a ceiling of 0 would abort instantly, the same trap as `reasoningBudget: 0` disabling thinking.
+ * Resolve the profile. Wall-clock ceilings are intentionally ignored: Kitten must not terminate a
+ * user session because a local model crossed an elapsed-time threshold.
  */
 export function effortProfile(value: unknown, env: NodeJS.ProcessEnv = process.env): EffortProfile {
   const base = EFFORT_PROFILES[resolveEffort(value)];
-  const raw = env.KITTEN_CEILING_MS?.trim();
-  if (!raw) return base;
-  const ms = Number(raw);
-  if (!Number.isFinite(ms) || ms <= 0) return base;
-  return { ...base, ceiling: { ...base.ceiling, maxWallMs: ms } };
+  void env;
+  return base;
 }
 
 /** One-line human description per level (surfaced as a hint next to the control). */

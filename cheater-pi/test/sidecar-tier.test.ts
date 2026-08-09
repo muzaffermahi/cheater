@@ -4,11 +4,11 @@ import { tierSidecar, type KittenModels } from "../src/core/llm.js";
 
 const base: KittenModels = { baseUrl: "", main: "ornith-1.0-35b", sidecar: "qwen3.5-2b" };
 
-test("tierSidecar tiers the sidecar cheap on a cloud endpoint", () => {
+test("tierSidecar is a compatibility no-op on a cloud endpoint", () => {
   const saved = process.env.KITTEN_SIDECAR_MODEL;
   delete process.env.KITTEN_SIDECAR_MODEL;
   const cloud = tierSidecar({ ...base, baseUrl: "https://ws-x.maas.aliyuncs.com/compatible-mode/v1" });
-  assert.equal(cloud.sidecar, "qwen3-8b", "cloud → cheap sidecar (mechanical jobs don't need the full model)");
+  assert.equal(cloud.sidecar, "qwen3.5-2b", "legacy explicit sidecar settings are preserved but never auto-created");
   if (saved) process.env.KITTEN_SIDECAR_MODEL = saved;
 });
 

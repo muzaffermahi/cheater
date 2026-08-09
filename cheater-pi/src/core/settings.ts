@@ -10,6 +10,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { DEFAULT_MODELS, type KittenModels } from "./llm.js";
+import { looksLikeGeneratedCommand, resolveServerBinary } from "./modelRuntime.js";
 
 export type ApprovalPolicy = "ask" | "auto-allow" | "auto-deny";
 
@@ -28,17 +29,35 @@ export interface ManagedRuntimeSettings {
 export interface RuntimeTuningSettings {
   /** --n-gpu-layers: "auto" = offload everything that fits (999); a number is passed verbatim (0 = CPU). */
   gpuLayers?: number | "auto";
-  /** --cpu-moe --no-mmap: "auto" = only when the weights dwarf VRAM; "on"/"off" force it. */
+  /** --cpu-moe / --n-cpu-moe: "auto" = only when the weights dwarf VRAM; "on"/"off" force it. */
   cpuMoe?: "auto" | "on" | "off";
+  /** How many leading layers keep their experts on the CPU. "auto" computes the minimum that fits,
+   *  "all" is the blanket --cpu-moe, a number is --n-cpu-moe N. */
+  cpuMoeLayers?: number | "all" | "auto";
   /** --flash-attn: "auto" = on for any GPU backend. */
   flashAttn?: "auto" | "on" | "off";
   /** --cache-type-k/v. "f16" is llama.cpp's default quality; "q8_0" halves KV memory (Kitten's auto). */
   kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  /** --no-kv-offload when "off": the KV cache stays in system RAM. */
+  kvOffload?: "auto" | "on" | "off";
+  /** --threads / --batch-size / --ubatch-size. "auto" leaves llama.cpp's own defaults alone. */
+  threads?: number | "auto";
+  batchSize?: number | "auto";
+  ubatchSize?: number | "auto";
+  /** --load-mode: mmap/mlock behaviour. "auto" lets the launch plan decide. */
+  loadMode?: "auto" | "none" | "mmap" | "mlock" | "mmap+mlock";
+  /** --main-gpu / --tensor-split for multi-GPU machines. */
+  mainGpu?: number | "auto";
+  tensorSplit?: string;
   /** Where the sidecar model lives: "cpu" (default — RAM, real parallelism with the GPU-bound main
    *  model) or "gpu" (contends with the main model's VRAM). */
   sidecarDevice?: "cpu" | "gpu";
   /** Raw extra flags appended verbatim at the end of the llama-server command (last wins). */
   extraArgs?: string;
+  /** A complete command line that REPLACES the generated one. Empty means "use the plan". */
+  argsOverride?: string;
+  parallelSlots?: number | "auto";
+  speculation?: "auto" | "ngram" | "mtp" | "off";
 }
 
 /** Task Compiler rollout switch. `off` restores pre-compiler behavior byte for byte, which is what
@@ -58,6 +77,7 @@ export interface KittenSettings {
   /** Web tool reach: "open" (any http(s) site behind the SSRF floor — the default), "allowlist"
    *  (reference-doc hosts only), or "off". */
   webAccess: "allowlist" | "open" | "off";
+  fastPath: "auto" | "off";
   /** Config files that were merged (for `kitten doctor` transparency). */
   sources: string[];
   /** Non-fatal problems (unknown keys, unreadable files) to surface in doctor. */
@@ -77,34 +97,57 @@ export interface SettingsUpdate {
   sidecarModelPath?: string;
   taskCompiler?: TaskCompilerFlag;
   webAccess?: "allowlist" | "open" | "off";
+  fastPath?: "auto" | "off";
   gpuLayers?: number | "auto";
   cpuMoe?: "auto" | "on" | "off";
+  cpuMoeLayers?: number | "all" | "auto";
   flashAttn?: "auto" | "on" | "off";
   kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  kvOffload?: "auto" | "on" | "off";
+  threads?: number | "auto";
+  batchSize?: number | "auto";
+  ubatchSize?: number | "auto";
+  loadMode?: "auto" | "none" | "mmap" | "mlock" | "mmap+mlock";
+  mainGpu?: number | "auto";
+  tensorSplit?: string;
   sidecarDevice?: "cpu" | "gpu";
   extraArgs?: string;
+  argsOverride?: string;
+  parallelSlots?: number | "auto";
+  speculation?: "auto" | "ngram" | "mtp" | "off";
 }
 
 const KNOWN_KEYS = new Set([
   "baseUrl", "sidecarBaseUrl", "mainModel", "sidecarModel", "embedModel", "apiKey",
   "approvalPolicy", "contextWindowTokens",
   "runtimeExecutable", "mainModelPath", "sidecarModelPath",
-  "taskCompiler", "webAccess",
-  "gpuLayers", "cpuMoe", "flashAttn", "kvCacheType", "sidecarDevice", "extraArgs",
+  "taskCompiler", "webAccess", "fastPath",
+  "gpuLayers", "cpuMoe", "cpuMoeLayers", "flashAttn", "kvCacheType", "kvOffload",
+  "threads", "batchSize", "ubatchSize", "loadMode", "mainGpu", "tensorSplit",
+  "sidecarDevice", "extraArgs", "argsOverride", "parallelSlots", "speculation",
 ]);
 
 interface RawConfig {
   baseUrl?: string; sidecarBaseUrl?: string; mainModel?: string; sidecarModel?: string; embedModel?: string; apiKey?: string;
   approvalPolicy?: string; contextWindowTokens?: number | string;
   runtimeExecutable?: string; mainModelPath?: string; sidecarModelPath?: string;
-  taskCompiler?: string; webAccess?: string;
-  gpuLayers?: number | string; cpuMoe?: string; flashAttn?: string; kvCacheType?: string; sidecarDevice?: string; extraArgs?: string;
+  taskCompiler?: string; webAccess?: string; fastPath?: string;
+  gpuLayers?: number | string; cpuMoe?: string; cpuMoeLayers?: number | string;
+  flashAttn?: string; kvCacheType?: string; kvOffload?: string;
+  threads?: number | string; batchSize?: number | string; ubatchSize?: number | string;
+  loadMode?: string; mainGpu?: number | string; tensorSplit?: string;
+  sidecarDevice?: string; extraArgs?: string; argsOverride?: string; parallelSlots?: number | string; speculation?: string;
 }
 
 function readConfig(path: string, warnings: string[]): RawConfig | null {
   if (!existsSync(path)) return null;
   try {
-    const data = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    // Strip a UTF-8 BOM before parsing. Every PowerShell way of writing a file — `Out-File`,
+    // `Set-Content -Encoding utf8`, `>` — prepends one, so a config edited or generated from a
+    // Windows shell parses as invalid JSON and the WHOLE file is discarded. The symptom is the worst
+    // kind: settings that appear to save and then have no effect, endpoint, weights and llama.cpp
+    // tuning alike, with the reason buried in a doctor warning nobody reads.
+    const data = JSON.parse(readFileSync(path, "utf8").replace(/^﻿/, "")) as Record<string, unknown>;
     for (const k of Object.keys(data)) {
       if (!KNOWN_KEYS.has(k)) warnings.push(`config ${path}: unknown key "${k}" (ignored)`);
     }
@@ -174,12 +217,24 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
     sidecarModelPath: undefined,
     taskCompiler: envStr("KITTEN_TASK_COMPILER"),
     webAccess: envStr("KITTEN_WEB_ACCESS"),
+    fastPath: envStr("KITTEN_FAST_PATH"),
     gpuLayers: envStr("KITTEN_GPU_LAYERS"),
     cpuMoe: envStr("KITTEN_CPU_MOE"),
+    cpuMoeLayers: envStr("KITTEN_CPU_MOE_LAYERS"),
     flashAttn: envStr("KITTEN_FLASH_ATTN"),
     kvCacheType: envStr("KITTEN_KV_CACHE_TYPE"),
+    kvOffload: envStr("KITTEN_KV_OFFLOAD"),
+    threads: envStr("KITTEN_THREADS"),
+    batchSize: envStr("KITTEN_BATCH_SIZE"),
+    ubatchSize: envStr("KITTEN_UBATCH_SIZE"),
+    loadMode: envStr("KITTEN_LOAD_MODE"),
+    mainGpu: envStr("KITTEN_MAIN_GPU"),
+    tensorSplit: envStr("KITTEN_TENSOR_SPLIT"),
     sidecarDevice: envStr("KITTEN_SIDECAR_DEVICE"),
     extraArgs: envStr("KITTEN_RUNTIME_EXTRA_ARGS"),
+    argsOverride: envStr("KITTEN_RUNTIME_ARGS_OVERRIDE"),
+    parallelSlots: envStr("KITTEN_PARALLEL_SLOTS"),
+    speculation: envStr("KITTEN_SPECULATION"),
   };
   const pick = <K extends keyof RawConfig>(k: K): RawConfig[K] =>
     (env[k] as RawConfig[K]) ?? (project?.[k]) ?? (user?.[k]);
@@ -221,18 +276,50 @@ export function loadKittenSettings(cwd = process.cwd()): KittenSettings {
 
   const oneOf = <T extends string>(value: unknown, allowed: readonly T[], fallback: T): T =>
     typeof value === "string" && (allowed as readonly string[]).includes(value) ? value as T : fallback;
-  const rawGpuLayers = pick("gpuLayers");
+  // A count reaches us as a number from a config file and as a string from the environment; both are
+  // valid, and anything else falls back to "auto" rather than to a silently wrong number.
+  const count = (value: unknown): number | "auto" =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value)
+      : typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value.trim()) : "auto";
+  const rawCpuMoeLayers = pick("cpuMoeLayers");
   const runtimeTuning: RuntimeTuningSettings = {
-    gpuLayers: typeof rawGpuLayers === "number" && Number.isFinite(rawGpuLayers) && rawGpuLayers >= 0 ? Math.floor(rawGpuLayers)
-      : typeof rawGpuLayers === "string" && /^\d+$/.test(rawGpuLayers) ? Number(rawGpuLayers) : "auto",
+    gpuLayers: count(pick("gpuLayers")),
     cpuMoe: oneOf(pick("cpuMoe"), ["auto", "on", "off"] as const, "auto"),
+    cpuMoeLayers: rawCpuMoeLayers === "all" ? "all" : count(rawCpuMoeLayers),
     flashAttn: oneOf(pick("flashAttn"), ["auto", "on", "off"] as const, "auto"),
     kvCacheType: oneOf(pick("kvCacheType"), ["auto", "q8_0", "f16", "q4_0"] as const, "auto"),
+    kvOffload: oneOf(pick("kvOffload"), ["auto", "on", "off"] as const, "auto"),
+    threads: count(pick("threads")),
+    batchSize: count(pick("batchSize")),
+    ubatchSize: count(pick("ubatchSize")),
+    loadMode: oneOf(pick("loadMode"), ["auto", "none", "mmap", "mlock", "mmap+mlock"] as const, "auto"),
+    mainGpu: count(pick("mainGpu")),
+    tensorSplit: typeof pick("tensorSplit") === "string" ? String(pick("tensorSplit")).trim() : "",
     sidecarDevice: oneOf(pick("sidecarDevice"), ["cpu", "gpu"] as const, "cpu"),
     extraArgs: typeof pick("extraArgs") === "string" ? String(pick("extraArgs")).trim() : "",
+    argsOverride: typeof pick("argsOverride") === "string" ? String(pick("argsOverride")).trim() : "",
+    parallelSlots: count(pick("parallelSlots")),
+    speculation: oneOf(pick("speculation"), ["auto", "ngram", "mtp", "off"] as const, "auto"),
   };
+  // Heal a config an older build corrupted. Its runtime panel saved the whole generated command into
+  // extraArgs, which appends LAST — so `--model <model id>` beat the real `--model <weights path>`
+  // and llama.cpp went looking for a file named after the model. Dropping it restores the launch;
+  // saying so is the difference between a fix and a mystery.
+  if (looksLikeGeneratedCommand(runtimeTuning.extraArgs)) {
+    warnings.push("Extra llama-server flags contained a whole generated command (an earlier version saved one there, which broke every launch by overriding the weights path). It has been ignored — re-add just the flags you want under Settings, Advanced.");
+    runtimeTuning.extraArgs = "";
+  }
+  // A runtime path may point at the FOLDER the server lives in. Resolve it to the binary rather than
+  // failing at spawn with an OS error.
+  const resolvedBinary = resolveServerBinary(managedRuntime.executable);
+  if (managedRuntime.executable && resolvedBinary && resolvedBinary !== managedRuntime.executable) {
+    managedRuntime.executable = resolvedBinary;
+  }
 
-  return { models, managedRuntime, runtimeTuning, approvalPolicy, contextWindowTokens, taskCompiler, webAccess, sources, warnings };
+  const rawFastPath = pick("fastPath");
+  const fastPath: KittenSettings["fastPath"] = rawFastPath === "off" ? "off" : "auto";
+  if (rawFastPath && rawFastPath !== fastPath) warnings.push(`fastPath "${rawFastPath}" is not one of auto|off — using "auto"`);
+  return { models, managedRuntime, runtimeTuning, approvalPolicy, contextWindowTokens, taskCompiler, webAccess, fastPath, sources, warnings };
 }
 
 /** Persist non-secret app settings atomically. API keys remain environment/config-file only. */
@@ -243,7 +330,9 @@ export function saveKittenSettings(update: SettingsUpdate, scope: "user" | "proj
   let current: Record<string, unknown> = {};
   if (existsSync(path)) {
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      // Same BOM tolerance as the read path — without it, saving ONE setting into a PowerShell-written
+      // config threw the whole file away and rewrote it with just that setting.
+      const parsed = JSON.parse(readFileSync(path, "utf8").replace(/^﻿/, ""));
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) current = parsed as Record<string, unknown>;
     } catch { /* overwrite malformed config with the explicit app update */ }
   }

@@ -168,10 +168,36 @@ export interface ToolCompleted {
   output: string;
 }
 
+/** One bounded model-call timing record; optional for older providers without llama.cpp timings. */
+export interface InferenceCompleted {
+  type: "inference.completed";
+  runId: string;
+  role: string;
+  cacheTokens: number;
+  promptTokens: number;
+  promptMs: number;
+  predictedTokens: number;
+  predictedMs: number;
+  decodeTokensPerSecond: number;
+  /** Truthful Runtime Director acknowledgement; optional for pre-director persisted events. */
+  runtimeReceipt?: {
+    phase: string;
+    role: string;
+    ownership: "managed-native" | "external-compatible";
+    evidence: "verified" | "sent-only";
+    requested: Record<string, unknown>;
+    applied: Record<string, unknown>;
+    dropped: string[];
+    unverifiable: string[];
+  };
+}
+
 export interface CandidateStarted {
   type: "candidate.started";
   runId: string;
   index: number;
+  /** The candidate whose reasoning and tool calls are being streamed live. */
+  lead?: boolean;
 }
 export interface CandidateCompleted {
   type: "candidate.completed";
@@ -265,6 +291,19 @@ export interface RunCompleted {
   summary: string;
   wallMs: number;
   usage: { prompt: number; completion: number; reasoning: number };
+  /** The engine's effort timer ended the run; the user did not press Stop. */
+  stoppedByCeiling?: boolean;
+  executionStrategy?: "compiled-fast" | "compiled-fast-to-reliable" | "agent";
+  performance?: {
+    modelCalls: number;
+    cacheTokens: number;
+    promptTokens: number;
+    promptMs: number;
+    predictedTokens: number;
+    predictedMs: number;
+    decodeTokensPerSecond: number;
+    effectiveOutputRate: number;
+  };
 }
 
 /** A run's file changes were rolled back by `/undo` (Goal §8). Records what was reverted/deleted. */
@@ -410,6 +449,17 @@ export interface PlanUpdated {
   reason?: string;
   steps: Array<{ id: string; label: string; status: string; dependsOn: string[]; agent?: string }>;
 }
+
+/** Immutable user-facing plan lifecycle. The revision/hash pair is the approval boundary. */
+export interface PlanLifecycle {
+  type: "plan.created" | "plan.revised" | "plan.approved" | "plan.started" | "plan.drifted" | "plan.completed" | "plan.cancelled";
+  runId: string;
+  planId: string;
+  revision: number;
+  hash: string;
+  status: string;
+  detail?: string;
+}
 /** A plan step began executing (task-graph source only). */
 export interface StepStarted {
   type: "step.started";
@@ -456,6 +506,7 @@ export type EventPayload =
   | ToolStarted
   | ToolOutput
   | ToolCompleted
+  | InferenceCompleted
   | CandidateStarted
   | CandidateCompleted
   | CandidateRejected
@@ -482,6 +533,7 @@ export type EventPayload =
   | TaskClarificationRequested
   | RunStepCritique
   | PlanUpdated
+  | PlanLifecycle
   | StepStarted
   | StepCompleted
   | WorkspaceVerification;
@@ -501,6 +553,16 @@ export interface EventEnvelope {
 }
 
 export type KittenEvent = EventEnvelope & EventPayload;
+
+/**
+ * Events that are broadcast to live listeners but never written to the durable log.
+ *
+ * Reasoning is the only member today, and it qualifies on its own terms: the renderer contract says
+ * it is "streamed live, not replayed", so every row written for it is disk spent on something no
+ * reader will ever ask for. Keeping it out of the log is also what makes a fine-grained stream
+ * affordable — the coarse 300-character flush existed to protect the store, not the reader.
+ */
+export const TRANSIENT_EVENTS: ReadonlySet<string> = new Set(["reasoning.delta"]);
 
 /** Derive the canonical event id from its coordinates. */
 export function eventId(conversationId: string, seq: number): string {

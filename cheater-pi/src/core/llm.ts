@@ -1,5 +1,7 @@
 // Kitten Core — the standalone LM Studio provider. NO Pi.
 //
+import type { InferenceCapabilities } from "./inferenceProfiles.js";
+
 // This is the "own the inference engine" layer: a direct OpenAI-compatible HTTP client for the
 // local LM Studio server, talking to three models at once —
 //   - MAIN (ornith-1.0-35b): a reasoning model on the GPU. Emits `reasoning_content` separately
@@ -18,7 +20,7 @@ export interface KittenModels {
   /** Optional separate OpenAI-compatible endpoint for the small sidecar runtime. */
   sidecarBaseUrl?: string;
   main: string;
-  /** Optional fast clerical model. Absent on a single-model endpoint → sidecar work runs on `main`. */
+  /** Legacy compatibility field. Kitten no longer provisions a second model; omitted by default. */
   sidecar?: string;
   embed?: string;
   /** Bearer token. Defaults to "lm-studio" (LM Studio ignores it); a real key for a cloud endpoint. */
@@ -30,7 +32,9 @@ export interface KittenModels {
 export const DEFAULT_MODELS: KittenModels = {
   baseUrl: process.env.KITTEN_BASE_URL || "http://localhost:1234/v1",
   main: process.env.KITTEN_MAIN_MODEL || "ornith-1.0-35b",
-  sidecar: process.env.KITTEN_SIDECAR_MODEL || "qwen3.5-2b",
+  // Sidecar is intentionally absent from the supported default runtime. Legacy callers may still
+  // provide `models.sidecar`, but all built-in phases use the primary model and Runtime Director.
+  sidecar: process.env.KITTEN_SIDECAR_MODEL || undefined,
   embed: process.env.KITTEN_EMBED_MODEL || "text-embedding-nomic-embed-text-v1.5",
   apiKey: process.env.KITTEN_API_KEY || undefined
 };
@@ -46,7 +50,7 @@ export function cloudModels(opts: { baseUrl: string; apiKey: string; main?: stri
   return {
     baseUrl: opts.baseUrl,
     main: opts.main || "qwen3.6-35b-a3b",
-    sidecar: opts.sidecar || opts.main || "qwen3.6-35b-a3b",
+    sidecar: opts.sidecar,
     apiKey: opts.apiKey
   };
 }
@@ -59,10 +63,8 @@ export function cloudModels(opts: { baseUrl: string; apiKey: string; main?: stri
  * explicitly (KITTEN_SIDECAR_MODEL). This keeps the expensive model spent only on the actual coding.
  */
 export function tierSidecar(models: KittenModels): KittenModels {
-  const isCloud = /^https?:\/\//.test(models.baseUrl) && !/localhost|127\.0\.0\.1|0\.0\.0\.0/.test(models.baseUrl);
-  if (isCloud && !process.env.KITTEN_SIDECAR_MODEL) {
-    return { ...models, sidecar: process.env.KITTEN_CLOUD_SIDECAR_MODEL || "qwen3-8b" };
-  }
+  // Kept as a source-compatible no-op for old settings and plugins. No automatic model tiering is
+  // allowed: it made runtime ownership ambiguous and silently routed calls to the wrong process.
   return models;
 }
 
@@ -111,6 +113,19 @@ export interface ChatResult {
   logprobs?: TokenLogprob[];
   /** Number of formatting-constraint fallbacks used for this request (normally 0/undefined). */
   formatRescues?: number;
+  /** llama.cpp server timings, when the endpoint exposes them. */
+  timings?: InferenceTimings;
+}
+
+export interface InferenceTimings {
+  cacheTokens?: number;
+  promptTokens?: number;
+  promptMs?: number;
+  promptTokensPerSecond?: number;
+  predictedTokens?: number;
+  predictedMs?: number;
+  predictedTokensPerSecond?: number;
+  totalMs?: number;
 }
 
 export interface ChatParams {
@@ -148,6 +163,10 @@ export interface ChatParams {
   minP?: number;
   /** DRY (don't-repeat-yourself) multiplier. llama.cpp native only. */
   dryMultiplier?: number;
+  /** Optional sampler controls; kept on auto until a provider advertises support. */
+  repeatPenalty?: number;
+  presencePenalty?: number;
+  seed?: number;
   /** Stop sequences. */
   stop?: string[];
   /** token-id → bias (OpenAI form `{id: -100}`). A hard ban is -100 (cloud/LM Studio) or `false` (native). */
@@ -160,6 +179,8 @@ export interface ChatParams {
    *  On a single-function task the model writes code directly ~2x faster; the harness supplies correctness.
    *  Needs a native `--jinja` server. */
   disableThinking?: boolean;
+  /** Optional role for bounded inference telemetry. */
+  role?: string;
 }
 
 /** An incremental piece of a streamed generation (content and/or reasoning that just arrived). */
@@ -177,8 +198,21 @@ export interface TokenLogprob {
 
 // Reasoning models need headroom: the reasoning block is counted against max_tokens, so a small
 // budget yields empty content (observed live: max_tokens=16 -> 16 reasoning tokens, no answer).
-const DEFAULT_MAIN_MAX_TOKENS = 4096;
-const DEFAULT_TIMEOUT_MS = 600_000;
+//
+// 4096 was far too small, and it failed in a way that looked like anything but a token cap. An agent
+// writing a whole file puts the file body inside ONE tool-call argument, so the cap cuts the JSON
+// string mid-value; llama.cpp then rejects its own model's output with
+// `HTTP 500 ... parse error ... invalid string: missing closing quote`. Observed live: a
+// single-file Pac-Man clone (~20 KB, comfortably past 4096 tokens) killed all four ascent candidates
+// this way, each dying identically, with nothing in the error naming a length limit.
+//
+// Measured against the reference llama.cpp runtime (32k ctx): max_tokens of 16384, 24576, 32768 and
+// even 65536 are all ACCEPTED and clamped server-side to the remaining context — there is no 4xx to
+// avoid, so the only thing the old value bought was truncation. 16384 fits a ~50 KB file in one
+// write while still bounding a runaway generation.
+const DEFAULT_MAIN_MAX_TOKENS = 16384;
+// No implicit generation timeout. A local model may spend longer than ten minutes in prefill or
+// reasoning; only an explicit caller timeout or user cancellation may abort the request.
 
 // Process-wide because project-local settings may construct separate KittenLLM instances while
 // still targeting the same LM Studio/llama.cpp endpoint.
@@ -219,10 +253,35 @@ function isToolCallParseFailure(status: number, body: string): boolean {
     || (/parse_error|parse error/i.test(body) && /invalid string|missing closing|unterminated/i.test(body));
 }
 
+/**
+ * "Loading model" is not a transient hiccup — it is a promise that the server will be ready shortly.
+ *
+ * llama.cpp answers 503 with this body for the entire time it reads a large GGUF, which on a 25 GB
+ * Q5_K_M is tens of seconds to minutes. The generic transient-retry budget (three attempts, 250ms and
+ * 750ms apart) expires inside one second, so every cold start failed the run outright with
+ * `HTTP 503 {"message":"Loading model"}` — the model then finished loading a minute later and sat
+ * there, ready, having already lost the turn.
+ */
+function isModelLoading(status: number, body: string | undefined): boolean {
+  if (status !== 503) return false;
+  return !body || /loading|not (?:yet )?ready|warming|starting/i.test(body);
+}
+
 function retryDelayMs(attempt: number, response: Response): number {
   const retryAfter = Number(response.headers.get("retry-after"));
   if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(2000, retryAfter * 1000);
   return [250, 750][Math.min(attempt, 1)] ?? 750;
+}
+
+/**
+ * How long to keep waiting on a server that says it is still loading its weights, and how often to
+ * ask. The backoff starts quick — a server that is nearly ready should not cost a full poll interval —
+ * and settles at two seconds, which is a sensible cadence for something that takes a minute.
+ */
+const LOADING_WAIT_CEILING_MS = 300_000;
+const LOADING_BACKOFF_MS = [200, 500, 1_000, 2_000] as const;
+function loadingPollMs(waited: number): number {
+  return LOADING_BACKOFF_MS[Math.min(waited, LOADING_BACKOFF_MS.length - 1)];
 }
 
 async function waitForRetry(ms: number, signal: AbortSignal): Promise<boolean> {
@@ -236,6 +295,23 @@ async function waitForRetry(ms: number, signal: AbortSignal): Promise<boolean> {
 
 export class KittenLLM {
   constructor(public readonly models: KittenModels = DEFAULT_MODELS) {}
+
+  /** Capability facts supplied to Runtime Director after a live engine probe. */
+  inferenceCapabilities?: InferenceCapabilities;
+  runtimeOwnership: "managed-native" | "external-compatible" = "external-compatible";
+  private _runtimePrepared = false;
+
+  /** Reconcile per-request controls with the actual endpoint once per client instance. */
+  async prepareRuntime(): Promise<InferenceCapabilities> {
+    if (this._runtimePrepared && this.inferenceCapabilities) return this.inferenceCapabilities;
+    const engine = await this.detectEngine(2000);
+    this.runtimeOwnership = engine === "llamacpp" ? "managed-native" : "external-compatible";
+    this.inferenceCapabilities = engine === "llamacpp"
+      ? { temperature: true, topP: true, topK: true, minP: true, dryMultiplier: true, repeatPenalty: true, presencePenalty: true, seed: true, reasoningBudget: true, maxTokens: true, structuredOutput: true, logprobs: true, cachePrompt: true }
+      : { temperature: true, topP: true, topK: true, minP: false, dryMultiplier: false, repeatPenalty: true, presencePenalty: true, seed: true, reasoningBudget: true, maxTokens: true, logprobs: false, cachePrompt: false };
+    this._runtimePrepared = true;
+    return this.inferenceCapabilities;
+  }
 
   // A single LM Studio/llama.cpp endpoint is commonly shared by the main and sidecar
   // models. Serialize requests per endpoint so a clerical JSON call cannot collide with
@@ -305,11 +381,20 @@ export class KittenLLM {
     if (params.topK !== undefined) body.top_k = params.topK;
     if (params.minP !== undefined) body.min_p = params.minP;
     if (params.dryMultiplier !== undefined) body.dry_multiplier = params.dryMultiplier;
+    if (params.repeatPenalty !== undefined) body.repeat_penalty = params.repeatPenalty;
+    if (params.presencePenalty !== undefined) body.presence_penalty = params.presencePenalty;
+    if (params.seed !== undefined) body.seed = params.seed;
     if (params.stop?.length) body.stop = params.stop;
     if (params.logitBias && Object.keys(params.logitBias).length) body.logit_bias = params.logitBias;
     if (params.grammar) body.grammar = params.grammar;
     if (params.cachePrompt) body.cache_prompt = params.cachePrompt;
-    if (params.disableThinking) body.chat_template_kwargs = { ...(body.chat_template_kwargs as object ?? {}), enable_thinking: false };
+    if (params.disableThinking) {
+      // Qwen3.5's official non-thinking path is the template kwarg. Force a zero budget too so
+      // runtimes that ignore one half of the contract cannot silently spend a full reasoning turn.
+      body.reasoning_budget = 0;
+      body.reasoning_effort = "none";
+      body.chat_template_kwargs = { ...(body.chat_template_kwargs as object ?? {}), enable_thinking: false };
+    }
     return body;
   }
 
@@ -330,18 +415,27 @@ export class KittenLLM {
     const started = Date.now();
     const body = this.buildBody(params, false);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const timer = params.timeoutMs && params.timeoutMs > 0 ? setTimeout(() => controller.abort(), params.timeoutMs) : undefined;
     const signal = effectiveSignal(params.signal, controller.signal);
     const release = await this.acquireEndpointLock(endpointKey(params.endpointBaseUrl ?? this.models.baseUrl), signal);
     if (!release) { clearTimeout(timer); return failure(params.signal?.aborted ? "cancelled" : "timeout", started); }
     try {
       let res: Response | undefined;
       let bodyText: string | undefined;   // consumed while deciding whether to retry
+      let loadingWaits = 0;
       for (let attempt = 0; attempt < 3; attempt++) {
         res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
         bodyText = undefined;
-        if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
+        if (res.ok) break;
         bodyText = await res.text().catch(() => "");
+        // A loading model is worth waiting for; a transient error is worth three quick tries.
+        if (isModelLoading(res.status, bodyText)) {
+          if (Date.now() - started > LOADING_WAIT_CEILING_MS) break;
+          if (!await waitForRetry(loadingPollMs(loadingWaits++), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
+          attempt = -1; // bounded by the ceiling above and by the caller's own timeout, not by attempts
+          continue;
+        }
+        if (!retryableRuntimeStatus(res.status) || attempt === 2) break;
         // An identical resend cannot fix the server failing to parse the model's own tool call —
         // only the agent loop's guided retry can. Surface it now rather than spending two more full
         // generations reproducing it.
@@ -381,6 +475,7 @@ export class KittenLLM {
         elapsedMs: Date.now() - started,
         raw: json,
         logprobs: parseLogprobs(choice.logprobs),
+        timings: parseInferenceTimings(json?.timings, usage),
         ...(formatRescues ? { formatRescues } : {})
       };
     } catch (err) {
@@ -404,7 +499,7 @@ export class KittenLLM {
     const started = Date.now();
     const body = this.buildBody(params, true);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const timer = params.timeoutMs && params.timeoutMs > 0 ? setTimeout(() => controller.abort(), params.timeoutMs) : undefined;
     const signal = effectiveSignal(params.signal, controller.signal);
     const release = await this.acquireEndpointLock(endpointKey(params.endpointBaseUrl ?? this.models.baseUrl), signal);
     if (!release) { clearTimeout(timer); return failure(params.signal?.aborted ? "cancelled" : "timeout", started); }
@@ -412,11 +507,20 @@ export class KittenLLM {
     try {
       let res: Response | undefined;
       let bodyText: string | undefined;   // consumed while deciding whether to retry
+      let loadingWaits = 0;
       for (let attempt = 0; attempt < 3; attempt++) {
         res = await fetch(this.url("/chat/completions", params.endpointBaseUrl), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal });
         bodyText = undefined;
-        if (res.ok || !retryableRuntimeStatus(res.status) || attempt === 2) break;
+        if (res.ok) break;
         bodyText = await res.text().catch(() => "");
+        // A loading model is worth waiting for; a transient error is worth three quick tries.
+        if (isModelLoading(res.status, bodyText)) {
+          if (Date.now() - started > LOADING_WAIT_CEILING_MS) break;
+          if (!await waitForRetry(loadingPollMs(loadingWaits++), signal)) return failure(params.signal?.aborted ? "cancelled" : "timeout", started);
+          attempt = -1; // bounded by the ceiling above and by the caller's own timeout, not by attempts
+          continue;
+        }
+        if (!retryableRuntimeStatus(res.status) || attempt === 2) break;
         // An identical resend cannot fix the server failing to parse the model's own tool call —
         // only the agent loop's guided retry can. Surface it now rather than spending two more full
         // generations reproducing it.
@@ -446,12 +550,13 @@ export class KittenLLM {
       // split — the whole response buffered and was dropped as a silent empty ok:true. Match all three,
       // split each frame's lines the same way, and flush a final frame that lacks a trailing blank line.
       const FRAME = /\r\n\r\n|\n\n|\r\r/;
+      let sawDone = false;
       const processFrame = (frame: string): void => {
         for (const line of frame.split(/\r\n|\n|\r/)) {
           const m = line.match(/^data:\s?(.*)$/);
           if (!m) continue;
           const payload = m[1];
-          if (payload === "[DONE]") continue;
+          if (payload === "[DONE]") { sawDone = true; acc.markDone(); continue; }
           let json: any;
           try { json = JSON.parse(payload); } catch { continue; } // skip a malformed/partial chunk
           const d = acc.consume(json);
@@ -470,7 +575,7 @@ export class KittenLLM {
         }
       }
       if (buf.length) processFrame(buf); // a final frame can arrive without a trailing blank line before EOF
-      const finalized = acc.finalize(started);
+      const finalized = acc.finalize(started, sawDone);
       return formatRescues ? { ...finalized, formatRescues } : finalized;
     } catch (err) {
       const e = err as Error;
@@ -575,7 +680,7 @@ export class KittenLLM {
     if (params.logitBias?.length) body.logit_bias = params.logitBias;
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), params.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      const timer = params.timeoutMs && params.timeoutMs > 0 ? setTimeout(() => controller.abort(), params.timeoutMs) : undefined;
       const res = await fetch(this.rootUrl("/completion"), { method: "POST", headers: this.headers(), body: JSON.stringify(body), signal: effectiveSignal(params.signal, controller.signal) });
       clearTimeout(timer);
       if (!res.ok) return { ok: false, content: "", error: `HTTP ${res.status}` };
@@ -647,13 +752,19 @@ class StreamAccumulator {
   private content = "";
   private reasoning = "";
   private finishReason = "stop";
+  private sawTerminal = false;
   private usage = { prompt: 0, completion: 0, reasoning: 0, total: 0 };
   private readonly toolAcc = new Map<number, { id: string; name: string; args: string }>();
   private lastRaw: unknown = null;
+  private timings: InferenceTimings | undefined;
+
+  markDone(): void { this.sawTerminal = true; }
 
   /** Fold one parsed SSE chunk in; return the content/reasoning that just arrived (for the UI). */
   consume(json: any): StreamDelta {
     this.lastRaw = json;
+    const parsedTimings = parseInferenceTimings(json?.timings, json?.usage);
+    if (parsedTimings) this.timings = { ...(this.timings ?? {}), ...parsedTimings };
     if (json?.usage) {
       const u = json.usage;
       this.usage = {
@@ -665,7 +776,10 @@ class StreamAccumulator {
     }
     const choice = json?.choices?.[0];
     if (!choice) return {};
-    if (choice.finish_reason) this.finishReason = choice.finish_reason;
+    if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+      this.finishReason = String(choice.finish_reason);
+      this.sawTerminal = true;
+    }
     const delta = choice.delta ?? {};
     const out: StreamDelta = {};
     if (typeof delta.content === "string" && delta.content) { this.content += delta.content; out.content = delta.content; }
@@ -685,7 +799,11 @@ class StreamAccumulator {
   }
 
   /** Reconstruct the final ChatResult — tool calls parsed EXACTLY from the assembled fragments. */
-  finalize(started: number): ChatResult {
+  finalize(started: number, sawDone = false): ChatResult {
+    // A dropped socket is not a valid completion. Previously the accumulator defaulted to
+    // finishReason="stop", so a disconnect became an apparently successful tool-free turn and the
+    // agent eventually stopped as "stalled". Let the agent's bounded transient retry recover it.
+    if (!this.sawTerminal && !sawDone) return failure("stream ended before completion", started);
     const raw = [...this.toolAcc.entries()].sort((a, b) => a[0] - b[0]).map(([, t], i) => ({
       id: t.id || `call-${i}`, type: "function" as const, function: { name: t.name, arguments: t.args },
     }));
@@ -698,8 +816,32 @@ class StreamAccumulator {
       ok: true,
       elapsedMs: Date.now() - started,
       raw: this.lastRaw,
+      ...(this.timings ? { timings: this.timings } : {}),
     };
   }
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Normalize llama.cpp/LM Studio timing payloads while tolerating older OpenAI-compatible servers. */
+export function parseInferenceTimings(raw: any, usage?: any): InferenceTimings | undefined {
+  const t = raw && typeof raw === "object" ? raw : {};
+  const cached = finiteNumber(t.cache_n ?? usage?.prompt_tokens_details?.cached_tokens);
+  const rawOut: InferenceTimings = {
+    cacheTokens: cached,
+    promptTokens: finiteNumber(t.prompt_n ?? usage?.prompt_tokens),
+    promptMs: finiteNumber(t.prompt_ms),
+    promptTokensPerSecond: finiteNumber(t.prompt_per_second ?? t.prompt_per_second_tokens),
+    predictedTokens: finiteNumber(t.predicted_n ?? usage?.completion_tokens),
+    predictedMs: finiteNumber(t.predicted_ms),
+    predictedTokensPerSecond: finiteNumber(t.predicted_per_second ?? t.predicted_per_second_tokens),
+    totalMs: finiteNumber(t.total_ms)
+  };
+  const out = Object.fromEntries(Object.entries(rawOut).filter(([, value]) => value !== undefined)) as InferenceTimings;
+  return Object.keys(out).length ? out : undefined;
 }
 
 function serializeMessage(m: ChatMessage): Record<string, unknown> {

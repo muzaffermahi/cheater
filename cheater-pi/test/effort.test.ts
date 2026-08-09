@@ -31,7 +31,7 @@ test("resolveEffort tolerates junk and the profiles stay ordered fast → think-
     assert.ok(order[i].maxRepairRounds >= order[i - 1].maxRepairRounds, "repair rounds monotone");
     assert.ok((order[i].ceiling.maxWallMs ?? 0) >= (order[i - 1].ceiling.maxWallMs ?? 0), "wall ceiling monotone");
   }
-  assert.equal(EFFORT_PROFILES["think-hard"].ceiling.maxWallMs, 45 * 60_000, "the agreed 45-min hard ceiling");
+  assert.equal(EFFORT_PROFILES["think-hard"].ceiling.maxWallMs, undefined, "thinking modes have no automatic wall-clock ceiling");
   assert.equal(EFFORT_PROFILES["think-hard"].reasoningBudget, undefined, "think-hard never sets 0 (0 disables thinking)");
 });
 

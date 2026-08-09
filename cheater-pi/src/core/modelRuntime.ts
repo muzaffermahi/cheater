@@ -4,9 +4,10 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, statSync, readFileSync, mkdirSync, openSync, readSync, closeSync, readdirSync } from "node:fs";
-import { basename, extname } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
 import { cpus, totalmem } from "node:os";
+import { planTuning, type TuningPlan } from "./autoTune.js";
 
 export type RuntimeKind = "managed-llama-cpp" | "lm-studio" | "ollama" | "openai-compatible";
 export type ComputeBackend = "cpu" | "cuda" | "vulkan" | "unknown";
@@ -71,6 +72,10 @@ export interface GgufKvMeta {
   embeddingLength: number;
   /** The model's own trained context length, when the header declares it. */
   contextLength?: number;
+  /** Number of routed experts. Present ⇒ this is a mixture-of-experts model, and a split is possible. */
+  expertCount?: number;
+  /** Number of stored next-token prediction layers for native MTP speculation. */
+  nextnPredictLayers?: number;
 }
 
 /** Discrete n_ctx choices, smallest first. A ladder (not a continuum) keeps sizes predictable and
@@ -104,7 +109,7 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
     const wanted = new Map<string, number>();
     let architecture = "";
     const need = (): string[] => architecture
-      ? [`${architecture}.block_count`, `${architecture}.attention.head_count`, `${architecture}.attention.head_count_kv`, `${architecture}.embedding_length`, `${architecture}.context_length`]
+      ? [`${architecture}.block_count`, `${architecture}.attention.head_count`, `${architecture}.attention.head_count_kv`, `${architecture}.embedding_length`, `${architecture}.context_length`, `${architecture}.expert_count`, `${architecture}.nextn_predict_layers`]
       : [];
     const readString = (): string | null => {
       if (off + 8 > buf.length) return null;
@@ -125,7 +130,14 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
         if (off + 12 > buf.length) return finish();
         const elemType = buf.readUInt32LE(off); off += 4;
         const count = Number(buf.readBigUInt64LE(off)); off += 8;
-        if (elemType === 8 || elemType === 9) {
+        if (elemType === 8) {
+          // Some exporters put general.tags before the architecture geometry. Skipping the
+          // strings, rather than stopping at the first array, lets us reach block_count and
+          // expert_count in Qwen3.6 GGUFs. Tokenizer arrays are still bounded by the 4 MiB read.
+          for (let j = 0; j < count; j++) if (readString() === null) return finish();
+          continue;
+        }
+        if (elemType === 9) {
           // A string/nested array (the tokenizer) — walking it element-by-element inside the bound
           // is pointless; everything we need appears before it. Stop here with what we have.
           return finish();
@@ -147,16 +159,18 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
         off += size;
         if (need().includes(key)) wanted.set(key, value);
       }
-      if (architecture && need().every((k) => wanted.has(k))) return finish();
+      if (architecture && need().slice(0, 5).every((k) => wanted.has(k)) && wanted.has(`${architecture}.expert_count`)) return finish();
     }
     return finish();
 
     function finish(): GgufKvMeta | null {
       if (!architecture) return null;
       const keys = need();
-      // context_length (the last key) is a BONUS: absent headers must still yield KV geometry.
+      // context_length and expert_count are BONUSES: absent headers must still yield KV geometry.
       if (!keys.slice(0, 4).every((k) => Number(wanted.get(k)) > 0)) return null;
       const contextLength = Number(wanted.get(keys[4]));
+      const expertCount = Number(wanted.get(keys[5]));
+      const nextnPredictLayers = Number(wanted.get(keys[6]));
       return {
         architecture,
         blockCount: wanted.get(keys[0])!,
@@ -164,9 +178,22 @@ export function readGgufKvMeta(path: string): GgufKvMeta | null {
         headCountKv: wanted.get(keys[2])!,
         embeddingLength: wanted.get(keys[3])!,
         ...(Number.isFinite(contextLength) && contextLength > 0 ? { contextLength } : {}),
+        ...(Number.isFinite(expertCount) && expertCount > 0 ? { expertCount } : {}),
+        ...(Number.isFinite(nextnPredictLayers) && nextnPredictLayers > 0 ? { nextnPredictLayers } : {}),
       };
     }
   } catch { return null; }
+}
+
+/**
+ * Whether these weights are a mixture-of-experts model — the only kind an expert split applies to.
+ * The header's expert count is the fact; the architecture name is the fallback for headers that
+ * predate the key.
+ */
+export function isMixtureOfExperts(meta: GgufKvMeta | null | undefined): boolean {
+  if (!meta) return true; // unknown: assume a split may be needed, which is the safe direction
+  if (meta.expertCount !== undefined) return meta.expertCount > 1;
+  return /moe|mixtral|deepseek|qwen\d*moe/i.test(meta.architecture);
 }
 
 /** Bytes of KV cache per context token. K and V each store headDim·kvHeads per layer; q8_0 carries a
@@ -178,16 +205,48 @@ export function kvBytesPerToken(meta: GgufKvMeta, cacheType: "q8_0" | "f16" = "q
 }
 
 /**
+ * The FEWEST leading layers whose expert tensors must live on the CPU for everything else to fit in
+ * VRAM — llama.cpp's `--n-cpu-moe N`, and the difference between a usable MoE and a slow one.
+ *
+ * The blanket `--cpu-moe` sends EVERY expert to system RAM, which on this class of hardware measured
+ * 7 tok/s against 30 for a hand-tuned partial offload: once the experts are the bottleneck, each
+ * layer left on the GPU is decode speed you keep. So compute the minimum instead of dumping them all.
+ *
+ * Returns null when the answer would be "all of them" or when an input is unknown — the caller then
+ * falls back to the blanket flag, which is slow but always fits.
+ */
+export function autoCpuMoeLayers(input: { modelBytes: number; vramBytes: number; blockCount: number; kvCacheBytes?: number; reserveBytes?: number; expertShare?: number }): number | null {
+  const { modelBytes, vramBytes, blockCount } = input;
+  if (!(modelBytes > 0) || !(vramBytes > 0) || !(blockCount > 0)) return null;
+  // Experts dominate a large MoE's weights; the dense path (attention, embeddings, norms) is the
+  // rest. 0.85 is deliberately conservative — over-estimating the expert share moves FEWER layers to
+  // the CPU, and the cost of guessing wrong in that direction is an OOM, so err the other way.
+  const expertShare = input.expertShare ?? 0.85;
+  const perLayerExperts = (modelBytes * expertShare) / blockCount;
+  if (!(perLayerExperts > 0)) return null;
+  const budget = vramBytes - (input.reserveBytes ?? 1.2e9) - (input.kvCacheBytes ?? 0);
+  if (budget <= 0) return null;
+  const overflow = modelBytes - budget;
+  if (overflow <= 0) return 0;
+  // One extra layer of headroom: the estimate is an estimate, and a launch that OOMs costs the user
+  // minutes of weight loading to find out.
+  const layers = Math.ceil(overflow / perLayerExperts) + 1;
+  return layers >= blockCount ? null : Math.max(1, layers);
+}
+
+/**
  * Pick the largest ladder rung whose KV cache fits the VRAM the weights leave free. Every input is
  * optional — each missing fact degrades to a conservative documented guess, and the reason string
  * always says which path was taken (it lands in the launch plan warnings).
  */
-export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: number; vramBytes?: number; reserveBytes?: number; cacheType?: "q8_0" | "f16" }): { contextTokens: number; reason: string } {
+export function autoSizeContextTokens(input: { modelPath?: string; modelBytes?: number; vramBytes?: number; reserveBytes?: number; cacheType?: "q8_0" | "f16"; meta?: GgufKvMeta | null }): { contextTokens: number; reason: string } {
   const { modelBytes, vramBytes } = input;
   if (!vramBytes || vramBytes <= 0) {
     return { contextTokens: 16384, reason: "ctx auto-sized to 16384: no VRAM reading (conservative default)" };
   }
-  const meta = input.modelPath ? readGgufKvMeta(input.modelPath) : null;
+  // The caller may already have parsed the header (buildLaunchPlan needs it for the MoE split too);
+  // re-reading 4 MB of GGUF twice per launch is pointless.
+  const meta = input.meta !== undefined ? input.meta : input.modelPath ? readGgufKvMeta(input.modelPath) : null;
   const cacheType = input.cacheType ?? "q8_0";
   // Heuristic fallback when the header is unreadable: a large MoE ~35B lands near 160 KiB/token at
   // q8_0; a mid-size dense model nearer 96 KiB. A guess, and labeled as one.
@@ -227,16 +286,130 @@ export function hashFile(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-/** Find already-installed llama.cpp servers without opening a shell or asking the user to type a command. */
-export function discoverRuntimeExecutables(): string[] {
+/**
+ * Where a llama-server binary plausibly lives on this machine, best-first: one sitting beside the app
+ * (`runtimes/llama.cpp`), then the backends LM Studio has already downloaded, then PATH, then the
+ * usual manual-install spots.
+ *
+ * PATH alone was not enough, and it was the wrong place to look first. A binary shipped beside the
+ * app is on nobody's PATH, and neither are LM Studio's — so "find the runtime" found nothing on a
+ * machine with eight copies of llama-server on it, and the user had to browse for one by hand.
+ */
+/**
+ * The accelerator names a machine's GPUs imply, best-first — the vocabulary LM Studio uses in its
+ * backend directory names. Takes an already-measured profile rather than probing: discovery is a
+ * filesystem lookup that must not open a shell, and the callers that care already know the hardware.
+ */
+export function preferredBackendTags(hardware?: HardwareProfile): string[] {
+  const tags: string[] = [];
+  for (const gpu of hardware?.gpus ?? []) {
+    if (gpu.vendor === "NVIDIA") tags.push("cuda");
+    else if (gpu.vendor === "AMD") tags.push("rocm", "vulkan");
+    else if (gpu.vendor === "Intel") tags.push("vulkan", "sycl");
+  }
+  return [...new Set(tags)];
+}
+
+/** Higher is better: a build matching this machine's accelerator beats a generic CPU one. */
+function backendRank(name: string, preferred: readonly string[]): number {
+  const lower = name.toLowerCase();
+  for (let i = 0; i < preferred.length; i++) if (lower.includes(preferred[i])) return 100 - i;
+  // An accelerated build for the WRONG vendor is worse than a plain CPU build: it will not load.
+  return /cuda|rocm|sycl|metal/.test(lower) ? 0 : 1;
+}
+
+function runtimeSearchDirectories(preferred: readonly string[]): string[] {
+  const dirs: string[] = [];
+  const add = (dir: string | undefined): void => {
+    if (!dir) return;
+    const normalized = dir.replace(/[\\/]+$/, "");
+    if (normalized && !dirs.includes(normalized)) dirs.push(normalized);
+  };
+  // Beside the app / the engine's own tree: an installed Kitten, and a repo checkout.
+  const roots = [process.env.KITTEN_RUNTIME_DIR, dirname(process.execPath), process.cwd()];
+  for (const root of roots) {
+    if (!root) continue;
+    add(root);
+    add(join(root, "runtimes", "llama.cpp"));
+    add(join(root, "..", "runtimes", "llama.cpp"));
+    add(join(root, "..", "..", "runtimes", "llama.cpp"));
+  }
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
+  if (home) {
+    // LM Studio downloads llama.cpp backends into its own extensions tree; those are real, current
+    // binaries the user already has. It keeps SEVERAL — a plain CPU build beside a CUDA one, across
+    // versions — and they sort alphabetically with "avx2" ahead of "nvidia-cuda", so taking the first
+    // entry would hand a CUDA machine a CPU-only server. Rank them against this machine instead.
+    for (const backendRoot of [join(home, ".lmstudio", "extensions", "backends"), join(home, ".cache", "lm-studio", "extensions", "backends")]) {
+      add(backendRoot);
+      try {
+        const entries = readdirSync(backendRoot).sort((a, b) => backendRank(b, preferred) - backendRank(a, preferred) || b.localeCompare(a, "en"));
+        for (const entry of entries) add(join(backendRoot, entry));
+      } catch { /* not installed */ }
+    }
+    add(join(home, "llama.cpp"));
+  }
+  for (const dir of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":")) add(dir.trim() || undefined);
+  if (process.platform === "win32") {
+    add("C:\\Program Files\\llama.cpp");
+    add("C:\\llama.cpp");
+  } else {
+    add("/usr/local/bin");
+    add("/opt/llama.cpp");
+  }
+  return dirs;
+}
+
+/**
+ * The llama-server binary a configured path refers to. A path can point at the FOLDER the server
+ * lives in rather than the executable itself — a folder passes an `existsSync` check and then fails
+ * at spawn with an OS error nobody can read — so a directory is resolved to the binary inside it.
+ * Returns null when there is no server there.
+ */
+export function resolveServerBinary(pathOrDirectory: string | undefined): string | null {
+  const candidate = (pathOrDirectory ?? "").trim();
+  if (!candidate) return null;
+  try {
+    const stat = statSync(candidate);
+    if (stat.isFile()) return candidate;
+    if (!stat.isDirectory()) return null;
+  } catch { return null; }
+  for (const name of process.platform === "win32" ? ["llama-server.exe", "llama-server"] : ["llama-server"]) {
+    const inside = join(candidate, name);
+    try { if (statSync(inside).isFile()) return inside; } catch { /* try the next name */ }
+  }
+  return null;
+}
+
+/**
+ * True when a saved "extra flags" string is really a whole generated command line.
+ *
+ * An earlier runtime panel wrote its editable command straight back into extraArgs, and extraArgs is
+ * appended LAST — so `--model <the model's id>` overrode the real `--model <path to the weights>`,
+ * and llama.cpp went looking for a file named after the model. Every launch failed, the duplication
+ * compounded on each save, and the setting that broke it looked like something the user had typed.
+ */
+export function looksLikeGeneratedCommand(extraArgs: string | undefined): boolean {
+  const raw = (extraArgs ?? "").trim();
+  if (!raw) return false;
+  return raw.includes("--model") && (raw.includes("--ctx-size") || raw.includes("--cont-batching") || raw.includes("--jinja"));
+}
+
+/**
+ * Find already-installed llama.cpp servers without opening a shell or asking the user to type a
+ * command. Pass a measured hardware profile to rank LM Studio's several backends against this
+ * machine's accelerator; without one they are ranked by version alone.
+ */
+export function discoverRuntimeExecutables(extraDirs: readonly string[] = [], hardware?: HardwareProfile): string[] {
   const names = process.platform === "win32" ? ["llama-server.exe", "llama-server"] : ["llama-server"];
-  const directories = (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":").filter(Boolean);
+  const directories = [...extraDirs.map((dir) => dir.replace(/[\\/]+$/, "")), ...runtimeSearchDirectories(preferredBackendTags(hardware))].filter(Boolean);
   const found: string[] = [];
   for (const directory of directories) {
     for (const name of names) {
-      const candidate = `${directory.replace(/[\\/]$/, "")}/${name}`;
-      try { if (existsSync(candidate) && statSync(candidate).isFile() && !found.includes(candidate)) found.push(candidate); } catch {}
+      const candidate = join(directory, name);
+      try { if (existsSync(candidate) && statSync(candidate).isFile() && !found.includes(candidate)) found.push(candidate); } catch { /* unreadable entry */ }
     }
+    if (found.length >= 8) return found.slice(0, 8);
   }
   return found.slice(0, 8);
 }
@@ -364,11 +537,44 @@ function nvidiaVramBytes(name: string): number | undefined {
 
 /** User launch tuning (settings.runtimeTuning). Every "auto" falls through to the heuristics. */
 export interface RuntimeTuning {
+  /** --n-gpu-layers: "auto" offloads everything that fits; a number is verbatim (0 = pure CPU). */
   gpuLayers?: number | "auto";
+  /** Whether the MoE experts run on the CPU at all. "auto" = only when the weights dwarf VRAM. */
   cpuMoe?: "auto" | "on" | "off";
+  /**
+   * How MANY leading layers keep their experts on the CPU (`--n-cpu-moe N`). "all" is the blanket
+   * `--cpu-moe`; a number is the partial split that keeps the remaining experts on the GPU. "auto"
+   * (the default) computes the minimum that fits — see autoCpuMoeLayers.
+   */
+  cpuMoeLayers?: number | "all" | "auto";
   flashAttn?: "auto" | "on" | "off";
   kvCacheType?: "auto" | "q8_0" | "f16" | "q4_0";
+  /** --no-kv-offload when "off": keeps the KV cache in system RAM instead of VRAM. */
+  kvOffload?: "auto" | "on" | "off";
+  /** --threads: generation thread count. "auto" leaves llama.cpp's own default (-1 = all cores). */
+  threads?: number | "auto";
+  /** --batch-size / --ubatch-size: prompt-processing batch geometry. */
+  batchSize?: number | "auto";
+  ubatchSize?: number | "auto";
+  /** --load-mode: "auto" lets Kitten choose (it disables mmap under a CPU-MoE split, as llama.cpp
+   *  itself advises); the rest are passed through verbatim. */
+  loadMode?: "auto" | "none" | "mmap" | "mlock" | "mmap+mlock";
+  /** --main-gpu: which device holds the model when it is not split. */
+  mainGpu?: number | "auto";
+  /** --tensor-split: comma-separated per-GPU fractions, e.g. "24,8". */
+  tensorSplit?: string;
+  /** Raw extra flags appended verbatim at the end of the command (last wins). */
   extraArgs?: string;
+  /**
+   * A COMPLETE llama-server command line that replaces the generated plan outright. This is what the
+   * runtime panel's editable command box writes: appending a hand-edited full command as "extra
+   * flags" duplicated every argument and silently pinned a stale command over every other setting.
+   */
+  argsOverride?: string;
+  /** Foreground llama-server slots. "auto" preserves server defaults; 1 is preferred for Kitten's serialized endpoint. */
+  parallelSlots?: number | "auto";
+  /** Speculative decoder selected by model capability. */
+  speculation?: "auto" | "ngram" | "mtp" | "off";
 }
 
 /** Split a raw extra-flags string into argv tokens (quoted segments stay whole). */
@@ -395,14 +601,19 @@ export function buildLaunchPlan(input: {
   /** MiB of host RAM llama.cpp may use as a prompt-cache pool across requests. */
   promptCacheMiB?: number;
   /** Prompt-lookup speculation. `"ngram"` (default) drafts from the context; `"off"` disables it. */
-  speculation?: "ngram" | "off";
+  speculation?: "auto" | "ngram" | "mtp" | "off";
   /** Flags the target binary advertises in --help. Empty/absent ⇒ unknown, emit everything. */
   supportedFlags?: Set<string>;
   /** The raw --help text, used to tell a valued flag from a bare boolean across llama.cpp versions. */
   supportedFlagsHelp?: string;
+  /** The id this model should be served under (`--alias`), so /v1/models advertises exactly the name
+   *  Kitten is configured to request instead of whatever the file happens to be called. */
+  modelAlias?: string;
   /** Overrides for tests; production measures the real file and the real device. */
   modelBytes?: number;
   vramBytes?: number;
+  /** The model's layer count, when the caller already knows it (tests, cached GGUF inspection). */
+  layerCount?: number;
 }): RuntimeLaunchPlan {
   const runtime = input.runtime ?? "managed-llama-cpp";
   const hardware = input.backend && input.vramBytes !== undefined ? null : detectHardware();
@@ -416,22 +627,44 @@ export function buildLaunchPlan(input: {
 
   const tuning = input.tuning ?? {};
   const kvCacheType = tuning.kvCacheType && tuning.kvCacheType !== "auto" ? tuning.kvCacheType : "q8_0";
+  // One header read serves both the context sizing and the MoE split below.
+  const ggufMeta = readGgufKvMeta(input.mainModel);
+  const blockCount = input.layerCount ?? ggufMeta?.blockCount;
 
-  // No pinned context ⇒ size it from the machine instead of wishing for 16384. An explicit number
-  // (settings pin, per-run request) is honored exactly as before.
+  // Context, expert split and batch geometry are ONE decision, not three. Choosing them in sequence
+  // is what produced a 131072-token window whose KV cache ate the card and pushed every expert onto
+  // the CPU — measured at 10.9 tok/s where the joint plan reaches 14.7. See autoTune.ts for the sweep.
   const contextSource: RuntimeLaunchPlan["contextSource"] = input.contextTokens === undefined ? "auto" : "explicit";
-  let contextTokens: number;
-  if (contextSource === "auto") {
-    const sized = autoSizeContextTokens({ modelPath: input.mainModel, modelBytes, vramBytes, cacheType: kvCacheType === "f16" ? "f16" : "q8_0" });
-    contextTokens = sized.contextTokens;
-    warnings.push(sized.reason);
-  } else {
-    contextTokens = Math.max(2048, Math.min(262144, Math.floor(input.contextTokens!)));
-  }
+  const tuned: TuningPlan = planTuning({
+    modelBytes: modelBytes ?? 0,
+    vramBytes: backend === "cpu" ? 0 : vramBytes,
+    ramBytes: hardware?.ramBytes,
+    meta: ggufMeta ?? (blockCount ? { architecture: "unknown", blockCount, headCount: 1, headCountKv: 1, embeddingLength: 1 } : null),
+    kvBytesPerToken: ggufMeta ? kvBytesPerToken(ggufMeta, kvCacheType === "f16" ? "f16" : "q8_0") : undefined,
+    contextTokens: contextSource === "explicit" ? Math.max(2048, Math.min(262144, Math.floor(input.contextTokens!))) : undefined,
+    mixtureOfExperts: isMixtureOfExperts(ggufMeta),
+  });
+  const contextTokens = tuned.contextTokens;
+  for (const reason of tuned.reasons) warnings.push(reason);
 
   if (backend === "unknown") warnings.push("GPU backend was not identified; the runtime will use its safe fallback.");
   if (sidecarMode === "contended") warnings.push("The sidecar shares the main device and will yield during user-blocking generation.");
   if (runtime !== "managed-llama-cpp") return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: 1, sidecarMode, args: [], warnings };
+
+  // A pinned command line replaces the plan entirely. This is the honest form of "what you see is
+  // what runs": the old behaviour appended a hand-edited command as EXTRA flags, so every argument
+  // appeared twice, the edit compounded on each save, and no tuning field could ever win against it.
+  const override = splitExtraArgs(tuning.argsOverride);
+  if (override.length) {
+    const pinnedCtxIndex = Math.max(override.indexOf("--ctx-size"), override.indexOf("-c"));
+    const pinnedCtx = pinnedCtxIndex >= 0 ? Number(override[pinnedCtxIndex + 1]) : NaN;
+    warnings.push("Launch arguments are pinned to a custom command; the tuning fields do not apply until you reset it.");
+    return {
+      kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel,
+      contextTokens: Number.isFinite(pinnedCtx) && pinnedCtx > 0 ? pinnedCtx : contextTokens,
+      contextSource: "explicit", parallelSlots: 1, sidecarMode, args: override, warnings,
+    };
+  }
 
   // Only emit flags this binary actually advertises. llama.cpp renames and deprecates constantly, and
   // a flag the build does not know turns a good launch into a wall of deprecation noise.
@@ -443,8 +676,18 @@ export function buildLaunchPlan(input: {
     args.push(flag, ...values);
   };
   args.push("--model", input.mainModel, "--ctx-size", String(contextTokens));
+  const parallelSlots = input.tuning?.parallelSlots;
+  const resolvedParallelSlots = typeof parallelSlots === "number" && Number.isFinite(parallelSlots) && parallelSlots > 0 ? Math.min(2, Math.floor(parallelSlots)) : 1;
+  // Serve the model under the id Kitten is configured to ask for. Without this the server advertises
+  // the file's own name, so /v1/models never matches the configured model and every health check has
+  // to be lenient about it.
+  if (input.modelAlias && input.modelAlias.trim()) push("--alias", input.modelAlias.trim());
   push("--jinja");
   push("--cont-batching");
+  push("--metrics");
+  // Kitten serializes calls to one endpoint, so four implicit server slots only fragment cache
+  // affinity. Auto therefore means one foreground slot; users can opt into two for experiments.
+  push("--parallel", String(resolvedParallelSlots));
 
   // GPU offload: "auto" offloads everything that fits (llama.cpp clamps 999 to the real layer
   // count); an explicit number is the user's call — including 0 for a pure-CPU load.
@@ -452,8 +695,12 @@ export function buildLaunchPlan(input: {
   if (gpuLayers !== null) {
     push("--n-gpu-layers", String(gpuLayers));
   } else if (backend !== "cpu") {
-    push("--n-gpu-layers", "999");
+    // "all that fit" for anything that fits; a real count for a dense model that does not.
+    push("--n-gpu-layers", tuned.gpuLayers === "all" ? "999" : String(tuned.gpuLayers));
   }
+  // Multi-GPU placement. Both are pure pass-throughs: Kitten has no basis to guess a split.
+  if (typeof tuning.mainGpu === "number" && Number.isFinite(tuning.mainGpu) && tuning.mainGpu >= 0) push("--main-gpu", String(Math.floor(tuning.mainGpu)));
+  if (tuning.tensorSplit && /^[\d.,\s]+$/.test(tuning.tensorSplit.trim())) push("--tensor-split", tuning.tensorSplit.trim().replace(/\s+/g, ""));
   // Attention on GPU is where flash-attention pays; auto = on for any GPU backend. Newer builds take
   // an on/off/auto VALUE, older ones are a bare boolean — emit whichever this build documents.
   const flashOn = tuning.flashAttn === "on" || (tuning.flashAttn !== "off" && backend !== "cpu" && gpuLayers !== 0);
@@ -470,24 +717,53 @@ export function buildLaunchPlan(input: {
   // can pin f16 (quality/default) or q4_0 (capacity) — q4 is never chosen automatically.
   push("--cache-type-k", kvCacheType);
   push("--cache-type-v", kvCacheType);
+  // LM Studio calls this "Offload KV cache to GPU". Off keeps the cache in system RAM, which buys
+  // VRAM for weights at the cost of attention speed.
+  if (tuning.kvOffload === "off") push("--no-kv-offload");
 
   // The expert tensors are the bulk of a MoE and the part that does not fit. Pushing them to CPU keeps
   // attention and the dense path resident instead of letting the driver thrash. This is also the
-  // heuristic a hand-tuner most often wants to OVERRIDE (measured on the dev box: auto cpu-moe gave
-  // 7 tok/s where the user's own launch gave 30) — so "off" is a first-class choice, not a hack.
-  const wantCpuMoe = tuning.cpuMoe === "on"
-    || (tuning.cpuMoe !== "off" && backend !== "cpu" && modelBytes !== undefined && vramBytes !== undefined && modelBytes > vramBytes * 0.8);
-  if (wantCpuMoe && backend !== "cpu") {
-    push("--cpu-moe");
-    // llama.cpp itself warns that CPU tensor overrides with mmap enabled are slower, so take its
-    // advice — but `--no-mmap` is DEPRECATED in favour of `--load-mode`, and a build can advertise
-    // BOTH (which is how a launch ends up buried in deprecation noise). Prefer the modern spelling
-    // where it exists; `none` is its "no special loading mode" value, i.e. the old --no-mmap.
-    // (The value matters: a wrong one makes llama-server print its usage and exit — verified live.)
-    if (known?.has("--load-mode")) args.push("--load-mode", "none");
-    else if (supports("--no-mmap")) args.push("--no-mmap");
-    if (tuning.cpuMoe !== "on") warnings.push(`The model is ${((modelBytes ?? 0) / 1e9).toFixed(1)} GB against ${((vramBytes ?? 0) / 1e9).toFixed(1)} GB of VRAM, so its experts run on the CPU. Decode speed will be bound by system memory bandwidth. Override with cpuMoe:"off" if your own tuning beats this.`);
+  // heuristic a hand-tuner most often wants to OVERRIDE (measured on the dev box: blanket cpu-moe gave
+  // 7 tok/s where the user's own launch gave 30) — so "off" is a first-class choice, not a hack, and
+  // "how many layers" is a first-class number rather than an all-or-nothing switch.
+  const pinnedLayers = typeof tuning.cpuMoeLayers === "number" && Number.isFinite(tuning.cpuMoeLayers) && tuning.cpuMoeLayers > 0
+    ? Math.floor(tuning.cpuMoeLayers) : null;
+  const forcedBlanket = tuning.cpuMoe === "on" && tuning.cpuMoeLayers === "all";
+  // "off" means off. Otherwise a pinned count wins, then the measured plan.
+  // A split is "in play" only when experts actually move. A plan of 0 layers means the model fits,
+  // and a model that fits must not inherit any of the settings that exist to rescue one that does not.
+  const planWantsSplit = (tuned.cpuMoeLayers !== null && tuned.cpuMoeLayers > 0) || tuned.blanketCpuMoe;
+  const wantCpuMoe = tuning.cpuMoe !== "off"
+    && backend !== "cpu"
+    && (tuning.cpuMoe === "on" || planWantsSplit);
+  const usedLoadMode = false;
+  if (wantCpuMoe) {
+    const layers = pinnedLayers ?? (forcedBlanket ? null : tuned.cpuMoeLayers);
+    if (layers !== null && layers > 0 && supports("--n-cpu-moe")) {
+      push("--n-cpu-moe", String(layers));
+    } else {
+      push("--cpu-moe");
+      if (tuning.cpuMoe !== "on") warnings.push(`${((modelBytes ?? 0) / 1e9).toFixed(1)} GB of weights against ${((vramBytes ?? 0) / 1e9).toFixed(1)} GB of VRAM: every expert runs on the CPU, so decode is bound by system memory bandwidth.`);
+    }
   }
+  // An explicit load mode is the user's. Otherwise the plan decides, and it never DISABLES mmap:
+  // llama.cpp advises that under CPU tensor overrides, and on the reference machine that advice cost
+  // 24s of load against 8s for no decode gain. What it does do is PIN the weights when RAM allows,
+  // because with experts on the CPU their residency is what decode speed is made of.
+  if (tuning.loadMode && tuning.loadMode !== "auto" && !usedLoadMode) push("--load-mode", tuning.loadMode);
+  else if ((!tuning.loadMode || tuning.loadMode === "auto") && !usedLoadMode && wantCpuMoe && tuned.loadMode) push("--load-mode", tuned.loadMode);
+
+  // CPU-side geometry. Every one of these is "leave it alone" by default: llama.cpp's own defaults
+  // are tuned for the machine, and a wrong thread count is a silent throughput loss.
+  if (typeof tuning.threads === "number" && Number.isFinite(tuning.threads) && tuning.threads > 0) push("--threads", String(Math.floor(tuning.threads)));
+  // Batch geometry is llama.cpp's unless the user says otherwise. Forcing a large one looked right and
+  // measured 2.3x SLOWER on the reference machine: the bigger compute buffer is VRAM taken from the
+  // resident experts, which is where the speed actually lives. See autoTune.ts.
+  const splitInPlay = wantCpuMoe && planWantsSplit;
+  const batchSize = typeof tuning.batchSize === "number" && tuning.batchSize > 0 ? Math.floor(tuning.batchSize) : splitInPlay ? tuned.batchSize : 0;
+  const ubatchSize = typeof tuning.ubatchSize === "number" && tuning.ubatchSize > 0 ? Math.floor(tuning.ubatchSize) : splitInPlay ? tuned.ubatchSize : 0;
+  if (batchSize > 0) push("--batch-size", String(batchSize));
+  if (ubatchSize > 0) push("--ubatch-size", String(ubatchSize));
 
   // Prefix reuse is the largest latency lever on this hardware, and none of it is on by default:
   // a similarity threshold so a near-identical prompt lands on the warm slot, a prompt-cache pool, and
@@ -519,7 +795,13 @@ export function buildLaunchPlan(input: {
   // UNMEASURED ON THIS BOX: A/B-ing it needs a second server instance, and with the 35B resident
   // there was 1.9 GB of 31.7 GB free — no headroom to run both. To measure, stop the live server and
   // compare tokens/s with and without `--spec-type ngram-mod` on a realistic edit prompt.
-  if (input.speculation !== "off") {
+  const speculation = input.speculation ?? tuning.speculation ?? "auto";
+  if (speculation === "mtp" && (ggufMeta?.nextnPredictLayers ?? 0) > 0) {
+    push("--spec-type", "draft-mtp");
+    push("--spec-draft-n-max", "1");
+  } else if (speculation === "mtp") {
+    warnings.push("MTP requested but the GGUF has no nextn prediction layer; speculation disabled.");
+  } else if (speculation === "ngram" || (speculation === "auto" && !ggufMeta?.nextnPredictLayers)) {
     push("--spec-type", "ngram-mod");
   }
 
@@ -530,7 +812,7 @@ export function buildLaunchPlan(input: {
   const extra = splitExtraArgs(tuning.extraArgs);
   if (extra.length) args.push(...extra);
 
-  return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : 1, sidecarMode, args, warnings };
+  return { kind: runtime, backend, mainModel: input.mainModel, sidecarModel: input.sidecarModel, contextTokens, contextSource, parallelSlots: sidecarMode === "separate-device" || sidecarMode === "co-resident" ? 2 : resolvedParallelSlots, sidecarMode, args, warnings };
 }
 
 // ── Model file discovery ────────────────────────────────────────────────────────────────────────
@@ -590,6 +872,78 @@ export function listModelFiles(seedPaths: ReadonlyArray<string | undefined> = []
   return out
     .filter((f) => { const key = f.path.toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; })
     .sort((a, b) => a.dir.localeCompare(b.dir) || b.bytes - a.bytes);
+}
+
+// ── Picking weights is the only decision the user has to make ───────────────────────────────────
+// Everything else about a local launch — which binary, what the model is called, how the experts are
+// split — is derivable from the file and the machine. These helpers derive it.
+
+/**
+ * The id a model file should be served and requested under. llama.cpp advertises whatever the file is
+ * called, quantisation suffix and all; strip that so the configured id reads like a model name
+ * ("ornith-1.0-35b") rather than a download artefact ("ornith-1.0-35b-Q5_K_M.gguf").
+ */
+export function suggestModelId(path: string): string {
+  const base = basename(path).replace(/\.gguf$/i, "");
+  return base
+    // Multi-part downloads and quantisation tags are file facts, not model identity.
+    .replace(/[-._]?(?:0000\d|\d{5})-of-\d{5}$/i, "")
+    .replace(/[-._](?:i?q\d(?:_[a-z0-9]+)*|f16|bf16|f32|mxfp4(?:_moe)?)$/i, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .toLowerCase() || basename(path);
+}
+
+export interface WeightsInspection {
+  path: string;
+  name: string;
+  bytes: number;
+  exists: boolean;
+  /** Architecture and layer count from the GGUF header; absent when the header is unreadable. */
+  architecture?: string;
+  layerCount?: number;
+  trainedContextTokens?: number;
+  suggestedModelId: string;
+  /** What the machine says this file needs: how many layers of experts must sit on the CPU, and the
+   *  context that then fits. Advisory — the settings panel shows it, the user decides. */
+  suggested: { cpuMoeLayers: number | "all" | null; contextTokens: number; reason: string };
+  vramBytes?: number;
+  ramBytes: number;
+}
+
+/** Everything the settings panel needs to configure a launch from one picked .gguf. */
+export function inspectWeights(path: string, hardware: HardwareProfile = detectHardware()): WeightsInspection {
+  const exists = existsSync(path);
+  let bytes = 0;
+  try { bytes = exists ? statSync(path).size : 0; } catch { bytes = 0; }
+  const meta = exists ? readGgufKvMeta(path) : null;
+  const vramBytes = hardware.gpus.find((gpu) => gpu.backend !== "unknown" && gpu.vramBytes)?.vramBytes;
+  const sized = autoSizeContextTokens({ modelPath: path, modelBytes: bytes || undefined, vramBytes, meta });
+  // Only propose a CPU-expert split when the weights genuinely do not fit; a model that fits should
+  // stay entirely on the GPU.
+  let cpuMoeLayers: number | "all" | null = null;
+  if (bytes > 0 && vramBytes && bytes > vramBytes * 0.8) {
+    const computed = meta
+      ? autoCpuMoeLayers({ modelBytes: bytes, vramBytes, blockCount: meta.blockCount, kvCacheBytes: sized.contextTokens * kvBytesPerToken(meta) })
+      : null;
+    cpuMoeLayers = computed ?? "all";
+  }
+  return {
+    path,
+    name: basename(path),
+    bytes,
+    exists,
+    ...(meta ? { architecture: meta.architecture, layerCount: meta.blockCount } : {}),
+    ...(meta?.contextLength ? { trainedContextTokens: meta.contextLength } : {}),
+    suggestedModelId: suggestModelId(path),
+    suggested: {
+      cpuMoeLayers,
+      contextTokens: sized.contextTokens,
+      reason: sized.reason,
+    },
+    ...(vramBytes ? { vramBytes } : {}),
+    ramBytes: hardware.ramBytes,
+  };
 }
 
 /**

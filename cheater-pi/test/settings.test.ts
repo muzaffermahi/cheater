@@ -129,3 +129,80 @@ test("saveKittenSettings round-trips the auto sentinel", () => {
     assert.equal(loadKittenSettings(dir).contextWindowTokens, "auto");
   });
 });
+
+test("a UTF-8 BOM does not silently void the whole config", () => {
+  // Every PowerShell way of writing a file prepends a BOM. Without tolerating it, a config that LOOKS
+  // right parses as invalid JSON, the entire file is discarded, and settings appear to save while
+  // having no effect whatsoever — which is exactly what happened to this machine's own config.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-bom-"));
+  mkdirSync(join(dir, ".kitten"), { recursive: true });
+  const path = join(dir, ".kitten", "config.json");
+  writeFileSync(path, "\ufeff" + JSON.stringify({
+    mainModel: "ornith-1.0-35b", runtimeExecutable: "C:/kitten/llama-server.exe",
+    mainModelPath: "C:/w/ornith.gguf", cpuMoeLayers: 30,
+  }));
+  withEnv({ KITTEN_MAIN_MODEL: undefined, KITTEN_HOME: dir }, () => {
+    const s = loadKittenSettings(dir);
+    assert.equal(s.models.main, "ornith-1.0-35b");
+    assert.equal(s.managedRuntime.executable, "C:/kitten/llama-server.exe");
+    assert.equal(s.runtimeTuning.cpuMoeLayers, 30);
+    assert.ok(!s.warnings.some((w) => /not valid JSON/.test(w)), "and it is not reported as broken");
+  });
+  // Saving into a BOM'd file must MERGE, not replace the file with only the update.
+  saveKittenSettings({ gpuLayers: 12 }, "project", dir);
+  withEnv({ KITTEN_MAIN_MODEL: undefined, KITTEN_HOME: dir }, () => {
+    const s = loadKittenSettings(dir);
+    assert.equal(s.runtimeTuning.gpuLayers, 12, "the new value landed");
+    assert.equal(s.models.main, "ornith-1.0-35b", "and the existing ones survived");
+    assert.equal(s.managedRuntime.mainModelPath, "C:/w/ornith.gguf");
+  });
+});
+
+test("the llama.cpp tuning fields round-trip through the config file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-tuning-"));
+  saveKittenSettings({
+    cpuMoe: "on", cpuMoeLayers: 24, kvOffload: "off", threads: 12, batchSize: 2048,
+    ubatchSize: 512, loadMode: "mlock", mainGpu: 1, tensorSplit: "24,8", argsOverride: "--model x.gguf",
+  }, "project", dir);
+  withEnv({ KITTEN_HOME: dir }, () => {
+    const t = loadKittenSettings(dir).runtimeTuning;
+    assert.equal(t.cpuMoe, "on");
+    assert.equal(t.cpuMoeLayers, 24);
+    assert.equal(t.kvOffload, "off");
+    assert.equal(t.threads, 12);
+    assert.equal(t.batchSize, 2048);
+    assert.equal(t.ubatchSize, 512);
+    assert.equal(t.loadMode, "mlock");
+    assert.equal(t.mainGpu, 1);
+    assert.equal(t.tensorSplit, "24,8");
+    assert.equal(t.argsOverride, "--model x.gguf");
+  });
+  // "all" is a distinct, preserved choice — not a number and not "auto".
+  saveKittenSettings({ cpuMoeLayers: "all" }, "project", dir);
+  withEnv({ KITTEN_HOME: dir }, () => assert.equal(loadKittenSettings(dir).runtimeTuning.cpuMoeLayers, "all"));
+});
+
+test("a config an older build corrupted heals itself on load, and says what it did", () => {
+  // Both faults come from one real config: the runtime path names the FOLDER, and extraArgs holds the
+  // whole generated command. Together they made every launch fail with an unreadable error.
+  const dir = mkdtempSync(join(tmpdir(), "kitten-heal-"));
+  const bin = mkdtempSync(join(tmpdir(), "kitten-heal-bin-"));
+  const exe = join(bin, process.platform === "win32" ? "llama-server.exe" : "llama-server");
+  writeFileSync(exe, "");
+  mkdirSync(join(dir, ".kitten"), { recursive: true });
+  writeFileSync(join(dir, ".kitten", "config.json"), JSON.stringify({
+    runtimeExecutable: bin,
+    extraArgs: "--model ornith-1.0-35b --ctx-size 24576 --jinja --cont-batching --n-gpu-layers 40 --cpu-moe --no-mmap",
+  }));
+  withEnv({ KITTEN_HOME: dir, KITTEN_RUNTIME_EXTRA_ARGS: undefined }, () => {
+    const s = loadKittenSettings(dir);
+    assert.equal(s.managedRuntime.executable, exe, "the folder resolved to the binary inside it");
+    assert.equal(s.runtimeTuning.extraArgs, "", "the pasted command is gone");
+    assert.ok(s.warnings.some((w) => /whole generated command/.test(w)), "and the user is told why");
+  });
+  // A real extra flag is never touched.
+  writeFileSync(join(dir, ".kitten", "config.json"), JSON.stringify({ extraArgs: "--threads 12" }));
+  withEnv({ KITTEN_HOME: dir, KITTEN_RUNTIME_EXTRA_ARGS: undefined }, () => {
+    assert.equal(loadKittenSettings(dir).runtimeTuning.extraArgs, "--threads 12");
+  });
+});
