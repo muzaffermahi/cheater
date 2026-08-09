@@ -15,6 +15,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
+import { shellFailureHint, interactiveStallHint } from "./shellGuard.js";
 
 export interface ToolContext {
   cwd: string;
@@ -440,10 +441,16 @@ export const bashTool: Tool = {
         const status = killedBy === "timeout" ? `(timed out after ${timeoutMs / 1000}s — process tree killed)`
           : killedBy === "cancelled" ? "(cancelled — process tree killed)"
           : signalName ? `killed by ${signalName}` : `exit ${code ?? 1}`;
+        // A shell failure that names something — a binary, a path — is worth one more sentence:
+        // what DOES exist nearby. "command not found" is the largest single failure bucket in the
+        // TB2 taxonomy, and on its own it tells the model nothing it can act on. See shellGuard.ts.
+        const hint = killedBy === "timeout"
+          ? interactiveStallHint(combined)
+          : killedBy === null ? shellFailureHint(combined, ctx.cwd) : null;
         resolve({
-          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`,
+          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]${hint ? `\n${hint}` : ""}`,
           isError: killedBy !== null || (code ?? 1) !== 0 || !!signalName,
-          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName },
+          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName, ...(hint ? { hint: true } : {}) },
         });
       };
       // "close" waits for every stdio pipe to drain, which is right for a normal finish: it

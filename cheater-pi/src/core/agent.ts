@@ -12,6 +12,7 @@ import { KittenLLM, assistantTurn, toolResultTurn, type ChatMessage, type ChatRe
 import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } from "./tools.js";
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
+import { AttemptLedger } from "./attemptLedger.js";
 import { aggregateSelfCertainty } from "./selfCertainty.js";
 import { parseTextToolCalls, stripTextToolCalls } from "./textToolCalls.js";
 import { isQwen35Family, profileChatParams, resolveInferenceProfile, type InferenceCapabilities, type InferenceOverrides, type InferenceRole, type InferenceProfile } from "./inferenceProfiles.js";
@@ -200,6 +201,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let nudgedToFinish = false;
   const bashOk: string[] = [];
   const bashAll: string[] = [];
+  // What has already been tried and failed, per run. Owned here so a candidate in an isolated
+  // workspace can never inherit another candidate's history.
+  const ledger = new AttemptLedger();
   const logprobChunks: (TokenLogprob[] | undefined)[] = [];
   // Self-certainty is a tiebreaker between candidates, so it is only worth its cost when there is
   // something to tie with. `candidateCount` is 1 for every ordinary run.
@@ -452,6 +456,15 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
           }
         }
       }
+      // Have we already tried exactly this, and failed, with nothing changed since? Past ~30 turns a
+      // model starts re-proposing actions whose failure is still in the transcript. The ledger answers
+      // with what happened last time instead of paying for the same failure again.
+      const priorAttempt = ledger.consider(call.name, call.args);
+      if (priorAttempt.blocked) {
+        messages.push(toolResultTurn(call.id, call.name, priorAttempt.feedback!));
+        emit({ turn, kind: "gate_block", detail: `repeat of a failed attempt: ${priorAttempt.feedback!.slice(0, 200)}` });
+        continue;
+      }
       // Every gate has passed — this call WILL execute. Announce it so a UI can show live activity
       // ("running: bash npm test") instead of a card that materializes only after the fact.
       currentCall = toolCalls;
@@ -460,12 +473,22 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       const toolStartedAt = Date.now();
       const res = await tool.execute(call.args, ctx);
       const toolDurationMs = Date.now() - toolStartedAt;
-      if (call.name === "edit" || call.name === "write") { if (!res.isError) { hasEdited = true; mutationSinceAutoCheck = true; } }
+      if (call.name === "edit" || call.name === "write") {
+        if (!res.isError) {
+          hasEdited = true; mutationSinceAutoCheck = true;
+          // The world changed: every earlier failure is worth re-attempting, so the ledger forgets.
+          ledger.noteMutation();
+        }
+      }
       if (call.name === "bash") {
         const c = String(call.args.command ?? ""); bashAll.push(c);
         if (!res.isError) { bashOk.push(c); if (hasEdited && RUN_CHECK_RE.test(c)) passingChecks++; }
       }
+      if (res.isError) ledger.recordFailure(call.name, call.args, res.output);
       let output = res.output;
+      // A first repeat is a warning, not a wall: the call ran, and the earlier failure rides along
+      // with its result so the model can see the pattern itself.
+      if (priorAttempt.feedback) output += `\n${priorAttempt.feedback}`;
       // Reliability hook: append a post-edit diagnostic (type/syntax gate — Tier A2) so a broken edit
       // is rejected and re-asked in the same turn, not three tool calls later.
       const extra = await params.postToolHook?.({ name: call.name, args: call.args }, res, ctx);
