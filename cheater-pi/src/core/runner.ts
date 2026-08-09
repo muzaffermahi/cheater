@@ -10,7 +10,7 @@ import type { Runner, RunContext, RunOutcome } from "./app.js";
 import type { InferenceCompleted } from "./events.js";
 import type { AgentEvent } from "./agent.js";
 import { runAgent } from "./agent.js";
-import { runReliableAgent } from "./reliable.js";
+import { runReliableAgent, type ReliableParams } from "./reliable.js";
 import { runBestOfN } from "./bestofn.js";
 import { runAscent, defaultAscentConfig } from "./ascent.js";
 import { KittenLLM, DEFAULT_MODELS } from "./llm.js";
@@ -211,7 +211,10 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
     return { allowed, feedback: allowed ? undefined : `denied by approval policy: ${assessment.message}` };
   };
 
-  if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent, profile);
+  // The ascent lane can decline to assemble (a poisoned experience store) and fall back to reliable.
+  // That fallback must run with the SAME guards as a first-class reliable run — approval gating above
+  // all — so it is handed the built parameter bag rather than reconstructing a thinner one.
+  if (ctx.lane === "ascent") return runAscentLane(ctx, llm, onEvent, profile, { ...common, commandGate });
 
   const preamble = ctx.conversationContext || undefined;
   // Stream the single-trajectory lanes (direct/reliable). bon/ascent run multiple candidates in parallel
@@ -277,26 +280,22 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
 }
 
 /**
- * Arm the effort profile's wall-clock ceiling as a real deadline for whichever lane runs.
+ * The lanes' cancellation signal. **There is deliberately no automatic wall-clock deadline.**
  *
- * Before this, "Fast ≈ 3 min … Think Hard ≈ 45 min" was a promise the engine could not keep. Two
- * separate reasons, and both had to go:
+ * An earlier version armed the effort profile's ceiling as a timer-backed AbortSignal, so
+ * "Fast ≈ 3 min … Think Hard ≈ 45 min" was enforced rather than advertised. That was removed on
+ * purpose: a timer that fires mid-candidate throws away work the run had already done, and the
+ * ceiling it enforced was a UI hint about typical cost, not a contract the user asked for. What
+ * bounds a run now is `maxTurns`, the budget governor's between-round accounting, and the user's
+ * own cancel — all of which stop at a seam where partial work survives.
  *
- *  1. `config.ceiling` was only ever set on the **ascent** branch, so a reliable or direct run had no
- *     wall-clock bound at all — only `maxTurns`.
- *  2. Even on ascent it was not a deadline. The BudgetGovernor records cost *after* a batch of
- *     attempts resolves and checks `exhausted()` only *between* rounds, so nothing samples the clock
- *     while a candidate is in flight. One long candidate simply overruns.
+ * A harness that genuinely needs a hard clock (a benchmark runner whose grader kills the container)
+ * owns that timeout itself and cancels through `ctx.signal`; the TB2 adapter does exactly this.
  *
- * A timer-backed AbortSignal fixes both: it fires wherever the run happens to be, and the lanes
- * already unwind cleanly on abort. `AbortSignal.any` keeps the user's own cancel working.
- *
- * The two causes must stay distinguishable — a run that hit its own ceiling is a very different
- * report from one the user stopped — so `expired` records which fired.
+ * This helper stays as the single place the lanes obtain their signal, so reintroducing a bound —
+ * should one ever be justified — is one function, not eight call sites.
  */
 function startEffortDeadline(ctx: RunContext): { signal: AbortSignal; expired: () => boolean; dispose: () => void } {
-  // Kept as a small compatibility seam for the ascent/reliable runners, but intentionally has no
-  // timer. Only the caller's explicit cancellation signal can stop a session.
   return { signal: ctx.signal ?? new AbortController().signal, expired: () => false, dispose: () => { /* no automatic deadline */ } };
 }
 
@@ -331,10 +330,9 @@ function ascentSummary(a: { summary: string; winnerHasExecutionReceipt: boolean 
 }
 
 /** Ascent lane: the full pass@k→pass@1 machine. Degrades to reliable if config assembly refuses. */
-async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void, profile: { systemPrompt?: string; model: string }): Promise<RunOutcome> {
-  // Ascent receives config.ceiling, but the governor only consults it BETWEEN rounds -- a single
-  // long candidate or repair loop overruns it entirely. The deadline signal is what actually bounds
-  // elapsed time, so this lane arms it too.
+async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: AgentEvent) => void, profile: { systemPrompt?: string; model: string }, fallback: ReliableParams): Promise<RunOutcome> {
+  // Ascent's own bound is config.ceiling, consulted BETWEEN rounds by the budget governor; this is
+  // just the user's cancellation signal (see startEffortDeadline — no automatic clock).
   const deadline = startEffortDeadline(ctx);
   // Pair started↔completed by the agent's own per-call number, so the completion closes the card the
   // start opened. A local counter would advance twice per call and never match.
@@ -349,7 +347,16 @@ async function runAscentLane(ctx: RunContext, llm: KittenLLM, onEvent: (e: Agent
   } catch (e) {
     // e.g. a poisoned experience store (DisjointnessError). Don't fail the user's run — degrade.
     ctx.emit({ type: "verification.failed", runId: ctx.runId, detail: `ascent setup declined (${(e as Error).message.slice(0, 120)}); using reliable lane` });
-    const result = await runReliableAgent({ task: ctx.task, cwd: ctx.cwd, llm, model: profile.model, systemPrompt: profile.systemPrompt, onEvent, signal: deadline.signal, contextPreamble: ctx.conversationContext || undefined, onVerification: verificationSink(ctx), maxTurns: ctx.profile.maxTurns, reasoningBudget: ctx.profile.reasoningBudget, effort: ctx.profile.level, scoutFiles: ctx.profile.scoutFiles });
+    // A degraded run is still the user's run. Rebuilding a thinner parameter set here is how it
+    // silently lost its destructive-shell approval gate, its file scope, and its inference phase —
+    // the fallback now inherits the caller's full bag and overrides only what is lane-local.
+    const result = await runReliableAgent({
+      ...fallback,
+      signal: deadline.signal,
+      contextPreamble: ctx.conversationContext || undefined,
+      onVerification: verificationSink(ctx),
+      scoutFiles: ctx.profile.scoutFiles,
+    });
     for (const f of result.filesWritten) ctx.emit({ type: "file.changed", runId: ctx.runId, path: f, added: 0, removed: 0 });
     return {
       finished: result.finished, summary: result.summary || result.stopReason, wallMs: result.wallMs, usage: result.usage,

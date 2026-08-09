@@ -162,6 +162,12 @@ auto-tiers to a cheap model (qwen3-8b) — which also fixes that the local 2b de
 cloud at all. The expensive model is spent only on the actual coding.
 
 **Result: kitten 7/10 vs opencode 5/10** (from 6-vs-5) — the two unique kitten wins (`intervals`, `vm`)
+<!-- HONESTY NOTE (audit, 2026-08-09): the only STORED result for this battery is 6/10 vs 5/10
+     (tbench-run/local-battery/results/kitten-vs-opencode-cloud/SUMMARY.md + results.jsonl, 20
+     records). The 7/10 above is prose from the session that added the worked-example gate and has
+     no results file behind it. Treat 6/10 as the measured number and 7/10 as unverified until the
+     battery is re-run and its output committed. -->
+
 plus the flipped `expr`, at ~3× opencode's wall-clock (the test-time-compute tradeoff). Remaining kitten
 fails (`cron`, `glob`, `regexlite`) are edge-case/hang bugs at the 35B's capability ceiling — an
 edge-case-enumeration prompt was tried and **reverted** (it added latency without improving them: the

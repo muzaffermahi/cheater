@@ -47,8 +47,21 @@ ORM lift over random       : +45.5 pts   (gap to oracle: 4.5 pts)
 
 The ORM captures nearly all of the pass@k ceiling as Best@1, leaving a small residual (the irreducible
 verifier error) — the SWE-Gym story in miniature. **The AUC on synthetic data is not a real capability
-claim**; it only proves the data→train→eval→infer loop works end to end and that the learned weights are
-sane (`hasPassingRun`, `finished`, `verifiedMarker` positive; `hasFailingRun`, `crashMarker` negative).
+claim**; it only proves the data→train→eval→infer loop works end to end.
+
+> **The committed `pol-ckpt.json` is NOT trustworthy and must not be cited or loaded.** An audit
+> (2026-08-09) found two things wrong with it, both visible in the file:
+>
+> 1. The sanity story above does not hold. `finished` is **−1.744**, not positive — this checkpoint
+>    learned that a trajectory saying it finished is *less* likely to have solved anything. On the
+>    synthetic corpus that may even be right (fabricated failures also "finish"), which is precisely
+>    why a synthetic checkpoint must not be pointed at real runs.
+> 2. `bias` (−0.40734597145868356) is byte-identical to `weights[2]` (`hasExecutionReceipt`). Two
+>    independently-fit parameters do not land on the same 17 significant figures; this is a copy
+>    artifact in `train.mjs`'s output, not a converged bias.
+>
+> The ORM is dark by default (`loadOrm()` returns null without `KITTEN_ORM_CHECKPOINT`), so nothing
+> in the product is affected. Fix `train.mjs`'s output and re-train before wiring anything to it.
 
 Wire it into the verifier with **zero code change**:
 

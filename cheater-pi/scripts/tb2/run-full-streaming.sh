@@ -25,9 +25,11 @@ export TB2_HOST_GATEWAY="${TB2_HOST_GATEWAY:-192.168.16.1}"
 export TB2_MAIN_PORT="${TB2_MAIN_PORT:-11435}"
 export TB2_MAIN_MODEL="${TB2_MAIN_MODEL:-kat-coder-v2.5-dev-apex-mtp}"
 export TB2_CONTEXT_TOKENS="${TB2_CONTEXT_TOKENS:-65536}"
-# Keep Kitten's own budget below the Harbor ceiling while leaving enough time for
-# long-context KAT runs to finish and flush their durable result.
-export TB2_KITTEN_CEILING_MS="${TB2_KITTEN_CEILING_MS:-1680000}"
+# Kitten has NO automatic wall clock (the effort levels are a cost hint, not a contract), so the
+# harness owns the deadline: the adapter passes this to `kitten run --deadline-ms`, which cancels the
+# run cleanly a little before Harbor kills the container — a run killed mid-flight writes nothing.
+# Keep it below TB2_TIMEOUT_SECONDS * 1000.
+export TB2_KITTEN_DEADLINE_MS="${TB2_KITTEN_DEADLINE_MS:-${TB2_KITTEN_CEILING_MS:-1680000}}"
 # Keep the model name explicit for the Kitten process as well as the benchmark
 # wrapper.  This is intentionally benchmark-only; product defaults are untouched.
 export KITTEN_MAIN_MODEL="${KITTEN_MAIN_MODEL:-$TB2_MAIN_MODEL}"

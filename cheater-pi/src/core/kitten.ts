@@ -31,6 +31,7 @@ import { resolveBenchmarkProfile } from "./benchmark.js";
 import { gatherSupportInfo } from "./support.js";
 import { launchApp, installLauncher } from "./app-launch.js";
 import type { KittenEvent, Lane } from "./events.js";
+import { parseRunFlags } from "./runFlags.js";
 import type { ConversationRow } from "./store/conversationStore.js";
 
 const dim = (s: string): string => `\x1b[2m${s}\x1b[0m`;
@@ -62,11 +63,10 @@ Usage:
 run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
               --effort fast|balanced|careful|think-hard   how much compute the run may spend
               -c, --conversation <id>   continue an existing conversation (headless multi-turn)
+              --deadline-ms N   cancel the run after N ms so the result is still written
+                                (for harnesses whose grader kills the process; there is no
+                                 automatic wall clock — see runner.startEffortDeadline)
 `;
-
-function isLane(s: string | undefined): s is Lane {
-  return s === "answer" || s === "direct" || s === "reliable" || s === "bon" || s === "ascent";
-}
 
 /** A concise human line for a streamed/replayed event. Returns null for events not worth showing. */
 function renderEvent(e: KittenEvent): string | null {
@@ -97,28 +97,7 @@ function renderEvent(e: KittenEvent): string | null {
 }
 
 async function cmdRun(rest: string[]): Promise<number> {
-  let cwd = process.cwd();
-  let model: string | undefined;
-  let lane: Lane | undefined;
-  let k: number | undefined;
-  let effort: string | undefined;
-  let json = false;
-  let dangerous = false;
-  let continueId: string | undefined;
-  const words: string[] = [];
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === "--cwd") cwd = resolve(rest[++i] ?? ".");
-    else if (a === "--model") model = rest[++i];
-    else if (a === "--lane") { const l = rest[++i]; if (isLane(l)) lane = l; }
-    else if (a === "--k") k = Math.max(1, Number(rest[++i]) || 1);
-    else if (a === "--effort") effort = rest[++i];
-    else if (a === "--json") json = true;
-    else if (a === "--dangerous" || a === "--yes") dangerous = true;
-    else if (a === "--conversation" || a === "-c") continueId = rest[++i];
-    else words.push(a);
-  }
-  const task = words.join(" ").trim();
+  const { cwd, model, lane, k, effort, json, dangerous, continueId, deadlineMs, task } = parseRunFlags(rest);
   if (!task) { process.stderr.write('kitten run: give a task, e.g. kitten run "fix the parser"\n'); return 2; }
 
   const store = ConversationStore.open(storePath());
@@ -166,11 +145,34 @@ async function cmdRun(rest: string[]): Promise<number> {
     conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
   }
   if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id}${continueId ? " (continued)" : ""} · ${cwd}`) + "\n");
+
+  // An explicit, caller-owned deadline. Kitten has no automatic wall clock — the effort levels are a
+  // cost hint, not a contract — but a harness whose grader kills the container at a fixed time needs
+  // the run to stop *itself* a little earlier so the durable result gets written. Measured on
+  // Terminal-Bench 2: the grader kills at 900s, and a run killed mid-flight loses everything it did.
+  // This cancels exactly as the user's own cancel does, at a seam where partial work survives.
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  let unsubscribeDeadline: (() => void) | undefined;
+  if (deadlineMs > 0) {
+    unsubscribeDeadline = app.subscribe((e) => {
+      if (e.type !== "run.started" || deadlineTimer) return;
+      const runId = e.runId;
+      deadlineTimer = setTimeout(() => {
+        process.stderr.write(`kitten run: deadline of ${Math.round(deadlineMs / 1000)}s reached; cancelling so the result is written\n`);
+        app.cancel(runId);
+      }, deadlineMs);
+      deadlineTimer.unref?.();
+      unsubscribeDeadline?.();
+    });
+  }
+
   const run = await app.submitMessage(conv.id, task, {
     lane: benchmarkProfile === "minimal" && lane && lane !== "answer" ? "reliable" : lane,
     k: benchmarkProfile === "minimal" ? 1 : k,
     effort,
   });
+  if (deadlineTimer) clearTimeout(deadlineTimer);
+  unsubscribeDeadline?.();
 
   if (json) {
     process.stdout.write(JSON.stringify({ conversationId: conv.id, run }) + "\n");
