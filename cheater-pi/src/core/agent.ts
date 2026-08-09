@@ -267,10 +267,15 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       // it. `reasoning_effort` alone is not a reliable control (only "none" dependably bites), so the
       // budget travels with it and is the thing that actually bounds the tax.
       reasoningBudget: params.reasoningBudget ?? profileTransport.reasoningBudget,
-      // Per-token probabilities are NOT free: llama.cpp reports roughly a 3x generation slowdown with
-      // n_probs > 0, and self-certainty is only ever consulted to break a tie between candidates. So
-      // capture them only when more than one candidate will exist — a single-candidate run has nothing
-      // to compare against and was paying the tax for a number nobody read.
+      // Self-certainty is only ever consulted to break a tie between candidates, so a single-candidate
+      // run captures a number nobody reads. That is the whole reason for the gate.
+      //
+      // It is NOT a cost argument, though it used to be recorded as one ("llama.cpp reports roughly a
+      // 3x generation slowdown with n_probs > 0"). Measured on the reference machine against a live
+      // ornith-35B at ncmoe 31, four paired runs after a discarded warm-up: 16.35 tok/s median with
+      // logprobs off, 17.88 with them on — a ratio of 0.91x, i.e. free, with the difference inside the
+      // run-to-run spread. The pre-declared threshold for turning the lever off was 1.5x. It is not
+      // close, so the levers that need logprobs stay on; only the pointless capture is skipped.
       logprobs: captureLogprobs || (profile.logprobs && Boolean(params.captureConfidence)),
       topLogprobs: (captureLogprobs || (profile.logprobs && Boolean(params.captureConfidence))) ? 5 : undefined,
       logitBias: params.decode?.logitBias,
