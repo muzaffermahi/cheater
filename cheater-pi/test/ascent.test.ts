@@ -68,17 +68,33 @@ test("attempt indices are globally unique across repair rounds (no cascade/verif
 test("candidate lifecycle hooks expose durable started/completed/rejected cards", async () => {
   const cwd = baseWorkspace();
   const events: Array<{ phase: string; index: number }> = [];
+  const starts: Array<{ index: number; lead: boolean }> = [];
+  // A start is announced from INSIDE the burst. When it was emitted by the caller after the burst
+  // resolved, this flag stayed false — and the UI sat on "starting" for the whole generation phase
+  // before learning everything at once. Observed live as an 8-minute blank panel.
+  let sawStartWhileGenerating = false;
   const runWrong: RunOne = async (p) => {
+    if (starts.length > 0) sawStartWhileGenerating = true;
     writeFileSync(join(p.cwd, "impl.py"), "def f(x):\n    return x + 1\n");
     return { finished: true, summary: "wrong", turns: 1, toolCalls: 1, filesWritten: ["impl.py"], events: [], usage: { prompt: 1, completion: 1, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
   };
   await runAscent(
     { task: "Implement `f` in impl.py. Examples: `f(2)` -> `4`; `f(3)` -> `6`.", cwd, forceSamples: 2, hardness: {} },
-    { llm: fakeLlm, runOne: runWrong, levers: { ...ALL_LEVERS }, onCandidate: ({ phase, attempt }) => { events.push({ phase, index: attempt.index }); } }
+    {
+      llm: fakeLlm, runOne: runWrong, levers: { ...ALL_LEVERS },
+      onCandidate: ({ phase, attempt }) => { events.push({ phase, index: attempt.index }); },
+      onCandidateStart: (e) => starts.push(e),
+    }
   );
-  assert.ok(events.filter((e) => e.phase === "started").length >= 2, "each generated candidate starts a durable card");
+  assert.ok(starts.length >= 2, `each generated candidate starts a durable card, got ${starts.length}`);
+  assert.ok(sawStartWhileGenerating, "starts are announced during generation, not after the burst resolves");
+  assert.ok(starts.some((s) => s.lead), "one candidate per round is marked as the streamed lead");
   assert.ok(events.some((e) => e.phase === "completed"), "candidate completion is emitted after generation");
   assert.ok(events.some((e) => e.phase === "rejected"), "execution-ineligible candidates are explained as rejected");
+  // A start and its completion must name the same candidate, or the UI updates the wrong row.
+  for (const e of events.filter((x) => x.phase === "completed")) {
+    assert.ok(starts.some((s) => s.index === e.index), `completion ${e.index} has no matching start [${starts.map((s) => s.index)}]`);
+  }
 });
 
 test("diversity lever OFF ⇒ a single attempt (k=1), no diverse batch", async () => {

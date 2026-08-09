@@ -29,6 +29,7 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
+import { generatePlans, selectPlan, planDirective, type CandidatePlan } from "./planFirst.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
@@ -85,8 +86,15 @@ export interface AscentConfig {
   /** Measurement hook (D1): awaited with all candidate workspaces + the verdict BEFORE cleanup, so a
    *  rig can oracle-score every candidate (pass@k) not just the winner. */
   onVerified?: (ctx: { attempts: BurstAttempt[]; verdict: { winner: number | null; slate: Array<{ index: number }> } }) => void | Promise<void>;
-  /** Durable candidate cards for the desktop/app event stream. */
-  onCandidate?: (event: { phase: "started" | "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
+  /** Durable candidate cards for the desktop/app event stream. Only ever fired with a REAL resolved
+   *  attempt, which is why "started" is a separate hook — at start there is no attempt yet. */
+  onCandidate?: (event: { phase: "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
+  /** The competing plans and the one chosen to implement (plan-diversity mode). */
+  onPlanSelected?: (event: { considered: CandidatePlan[]; chosen: CandidatePlan; reason: string }) => void;
+  /** A candidate has begun generating. Fires immediately, not once the burst resolves. */
+  onCandidateStart?: (event: { index: number; lead: boolean }) => void;
+  /** Live agent events from the lead candidate, so the generation phase is not a black box. */
+  onLeadEvent?: (e: AgentEvent) => void;
 }
 
 export interface AscentParams {
@@ -278,6 +286,22 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   let round = 0;
   const maxRounds = lever(config, "diversity") ? (config.maxRepairRounds ?? (samples <= 1 ? 1 : 2)) : 1;
 
+  // Plan-diversity: spend k on PLANS, then implement once. Only when the candidates would serialize
+  // (concurrency 1 — a local single-slot runtime); a cloud burst runs them concurrently and keeps the
+  // stronger implementation-diversity. See planFirst.ts for the measurement behind this.
+  let planDirectiveText: string | undefined;
+  if (samples > 1 && concurrency === 1 && lever(config, "diversity")) {
+    const generated = await generatePlans(genLlm, params.task, samples, params.signal);
+    const selection = await selectPlan(genLlm, params.task, generated, params.signal);
+    if (selection.chosen) {
+      planDirectiveText = planDirective(selection.chosen);
+      receipts.push(`plan-first: ${generated.length} plan(s) generated, ${selection.reason} → 1 implementation (candidates would have run serially)`);
+      try { config.onPlanSelected?.({ considered: selection.considered, chosen: selection.chosen, reason: selection.reason }); } catch { /* UI hook */ }
+      // The diversity budget was spent on plans. Implementing k times as well would be paying twice.
+      samples = 1;
+    }
+  }
+
   for (round = 1; round <= maxRounds; round++) {
     if (governor.exhausted()) { receipts.push("budget exhausted → stop generating"); break; }
     const plans = planAttempts(samples, {
@@ -291,23 +315,32 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     // and any candidate that hits the finish gate gets its reasoning back for the repair turns.
     const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
     if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
-    const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
-        decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
-      plans,
-      { concurrency, runOne: config.runOne }
-    );
-    for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
     // cloudBurst assigns round-local indices 1..k, but cascade/verifier/measure use `index` as a stable
     // GLOBAL identity. Without reindexing, a repair round's indices collide with round 1 — collapsing the
     // survivorsByIndex map (round 2 shadows round 1), adopting the wrong round's workspace, and
-    // misattributing Best@1. Give each attempt a unique index across rounds.
+    // misattributing Best@1. Give each attempt a unique index across rounds. Computed BEFORE the burst
+    // so a candidate announced at start carries the same identity it will report at completion.
     const indexBase = allAttempts.length;
+    const attempts = await cloudBurstGenerate(
+      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: [basePrime, planDirectiveText].filter(Boolean).join("\n\n"), contextPreamble: params.contextPreamble,
+        decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
+      plans,
+      {
+        concurrency, runOne: config.runOne,
+        // Announce each candidate as it STARTS. This used to run after the burst resolved, which meant
+        // the whole generation phase — the longest part of the run — reported nothing at all.
+        onStart: (plan) => {
+          // Global index, matching the reindexing applied to the resolved attempts below, so a
+          // "started" and its later "completed" name the same candidate.
+          const slot = plans.findIndex((p) => p === plan);
+          try { config.onCandidateStart?.({ index: indexBase + (slot < 0 ? 0 : slot) + 1, lead: slot === 0 }); } catch { /* UI hook */ }
+        },
+        onLeadEvent: config.onLeadEvent,
+      }
+    );
+    for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
     attempts.forEach((a, j) => { a.index = indexBase + j + 1; });
     allAttempts = allAttempts.concat(attempts);
-    for (const attempt of attempts) {
-      try { await config.onCandidate?.({ phase: "started", attempt }); } catch { /* telemetry-free UI hook */ }
-    }
 
     // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
     // not enough — a candidate can pass its own finish gate yet be wrong on the worked examples, and

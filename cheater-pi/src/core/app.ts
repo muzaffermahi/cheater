@@ -15,7 +15,7 @@
 import {
   ConversationStore, type ConversationRow, type RunRow,
 } from "./store/conversationStore.js";
-import { EVENT_SCHEMA_VERSION, type EventPayload, type KittenEvent, type Lane } from "./events.js";
+import { EVENT_SCHEMA_VERSION, TRANSIENT_EVENTS, type EventPayload, type KittenEvent, type Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
 import type { HardnessSignal } from "../runtime/computeBudget.js";
 import { effortProfile, resolveEffort, type EffortLevel, type EffortProfile } from "./effort.js";
@@ -34,6 +34,7 @@ import {
   type CompileResult, type TaskCompilerFlag,
 } from "./taskCompiler/index.js";
 import { SidecarAssist, type RunFacts } from "./sidecarAssist.js";
+import { approvePlan as approvePlanArtifact, createPlanArtifact, isApprovedExact, revisePlan as revisePlanArtifact, workspaceFingerprint, type PlanArtifact, type PlanPatch } from "./planArtifact.js";
 
 /** Everything a Runner needs to execute one run, plus the sink it emits progress into. */
 export interface RunContext {
@@ -84,6 +85,19 @@ export type ApprovalPolicy = "ask" | "auto-allow" | "auto-deny";
     verified: boolean;
     /** Effective model used for the run. */
     model?: string;
+    /** The engine stopped itself at the selected effort ceiling; this is not a user cancellation. */
+    stoppedByCeiling?: boolean;
+    executionStrategy?: "compiled-fast" | "compiled-fast-to-reliable" | "agent";
+    performance?: {
+      modelCalls: number;
+      cacheTokens: number;
+      promptTokens: number;
+      promptMs: number;
+      predictedTokens: number;
+      predictedMs: number;
+      decodeTokensPerSecond: number;
+      effectiveOutputRate: number;
+    };
   }
 
 /** The execution seam. Default = engine-backed (runner.ts); tests inject a deterministic scripted one. */
@@ -231,6 +245,90 @@ export class KittenApp {
     return { runId: row.runId, mode: row.mode, family: row.family, ir: row.ir, trace: row.trace, rendered: row.rendered, promptEpoch: row.promptEpoch };
   }
 
+  createPlanArtifact(input: Omit<Parameters<typeof createPlanArtifact>[0], "now"> & { now?: number }): PlanArtifact {
+    const plan = createPlanArtifact({ ...input, now: input.now ?? this.now() });
+    this.store.savePlan(plan);
+    this.emit(plan.conversationId, { type: "plan.created", runId: plan.id, planId: plan.id, revision: plan.revision, hash: plan.hash, status: plan.status });
+    return plan;
+  }
+
+  getPlanArtifact(id: string, revision?: number): PlanArtifact | null { return this.store.getPlan(id, revision)?.artifact ?? null; }
+
+  listPlanArtifacts(conversationId: string): PlanArtifact[] { return this.store.listPlans(conversationId).map((row) => row.artifact); }
+
+  revisePlanArtifact(id: string, patch: PlanPatch): PlanArtifact {
+    const previous = this.getPlanArtifact(id);
+    if (!previous) throw new Error(`unknown plan: ${id}`);
+    const revised = revisePlanArtifact(previous, patch, this.now());
+    this.store.updatePlanStatus(previous.id, previous.revision, "superseded", this.now());
+    this.store.savePlan(revised);
+    this.emit(revised.conversationId, { type: "plan.revised", runId: revised.id, planId: revised.id, revision: revised.revision, hash: revised.hash, status: revised.status, detail: `supersedes revision ${previous.revision}` });
+    return revised;
+  }
+
+  approvePlanArtifact(id: string, revision?: number): PlanArtifact {
+    const current = this.getPlanArtifact(id, revision);
+    if (!current) throw new Error(`unknown plan: ${id}`);
+    const approved = approvePlanArtifact(current, this.now());
+    this.store.savePlan(approved);
+    this.emit(approved.conversationId, { type: "plan.approved", runId: approved.id, planId: approved.id, revision: approved.revision, hash: approved.hash, status: approved.status });
+    return approved;
+  }
+
+  cancelPlanArtifact(id: string, revision?: number): PlanArtifact {
+    const current = this.getPlanArtifact(id, revision);
+    if (!current) throw new Error(`unknown plan: ${id}`);
+    if (current.status === "completed" || current.status === "superseded") throw new Error(`cannot cancel a ${current.status} plan`);
+    const cancelled = { ...current, status: "cancelled" as const, updatedAt: this.now() };
+    this.store.savePlan(cancelled);
+    this.emit(cancelled.conversationId, { type: "plan.cancelled", runId: id, planId: id, revision: cancelled.revision, hash: cancelled.hash, status: cancelled.status, detail: "cancelled by user" });
+    return cancelled;
+  }
+
+  /** Execute exactly the approved artifact. A workspace change in a planned file blocks execution
+   * and creates an explicit drift event instead of silently asking the model for a new plan. */
+  async executePlanArtifact(id: string, revision?: number, parentRunId?: string, signal?: AbortSignal): Promise<TaskNodeRow[]> {
+    const plan = this.getPlanArtifact(id, revision);
+    if (!plan) throw new Error(`unknown plan: ${id}`);
+    if (!isApprovedExact(plan)) throw new Error(`plan ${id} revision ${plan.revision} is not approved exactly`);
+    const files = [...new Set(plan.steps.flatMap((step) => step.allowedFiles))];
+    const currentFingerprint = workspaceFingerprint(plan.projectRoot, files);
+    if (currentFingerprint !== plan.workspaceFingerprint) {
+      const drifted = { ...plan, status: "needs_review" as const, updatedAt: this.now() };
+      this.store.savePlan(drifted);
+      this.emit(plan.conversationId, { type: "plan.drifted", runId: plan.id, planId: plan.id, revision: plan.revision, hash: plan.hash, status: drifted.status, detail: "planned files changed since approval" });
+      throw new Error("planned files changed since approval; review the plan before implementing");
+    }
+    const runId = parentRunId ?? this.newId("plan-run");
+    this.store.updatePlanStatus(plan.id, plan.revision, "running", this.now());
+    this.emit(plan.conversationId, { type: "plan.started", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: "running" });
+    const nodes = plan.steps.map((step) => ({
+      id: `${plan.id}-r${plan.revision}-${step.id}`,
+      agent: step.agent,
+      objective: step.objective,
+      dependencies: step.dependsOn.map((dep) => `${plan.id}-r${plan.revision}-${dep}`),
+      allowedFiles: step.allowedFiles,
+      forbiddenFiles: step.forbiddenFiles,
+      acceptanceCriteria: step.acceptanceCriteria,
+      modelTier: step.modelTier,
+      workspaceMode: step.workspaceMode,
+      budget: { maxTurns: 20, maxTokens: 24_000, maxWallMs: 0, maxToolCalls: 60 },
+    }));
+    try {
+      this.createTaskPlan({ conversationId: plan.conversationId, nodes, ts: this.now() }, runId);
+      const settled = await this.runTaskPlan(plan.conversationId, runId, signal);
+      const ok = settled.every((node) => node.status === "completed" || node.status === "waiting");
+      this.store.updatePlanStatus(plan.id, plan.revision, ok ? "completed" : "needs_review", this.now());
+      this.emit(plan.conversationId, { type: "plan.completed", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: ok ? "completed" : "needs_review", detail: ok ? "all approved steps settled" : "one or more approved steps did not complete" });
+      return settled;
+    } catch (error) {
+      const cancelled = signal?.aborted || /cancel/i.test(String((error as Error).message ?? error));
+      this.store.updatePlanStatus(plan.id, plan.revision, cancelled ? "cancelled" : "needs_review", this.now());
+      this.emit(plan.conversationId, { type: "plan.cancelled", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: cancelled ? "cancelled" : "needs_review", detail: String((error as Error).message ?? error).slice(0, 300) });
+      throw error;
+    }
+  }
+
   /** Change the approval policy (e.g. a TUI sets "ask", a --dangerous headless run sets "auto-allow"). */
   setApprovalPolicy(policy: ApprovalPolicy): void {
     this.approvalPolicy = policy;
@@ -294,6 +392,15 @@ export class KittenApp {
   /** Persist an event, then broadcast it. Persistence-before-broadcast guarantees a late subscriber
    *  can replay from the store and see exactly what earlier subscribers saw. */
   private emit(conversationId: string, payload: EventPayload): KittenEvent {
+    // Reasoning is streamed live and deliberately never replayed (see the renderer contract), so
+    // writing it to the durable log only costs disk. That cost is what forced the stream to be
+    // coarse — one event per 300 characters, which reads as the model thinking in slow lurches.
+    // Broadcasting it without persisting is what lets it stream at a readable rate.
+    if (TRANSIENT_EVENTS.has(payload.type)) {
+      const live = { id: `${conversationId}:live`, conversationId, seq: 0, ts: this.now(), schemaVersion: EVENT_SCHEMA_VERSION, ...payload } as KittenEvent;
+      for (const fn of this.listeners) { try { fn(live); } catch { /* a bad listener never breaks a run */ } }
+      return live;
+    }
     const event = this.store.appendEvent(conversationId, payload, this.now());
     for (const fn of this.listeners) { try { fn(event); } catch { /* a bad listener never breaks a run */ } }
     return event;
@@ -834,6 +941,9 @@ export class KittenApp {
         this.emit(conversationId, {
           type: "run.completed", runId, finished: outcome.finished, verified: outcome.verified, lane: decision.lane,
           model: outcome.model ?? conv.model, summary: outcome.summary, wallMs: outcome.wallMs, usage: outcome.usage,
+          ...(outcome.stoppedByCeiling ? { stoppedByCeiling: true } : {}),
+          ...(outcome.executionStrategy ? { executionStrategy: outcome.executionStrategy } : {}),
+          ...(outcome.performance ? { performance: outcome.performance } : {}),
         });
         this.emit(conversationId, {
           type: "receipt.finalized", runId, lines: outcome.receiptLines,

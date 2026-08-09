@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KittenLLM, cloudModels } from "./llm.js";
 import { runReliableAgent, type ReliableParams } from "./reliable.js";
-import type { AgentRunResult } from "./agent.js";
+import type { AgentRunResult, AgentEvent } from "./agent.js";
 import { rotateLocalization, type AttemptPlan } from "./diversity.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
 
@@ -81,6 +81,22 @@ export interface CloudBurstParams {
 export interface CloudBurstOpts {
   concurrency?: number;
   runOne?: RunOne;             // injectable (default runReliableAgent)
+  /**
+   * Fired the moment a candidate's agent is about to start — NOT after the burst resolves.
+   *
+   * Ascent used to announce every candidate only once `cloudBurstGenerate` had already returned, i.e.
+   * after all of them had finished. On a local 35B that is the entire multi-minute run, so the UI sat
+   * on "starting" for eight minutes and then learned everything at once. A start hook has to be a
+   * start hook.
+   */
+  onStart?: (plan: AttemptPlan) => void;
+  /**
+   * Live agent events from ONE designated candidate (the lead). k candidates interleaving their token
+   * streams is unreadable noise, which is why this lane streamed nothing at all — but "nothing at all"
+   * left the hardest tasks as the most opaque ones. Following a single candidate is readable and
+   * honest, and the others stay silent.
+   */
+  onLeadEvent?: (e: AgentEvent) => void;
 }
 
 /**
@@ -92,12 +108,20 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
   const runOne = opts.runOne ?? runReliableAgent;
   const contract = extractAcceptanceContract(params.task);
   const concurrency = Math.max(1, opts.concurrency ?? 6);
+  // One candidate carries the live view. The first plan is the natural choice: it is the unperturbed
+  // one (no directive rotation, base temperature), so what the user watches is the straight attempt.
+  const leadIndex = plans.length ? plans[0].index : -1;
   return mapLimit(plans, concurrency, async (plan) => {
     const workspace = isolate(params.cwd);
     const localizationFiles = plan.localizationRotation > 0 ? rotateLocalization(contract.files, plan.localizationRotation) : undefined;
+    const isLead = plan.index === leadIndex && typeof opts.onLeadEvent === "function";
+    try { opts.onStart?.(plan); } catch { /* a UI hook must never fail a candidate */ }
     let result: AgentRunResult & { contractTargets: string[] };
     try {
       result = await runOne({
+        // Only the lead reports. `streamDeltas` without an `onEvent` sink is pointless work, so the
+        // two travel together.
+        ...(isLead ? { onEvent: opts.onLeadEvent, streamDeltas: true } : {}),
         task: params.task, cwd: workspace, llm: params.llm, model: params.model,
         maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, temperature: plan.temperature,
         extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime,

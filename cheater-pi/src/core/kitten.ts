@@ -15,7 +15,6 @@
 import { resolve } from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { SidecarAssist } from "./sidecarAssist.js";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
@@ -27,6 +26,8 @@ import { runTui } from "./tui.js";
 import { runWeb, runServe } from "./web.js";
 import { VERSION } from "../config.js";
 import { runAttach } from "./tui.js";
+import { SidecarAssist } from "./sidecarAssist.js";
+import { resolveBenchmarkProfile } from "./benchmark.js";
 import { gatherSupportInfo } from "./support.js";
 import { launchApp, installLauncher } from "./app-launch.js";
 import type { KittenEvent, Lane } from "./events.js";
@@ -123,10 +124,23 @@ async function cmdRun(rest: string[]): Promise<number> {
   const store = ConversationStore.open(storePath());
   // Resolve endpoint/model from config (env > project .kitten > user config > defaults); --model wins.
   const settings = loadKittenSettings(cwd);
+  const benchmarkProfile = resolveBenchmarkProfile();
+  // Benchmark switches are intentionally environment-only and never appear in supported config/UI.
+  const benchmarkCompilerOff = benchmarkProfile === "minimal" || benchmarkProfile === "no-compiler" || benchmarkProfile === "no-learned";
+  const benchmarkWebAccess = benchmarkProfile === "full" ? settings.webAccess : "off";
   const resolvedModel = model ?? settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
   // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: dangerous ? "auto-allow" : "auto-deny", taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
+  // The supported CLI path uses one primary runtime; legacy sidecar assist is not scheduled.
+  const app = new KittenApp({
+    store,
+    runner: defaultRunner(llm, { webAccess: benchmarkWebAccess, fastPath: benchmarkProfile === "minimal" ? "off" : settings.fastPath }),
+    projectRoot: cwd,
+    model: resolvedModel,
+    contextWindowTokens: typeof settings.contextWindowTokens === "number" ? settings.contextWindowTokens : undefined,
+    approvalPolicy: dangerous ? "auto-allow" : "auto-deny",
+    taskCompiler: benchmarkCompilerOff ? "off" : settings.taskCompiler,
+  });
   app.recover();
   if (!json) {
     // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
@@ -152,7 +166,11 @@ async function cmdRun(rest: string[]): Promise<number> {
     conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
   }
   if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id}${continueId ? " (continued)" : ""} · ${cwd}`) + "\n");
-  const run = await app.submitMessage(conv.id, task, { lane, k, effort });
+  const run = await app.submitMessage(conv.id, task, {
+    lane: benchmarkProfile === "minimal" && lane && lane !== "answer" ? "reliable" : lane,
+    k: benchmarkProfile === "minimal" ? 1 : k,
+    effort,
+  });
 
   if (json) {
     process.stdout.write(JSON.stringify({ conversationId: conv.id, run }) + "\n");

@@ -239,11 +239,9 @@ test("route.selected carries the deterministic hardness score", async () => {
 
 // ── E12b: the effort ceiling is a real deadline ─────────────────────────────────────────────────
 
-test("a run that overruns its effort ceiling is stopped, and says so", async () => {
-  // The dial promised "Fast ≈ 3 min ... Think Hard ≈ 45 min" and could not keep it. config.ceiling
-  // was set only on the ascent branch, and even there the governor checks the clock only BETWEEN
-  // rounds — so nothing bounded a candidate in flight. template_engine ran 900s under Balanced
-  // (a 10 min ceiling) and had to be killed from outside, losing everything it had.
+test("a run is never stopped by an effort wall-clock ceiling", async () => {
+  // Wall-clock ceilings are intentionally ignored. A local model can spend longer in prefill or
+  // reasoning than a mode's old limit; only explicit cancellation/max-turn or token controls apply.
   const cwd = mkdtempSync(join(tmpdir(), "kitten-deadline-"));
   writeFileSync(join(cwd, "marker.txt"), "content the model keeps re-reading\n");
   let calls = 0;
@@ -266,20 +264,16 @@ test("a run that overruns its effort ceiling is stopped, and says so", async () 
   } as unknown as KittenLLM;
 
   const events: EventPayload[] = [];
-  const profile = { ...EFFORT_PROFILES.fast, level: "fast" as const, maxTurns: 500, ceiling: { maxWallMs: 300 } };
+  const profile = { ...EFFORT_PROFILES.fast, level: "fast" as const, maxTurns: 3, ceiling: { maxWallMs: 1 } };
   const started = Date.now();
   const outcome = await defaultRunner(neverFinishes)(runCtx({
     cwd, lane: "direct", profile, emit: (p) => events.push(p),
   }));
   const elapsed = Date.now() - started;
 
-  assert.ok(elapsed < 8000, `the ceiling must actually stop the run, took ${elapsed}ms`);
-  assert.ok(outcome.receiptLines.some((l) => /effort ceiling/i.test(l)),
-    `the receipt must explain WHY it stopped, got: ${JSON.stringify(outcome.receiptLines)}`);
-  assert.ok(outcome.receiptLines.some((l) => /raise the effort dial/i.test(l)),
-    "and must tell the user the lever that fixes it");
-  assert.ok(events.some((e) => e.type === "run.status" && /effort ceiling/i.test(e.detail ?? "")),
-    "the UI must be told too, not just the receipt");
+  assert.ok(elapsed >= 60, `the 1ms ceiling must not abort the model, took ${elapsed}ms`);
+  assert.ok(!outcome.receiptLines.some((l) => /effort ceiling/i.test(l)), "no automatic wall-clock stop is reported");
+  assert.ok(!events.some((e) => e.type === "run.status" && /effort ceiling/i.test(e.detail ?? "")), "the UI receives no wall-clock stop");
 });
 
 test("a run inside its ceiling is untouched by the deadline", async () => {
@@ -346,27 +340,74 @@ test("a tool call rejected for bad arguments names the reason, and oversized pay
   assert.match(toolReply, /smaller pieces/, "an oversized payload gets advice it can act on, not 'use valid JSON'");
 });
 
-test("KITTEN_CEILING_MS overrides the wall clock without disturbing the rest of the profile", async () => {
-  // Terminal-Bench kills the agent at 900s. The stock levels are 3/10/20/45 min, so `balanced`
-  // wastes 300s of usable budget on every task while `careful` overshoots and is killed with
-  // nothing written. An external deadline that falls between the levels needs a direct override.
+test("KITTEN_CEILING_MS cannot reintroduce an automatic wall-clock stop", async () => {
   const { effortProfile, EFFORT_PROFILES } = await import("../src/core/effort.js");
 
   const overridden = effortProfile("balanced", { KITTEN_CEILING_MS: "840000" } as NodeJS.ProcessEnv);
-  assert.equal(overridden.ceiling.maxWallMs, 840_000);
+  assert.equal(overridden.ceiling.maxWallMs, undefined);
   assert.equal(overridden.ceiling.maxTokens, EFFORT_PROFILES.balanced.ceiling.maxTokens,
     "only the wall clock moves; the token ceiling is untouched");
   assert.equal(overridden.maxTurns, EFFORT_PROFILES.balanced.maxTurns);
   assert.equal(overridden.kCap, EFFORT_PROFILES.balanced.kCap);
 
   // Nothing set: the profile is returned exactly as declared.
-  assert.equal(effortProfile("balanced", {} as NodeJS.ProcessEnv).ceiling.maxWallMs,
-    EFFORT_PROFILES.balanced.ceiling.maxWallMs);
+  assert.equal(effortProfile("balanced", {} as NodeJS.ProcessEnv).ceiling.maxWallMs, undefined);
 
   // Garbage and non-positive values are IGNORED, never taken literally. A ceiling of 0 would abort
   // the run instantly -- the same trap as reasoningBudget 0 silently disabling thinking.
   for (const bad of ["0", "-5", "abc", "", "   "]) {
     assert.equal(effortProfile("balanced", { KITTEN_CEILING_MS: bad } as NodeJS.ProcessEnv).ceiling.maxWallMs,
-      EFFORT_PROFILES.balanced.ceiling.maxWallMs, `KITTEN_CEILING_MS=${JSON.stringify(bad)} must be ignored`);
+      undefined, `KITTEN_CEILING_MS=${JSON.stringify(bad)} must be ignored`);
   }
+});
+
+// ── The output cap is diagnosed where the length is known ────────────────────────────────────────
+//
+// Observed live: a single-file Pac-Man clone killed all four ascent candidates. The model put the
+// whole HTML into one `write` argument, the 4096-token cap cut the JSON string mid-value, and the
+// ONLY symptom was llama.cpp rejecting its own model's output with a generic parse-error 500. The
+// cap is knowable here, one layer before that, and must be reported as itself.
+
+test("a generation stopped by the output cap is retried with split-the-write guidance", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-live-length-"));
+  let calls = 0;
+  const seenMessages: string[][] = [];
+  const llm = {
+    models: { main: "fake" },
+    chat: async (p: ChatParams): Promise<ChatResult> => {
+      calls++;
+      seenMessages.push(p.messages.map((m) => `${m.role}:${String(m.content).slice(0, 400)}`));
+      if (calls === 1) {
+        // Cut off mid-argument: content but no usable tool call, finish_reason "length".
+        return { content: "{\"path\":\"game.html\",\"content\":\"<!DOCTYPE html><html", reasoning: "", toolCalls: [], finishReason: "length", usage: { prompt: 10, completion: 4096, reasoning: 0, total: 4106 }, ok: true, elapsedMs: 1 };
+      }
+      return { content: "", reasoning: "", toolCalls: [{ id: "c", name: "finish", args: { summary: "wrote it in sections" }, raw: "" }], finishReason: "tool_calls", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, ok: true, elapsedMs: 1 };
+    },
+  } as unknown as KittenLLM;
+  const events: import("../src/core/agent.js").AgentEvent[] = [];
+  const r = await runAgent({ task: "build a pac-man clone in one html file", cwd, llm, onEvent: (e) => events.push(e) });
+  assert.equal(r.finished, true, "a truncated turn is recoverable, not fatal");
+  assert.ok(
+    events.some((e) => e.kind === "nudge" && /length cap/.test(e.detail)),
+    `the cap is named, not left as a server parse error: ${JSON.stringify(events.filter((e) => e.kind === "nudge").map((e) => e.detail))}`
+  );
+  const secondCall = seenMessages[1] ?? [];
+  assert.ok(secondCall.some((m) => /SEVERAL smaller calls/.test(m)), "the retry tells the model how to split the write");
+  // A truncated turn must NOT be treated as the model declining to act — that path stops the run.
+  assert.ok(!events.some((e) => e.kind === "nudge" && /nudging to act/.test(e.detail)), "not mistaken for an idle turn");
+});
+
+test("a model that keeps overrunning the cap stops instead of retrying forever", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-live-length-loop-"));
+  let calls = 0;
+  const llm = {
+    models: { main: "fake" },
+    chat: async (): Promise<ChatResult> => {
+      calls++;
+      return { content: "partial…", reasoning: "", toolCalls: [], finishReason: "length", usage: { prompt: 1, completion: 4096, reasoning: 0, total: 4097 }, ok: true, elapsedMs: 1 };
+    },
+  } as unknown as KittenLLM;
+  const r = await runAgent({ task: "x", cwd, llm });
+  assert.equal(r.finished, false);
+  assert.ok(calls <= 8, `bounded, not an infinite retry loop (got ${calls} calls)`);
 });

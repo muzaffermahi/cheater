@@ -2,7 +2,7 @@
 // exposes only typed local IPC; no HTTP listener, browser, or terminal is needed by the user.
 
 import { createServer, type Socket } from "node:net";
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { KittenApp } from "./app.js";
@@ -15,9 +15,11 @@ import { DESKTOP_PROTOCOL_VERSION, encodeFrame, FrameDecoder, type DesktopComman
 import type { KittenEvent } from "./events.js";
 import { WorkspaceIndex } from "./workspaceIndex.js";
 import { inspectWorkspaceChanges } from "./workspaceChanges.js";
-import { buildLaunchPlan, cleanRuntimeLog, detectHardware, detectServerFlags, probeEndpoint, inspectModel, runtimeFailureReason, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, listModelFiles, CTX_LADDER, type RuntimeTuning } from "./modelRuntime.js";
+import { buildLaunchPlan, cleanRuntimeLog, detectHardware, detectServerFlags, probeEndpoint, inspectModel, inspectWeights, resolveServerBinary, runtimeFailureReason, spawnManagedRuntime, discoverRuntimeExecutables, discoverLocalEndpoints, listModelFiles, suggestModelId, CTX_LADDER, type RuntimeTuning } from "./modelRuntime.js";
+import { workspaceFingerprint } from "./planArtifact.js";
+import { calibrateRuntime, readCalibration } from "./calibrate.js";
+import { calibrationFingerprint } from "./autoTune.js";
 import { SidecarControlPlane } from "./sidecarControlPlane.js";
-import { SidecarAssist } from "./sidecarAssist.js";
 import { runCatalogJob, SIDECAR_JOB_TYPES, SIDECAR_WORKFLOWS, isSidecarJobType, sidecarWorkflow, type SidecarJobType } from "./sidecarJobs.js";
 import { downloadModel, parseModelCatalog, type ModelCatalogEntry } from "./modelCatalog.js";
 import { listAgents } from "./agents.js";
@@ -28,6 +30,8 @@ import { profileSummary, recommendModelProfiles } from "./modelProfiles.js";
 import { runWorkspaceVerification } from "./workspaceVerification.js";
 import { probeCapabilities, probeContextSize, readCachedCapabilities } from "./capabilities.js";
 import { gatherSupportInfo } from "./support.js";
+import { AgentRuntime, CacheScoutPolicy } from "./agentRuntime.js";
+import { SidecarAssist } from "./sidecarAssist.js";
 
 export interface DesktopEngineOptions {
   endpoint?: string;
@@ -40,6 +44,8 @@ export interface DesktopEngineOptions {
   models?: Partial<KittenModels>;
   /** Injectable client for deterministic native-engine tests; production constructs the local HTTP client. */
   llm?: KittenLLM;
+  /** Opt into the pre-Director sidecar surface for compatibility fixtures only. */
+  enableLegacySidecar?: boolean;
   /** Handshake secret. Generated per launch when omitted; never logged and never sent in an event. */
   token?: string;
   /**
@@ -88,6 +94,9 @@ export interface DesktopEngineHandle {
   /** Where the socket path + token were published, when they were. */
   infoPath: string | null;
   close(): Promise<void>;
+  /** Withdraw the published token synchronously — safe to call from a `process.on("exit")` handler,
+   *  where async work never runs. A stale token file is what makes the NEXT engine unreachable. */
+  closeSync(): void;
 }
 
 /** The file the native shell reads to find and authenticate to the hidden engine. */
@@ -268,6 +277,8 @@ interface ManagedRuntimeLaunchRequest {
   contextTokens?: number;
   /** User launch tuning (settings.runtimeTuning) applied to the MAIN model's plan. */
   tuning?: RuntimeTuning;
+  /** The id the served model should advertise, so /v1/models matches what Kitten asks for. */
+  modelAlias?: string;
   /** "cpu" (default) keeps the sidecar in RAM so it runs in real parallel with the GPU-bound main. */
   sidecarDevice?: "cpu" | "gpu";
   runtimeRoot: string;
@@ -305,9 +316,85 @@ async function stopManagedRuntime(holder: { current: ManagedRuntimeHandle | null
   holder.current = null;
 }
 
+/**
+ * Fold a measured calibration into the tuning for this launch.
+ *
+ * The static plan is deliberately safe and therefore leaves a few percent on the table — only a
+ * measurement can find the exact edge of the cliff, and once one exists it should be what runs. A
+ * value the user pinned themselves always wins: calibration informs the "auto" path, it does not
+ * overrule a person.
+ */
+function calibratedTuning(settings: KittenSettings, modelPath: string | undefined): RuntimeTuning {
+  const tuning = settings.runtimeTuning;
+  if (!modelPath || !existsSync(modelPath)) return tuning;
+  if (tuning.cpuMoe === "off") return tuning;
+  const pinnedSplit = typeof tuning.cpuMoeLayers === "number" || tuning.cpuMoeLayers === "all";
+  if (pinnedSplit) return tuning;
+  try {
+    const hardware = detectHardware();
+    const gpu = hardware.gpus.find((device) => device.backend !== "unknown" && device.vramBytes);
+    const record = readCalibration(calibrationFingerprint({
+      modelPath, modelBytes: statSync(modelPath).size, gpuName: gpu?.name, vramBytes: gpu?.vramBytes,
+    }));
+    if (!record) return tuning;
+    return { ...tuning, cpuMoe: "on", cpuMoeLayers: record.cpuMoeLayers };
+  } catch { return tuning; }
+}
+
+/**
+ * Hold a submission until the model can actually answer it.
+ *
+ * A 25 GB MoE takes tens of seconds to load, and Kitten used to start the turn the instant the user
+ * pressed Run — straight into `fetch failed` if the server had not bound its socket yet, or
+ * `HTTP 503 "Loading model"` if it had. Both surfaced as a failed run beside a model that was about
+ * to be perfectly ready. Starting work you cannot do is not resilience, it is a race.
+ *
+ * Returns true when the endpoint answers, false when the wait was cancelled or ran out. A false is
+ * not fatal: the caller proceeds, the request fails honestly, and the reason is the one the server
+ * gave rather than a race we created.
+ */
+async function awaitRuntimeReady(baseUrl: string, timeoutMs: number, signal: AbortSignal | undefined, onWaiting: (elapsedMs: number, loading: boolean) => void): Promise<boolean> {
+  const started = Date.now();
+  let announced = false;
+  for (;;) {
+    if (signal?.aborted) return false;
+    const probe = await probeEndpoint(baseUrl, 2000);
+    if (probe.reachable) return true;
+    const elapsed = Date.now() - started;
+    if (elapsed > timeoutMs) return false;
+    // Only say something once the wait is long enough to be worth explaining.
+    if (elapsed > 1500) { onWaiting(elapsed, Boolean(probe.loading)); announced = true; }
+    await new Promise((resolve) => setTimeout(resolve, announced ? 1000 : 400));
+  }
+}
+
 /** "auto" means the launch plan sizes n_ctx from the machine; a pinned number reaches the server. */
 function explicitContextTokens(settings: KittenSettings): number | undefined {
   return typeof settings.contextWindowTokens === "number" && settings.contextWindowTokens > 0 ? settings.contextWindowTokens : undefined;
+}
+
+/**
+ * The llama-server this machine should use: the configured one if it is still there, otherwise the
+ * best one Kitten can find (it ships one itself). Choosing a binary is not a decision worth asking a
+ * user to make — the weights are.
+ */
+function resolveRuntimeExecutable(settings: KittenSettings): { executable?: string; autoDetected: boolean } {
+  const configured = resolveServerBinary(settings.managedRuntime.executable);
+  if (configured) return { executable: configured, autoDetected: false };
+  // The hardware profile is what tells a CUDA build from a CPU-only one among LM Studio's backends.
+  const found = discoverRuntimeExecutables([], detectHardware())[0];
+  return { executable: found, autoDetected: Boolean(found) };
+}
+
+/** The weights to load: the configured file if it still exists, else the largest local .gguf. */
+function resolveMainWeights(settings: KittenSettings): { path?: string; autoDetected: boolean } {
+  const configured = settings.managedRuntime.mainModelPath;
+  if (configured && existsSync(configured)) return { path: configured, autoDetected: false };
+  const candidates = listModelFiles([configured, settings.managedRuntime.sidecarModelPath]);
+  // Largest first: the quant someone downloaded on purpose is the big one, and a 2B sidecar file
+  // sitting in the same tree must never be mistaken for the main model.
+  const best = [...candidates].sort((a, b) => b.bytes - a.bytes)[0];
+  return { path: best?.path, autoDetected: Boolean(best) };
 }
 
 const OOM_STDERR = /out of memory|failed to allocate|cuda\S*\s*alloc|ggml_backend_\S*_buffer/i;
@@ -316,7 +403,26 @@ const OOM_STDERR = /out of memory|failed to allocate|cuda\S*\s*alloc|ggml_backen
  * validation/probe path. Manual runtime.start and startup auto-recovery must not drift apart.
  * With an auto-sized context, one OOM step-down retry at the next-lower ladder rung: a mis-estimate
  * costs one retry, never a dead runtime with a hex dump. */
+/**
+ * The launch currently in flight, so a second caller joins it instead of starting a rival.
+ *
+ * `launchManagedRuntimeOnce` begins by stopping whatever is running — which is correct for a restart
+ * and catastrophic for a race. The engine auto-starts the runtime when it boots, and the shell calls
+ * `runtime.ensure` as soon as it activates a conversation, so the two overlapped: the second launch
+ * killed the first one's server about two seconds into a fifteen-second load, then the next ensure
+ * killed that one, and so on. The symptom was a runtime that "did not become reachable" while
+ * llama-server was never alive long enough to be seen in the process list.
+ */
+let launchInFlight: Promise<ManagedRuntimeLaunchResult> | null = null;
+
 async function launchManagedRuntime(request: ManagedRuntimeLaunchRequest, holder: ManagedRuntimeHolder): Promise<ManagedRuntimeLaunchResult> {
+  if (launchInFlight) return launchInFlight;
+  const attempt = launchManagedRuntimeInner(request, holder).finally(() => { launchInFlight = null; });
+  launchInFlight = attempt;
+  return attempt;
+}
+
+async function launchManagedRuntimeInner(request: ManagedRuntimeLaunchRequest, holder: ManagedRuntimeHolder): Promise<ManagedRuntimeLaunchResult> {
   try {
     return await launchManagedRuntimeOnce(request, holder);
   } catch (error) {
@@ -331,7 +437,15 @@ async function launchManagedRuntime(request: ManagedRuntimeLaunchRequest, holder
 }
 
 async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, holder: ManagedRuntimeHolder): Promise<ManagedRuntimeLaunchResult> {
-  if (!request.executable || !existsSync(request.executable)) throw new Error("managed runtime executable does not exist");
+  // A configured path can point at the folder the server lives in; that passes an existence check and
+  // then fails at spawn with an unreadable OS error. Resolve it to the binary first.
+  const executable = resolveServerBinary(request.executable);
+  if (!executable) {
+    throw new Error(request.executable
+      ? `no llama-server was found at ${request.executable} — set the runtime under Settings, Local runtime`
+      : "no llama-server is configured");
+  }
+  request = { ...request, executable };
   if (!request.mainModelPath || !existsSync(request.mainModelPath)) throw new Error("managed main model path does not exist");
   const sidecarBaseUrl = request.sidecarModelPath
     ? (request.sidecarBaseUrl ?? (() => {
@@ -345,7 +459,7 @@ async function launchManagedRuntimeOnce(request: ManagedRuntimeLaunchRequest, ho
   const sidecarEndpoint = sidecarBaseUrl ? endpointHostPort(sidecarBaseUrl) : undefined;
   // Ask the binary what it supports before composing a command for it.
   const capability = detectServerFlags(request.executable);
-  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, contextTokens: request.contextTokens, tuning: request.tuning, supportedFlags: capability.flags, supportedFlagsHelp: capability.helpText });
+  const plan = buildLaunchPlan({ runtime: "managed-llama-cpp", backend: request.backend, mainModel: request.mainModelPath, modelAlias: request.modelAlias, contextTokens: request.contextTokens, tuning: request.tuning, supportedFlags: capability.flags, supportedFlagsHelp: capability.helpText });
   const args = [...plan.args, "--host", endpoint.host, "--port", String(endpoint.port)];
   if (request.bootstrapScript) {
     if (!existsSync(request.bootstrapScript)) throw new Error("managed runtime bootstrap script does not exist");
@@ -584,6 +698,24 @@ async function automaticSidecarContext(text: string, root: string, runtime: { mo
   if (!index.overview().files) {
     try { await index.refresh(root); persistWorkspaceIndex(root, index); } catch { /* orientation can still use the prompt */ }
   }
+  // There is nothing for a sidecar to localize in a genuinely empty project. Returning the
+  // deterministic floor avoids an unnecessary 2B request (and its queue/deadline) on every
+  // from-scratch task; the main agent already has the full task and the reliable lane will create
+  // the first file. Keep sidecar orientation enabled for existing projects, where file ranking is
+  // actually useful.
+  if (!index.overview().files) {
+    // Yield briefly before returning so the preflight remains cancellable at the desktop protocol
+    // boundary (the UI can send Stop after receiving `sidecar.preflight:started`). This is still
+    // materially cheaper than invoking a model that has no files to rank.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, 10);
+      const onAbort = (): void => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); reject(new Error("submission cancelled")); };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    if (signal?.aborted) throw new Error("submission cancelled");
+    return "[SIDECAR ORIENTATION]\nTask class: from-scratch\nCandidate files: none; the workspace is empty, so create the requested deliverable directly.";
+  }
   // Automatic orientation is one bounded structured pass. A separate endpoint is preferred for true
   // concurrency, but a configured sidecar must still be
   // useful on the common single-endpoint LM Studio/llama.cpp setup. KittenLLM.sidecar routes to the
@@ -667,14 +799,30 @@ function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
   else if (raw.contextWindowTokens === "auto") update.contextWindowTokens = "auto";
   if (raw.taskCompiler === "off" || raw.taskCompiler === "auto" || raw.taskCompiler === "force") update.taskCompiler = raw.taskCompiler;
   if (raw.webAccess === "allowlist" || raw.webAccess === "open" || raw.webAccess === "off") update.webAccess = raw.webAccess;
+  if (raw.fastPath === "auto" || raw.fastPath === "off") update.fastPath = raw.fastPath;
   // Runtime tuning knobs (the llama.cpp control surface).
-  if (typeof raw.gpuLayers === "number" && Number.isFinite(raw.gpuLayers) && raw.gpuLayers >= 0) update.gpuLayers = Math.floor(raw.gpuLayers);
-  else if (raw.gpuLayers === "auto") update.gpuLayers = "auto";
-  if (raw.cpuMoe === "auto" || raw.cpuMoe === "on" || raw.cpuMoe === "off") update.cpuMoe = raw.cpuMoe;
-  if (raw.flashAttn === "auto" || raw.flashAttn === "on" || raw.flashAttn === "off") update.flashAttn = raw.flashAttn;
-  if (raw.kvCacheType === "auto" || raw.kvCacheType === "q8_0" || raw.kvCacheType === "f16" || raw.kvCacheType === "q4_0") update.kvCacheType = raw.kvCacheType;
-  if (raw.sidecarDevice === "cpu" || raw.sidecarDevice === "gpu") update.sidecarDevice = raw.sidecarDevice;
+  const countOrAuto = (value: unknown): number | "auto" | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : value === "auto" ? "auto" : undefined;
+  const oneOf = <T extends string>(value: unknown, allowed: readonly T[]): T | undefined =>
+    typeof value === "string" && (allowed as readonly string[]).includes(value) ? value as T : undefined;
+  const assign = <K extends keyof SettingsUpdate>(key: K, value: SettingsUpdate[K] | undefined): void => { if (value !== undefined) update[key] = value; };
+  assign("gpuLayers", countOrAuto(raw.gpuLayers));
+  assign("cpuMoe", oneOf(raw.cpuMoe, ["auto", "on", "off"] as const));
+  assign("cpuMoeLayers", raw.cpuMoeLayers === "all" ? "all" : countOrAuto(raw.cpuMoeLayers));
+  assign("flashAttn", oneOf(raw.flashAttn, ["auto", "on", "off"] as const));
+  assign("kvCacheType", oneOf(raw.kvCacheType, ["auto", "q8_0", "f16", "q4_0"] as const));
+  assign("kvOffload", oneOf(raw.kvOffload, ["auto", "on", "off"] as const));
+  assign("threads", countOrAuto(raw.threads));
+  assign("batchSize", countOrAuto(raw.batchSize));
+  assign("ubatchSize", countOrAuto(raw.ubatchSize));
+  assign("loadMode", oneOf(raw.loadMode, ["auto", "none", "mmap", "mlock", "mmap+mlock"] as const));
+  assign("mainGpu", countOrAuto(raw.mainGpu));
+  assign("parallelSlots", countOrAuto(raw.parallelSlots));
+  assign("speculation", oneOf(raw.speculation, ["auto", "ngram", "mtp", "off"] as const));
+  if (typeof raw.tensorSplit === "string") update.tensorSplit = raw.tensorSplit.trim();
+  assign("sidecarDevice", oneOf(raw.sidecarDevice, ["cpu", "gpu"] as const));
   if (typeof raw.extraArgs === "string") update.extraArgs = raw.extraArgs.trim();
+  if (typeof raw.argsOverride === "string") update.argsOverride = raw.argsOverride.trim();
   if (!Object.keys(update).length) throw new Error("settings.update contained no valid non-secret settings");
   // Settings are a durable source of truth, so reject a known-size model that would
   // put either lane outside Kitten's supported contract. Unknown-size IDs remain
@@ -692,28 +840,33 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     try { unlinkSync(socketPath); } catch { /* a live owner will make listen fail */ }
   }
   const settings = loadKittenSettings(opts.projectRoot ?? process.cwd());
+  // Injected runners/LLMs are test and embedding compatibility surfaces; production launches do
+  // not provide either, so the user-facing desktop path remains sidecar-free by default.
+  const legacySidecarEnabled = opts.enableLegacySidecar ?? Boolean(opts.runner || opts.llm || opts.models?.sidecar || opts.models?.sidecarBaseUrl);
   const initialModels = tierSidecar({ ...DEFAULT_MODELS, ...settings.models, ...opts.models, baseUrl: opts.endpoint ?? opts.models?.baseUrl ?? settings.models.baseUrl });
   const runtime = { models: initialModels, llm: opts.llm ?? new KittenLLM(initialModels) };
+  // Keep the policy layer alive in the native engine even when no optional cache capability is
+  // advertised; adapters can enable it later without changing the desktop payload shape.
+  const policyRuntime = new AgentRuntime().register(new CacheScoutPolicy());
+  policyRuntime.setEnabled("cache-scout", process.env.KITTEN_CACHE_SCOUT !== "0");
   const store = ConversationStore.open(opts.store ?? storePath());
   let appRef: KittenApp | null = null;
   const app = new KittenApp({
     store,
     runner: opts.runner ?? ((ctx) => {
       const projectRoot = appRef?.getConversation(ctx.conversationId)?.projectRoot ?? opts.projectRoot ?? process.cwd();
-      return defaultRunner(runtimeForProject(projectRoot, runtime, opts).llm, { webAccess: loadKittenSettings(projectRoot).webAccess })(ctx);
+      const projectSettings = loadKittenSettings(projectRoot);
+      return defaultRunner(runtimeForProject(projectRoot, runtime, opts).llm, { webAccess: projectSettings.webAccess, fastPath: projectSettings.fastPath })(ctx);
     }),
     projectRoot: opts.projectRoot ?? process.cwd(),
     model: runtime.models.main,
-    sidecarModel: runtime.models.sidecar,
+    ...(legacySidecarEnabled ? { sidecarModel: runtime.models.sidecar } : {}),
     // "auto": interim harness value until a launched/probed server reports its true n_ctx (the
     // reconcile in pushRuntimeState overwrites this with the measured number).
     contextWindowTokens: typeof settings.contextWindowTokens === "number" ? settings.contextWindowTokens : 16384,
     approvalPolicy: settings.approvalPolicy,
     taskCompiler: settings.taskCompiler,
-    sidecarAssist: new SidecarAssist({
-      llm: runtime.llm,
-      index: (projectRoot) => getWorkspaceIndex(projectRoot, indexes),
-    }),
+    ...(legacySidecarEnabled ? { sidecarAssist: new SidecarAssist({ llm: runtime.llm, index: (projectRoot) => getWorkspaceIndex(projectRoot, indexes) }) } : {}),
     // Only hand the compiler an index that has actually been populated: an empty one would rank
     // nothing while looking like grounding succeeded. `indexes` is captured, not read, at construction.
     workspaceIndex: (projectRoot) => {
@@ -738,6 +891,8 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
   const modelDownloadControllers = new Map<string, AbortController>();
   const verificationControllers = new Map<string, AbortController>();
   const benchmarkControllers = new Map<string, AbortController>();
+  /** In-flight tuning measurements, so a long calibration can be cancelled from the panel. */
+  const calibrationControllers = new Map<string, AbortController>();
   const managedRuntime: { current: ManagedRuntimeHandle | null } = { current: null };
   const broadcast = (e: ReturnType<typeof eventFromKitten>): void => {
     const frame = encodeFrame(e);
@@ -753,7 +908,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
     const payload: RuntimeStatePayload = {
       endpoint: next.endpoint ?? runtime.models.baseUrl,
       model: next.model ?? runtime.models.main,
-      ...(runtime.models.sidecar ? { sidecarModel: runtime.models.sidecar } : {}),
+      ...(legacySidecarEnabled && runtime.models.sidecar ? { sidecarModel: runtime.models.sidecar } : {}),
       ...next,
       ts: Date.now(),
     };
@@ -855,7 +1010,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           socket.write(encodeFrame(response(id, { authenticated: true, protocolVersion: DESKTOP_PROTOCOL_VERSION, pid: process.pid })));
           continue;
         }
-        void handleCommand(cmd, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, runtimeState, pushRuntimeState, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
+        void handleCommand(cmd, app, socket, { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, calibrationControllers, managedRuntime, runtimeState, pushRuntimeState, emit: (type, payload) => broadcast({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `desktop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: Date.now(), payload }) });
       }
     });
     socket.on("close", forget);
@@ -896,7 +1051,7 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
       } else {
         const tierWarnings = modelTierWarnings(runtime.models);
         if (tierWarnings.length) throw new Error(tierWarnings.join("; "));
-        const sidecarModelPath = settings.managedRuntime.sidecarModelPath && existsSync(settings.managedRuntime.sidecarModelPath)
+        const sidecarModelPath = legacySidecarEnabled && settings.managedRuntime.sidecarModelPath && existsSync(settings.managedRuntime.sidecarModelPath)
           ? settings.managedRuntime.sidecarModelPath : undefined;
         runtimeState.launching = true;
         pushRuntimeState({ phase: "starting" });
@@ -904,20 +1059,27 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
           executable: settings.managedRuntime.executable,
           mainModelPath: settings.managedRuntime.mainModelPath,
           sidecarModelPath,
+          // The startup path was the one launch that never set an alias, so /v1/models advertised a
+          // file path where every other path advertises the configured model id.
+          modelAlias: runtime.models.main,
           baseUrl: runtime.models.baseUrl,
           sidecarBaseUrl: sidecarModelPath ? runtime.models.sidecarBaseUrl : undefined,
           contextTokens: explicitContextTokens(settings),
-          tuning: settings.runtimeTuning,
+          tuning: calibratedTuning(settings, settings.managedRuntime.mainModelPath),
           sidecarDevice: settings.runtimeTuning.sidecarDevice,
           runtimeRoot: opts.projectRoot ?? process.cwd(),
-          probeTimeoutMs: 30_000,
+          // The same patience as every other launch path. This one was left at 30s, so the startup
+          // auto-start gave up on a 25 GB model that was loading perfectly well and then KILLED it —
+          // the server's last words were `load_model: loading model`, and Kitten was the thing that
+          // stopped it. A timeout that shoots a healthy process is worse than no timeout at all.
+          probeTimeoutMs: 240_000,
           onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", elapsedMs: info.elapsedMs, log: info.log }),
         }, managedRuntime);
         runtime.models = { ...runtime.models, baseUrl: launched.baseUrl, sidecarBaseUrl: launched.sidecarBaseUrl };
         runtime.llm = new KittenLLM(runtime.models);
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
-        app.setSidecarModel(runtime.models.sidecar);
+        if (legacySidecarEnabled) app.setSidecarModel(runtime.models.sidecar);
         pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
       }
     } catch (error) {
@@ -951,11 +1113,17 @@ export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promi
       if (infoPath) { try { unlinkSync(infoPath); } catch { /* a later launch overwrites it anyway */ } }
       if (process.platform !== "win32") { try { unlinkSync(socketPath); } catch {} }
     },
+    /** The one thing that MUST happen on the way out, in a form an `exit` handler can call: stop
+     *  advertising a token that no longer opens anything. Everything else the OS reclaims. */
+    closeSync() {
+      if (infoPath) { try { unlinkSync(infoPath); } catch { /* a later launch overwrites it anyway */ } }
+    },
   };
 }
 
-async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, ActiveSidecarWorkflow>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; runtimeState: { last: RuntimeStatePayload | null; launching: boolean }; pushRuntimeState: (next: Omit<RuntimeStatePayload, "ts" | "endpoint" | "model"> & { endpoint?: string; model?: string }) => void; emit: (type: string, payload: unknown) => void }): Promise<void> {
-  const { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, managedRuntime, runtimeState, pushRuntimeState } = context;
+async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Socket, context: { runtime: { models: KittenModels; llm: KittenLLM }; opts: DesktopEngineOptions; indexes: Map<string, WorkspaceIndex>; sidecar: SidecarControlPlane; sidecarWorkflowActive: Map<string, ActiveSidecarWorkflow>; taskControllers: Map<string, AbortController>; submitControllers: Map<string, AbortController>; modelDownloadControllers: Map<string, AbortController>; verificationControllers: Map<string, AbortController>; benchmarkControllers: Map<string, AbortController>; calibrationControllers: Map<string, AbortController>; managedRuntime: { current: ManagedRuntimeHandle | null }; runtimeState: { last: RuntimeStatePayload | null; launching: boolean }; pushRuntimeState: (next: Omit<RuntimeStatePayload, "ts" | "endpoint" | "model"> & { endpoint?: string; model?: string }) => void; emit: (type: string, payload: unknown) => void }): Promise<void> {
+  const { runtime, opts, indexes, sidecar, sidecarWorkflowActive, taskControllers, submitControllers, modelDownloadControllers, verificationControllers, benchmarkControllers, calibrationControllers, managedRuntime, runtimeState, pushRuntimeState } = context;
+  const legacySidecarEnabled = opts.enableLegacySidecar ?? Boolean(opts.runner || opts.llm || opts.models?.sidecar || opts.models?.sidecarBaseUrl);
   if (frame.protocolVersion !== DESKTOP_PROTOCOL_VERSION) {
     socket.write(encodeFrame(failure(frame.id, `unsupported protocol version ${frame.protocolVersion}`)));
     return;
@@ -1003,7 +1171,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setApprovalPolicy(fresh.approvalPolicy);
         app.setDefaultModel(runtime.models.main);
-        app.setSidecarModel(runtime.models.sidecar);
+        if (legacySidecarEnabled) app.setSidecarModel(runtime.models.sidecar);
         // "auto" keeps the harness on the live server's measured n_ctx (or the interim default).
         app.setContextWindowTokens(typeof fresh.contextWindowTokens === "number" ? fresh.contextWindowTokens : runtimeState.last?.ctxTokens ?? 16384);
         app.setTaskCompiler(fresh.taskCompiler);
@@ -1044,6 +1212,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const projectRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
         const active = runtimeForProject(projectRoot, runtime, opts);
         const role = p.role === "sidecar" ? "sidecar" : "main";
+        if (role === "sidecar" && !legacySidecarEnabled) { result = { valid: false, verified: false, role, error: "sidecar runtime is disabled" }; break; }
         const model = typeof p.model === "string" && p.model.trim() ? p.model.trim() : role === "sidecar" ? active.models.sidecar : active.models.main;
         const endpoint = typeof p.baseUrl === "string" && p.baseUrl.trim() ? p.baseUrl.trim() : role === "sidecar" && active.models.sidecarBaseUrl ? active.models.sidecarBaseUrl : active.models.baseUrl;
         if (!model) { result = { valid: false, verified: false, role, error: "no model configured" }; break; }
@@ -1055,6 +1224,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const projectRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
         const active = runtimeForProject(projectRoot, runtime, opts);
         const role = p.role === "sidecar" ? "sidecar" : "main";
+        if (role === "sidecar" && !legacySidecarEnabled) { result = { endpoint: active.models.baseUrl, role, configured: "", endpointReachable: false, rows: [], recommendations: [], warning: "sidecar runtime is disabled" }; break; }
         const configured = role === "sidecar" ? active.models.sidecar : active.models.main;
         const endpoint = role === "sidecar" && active.models.sidecarBaseUrl ? active.models.sidecarBaseUrl : active.models.baseUrl;
         if (!configured) { result = { endpoint, role, configured: "", endpointReachable: false, rows: [], recommendations: [], warning: "no model configured" }; break; }
@@ -1070,6 +1240,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         if (!model) throw new Error("model.select requires a model id");
         const tierError = modelTierMismatch(role, model);
         if (p.allowMismatch !== true && tierError) throw new Error(`${tierError}; pass an explicit override only for diagnostics`);
+        if (role === "sidecar" && !legacySidecarEnabled) throw new Error("sidecar runtime is disabled; configure an explicit legacy sidecar to use this lane");
         const endpoint = role === "sidecar" && active.models.sidecarBaseUrl ? active.models.sidecarBaseUrl : active.models.baseUrl;
         const client = endpoint === active.models.baseUrl ? active.llm : new KittenLLM({ ...active.models, baseUrl: endpoint, main: model, sidecar: model });
         const validation = await validateModel(client, model, typeof p.provider === "string" && p.provider.trim() ? p.provider.trim() : "local", undefined, { probeAdvertised: true, timeoutMs: typeof p.timeoutMs === "number" ? p.timeoutMs : 45_000 });
@@ -1084,7 +1255,10 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         if (role === "sidecar") runtime.models.sidecar = model;
         else runtime.models.main = model;
         runtime.llm = new KittenLLM(runtime.models);
-        if (role === "sidecar") app.setSidecarModel(model); else app.setDefaultModel(model);
+        if (role === "sidecar") {
+          if (!legacySidecarEnabled) throw new Error("sidecar runtime is disabled; configure an explicit legacy sidecar to use this lane");
+          app.setSidecarModel(model);
+        } else app.setDefaultModel(model);
         result = { selected: true, role, model, endpoint, scope, verified: validation.verified === true, ...(validation.verified ? {} : { warning: validation.error ?? `model '${model}' has not answered yet` }) };
         break;
       }
@@ -1169,6 +1343,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const projectRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
         const active = runtimeForProject(projectRoot, runtime, opts);
         const role = p.role === "sidecar" ? "sidecar" : "main";
+        if (role === "sidecar" && !legacySidecarEnabled) { result = { available: false, role, reason: "sidecar runtime is disabled" }; break; }
         const model = role === "sidecar" ? active.models.sidecar : active.models.main;
         const baseUrl = role === "sidecar" && active.models.sidecarBaseUrl ? active.models.sidecarBaseUrl : active.models.baseUrl;
         if (!model) { result = { available: false, role, reason: "no sidecar model configured" }; break; }
@@ -1185,15 +1360,85 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         break;
       }
       case "model.launch-plan": {
-        const mainModel = String(p.mainModel ?? runtime.models.main);
-        const sidecarModel = typeof p.sidecarModel === "string" ? p.sidecarModel : undefined;
-        const tierError = modelTierMismatch("main", mainModel) ?? (sidecarModel ? modelTierMismatch("sidecar", sidecarModel) : null);
-        if (tierError) throw new Error(tierError);
-        // Tuning comes from the payload when the settings dialog previews unsaved values, else from
-        // the saved settings — the preview must show the command that would actually run.
         const planRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
-        const tuning: RuntimeTuning = p.tuning && typeof p.tuning === "object" ? p.tuning as RuntimeTuning : settingsFor(opts, planRoot).runtimeTuning;
-        result = buildLaunchPlan({ runtime: typeof p.runtime === "string" ? p.runtime as never : undefined, backend: typeof p.backend === "string" ? p.backend as never : undefined, mainModel, sidecarModel, contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : undefined, sidecarMode: typeof p.sidecarMode === "string" ? p.sidecarMode as never : undefined, tuning });
+        const planSettings = settingsFor(opts, planRoot);
+        const modelAlias = String(p.mainModel ?? runtime.models.main);
+        // Keep explicit sidecar payloads tier-validated for compatibility/diagnostics, but never
+        // infer or launch the lane unless legacy mode was explicitly enabled.
+        const sidecarModel = typeof p.sidecarModel === "string" ? p.sidecarModel : undefined;
+        const tierError = modelTierMismatch("main", modelAlias) ?? (sidecarModel ? modelTierMismatch("sidecar", sidecarModel) : null);
+        if (tierError) throw new Error(tierError);
+        // A preview that does not use the real weights file is a preview of a different launch: the
+        // file is what the VRAM/expert/context heuristics measure, and the model id is only a label.
+        const previewWeights = typeof p.mainModelPath === "string" && p.mainModelPath.trim()
+          ? p.mainModelPath.trim()
+          : planSettings.managedRuntime.mainModelPath ?? modelAlias;
+        // Likewise the flag set: previewing flags the installed build would silently skip is how the
+        // command box and the actual launch drift apart.
+        const previewExecutable = typeof p.executable === "string" && p.executable.trim() ? p.executable.trim() : resolveRuntimeExecutable(planSettings).executable;
+        const previewCapability = previewExecutable && existsSync(previewExecutable) ? detectServerFlags(previewExecutable) : null;
+        // Tuning comes from the payload when the settings panel previews unsaved values, else from
+        // the saved settings — the preview must show the command that would actually run.
+        const tuning: RuntimeTuning = p.tuning && typeof p.tuning === "object" ? p.tuning as RuntimeTuning : planSettings.runtimeTuning;
+        result = buildLaunchPlan({
+          runtime: typeof p.runtime === "string" ? p.runtime as never : undefined,
+          backend: typeof p.backend === "string" ? p.backend as never : undefined,
+          mainModel: previewWeights,
+          modelAlias,
+          sidecarModel: legacySidecarEnabled ? sidecarModel : undefined,
+          contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : explicitContextTokens(planSettings),
+          sidecarMode: typeof p.sidecarMode === "string" ? p.sidecarMode as never : undefined,
+          tuning,
+          ...(previewCapability ? { supportedFlags: previewCapability.flags, supportedFlagsHelp: previewCapability.helpText } : {}),
+        });
+        break;
+      }
+      case "model.inspect-weights": {
+        // What one picked .gguf implies: its size and layer count, the id it should be served under,
+        // and the expert split and context the machine can actually hold. This is what lets the
+        // settings panel ask for weights and nothing else.
+        const weightsRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const requested = typeof p.path === "string" && p.path.trim() ? p.path.trim() : settingsFor(opts, weightsRoot).managedRuntime.mainModelPath;
+        if (!requested) throw new Error("model.inspect-weights requires a .gguf path");
+        result = inspectWeights(requested);
+        break;
+      }
+      case "runtime.autoconfig": {
+        // Everything Kitten can work out for itself before the user is asked anything: which server
+        // binary to use, which weights are already on this machine, and what the hardware allows.
+        const autoRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const autoSettings = settingsFor(opts, autoRoot);
+        const autoHardware = detectHardware();
+        const executable = resolveRuntimeExecutable(autoSettings);
+        const weights = resolveMainWeights(autoSettings);
+        const files = listModelFiles([autoSettings.managedRuntime.mainModelPath, autoSettings.managedRuntime.sidecarModelPath]);
+        const inspection = weights.path ? inspectWeights(weights.path) : null;
+        const warnings: string[] = [];
+        if (!executable.executable) warnings.push("No llama-server was found beside the app, among the LM Studio backends, or on PATH. Point Kitten at one under Local runtime, or use an endpoint you start yourself.");
+        if (!weights.path) warnings.push("No .gguf weights were found beside the configured model or in the LM Studio folders. Choose a file in Local runtime.");
+        // `apply` is the only side effect in this handler, and it only ever fills in blanks.
+        if (p.apply === true && (executable.autoDetected || weights.autoDetected)) {
+          const update: SettingsUpdate = {};
+          if (executable.autoDetected && executable.executable) update.runtimeExecutable = executable.executable;
+          if (weights.autoDetected && weights.path) update.mainModelPath = weights.path;
+          if (Object.keys(update).length) {
+            try { saveKittenSettings(update, "project", autoRoot); }
+            catch (error) { warnings.push(`Could not save the detected setup: ${error instanceof Error ? error.message : String(error)}`); }
+          }
+        }
+        result = {
+          projectRoot: autoRoot,
+          executable: executable.executable ?? null,
+          executableAutoDetected: executable.autoDetected,
+          executables: discoverRuntimeExecutables([], autoHardware),
+          mainModelPath: weights.path ?? null,
+          weightsAutoDetected: weights.autoDetected,
+          weights: inspection,
+          suggestedModelId: weights.path ? suggestModelId(weights.path) : null,
+          files,
+          hardware: autoHardware,
+          warnings,
+        };
         break;
       }
       case "model.files": {
@@ -1232,11 +1477,17 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         const projectRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
         const projectSettings = settingsFor(opts, projectRoot);
         const active = runtimeForProject(projectRoot, runtime, opts);
-        const executable = projectSettings.managedRuntime.executable;
+        // Finding the server binary is Kitten's job, not the user's: it ships one, and a fresh
+        // install that only knows which weights to load must still be able to start.
+        const resolvedExecutable = resolveRuntimeExecutable(projectSettings);
+        const executable = resolvedExecutable.executable;
         const mainModelPath = projectSettings.managedRuntime.mainModelPath;
-        if (!executable || !mainModelPath || !existsSync(executable) || !existsSync(mainModelPath)) {
-          result = { configured: false, running: false, projectRoot };
+        if (!executable || !mainModelPath || !existsSync(mainModelPath)) {
+          result = { configured: false, running: false, projectRoot, missing: !executable ? "runtime" : "weights" };
           break;
+        }
+        if (resolvedExecutable.autoDetected) {
+          try { saveKittenSettings({ runtimeExecutable: executable }, "project", projectRoot); } catch { /* a read-only project must not block the launch */ }
         }
         const mainTierError = modelTierMismatch("main", active.models.main);
         const sidecarTierError = active.models.sidecar ? modelTierMismatch("sidecar", active.models.sidecar) : null;
@@ -1250,7 +1501,12 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           result = { configured: true, running: false, external: true, endpoint: active.models.baseUrl, projectRoot };
           break;
         }
-        const sidecarModelPath = projectSettings.managedRuntime.sidecarModelPath && existsSync(projectSettings.managedRuntime.sidecarModelPath)
+        // Something is already starting this model: join it rather than killing it and starting over.
+        if (runtimeState.launching) {
+          result = { configured: true, running: true, joined: true, endpoint: active.models.baseUrl, projectRoot };
+          break;
+        }
+        const sidecarModelPath = legacySidecarEnabled && projectSettings.managedRuntime.sidecarModelPath && existsSync(projectSettings.managedRuntime.sidecarModelPath)
           ? projectSettings.managedRuntime.sidecarModelPath : undefined;
         runtimeState.launching = true;
         pushRuntimeState({ phase: "starting", endpoint: active.models.baseUrl, model: active.models.main });
@@ -1258,13 +1514,18 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         try {
           launched = await launchManagedRuntime({
             executable, mainModelPath, sidecarModelPath,
+            modelAlias: active.models.main,
             baseUrl: active.models.baseUrl,
             sidecarBaseUrl: sidecarModelPath ? active.models.sidecarBaseUrl : undefined,
             contextTokens: explicitContextTokens(projectSettings),
-            tuning: projectSettings.runtimeTuning,
+            tuning: calibratedTuning(projectSettings, mainModelPath),
             sidecarDevice: projectSettings.runtimeTuning.sidecarDevice,
             runtimeRoot: projectRoot,
-            probeTimeoutMs: 30_000,
+            // Weight loading is PROGRESS, not failure. A 25 GB Q5_K_M reads for a minute or more from
+            // a cold page cache, and a 30s ceiling turned that into "the runtime did not become
+            // reachable" — declaring a perfectly healthy load dead. The probe already gives up the
+            // moment the process actually exits, so patience here costs nothing and buys correctness.
+            probeTimeoutMs: 240_000,
             onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", endpoint: active.models.baseUrl, model: active.models.main, elapsedMs: info.elapsedMs, log: info.log }),
           }, managedRuntime);
         } catch (error) {
@@ -1277,13 +1538,46 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         runtime.llm = new KittenLLM(runtime.models);
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
-        app.setSidecarModel(runtime.models.sidecar);
+        if (legacySidecarEnabled) app.setSidecarModel(runtime.models.sidecar);
         pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
         result = { configured: true, running: true, pid: launched.mainProcess.process.pid, sidecarPid: launched.sidecarProcess?.process.pid ?? null, endpoint: launched.baseUrl, sidecarEndpoint: launched.sidecarBaseUrl, projectRoot };
         break;
       }
+      case "runtime.calibrate": {
+        // Measure this machine rather than reasoning about it. Each rung is a cold model load, so
+        // this is explicitly a thing the user asks for, reports progress while it runs, and is
+        // remembered afterwards so it is never paid for twice.
+        const calRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : opts.projectRoot ?? process.cwd();
+        const calSettings = settingsFor(opts, calRoot);
+        const executable = resolveRuntimeExecutable(calSettings).executable;
+        const weights = calSettings.managedRuntime.mainModelPath;
+        if (!executable) throw new Error("no llama-server to calibrate with — set one under Local runtime");
+        if (!weights || !existsSync(weights)) throw new Error("choose model weights before calibrating");
+        // The runtime under test needs the card to itself.
+        await stopManagedRuntime(managedRuntime);
+        pushRuntimeState({ phase: "stopped" });
+        const controller = new AbortController();
+        calibrationControllers.set(calRoot, controller);
+        try {
+          const record = await calibrateRuntime({
+            executable, modelPath: weights, projectRoot: calRoot,
+            maxRungs: typeof p.maxRungs === "number" ? p.maxRungs : undefined,
+            signal: controller.signal,
+            onProgress: (progress) => context.emit("runtime.calibration", progress),
+          });
+          result = record;
+        } finally {
+          calibrationControllers.delete(calRoot);
+        }
+        break;
+      }
+      case "runtime.calibrate.cancel": {
+        for (const controller of calibrationControllers.values()) controller.abort("cancelled");
+        result = { cancelled: true };
+        break;
+      }
       case "runtime.discover":
-        result = { executables: discoverRuntimeExecutables() };
+        result = { executables: discoverRuntimeExecutables([], detectHardware()) };
         break;
       case "runtime.log": {
         // The runtime's own output, cleaned — the UI shows THIS instead of inventing an explanation.
@@ -1312,20 +1606,21 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         result = { stopped: true };
         break;
       case "runtime.start": {
+        const sidecarRequested = legacySidecarEnabled || Boolean(p.sidecarModelPath || p.sidecarModel || p.sidecarBaseUrl);
         const executable = String(p.executable ?? "").trim();
         const mainModelPath = String(p.mainModelPath ?? "").trim();
-        const sidecarModelPath = typeof p.sidecarModelPath === "string" && p.sidecarModelPath.trim() ? p.sidecarModelPath.trim() : undefined;
+        const sidecarModelPath = sidecarRequested && typeof p.sidecarModelPath === "string" && p.sidecarModelPath.trim() ? p.sidecarModelPath.trim() : undefined;
         const baseUrl = typeof p.baseUrl === "string" && p.baseUrl.trim() ? p.baseUrl.trim() : runtime.models.baseUrl;
-        const requestedSidecarBaseUrl = typeof p.sidecarBaseUrl === "string" && p.sidecarBaseUrl.trim() ? p.sidecarBaseUrl.trim() : undefined;
+        const requestedSidecarBaseUrl = sidecarRequested && typeof p.sidecarBaseUrl === "string" && p.sidecarBaseUrl.trim() ? p.sidecarBaseUrl.trim() : undefined;
         const requestedMainModel = typeof p.mainModel === "string" && p.mainModel.trim() ? p.mainModel.trim() : undefined;
-        const requestedSidecarModel = typeof p.sidecarModel === "string" && p.sidecarModel.trim() ? p.sidecarModel.trim() : undefined;
+        const requestedSidecarModel = sidecarRequested && typeof p.sidecarModel === "string" && p.sidecarModel.trim() ? p.sidecarModel.trim() : undefined;
         const requestedMainTierError = requestedMainModel ? modelTierMismatch("main", requestedMainModel) : null;
         const requestedSidecarTierError = requestedSidecarModel ? modelTierMismatch("sidecar", requestedSidecarModel) : null;
         if (requestedMainTierError || requestedSidecarTierError) throw new Error(`${requestedMainTierError ?? requestedSidecarTierError}; choose a model in Kitten's supported local tier`);
         const runtimeRoot = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot.trim() : (opts.projectRoot ?? process.cwd());
         const configuredRuntimeModels = runtimeForProject(runtimeRoot, runtime, opts).models;
         const effectiveMainTierError = modelTierMismatch("main", requestedMainModel ?? configuredRuntimeModels.main);
-        const effectiveSidecarTierError = (requestedSidecarModel ?? configuredRuntimeModels.sidecar) ? modelTierMismatch("sidecar", requestedSidecarModel ?? configuredRuntimeModels.sidecar!) : null;
+        const effectiveSidecarTierError = sidecarRequested && (requestedSidecarModel ?? configuredRuntimeModels.sidecar) ? modelTierMismatch("sidecar", requestedSidecarModel ?? configuredRuntimeModels.sidecar!) : null;
         if (effectiveMainTierError || effectiveSidecarTierError) throw new Error(`${effectiveMainTierError ?? effectiveSidecarTierError}; choose a model in Kitten's supported local tier`);
         const sidecarBaseUrl = sidecarModelPath ? (requestedSidecarBaseUrl ?? (() => {
           const url = new URL(baseUrl);
@@ -1349,12 +1644,17 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         try {
           launched = await launchManagedRuntime({
             executable, mainModelPath, sidecarModelPath, baseUrl, sidecarBaseUrl,
+            modelAlias: requestedMainModel ?? configuredRuntimeModels.main,
             backend: typeof p.backend === "string" ? p.backend as ManagedRuntimeLaunchRequest["backend"] : undefined,
             contextTokens: typeof p.contextTokens === "number" ? p.contextTokens : explicitContextTokens(settingsFor(opts, runtimeRoot)),
-            tuning: settingsFor(opts, runtimeRoot).runtimeTuning,
+            tuning: calibratedTuning(settingsFor(opts, runtimeRoot), mainModelPath),
             sidecarDevice: settingsFor(opts, runtimeRoot).runtimeTuning.sidecarDevice,
             runtimeRoot, bootstrapScript: bootstrap,
-            probeTimeoutMs: 30_000,
+            // Weight loading is PROGRESS, not failure. A 25 GB Q5_K_M reads for a minute or more from
+            // a cold page cache, and a 30s ceiling turned that into "the runtime did not become
+            // reachable" — declaring a perfectly healthy load dead. The probe already gives up the
+            // moment the process actually exits, so patience here costs nothing and buys correctness.
+            probeTimeoutMs: 240_000,
             onProgress: (info) => pushRuntimeState({ phase: info.phase === "loading" ? "loading" : "starting", endpoint: baseUrl, model: requestedMainModel ?? configuredRuntimeModels.main, elapsedMs: info.elapsedMs, log: info.log }),
           }, managedRuntime);
         } catch (error) {
@@ -1363,7 +1663,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         } finally {
           runtimeState.launching = false;
         }
-        runtime.models.sidecarBaseUrl = sidecarBaseUrl;
+        runtime.models.sidecarBaseUrl = sidecarRequested ? sidecarBaseUrl : undefined;
         // Starting a managed runtime is also a model configuration action. Update the live client
         // immediately so the very next native submission uses the endpoint just started instead of
         // silently continuing to call the old default (the settings file alone is not enough for an
@@ -1371,14 +1671,14 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         runtime.models = {
           ...runtime.models,
           baseUrl,
-          sidecarBaseUrl,
+          sidecarBaseUrl: sidecarRequested ? sidecarBaseUrl : undefined,
           ...(requestedMainModel ? { main: requestedMainModel } : {}),
-          ...(requestedSidecarModel ? { sidecar: requestedSidecarModel } : {}),
+          ...(requestedSidecarModel ? { sidecar: requestedSidecarModel } : sidecarRequested ? {} : { sidecar: undefined }),
         };
         runtime.llm = new KittenLLM(runtime.models);
         sidecar.setMaxConcurrent(sidecarConcurrency(runtime.models));
         app.setDefaultModel(runtime.models.main);
-        app.setSidecarModel(runtime.models.sidecar);
+        if (sidecarRequested) app.setSidecarModel(runtime.models.sidecar);
         pushRuntimeState({ phase: "ready", pid: launched.mainProcess.process.pid, ctxTokens: launched.plan.contextTokens });
         result = { started: true, pid: launched.mainProcess.process.pid, endpoint: baseUrl, sidecarEndpoint: sidecarBaseUrl, sidecarPid: launched.sidecarProcess?.process.pid ?? null, launchPlan: launched.plan, probe: launched.probe, sidecarProbe: launched.sidecarProbe };
         break;
@@ -1570,6 +1870,64 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
       }
       case "task.list": result = app.listTasks(String(p.conversationId ?? frame.conversationId)); break;
       case "task.compiled-get": result = app.getCompiledTask(String(p.runId ?? "")); break;
+      case "plan.list": result = app.listPlanArtifacts(String(p.conversationId ?? frame.conversationId)); break;
+      case "plan.get": result = app.getPlanArtifact(String(p.planId ?? p.id ?? ""), typeof p.revision === "number" ? p.revision : undefined); break;
+      case "plan.create": {
+        const conversationId = String(p.conversationId ?? frame.conversationId);
+        const prompt = String(p.text ?? p.prompt ?? "").trim();
+        if (!prompt) throw new Error("plan.create requires text");
+        const conversation = app.getConversation(conversationId);
+        const root = typeof p.projectRoot === "string" && p.projectRoot.trim() ? p.projectRoot : conversation?.projectRoot ?? opts.projectRoot ?? process.cwd();
+        const active = runtimeForProject(root, runtime, opts);
+        const planId = String(p.planId ?? `plan-${Date.now().toString(36)}`);
+        const controller = new AbortController();
+        taskControllers.set(planId, controller);
+        try {
+          const orientation = await automaticSidecarContext(prompt, root, active, indexes, sidecar, controller.signal);
+          const suggested = await suggestEditableTaskPlan(conversationId, prompt, root, indexes, orientation);
+          if (!suggested.nodes.length) throw new Error(suggested.note);
+          const files = suggested.allowedFiles;
+          result = app.createPlanArtifact({
+            id: planId, conversationId, request: prompt, projectRoot: root,
+            workspaceFingerprint: workspaceFingerprint(root, files),
+            goal: prompt, requirements: [suggested.note], steps: suggested.nodes as never[],
+            verification: ["Run the plan's verification step and inspect the resulting diff."],
+          });
+        } finally { taskControllers.delete(planId); }
+        break;
+      }
+      case "plan.revise": {
+        const planId = String(p.planId ?? p.id ?? "");
+        if (!planId || !p.patch || typeof p.patch !== "object") throw new Error("plan.revise requires planId and patch");
+        result = app.revisePlanArtifact(planId, p.patch as never);
+        break;
+      }
+      case "plan.approve": result = app.approvePlanArtifact(String(p.planId ?? p.id ?? ""), typeof p.revision === "number" ? p.revision : undefined); break;
+      case "plan.execute": {
+        const planId = String(p.planId ?? p.id ?? "");
+        const parentRunId = String(p.parentRunId ?? `plan-run-${Date.now().toString(36)}`);
+        const controller = new AbortController();
+        taskControllers.set(parentRunId, controller);
+        try { result = await app.executePlanArtifact(planId, typeof p.revision === "number" ? p.revision : undefined, parentRunId, controller.signal); }
+        finally { taskControllers.delete(parentRunId); }
+        break;
+      }
+      case "plan.resume": {
+        const planId = String(p.planId ?? p.id ?? "");
+        const parentRunId = String(p.parentRunId ?? `plan-resume-${Date.now().toString(36)}`);
+        const controller = new AbortController();
+        taskControllers.set(parentRunId, controller);
+        try { result = await app.executePlanArtifact(planId, typeof p.revision === "number" ? p.revision : undefined, parentRunId, controller.signal); }
+        finally { taskControllers.delete(parentRunId); }
+        break;
+      }
+      case "plan.cancel": {
+        const key = String(p.parentRunId ?? p.runId ?? p.planId ?? p.id ?? "");
+        const controller = taskControllers.get(key);
+        if (controller) { controller.abort("cancelled"); result = true; }
+        else { result = app.cancelPlanArtifact(String(p.planId ?? p.id ?? ""), typeof p.revision === "number" ? p.revision : undefined); }
+        break;
+      }
       case "task.plan-suggest": {
         const conversationId = String(p.conversationId ?? frame.conversationId);
         const prompt = String(p.text ?? p.prompt ?? "").trim();
@@ -1668,7 +2026,22 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
         sidecar.setMaxConcurrent(sidecarConcurrency(activeRuntime.models));
         let contextPreamble = "";
         try {
-          if (p.autoSidecar !== false && conversation) {
+          // The model has to exist before the turn does. A local runtime that is still reading its
+          // weights answers `fetch failed` or 503, and a run started into that fails for a reason
+          // that has nothing to do with the user's request.
+          //
+          // Only for a runtime Kitten manages: an injected runner, a fixture, or a cloud endpoint has
+          // nothing to wait for, and polling one that will never answer would be a hang, not a fix.
+          const submitSettings = settingsFor(opts, conversation?.projectRoot);
+          const managesRuntime = !opts.runner && !opts.llm
+            && Boolean(submitSettings.managedRuntime.executable && submitSettings.managedRuntime.mainModelPath);
+          if (managesRuntime) {
+            const ready = await awaitRuntimeReady(activeRuntime.models.baseUrl, 300_000, submitController.signal, (elapsedMs, loading) => {
+              pushRuntimeState({ phase: loading ? "loading" : "starting", endpoint: activeRuntime.models.baseUrl, model: activeRuntime.models.main, elapsedMs });
+            });
+            if (!ready && submitController.signal.aborted) { result = { cancelled: true, phase: "waiting-for-model" }; break; }
+          }
+          if (legacySidecarEnabled && p.autoSidecar !== false && conversation) {
             socket.write(encodeFrame({ protocolVersion: DESKTOP_PROTOCOL_VERSION, eventId: `sidecar:${frame.id}:started`, type: "sidecar.preflight", conversationId, timestamp: Date.now(), payload: { phase: "started" } }));
             try {
               contextPreamble = await automaticSidecarContext(text, conversation.projectRoot, activeRuntime, indexes, sidecar, submitController.signal);
@@ -1684,7 +2057,7 @@ async function handleCommand(frame: DesktopCommand, app: KittenApp, socket: Sock
           result = await app.submitMessage(conversationId, text, { lane: typeof p.lane === "string" ? p.lane as never : undefined, k: typeof p.k === "number" ? p.k : undefined, effort: typeof p.effort === "string" ? p.effort : undefined, contextPreamble, signal: submitController.signal });
           // A per-message effort is also the user's new preference for this conversation.
           if (typeof p.effort === "string") app.setEffort(conversationId, p.effort);
-          if (conversation && /^(?:new task|new conversation)$/i.test(conversation.title.trim())) {
+          if (legacySidecarEnabled && conversation && /^(?:new task|new conversation)$/i.test(conversation.title.trim())) {
             void automaticSidecarTitle(text, activeRuntime, sidecar).then((title) => { if (title) app.rename(conversationId, title); }).catch(() => { /* title is cosmetic; the run must never depend on it */ });
           }
           // Postflight review and failure triage now run inside KittenApp (sidecarAssist), so every
@@ -1729,6 +2102,23 @@ async function main(): Promise<void> {
   parentWatch?.unref();
   process.on("SIGINT", () => void handle.close().then(() => process.exit(0)));
   process.on("SIGTERM", () => void handle.close().then(() => process.exit(0)));
+
+  // A stray async throw must not take the whole app down with it. Node terminates the process on an
+  // unhandled rejection, and this engine IS the app: when it dies the window is left connected to
+  // nothing, its published token goes stale, and every action afterwards fails with a handshake
+  // error that says nothing about the actual fault. One failed request is a failed request; it is
+  // not a reason to end the session. The other entry points already take this position — this one
+  // was the exception, and it is the one whose death is most expensive.
+  const survive = (kind: string) => (reason: unknown): void => {
+    const detail = reason instanceof Error ? reason.stack ?? reason.message : String(reason);
+    process.stderr.write(`kitten engine: ${kind} (continuing): ${detail}\n`);
+  };
+  process.on("unhandledRejection", survive("unhandled rejection"));
+  process.on("uncaughtException", survive("uncaught exception"));
+
+  // Whatever ends this process, stop advertising a token that no longer opens anything. A client
+  // that reads a dead engine's file connects to the NEXT engine with the wrong token.
+  process.on("exit", () => { try { handle.closeSync(); } catch { /* exiting anyway */ } });
 }
 
 if (process.argv[1]?.endsWith("desktopEngine.js")) void main();

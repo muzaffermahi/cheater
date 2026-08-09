@@ -765,8 +765,8 @@ test("desktop engine exposes a bounded model responsiveness benchmark", async ()
     assert.ok(result.medianLatencyMs >= 0);
     assert.ok(result.medianTokensPerSecond > 0);
     const battery = await call(socket, "battery", "model.benchmark-battery", { samples: 1 });
-    assert.equal(battery.rows.length, 2);
-    assert.deepEqual(battery.rows.map((row: { role: string }) => row.role), ["main", "sidecar"]);
+    assert.equal(battery.rows.length, 1);
+    assert.deepEqual(battery.rows.map((row: { role: string }) => row.role), ["main"]);
     assert.match(battery.reportPath, /model-benchmark-.*\.json$/);
   } finally {
     socket.destroy();
@@ -1054,5 +1054,77 @@ test("a model whose weights are still loading can still be selected, with an hon
     await engine.close();
     await new Promise<void>((resolve) => slow.close(() => resolve()));
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the engine withdraws its published token synchronously, so the next one is reachable", async () => {
+  // A dead engine that leaves its token file behind is worse than one that leaves nothing: the shell
+  // reads the dead secret at once, never waits for the live engine to publish its own, and then
+  // presents the wrong token the moment the new pipe appears. The user is told the handshake is
+  // "invalid" — a security-shaped message for a leftover file. closeSync exists to be callable from
+  // a `process.on("exit")` handler, where nothing async ever runs.
+  const home = await mkdtemp(join(tmpdir(), "kitten-engine-info-"));
+  const infoPath = join(home, "engine.json");
+  const socketPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\kitten-info-${process.pid}-${Date.now().toString(36)}`
+    : join(home, "engine.sock");
+  const engine = await startDesktopEngine({
+    socketPath, infoPath, projectRoot: home, store: join(home, "store.db"),
+    runner: async () => ({ finished: true, verified: false, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] }), runtimeWatchdogMs: 0,
+  });
+  try {
+    assert.ok(existsSync(infoPath), "the token is published once the socket is bound");
+    const published = JSON.parse(await readFile(infoPath, "utf8")) as { token: string; pid: number };
+    assert.equal(published.token, engine.token);
+    assert.equal(published.pid, process.pid, "and it names the process that owns the pipe, so a reader can check it is alive");
+
+    engine.closeSync();
+    assert.ok(!existsSync(infoPath), "and it is withdrawn without awaiting anything");
+    engine.closeSync(); // idempotent: an exit handler may run after an orderly close
+  } finally {
+    await engine.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("one failing command does not take the engine down with it", async () => {
+  // Node ends the process on an unhandled rejection, and this engine IS the app: when it dies the
+  // window is left connected to nothing and every action afterwards fails with a handshake error
+  // that says nothing about the actual fault. A bad request must cost one request.
+  const home = await mkdtemp(join(tmpdir(), "kitten-engine-survive-"));
+  const socketPath = process.platform === "win32"
+    ? `\\\\.\\pipe\\kitten-survive-${process.pid}-${Date.now().toString(36)}`
+    : join(home, "engine.sock");
+  const engine = await startDesktopEngine({
+    socketPath, infoPath: null, projectRoot: home, store: join(home, "store.db"),
+    runner: async () => ({ finished: true, verified: false, summary: "fixture", wallMs: 1, usage: { prompt: 0, completion: 0, reasoning: 0 }, receiptLines: [], filesChanged: [] }), runtimeWatchdogMs: 0,
+  });
+  const socket = await open(socketPath);
+  const decoder = new FrameDecoder();
+  const frames: Array<Record<string, unknown>> = [];
+  socket.on("data", (chunk: Buffer) => { for (const frame of decoder.push(chunk)) frames.push(frame as unknown as Record<string, unknown>); });
+  const send = (id: string, type: string, payload?: unknown): void => { socket.write(encodeFrame(command(id, type, payload))); };
+  const settle = async (): Promise<void> => { await new Promise((resolve) => setTimeout(resolve, 250)); };
+  try {
+    send("hello", "hello", { token: engine.token });
+    await settle();
+
+    // A command the engine cannot serve: it must answer with a failure, not stop answering.
+    send("bad", "model.inspect-weights", {});
+    await settle();
+    const failed = frames.find((frame) => frame.id === "bad");
+    assert.ok(failed, "the bad command was answered");
+    assert.equal(failed?.ok, false, "as a failure");
+
+    // The very next command still works — the connection and the engine both survived.
+    send("after", "health");
+    await settle();
+    const healthy = frames.find((frame) => frame.id === "after");
+    assert.ok(healthy, "a later command still gets a reply");
+    assert.equal(healthy?.ok, true);
+  } finally {
+    socket.destroy();
+    await engine.close();
+    await rm(home, { recursive: true, force: true });
   }
 });

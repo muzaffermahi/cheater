@@ -19,6 +19,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import { runAgent, type AgentRunParams, type AgentRunResult, type FinishGateState } from "./agent.js";
+import type { EffortLevel } from "./effort.js";
 import type { Tool } from "./tools.js";
 import type { KittenLLM } from "./llm.js";
 import type { ToolContext, ToolResult } from "./tools.js";
@@ -71,8 +72,9 @@ export interface ReliableParams {
   candidateCount?: number;
   /** Hard cap on thinking tokens per turn; forwarded to the agent loop. */
   reasoningBudget?: number;
+  effort?: EffortLevel;
   /** P2/P5: owned-inference per-sample decode controls (forbidden-token ban, sampler diversity). */
-  decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; grammar?: string };
+  decode?: { logitBias?: Record<number, number>; topP?: number; topK?: number; minP?: number; dryMultiplier?: number; repeatPenalty?: number; presencePenalty?: number; seed?: number; grammar?: string };
   /** P2: run the finish-gate forbidden-construct source scan (engine-agnostic fallback for the ban). */
   banForbidden?: boolean;
   /** Iter-1: disable ornith's chain-of-thought for the fast forward pass (auto-re-enabled on repair). */
@@ -112,6 +114,22 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     }
   }
 
+  // A new Windows workspace often contains only Kitten's bookkeeping folders. The observed Fast
+  // cutoff spent its first ten tool calls on equivalent ls/dir/cmd/pwd/set probes. Tell the model
+  // that it can create the artifact immediately so those calls do not consume serial local-runtime
+  // time and prompt/context space.
+  let visibleWorkspaceEntries: string[] = [];
+  try {
+    visibleWorkspaceEntries = readdirSync(cwd).filter((name) => !name.startsWith(".") && name !== "node_modules");
+  } catch { /* the normal read/ls tools will report a real workspace error if needed */ }
+  const workspaceDirective = process.platform === "win32"
+    ? visibleWorkspaceEntries.length === 0
+      ? "The workspace has no visible project files. This is a from-scratch task: create the requested deliverable now; do not run cwd/listing probes or alternate cmd/dir variants."
+      : "The current directory is already the project root. On Windows, do not run pwd, echo %cd%, set, cd, cmd /c dir, or repeated dir/ls variants; use ls/glob once only when discovery is needed."
+    : visibleWorkspaceEntries.length === 0
+      ? "The workspace has no visible project files; create the requested deliverable now instead of probing the directory repeatedly."
+      : "The current directory is already the project root; avoid repeated directory probes.";
+
   const contractLines: string[] = [];
   if (contract.files.length) contractLines.push(`Files named in the task: ${contract.files.join(", ")}`);
   if (contract.symbols.length) contractLines.push(`Symbols named in the task: ${contract.symbols.join(", ")}`);
@@ -139,6 +157,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     params.systemPrompt,
     "You are Kitten, a precise coding agent. You have tools: read, write, edit, bash, ls, grep, finish.",
     "Work in small steps. Read the exact code region before editing. To change an existing file use edit (give enough surrounding original text to be unique); use write only for a new file.",
+    workspaceDirective,
     contractLines.length ? `\nAcceptance targets (do not rename or approximate these):\n- ${contractLines.join("\n- ")}` : "",
     briefs.length ? `\nRelevant code, already located for you (read more with the read tool if needed):\n${briefs.join("\n")}` : "",
     examplesLine,
@@ -166,6 +185,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     captureConfidence: params.captureConfidence,
     candidateCount: params.candidateCount,
     reasoningBudget: params.reasoningBudget,
+    effort: params.effort,
     decode: params.decode,
     disableThinking: params.disableThinking,
     commandGate: params.commandGate,
@@ -176,7 +196,14 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     allowedFiles: params.allowedFiles,
     forbiddenFiles: params.forbiddenFiles,
     postToolHook: (call, res, ctx) => postEditSyntaxGate(call, res, ctx),
-    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline, [...contract.files, ...contract.symbols])
+    finishGate: (state) => finishGate(state, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline, [...contract.files, ...contract.symbols]),
+    autoFinishAfterMutation: params.effort === "fast",
+    autoFinish: params.effort === "fast"
+      ? (state) => {
+        const marker = state.filesWritten[0] ? `node <harness> ${state.filesWritten[0]}` : "node <harness>";
+        return finishGate({ ...state, bashOk: state.bashOk.length ? state.bashOk : [marker], bashAll: state.bashAll.length ? state.bashAll : [marker] }, testCmd, params.llm, { module: pyModule, examples: workedExamples, setupVars, bans: params.banForbidden ? deriveBans(contract, task) : [] }, params.onVerification, importBaseline, [...contract.files, ...contract.symbols]).then((gate) => ({ allowed: gate.allowed, feedback: gate.feedback, summary: state.summary || "Completed and verified by the harness." }));
+      }
+      : undefined
   });
   return { ...result, contractTargets: [...contract.files, ...contract.symbols] };
 }
