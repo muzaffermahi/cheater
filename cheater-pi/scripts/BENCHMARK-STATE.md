@@ -97,10 +97,42 @@ would previously have planned against the 16k default), `--deadline-ms` fired an
 **with the repaired file written** (the exact behaviour TB2 needs and did not have), and the fix
 itself was correct including the even-length case the original never handled.
 
-**Unexplained, worth a calibration run:** decode measured ~16 tok/s here against the 32.45 tok/s the
-sweep recorded at ncmoe 30. The auto-tuner proposes 31 (deliberately the safe side of a one-layer
-cliff), and other VRAM was in use. This is exactly what *Settings → Performance → Tune for this
-machine* exists to resolve — the formula cannot see what else is holding the card.
+**The tuning doc's headline number does not survive a cold launch.** `KITTEN-TUNING.md` quotes
+32.45 tok/s decode at ncmoe 30, from a warm ladder that deliberately held the page cache still. The
+calibration store (`~/.kitten/calibration.json`, measured 2026-08-03 by the shipped calibrator, which
+cold-launches every rung) says something different on the same machine and model:
+
+```
+ncmoe 31   19.64 tok/s decode   93 tok/s prefill    ← chosen (scored on time-to-finish-a-turn)
+ncmoe 30   21.34 tok/s decode   85 tok/s prefill
+ncmoe 29   14.05 tok/s decode   42 tok/s prefill    ← the cliff, exactly where the sweep found it
+```
+
+The E0 runs above (~16 tok/s) sit in this range, not the doc's. **Both numbers are real and they are
+measuring different things**: the sweep answers "how fast can this configuration go once everything
+is resident", the calibrator answers "how fast is it when you start it", and only the second is what
+a user or a benchmark experiences. The ORDERING the sweep established survives intact — 30 and 31 are
+close, 29 falls off a cliff — which is the part any decision rests on. But the 32.45 should not be
+quoted as what this machine does; ~20 is.
+
+Worth noting the calibrator picked 31 over the faster-decoding 30 because it scores time to finish a
+representative turn, not decode alone, and 31's prefill is ~10% better. That is the intended
+behaviour (a configuration that collapses prefill must never win) and it is working.
+
+**Independent confirmation of the batch finding.** The store holds a second ladder from the day
+before, run with `batch 4096` forced:
+
+```
+                 batch 4096          default batch
+ncmoe 31    12.96 tok/s / 151     19.64 tok/s / 93
+ncmoe 30    13.24 tok/s / 141     21.34 tok/s / 85
+ncmoe 29    10.80 tok/s /  53     14.05 tok/s / 42
+```
+
+Same machine, same rungs, cold launches both times: forcing a large batch costs **~1.5× decode** and
+buys ~1.6× prefill. `KITTEN-TUNING.md` reported 2.3× decode loss from the warm ladder, so the
+magnitude is smaller here but the direction and the decision are identical — and this is a completely
+separate measurement from the one the doc is based on. Kitten still leaves batch geometry alone.
 
 ## What this pass changed that a re-measurement should show
 

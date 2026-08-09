@@ -22,6 +22,13 @@ of the things the first sweep appeared to prove were artefacts of how it was run
 every absolute number. With experts on the CPU, decode reads them from RAM on every token, so whether
 those pages are cached is worth about 2×. The *ordering* survived that; the magnitudes did not.
 
+> **These are WARM numbers, and a cold launch is slower.** The shipped calibrator cold-launches every
+> rung — which is what a user and a benchmark actually experience — and on the same machine and model
+> it measured 21.3 tok/s at ncmoe 30 and 19.6 at 31, not 32.4 (`~/.kitten/calibration.json`,
+> 2026-08-03; a live E0 run on 2026-08-09 landed at ~16–18). The **ordering below is what survives and
+> is what any decision rests on**: 30 and 31 are close, 29 falls off a cliff. Do not quote 32.45 as
+> what this machine does in use. See `cheater-pi/scripts/BENCHMARK-STATE.md`.
+
 ## The warm ladder — one session, mmap throughout
 
 | configuration | decode tok/s | prefill tok/s |
