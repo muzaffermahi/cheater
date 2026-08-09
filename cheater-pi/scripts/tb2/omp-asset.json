@@ -1,0 +1,10 @@
+{
+  "version": "17.2.7",
+  "platform": "linux-x64",
+  "url": "https://github.com/can1357/oh-my-pi/releases/download/v17.2.7/omp-linux-x64",
+  "sha256": "6e382c80b0af58016b0f537b604a3a29f1e9104abb498705295341e38fbdc774",
+  "bytes": 187938944,
+  "compressedUrlSuffix": ".gz",
+  "compressedBytes": 104487816,
+  "compressedSha256": "7c3bd1ad0e291e171f4ebb16279e64a1fbd5d38816fafbf7b07b06451998f64f"
+}

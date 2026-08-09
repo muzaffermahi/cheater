@@ -63,6 +63,7 @@
     "zero-dep-gate": "node scripts/zero-dep-gate.mjs",
     "version-check": "node scripts/version-check.mjs",
     "cleanroom-smoke": "node scripts/cleanroom-smoke.mjs",
+    "benchmark:compare": "node scripts/compare-agents.mjs",
     "prepack": "npm run build && npm run zero-dep-gate",
     "smoke": "node scripts/pack-smoke.mjs",
     "kitten": "node dist/src/core/kitten.js"
