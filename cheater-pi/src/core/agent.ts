@@ -13,6 +13,7 @@ import { CORE_TOOLS, toolByName, type Tool, type ToolContext, type ToolResult } 
 import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
 import { AttemptLedger } from "./attemptLedger.js";
+import { maskOldObservations } from "./observationMask.js";
 import { aggregateSelfCertainty } from "./selfCertainty.js";
 import { parseTextToolCalls, stripTextToolCalls } from "./textToolCalls.js";
 import { isQwen35Family, profileChatParams, resolveInferenceProfile, type InferenceCapabilities, type InferenceOverrides, type InferenceRole, type InferenceProfile } from "./inferenceProfiles.js";
@@ -44,6 +45,10 @@ export interface AgentRunParams {
   systemPrompt?: string;
   maxTurns?: number;
   maxTokens?: number;
+  /** The engine's context window, in tokens. When set, old tool OUTPUT is elided as the transcript
+   *  approaches it instead of the run dying on "Context size has been exceeded" — the failure that
+   *  once reported a 13/13 build as a model error. Omit to disable (no masking, unbounded growth). */
+  contextWindowTokens?: number;
   temperature?: number;
   model?: string;
   /** Owned-engine lever: cap ornith's reasoning depth per turn (it reasons ~130 tok even for a
@@ -232,6 +237,15 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     if (params.signal?.aborted) { stopReason = "aborted"; break; }
+    // Shed weight BEFORE the call that would have overflowed. Old tool OUTPUT is stubbed; the system
+    // message, the task, the conversation's shape and the recent turns are all untouched. See
+    // observationMask.ts for why this is masking and not summarization.
+    if (params.contextWindowTokens) {
+      const shed = maskOldObservations(messages, { contextWindowTokens: params.contextWindowTokens });
+      if (shed.masked) {
+        emit({ turn, kind: "nudge", detail: `context: elided ${shed.masked} old tool output${shed.masked === 1 ? "" : "s"} (${Math.round(shed.charsFreed / 1000)}k chars) to stay inside the window` });
+      }
+    }
     const chatParams = {
       model: params.model,
       messages,

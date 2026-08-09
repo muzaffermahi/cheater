@@ -54,6 +54,8 @@ export interface ReliableParams {
   /** Agent profile instructions layered ahead of the reliability contract. */
   systemPrompt?: string;
   maxTurns?: number;
+  /** Forwarded to the agent loop so old tool output is elided as the window fills. */
+  contextWindowTokens?: number;
   temperature?: number;
   reasoningEffort?: "low" | "medium" | "high";
   onEvent?: AgentRunParams["onEvent"];
@@ -177,6 +179,7 @@ export async function runReliableAgent(params: ReliableParams): Promise<AgentRun
     llm: params.llm,
     model: params.model,
     maxTurns: params.maxTurns,
+    contextWindowTokens: params.contextWindowTokens,
     temperature: params.temperature,
     reasoningEffort: params.reasoningEffort,
     systemPrompt,

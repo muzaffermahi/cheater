@@ -68,6 +68,9 @@ export interface RunContext {
   spawnTask?(input: { agent: string; prompt: string; model?: string }): Promise<{ conversationId: string; runId: string; status: string; summary: string }>;
   allowedFiles?: readonly string[];
   forbiddenFiles?: readonly string[];
+  /** The engine's context window in tokens, as the app understands it. Lanes pass it to the agent
+   *  loop so a long run can shed old tool output instead of dying on "context size exceeded". */
+  contextWindowTokens?: number;
 }
 
 /** How the app resolves approval requests. Interactive clients (TUI/web) use "ask" and respond via
@@ -926,6 +929,9 @@ export class KittenApp {
         hardness: decision.signal,
         profile,
         snapshotRef,
+        // The same window the history preamble was budgeted against, so the in-run masking and the
+        // cross-turn digest are working from one number rather than two guesses.
+        contextWindowTokens: this.context.windowTokens(),
         emit: (payload) => { this.emit(conversationId, payload); },
         requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),
         spawnTask: (input) => this.spawnChild({ parentConversationId: conversationId, parentRunId: runId, agent: input.agent, prompt: input.prompt, model: input.model }).then((child) => ({ conversationId: child.conversation.id, runId: child.run.id, status: child.run.status, summary: child.run.summary })),

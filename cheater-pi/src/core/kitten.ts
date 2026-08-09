@@ -21,6 +21,7 @@ import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { loadKittenSettings } from "./settings.js";
+import { probeContextSize } from "./capabilities.js";
 import { runRepl } from "./repl.js";
 import { runTui } from "./tui.js";
 import { runWeb, runServe } from "./web.js";
@@ -121,6 +122,17 @@ async function cmdRun(rest: string[]): Promise<number> {
     taskCompiler: benchmarkCompilerOff ? "off" : settings.taskCompiler,
   });
   app.recover();
+  // "auto" means ASK THE SERVER, not "fall back to the 16k default". The desktop closes this loop on
+  // every runtime state change; headless never did, so a benchmark against a 64k llama.cpp planned
+  // its whole run against 16k — a quarter of the window, on the one path every measurement uses.
+  // Best-effort and bounded: an unreachable endpoint leaves the default in place and the run proceeds.
+  if (settings.contextWindowTokens === "auto") {
+    const probed = await probeContextSize(settings.models.baseUrl, settings.models.apiKey);
+    if (probed && probed > 0) {
+      app.setContextWindowTokens(probed);
+      if (!json) process.stdout.write(dim(`context: ${probed} tokens (from the server)\n`));
+    }
+  }
   if (!json) {
     // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
     const streamed = new Set<string>();

@@ -197,6 +197,8 @@ async function runCoding(ctx: RunContext, llm: KittenLLM, opts: RunnerOpts = {})
     maxTurns: profile.maxTurns ?? ctx.profile.maxTurns,
     reasoningBudget: ctx.profile.reasoningBudget,
     effort: ctx.profile.level,
+    // Lets a long run shed old tool output instead of dying on "context size exceeded".
+    contextWindowTokens: ctx.contextWindowTokens,
     inferencePhase: profile.phase,
     inferenceOverrides: profile.inferenceOverrides,
     bootProfile: { ownership: llm.runtimeOwnership, model: profile.model },
