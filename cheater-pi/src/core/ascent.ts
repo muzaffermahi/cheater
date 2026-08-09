@@ -29,6 +29,7 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
+import { generateReproScript, isRepoShaped } from "./reproTest.js";
 import { generatePlans, selectPlan, planDirective, type CandidatePlan } from "./planFirst.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
@@ -243,6 +244,20 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // B2 target (single-fn consensus), computed once.
   const probe = await generateFnProbes(config.llm, params.task, contract).catch(() => null);
 
+  // B1 red-then-green for a REPO-shaped task. The probes above cover the single-function case; a task
+  // that is "here is a codebase and an issue" has no worked examples and its existing suite usually
+  // passes on the unfixed code, so `reproduction` was permanently n/a and eligibility collapsed to
+  // "did not break anything" — satisfied by a candidate that changed nothing of consequence. One
+  // model call buys the missing signal, and the verifier screens it on the base before believing it.
+  // Only asked when there is a base to screen against; an unscreened script is worse than none.
+  // The base IS `params.cwd`: candidates run in isolated copies and the winner is applied only after
+  // verification, so until then the project directory still holds the unchanged code. Nothing is ever
+  // written into it — the script runs from a temp directory with the workspace on the import path.
+  const reproScript = !probe && isRepoShaped(contract, params.task)
+    ? await generateReproScript(config.llm, params.task, contract).catch(() => null)
+    : null;
+  if (reproScript) receipts.push("generated a reproduction script (screened against the base before it counts)");
+
   // Consensus floor: a statically-"easy" task (hardness 0 → k=1) can still hide edge-case difficulty —
   // json_query reads easy yet a lone k=1 candidate shipped 2/56 wrong. When a self-probe exists and the
   // caller didn't pin k, floor easy tasks to k=2 so there are ≥2 candidates to select between. Originally
@@ -411,6 +426,9 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // candidate that fails them is ineligible regardless of consensus (real I/O beats model-generated votes).
   const verifier = new Verifier({
     llm: config.llm, task: params.task, contract, testCommand,
+    // The unchanged project directory is the base every red-then-green screen is measured against.
+    baseWorkspace: params.cwd,
+    reproScript,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
     confidence: lever(config, "confidence"), module: pyModule,
     workedExamples, workedModule: pyModule, setupVars,
