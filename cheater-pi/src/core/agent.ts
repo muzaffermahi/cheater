@@ -14,6 +14,7 @@ import { nounGateVerdict, resetNounGate } from "../reliability/nounGate.js";
 import { assessCommandSafety, type SafetyResult } from "../reliability/commandSafety.js";
 import { AttemptLedger } from "./attemptLedger.js";
 import { maskOldObservations } from "./observationMask.js";
+import { toolCallGrammar } from "./grammar.js";
 import { aggregateSelfCertainty } from "./selfCertainty.js";
 import { parseTextToolCalls, stripTextToolCalls } from "./textToolCalls.js";
 import { isQwen35Family, profileChatParams, resolveInferenceProfile, type InferenceCapabilities, type InferenceOverrides, type InferenceRole, type InferenceProfile } from "./inferenceProfiles.js";
@@ -150,6 +151,10 @@ const MAX_MODEL_ERROR_RETRIES = 3;
 // A cut-off generation is retried with "write it in pieces" guidance. Bounded, because a model that
 // cannot stay under the cap will not learn to on the fourth try, and each attempt is a full generation.
 const MAX_LENGTH_RETRIES = 2;
+// Grammar-constrained retries after an argument parse failure. Two, because a constraint that has not
+// produced a parseable call twice is not going to on the third try, and it is not free: a grammar
+// narrows what the model may say, which is exactly why it is armed one turn at a time.
+const MAX_GRAMMAR_RETRIES = 2;
 
 // A bash command that actually exercises code (not a bare read/ls) — used only to count how many times
 // the model has re-verified after editing, so the loop can nudge it to stop re-checking what passes.
@@ -196,6 +201,10 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
   let forcedFinish = false;
   let modelErrorRetries = 0;
   let lengthRetries = 0;
+  // Grammar-constrained retry after an argument parse failure. Armed for exactly ONE next turn, then
+  // disarmed — a constraint left on is a constraint that costs content on every turn after it helped.
+  let grammarRetries = 0;
+  let retryGrammar: string | undefined;
   const maxFinishRejections = params.maxFinishRejections ?? 2;
   // Verification-spiral cap: after the model has edited code and then run several PASSING checks, one
   // gentle nudge toward finish. Fires only after thorough verification (never on the ~3-turn median),
@@ -272,7 +281,9 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       repeatPenalty: params.decode?.repeatPenalty ?? profileTransport.repeatPenalty,
       presencePenalty: params.decode?.presencePenalty ?? profileTransport.presencePenalty,
       seed: params.decode?.seed ?? profileTransport.seed,
-      grammar: params.decode?.grammar,
+      // A one-shot constraint armed by the previous turn's parse failure wins over the caller's, and
+      // only for this turn (it is cleared immediately below).
+      grammar: retryGrammar ?? params.decode?.grammar,
       // Iter-1: no-think for the fast forward pass, but the moment the finish gate has bounced a "done"
       // the model is repairing a real failure — give it its reasoning back for every turn after that.
       disableThinking: (params.disableThinking ?? profile.samplingMode === "instruct") && finishRejections === 0,
@@ -283,6 +294,8 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
       role: params.inferenceRole,
       signal: params.signal
     };
+    // Disarm now, not after the call: whatever this turn produces, the next one must be unconstrained.
+    retryGrammar = undefined;
     // Real streaming when asked + supported: emit coalesced content/reasoning deltas as they arrive, so
     // a slow local model shows live progress instead of a frozen pause. The reconstructed result is
     // identical to the non-streaming path. Tests/measurement (streamDeltas off) take the plain chat path.
@@ -406,10 +419,24 @@ export async function runAgent(params: AgentRunParams): Promise<AgentRunResult> 
         // valid-looking JSON is useless advice; telling it to split the write is actionable.
         const rawSize = call.raw?.length ?? 0;
         const oversized = rawSize >= 4000;
-        const advice = oversized
-          ? ` The arguments were ${Math.round(rawSize / 1024)} KB, which is large enough that the parser can fail mid-string. Write the file in smaller pieces instead: create it with the first section, then append the rest with follow-up edits.`
-          : " Re-emit the call with valid JSON arguments.";
+        // On an owned engine there is a better answer than advice: make the malformed shape
+        // UNREPRESENTABLE for one retry. The tag format escapes nothing, so the payload that broke
+        // the JSON parser passes through literally. Retry-only on purpose — Kitten's own A/B measured
+        // an always-on constraint costing content on the 2B, while NVIDIA measured constrained RETRY
+        // lifting small-model bash-task pass rates 62.5% → 75.2%. Both point at the same narrow use.
+        const canConstrain = grammarRetries < MAX_GRAMMAR_RETRIES
+          && (params.inferenceCapabilities ?? llm.inferenceCapabilities)?.structuredOutput === true;
+        const advice = canConstrain
+          ? " Re-emit it as a tag-format tool call — that format escapes nothing, so a large payload cannot break it mid-string."
+          : oversized
+            ? ` The arguments were ${Math.round(rawSize / 1024)} KB, which is large enough that the parser can fail mid-string. Write the file in smaller pieces instead: create it with the first section, then append the rest with follow-up edits.`
+            : " Re-emit the call with valid JSON arguments.";
         messages.push(toolResultTurn(call.id, call.name, `error: ${call.argError}.${advice}`));
+        if (canConstrain) {
+          grammarRetries++;
+          retryGrammar = toolCallGrammar(tools.map((t) => t.schema.name));
+          emit({ turn, kind: "nudge", detail: `arguments did not parse — retrying under a tool-call grammar (${grammarRetries}/${MAX_GRAMMAR_RETRIES})` });
+        }
         // The UI used to receive exactly "bad args for write" — no argument, no reason. Neither the
         // model nor the person watching could act on that.
         emit({
