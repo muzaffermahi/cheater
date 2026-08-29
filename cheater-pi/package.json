@@ -55,7 +55,7 @@
     "build": "tsc -p tsconfig.json",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/test/*.test.js",
+    "test": "npm run build && node --test --test-force-exit dist/test/*.test.js",
     "desktop-engine": "npm run build && node dist/src/core/desktopEngine.js",
     "package-desktop": "npm run build && node scripts/package-desktop.mjs",
     "native-engine-smoke": "node scripts/native-engine-smoke.mjs",
