@@ -94,4 +94,4 @@ Internals still read `.cheater/` for compatibility; the canonical data/config ho
 
 ## License
 
-MIT — see [`cheater-pi/LICENSE`](./cheater-pi/LICENSE).
+MIT — see [`LICENSE`](./LICENSE).
