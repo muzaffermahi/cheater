@@ -30,7 +30,7 @@ jobs:
       - name: Build
         run: npm run build
       - name: Unit + integration tests
-        run: node --test --test-force-exit dist/test/*.test.js
+        run: node --test dist/test/*.test.js
 
   pack-smoke:
     name: packed-install smoke (${{ matrix.os }})

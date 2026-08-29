@@ -137,7 +137,10 @@ class DevLog {
     const dir = join(resolve(cwd), LOG_DIR);
     mkdirSync(dir, { recursive: true });
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
-    this.file = join(dir, `dev-trace-${ts}.log`);
+    const base = join(dir, `dev-trace-${ts}`);
+    let candidate = `${base}.log`;
+    for (let suffix = 1; existsSync(candidate); suffix++) candidate = `${base}-${suffix}.log`;
+    this.file = candidate;
     this.start = Date.now();
     this.enabled = true;
     this.count = 0;

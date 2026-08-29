@@ -1,7 +1,7 @@
 // Hidden engine entrypoint for the native desktop app. It owns the existing KittenApp service and
 // exposes only typed local IPC; no HTTP listener, browser, or terminal is needed by the user.
 
-import { createServer, type Socket } from "node:net";
+import { createConnection, createServer, type Socket } from "node:net";
 import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
@@ -128,6 +128,36 @@ function tokenOk(given: unknown, token: string): boolean {
 function defaultSocketPath(): string {
   if (process.platform === "win32") return `\\\\.\\pipe\\kitten-engine-${process.env.USERNAME ?? "user"}`;
   return join(kittenHome(), "engine.sock");
+}
+
+/**
+ * A Unix-domain socket file may outlive a crashed process, but unlinking it blindly also detaches
+ * a live listener and lets a second engine steal the address. Probe first: only ECONNREFUSED is a
+ * stale socket. Timeouts and permission errors are treated as occupied/unsafe to replace.
+ */
+async function prepareUnixSocket(socketPath: string): Promise<void> {
+  if (process.platform === "win32" || !existsSync(socketPath)) return;
+  const stale = await new Promise<boolean>((resolve, reject) => {
+    const probe = createConnection(socketPath);
+    const finish = (value: boolean): void => {
+      probe.removeAllListeners();
+      probe.destroy();
+      resolve(value);
+    };
+    probe.once("connect", () => finish(false));
+    probe.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED" || error.code === "ENOENT") finish(true);
+      else { probe.destroy(); reject(error); }
+    });
+    probe.setTimeout(500, () => finish(false));
+  });
+  if (!stale) {
+    const error = new Error(`listen EADDRINUSE: address already in use ${socketPath}`) as NodeJS.ErrnoException;
+    error.code = "EADDRINUSE";
+    throw error;
+  }
+  try { unlinkSync(socketPath); }
+  catch (error) { if (existsSync(socketPath)) throw error; }
 }
 
 function response(id: string, result: unknown): DesktopResponse {
@@ -836,9 +866,7 @@ function sanitizeSettingsUpdate(value: unknown): SettingsUpdate {
 
 export async function startDesktopEngine(opts: DesktopEngineOptions = {}): Promise<DesktopEngineHandle> {
   const socketPath = opts.socketPath ?? defaultSocketPath();
-  if (process.platform !== "win32" && existsSync(socketPath)) {
-    try { unlinkSync(socketPath); } catch { /* a live owner will make listen fail */ }
-  }
+  await prepareUnixSocket(socketPath);
   const settings = loadKittenSettings(opts.projectRoot ?? process.cwd());
   // Injected runners/LLMs are test and embedding compatibility surfaces; production launches do
   // not provide either, so the user-facing desktop path remains sidecar-free by default.
