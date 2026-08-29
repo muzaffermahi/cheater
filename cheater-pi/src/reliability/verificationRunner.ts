@@ -75,7 +75,11 @@ function portInUse(port: number): Promise<boolean> {
 }
 
 function killOwnedProcess(pid: number | null, child?: ChildProcess): void {
-  if (pid) {
+  // PID 1 is the init process on Unix (and can be the test runner in a container).
+  // A negative signal for it is especially dangerous because kill(-1) targets every
+  // process we are allowed to signal. Never let mocked or stale metadata reach that
+  // path, and never ask the verifier to terminate its own process.
+  if (pid && pid > 1 && pid !== process.pid) {
     if (process.platform === "win32") {
       try {
         spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true });
