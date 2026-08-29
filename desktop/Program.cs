@@ -1,15 +1,30 @@
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
+using System.IO.Pipes;
+using System.Text.Json;
 
 namespace Kitten.Desktop;
 
 internal static class Program
 {
+    private static readonly string ActivationPipeName = $"Kitten.Desktop.Activate.{Environment.UserName}";
+
     [STAThread]
     public static void Main(string[] args)
     {
+        // `kitten app --cwd <dir>` (and a project shortcut) pass the workspace here. It used to be
+        // silently ignored — the engine started rootless and every launch landed on the empty state.
+        var projectRoot = ArgValue(args, "--project-root");
+        if (projectRoot is not null)
+        {
+            try { projectRoot = Path.GetFullPath(projectRoot); if (!Directory.Exists(projectRoot)) projectRoot = null; }
+            catch { projectRoot = null; }
+        }
+        MainWindow.InitialProjectRoot = projectRoot;
+
         // A user interface cannot be reviewed by compiling it: a build that succeeds says nothing about
         // whether the window is readable. `--snapshot <file.png>` lays the real window out against the
         // real engine, writes a PNG and exits, so the shell can be inspected during development and
@@ -23,8 +38,69 @@ internal static class Program
         }
 
         using var mutex = new Mutex(true, "Kitten.Desktop.SingleInstance", out var created);
-        if (!created) return;
+        if (!created)
+        {
+            // A second launch used to exit in silence — double-clicking the icon while Kitten ran did
+            // nothing visible. Hand the running instance our project root and let it come forward.
+            NotifyRunningInstance(projectRoot);
+            return;
+        }
+        StartActivationListener();
         BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+    }
+
+    /// <summary>Losing side of the single-instance race: pass the request to the winner and exit.</summary>
+    private static void NotifyRunningInstance(string? projectRoot)
+    {
+        try
+        {
+            using var pipe = new NamedPipeClientStream(".", ActivationPipeName, PipeDirection.Out);
+            pipe.Connect(1500);
+            var payload = JsonSerializer.SerializeToUtf8Bytes(new { projectRoot });
+            pipe.Write(payload, 0, payload.Length);
+            pipe.Flush();
+        }
+        catch { /* the running instance may be mid-shutdown; nothing more to do */ }
+    }
+
+    /// <summary>
+    /// Winning side: a tiny same-user pipe loop that foregrounds the window (and switches project)
+    /// when a second launch knocks. Everything is parsed defensively — a malformed local write must
+    /// never take down the UI thread.
+    /// </summary>
+    private static void StartActivationListener()
+    {
+        var listener = new Thread(() =>
+        {
+            while (true)
+            {
+                try
+                {
+                    using var server = new NamedPipeServerStream(ActivationPipeName, PipeDirection.In, 1);
+                    server.WaitForConnection();
+                    var buffer = new byte[4096];
+                    var read = server.Read(buffer, 0, buffer.Length);
+                    string? root = null;
+                    if (read > 0)
+                    {
+                        try
+                        {
+                            using var doc = JsonDocument.Parse(buffer.AsSpan(0, read).ToArray());
+                            if (doc.RootElement.TryGetProperty("projectRoot", out var rootValue) && rootValue.ValueKind == JsonValueKind.String) root = rootValue.GetString();
+                        }
+                        catch { /* not JSON — treat as a bare activation knock */ }
+                    }
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        var window = (Application.Current?.ApplicationLifetime as IClassicDesktopStyleApplicationLifetime)?.MainWindow as MainWindow;
+                        window?.ActivateFromSecondInstance(root);
+                    });
+                }
+                catch { /* pipe hiccup — keep listening */ }
+            }
+        })
+        { IsBackground = true, Name = "kitten-activation" };
+        listener.Start();
     }
 
     private static string? ArgValue(string[] args, string name)

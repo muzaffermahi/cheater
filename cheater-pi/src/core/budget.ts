@@ -84,7 +84,7 @@ export class BudgetGovernor {
   }
 }
 
-/** A sensible default ceiling for a hard task at ~25 tok/s targeting a ~15-min wall-clock. */
+/** A sensible default token ceiling for a hard task. Wall-clock is intentionally unbounded. */
 export function defaultCeiling(usdPerMTokens?: number): ComputeCeiling {
-  return { maxTokens: 400_000, maxWallMs: 15 * 60_000, maxUsd: usdPerMTokens ? 0.5 : undefined, usdPerMTokens };
+  return { maxTokens: 400_000, maxUsd: usdPerMTokens ? 0.5 : undefined, usdPerMTokens };
 }

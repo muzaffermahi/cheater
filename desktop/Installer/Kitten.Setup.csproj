@@ -10,5 +10,6 @@
     <SelfContained>true</SelfContained>
     <AssemblyName>Kitten.Setup</AssemblyName>
     <RootNamespace>Kitten.Setup</RootNamespace>
+    <ApplicationIcon>..\..\assets\icon\kitten.ico</ApplicationIcon>
   </PropertyGroup>
 </Project>

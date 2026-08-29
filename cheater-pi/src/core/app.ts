@@ -15,11 +15,15 @@
 import {
   ConversationStore, type ConversationRow, type RunRow,
 } from "./store/conversationStore.js";
-import { EVENT_SCHEMA_VERSION, type EventPayload, type KittenEvent, type Lane } from "./events.js";
+import { EVENT_SCHEMA_VERSION, TRANSIENT_EVENTS, type EventPayload, type KittenEvent, type Lane } from "./events.js";
 import { routeMessage, type RouteDecision } from "./router.js";
+import type { HardnessSignal } from "../runtime/computeBudget.js";
+import { effortProfile, resolveEffort, type EffortLevel, type EffortProfile } from "./effort.js";
+import { decomposeCompiledTask } from "./taskCompiler/index.js";
+import { validateTaskPlan } from "./taskGraph.js";
 import { captureSnapshot, captureSnapshotAfter, restoreSnapshot, redoSnapshot, type RunSnapshot, type UndoResult } from "./undo.js";
 import { ContextBuilder, contextBudgetForWindow } from "./context.js";
-import { TaskGraphController, type TaskGraphPlan } from "./taskGraph.js";
+import { TaskGraphController, type TaskGraphPlan, type TaskGraphEvent } from "./taskGraph.js";
 import type { TaskNodeRow } from "./store/conversationStore.js";
 import { exportConversationMarkdown } from "./export.js";
 import { getAgent } from "./agents.js";
@@ -30,6 +34,7 @@ import {
   type CompileResult, type TaskCompilerFlag,
 } from "./taskCompiler/index.js";
 import { SidecarAssist, type RunFacts } from "./sidecarAssist.js";
+import { approvePlan as approvePlanArtifact, createPlanArtifact, isApprovedExact, revisePlan as revisePlanArtifact, workspaceFingerprint, type PlanArtifact, type PlanPatch } from "./planArtifact.js";
 
 /** Everything a Runner needs to execute one run, plus the sink it emits progress into. */
 export interface RunContext {
@@ -47,6 +52,10 @@ export interface RunContext {
    *  ContextBuilder from durable state. Empty on a brand-new conversation's first turn. Every lane
    *  injects this so a resumed/multi-turn conversation actually informs the model. */
   conversationContext: string;
+  /** The router's hardness evidence, threaded so the ascent budget sees what the router saw. */
+  hardness: HardnessSignal;
+  /** The resolved effort profile for this run — every compute lever reads its bounds from here. */
+  profile: EffortProfile;
   /** Pre-run git snapshot ref (or null), so a lane that isolates its work (Ascent) can derive the
    *  winner's changed files via git after adoption. */
   snapshotRef: string | null;
@@ -59,6 +68,9 @@ export interface RunContext {
   spawnTask?(input: { agent: string; prompt: string; model?: string }): Promise<{ conversationId: string; runId: string; status: string; summary: string }>;
   allowedFiles?: readonly string[];
   forbiddenFiles?: readonly string[];
+  /** The engine's context window in tokens, as the app understands it. Lanes pass it to the agent
+   *  loop so a long run can shed old tool output instead of dying on "context size exceeded". */
+  contextWindowTokens?: number;
 }
 
 /** How the app resolves approval requests. Interactive clients (TUI/web) use "ask" and respond via
@@ -76,6 +88,19 @@ export type ApprovalPolicy = "ask" | "auto-allow" | "auto-deny";
     verified: boolean;
     /** Effective model used for the run. */
     model?: string;
+    /** The engine stopped itself at the selected effort ceiling; this is not a user cancellation. */
+    stoppedByCeiling?: boolean;
+    executionStrategy?: "compiled-fast" | "compiled-fast-to-reliable" | "agent";
+    performance?: {
+      modelCalls: number;
+      cacheTokens: number;
+      promptTokens: number;
+      promptMs: number;
+      predictedTokens: number;
+      predictedMs: number;
+      decodeTokensPerSecond: number;
+      effectiveOutputRate: number;
+    };
   }
 
 /** The execution seam. Default = engine-backed (runner.ts); tests inject a deterministic scripted one. */
@@ -119,6 +144,8 @@ export interface CreateConversationInput {
   /** Default lane for the conversation; "auto" (default) lets the router decide per message. */
   mode?: Lane | "auto";
   agent?: string;
+  /** The conversation's effort level (fast|balanced|careful|think-hard). Default "balanced". */
+  effort?: string;
 }
 
 export interface SubmitOptions {
@@ -126,6 +153,8 @@ export interface SubmitOptions {
   lane?: Lane;
   /** Force the sample count for bon/ascent. */
   k?: number;
+  /** Per-message effort override; falls back to the conversation's stored level. */
+  effort?: string;
   /** Parent/task-plan cancellation signal, linked to the app-owned run controller. */
   signal?: AbortSignal;
   allowedFiles?: readonly string[];
@@ -193,6 +222,9 @@ export class KittenApp {
     this.sidecarModel = opts.sidecarModel?.trim() || undefined;
     this.now = opts.now ?? (() => Date.now());
     this.tasks = new TaskGraphController(opts.store, this.now);
+    // Bridge the task graph's own bus into the durable event stream: DAG progress used to live and die
+    // on an in-memory listener set, so no client (or replay) ever saw a subagent step change state.
+    this.tasks.subscribe((e) => this.bridgeTaskGraphEvent(e));
     this.newId = opts.newId ?? defaultIdGen();
     this.approvalPolicy = opts.approvalPolicy ?? "auto-deny";
     this.taskCompiler = opts.taskCompiler ?? "auto";
@@ -214,6 +246,90 @@ export class KittenApp {
     const row = this.store.getTaskCompilation(runId);
     if (!row) return null;
     return { runId: row.runId, mode: row.mode, family: row.family, ir: row.ir, trace: row.trace, rendered: row.rendered, promptEpoch: row.promptEpoch };
+  }
+
+  createPlanArtifact(input: Omit<Parameters<typeof createPlanArtifact>[0], "now"> & { now?: number }): PlanArtifact {
+    const plan = createPlanArtifact({ ...input, now: input.now ?? this.now() });
+    this.store.savePlan(plan);
+    this.emit(plan.conversationId, { type: "plan.created", runId: plan.id, planId: plan.id, revision: plan.revision, hash: plan.hash, status: plan.status });
+    return plan;
+  }
+
+  getPlanArtifact(id: string, revision?: number): PlanArtifact | null { return this.store.getPlan(id, revision)?.artifact ?? null; }
+
+  listPlanArtifacts(conversationId: string): PlanArtifact[] { return this.store.listPlans(conversationId).map((row) => row.artifact); }
+
+  revisePlanArtifact(id: string, patch: PlanPatch): PlanArtifact {
+    const previous = this.getPlanArtifact(id);
+    if (!previous) throw new Error(`unknown plan: ${id}`);
+    const revised = revisePlanArtifact(previous, patch, this.now());
+    this.store.updatePlanStatus(previous.id, previous.revision, "superseded", this.now());
+    this.store.savePlan(revised);
+    this.emit(revised.conversationId, { type: "plan.revised", runId: revised.id, planId: revised.id, revision: revised.revision, hash: revised.hash, status: revised.status, detail: `supersedes revision ${previous.revision}` });
+    return revised;
+  }
+
+  approvePlanArtifact(id: string, revision?: number): PlanArtifact {
+    const current = this.getPlanArtifact(id, revision);
+    if (!current) throw new Error(`unknown plan: ${id}`);
+    const approved = approvePlanArtifact(current, this.now());
+    this.store.savePlan(approved);
+    this.emit(approved.conversationId, { type: "plan.approved", runId: approved.id, planId: approved.id, revision: approved.revision, hash: approved.hash, status: approved.status });
+    return approved;
+  }
+
+  cancelPlanArtifact(id: string, revision?: number): PlanArtifact {
+    const current = this.getPlanArtifact(id, revision);
+    if (!current) throw new Error(`unknown plan: ${id}`);
+    if (current.status === "completed" || current.status === "superseded") throw new Error(`cannot cancel a ${current.status} plan`);
+    const cancelled = { ...current, status: "cancelled" as const, updatedAt: this.now() };
+    this.store.savePlan(cancelled);
+    this.emit(cancelled.conversationId, { type: "plan.cancelled", runId: id, planId: id, revision: cancelled.revision, hash: cancelled.hash, status: cancelled.status, detail: "cancelled by user" });
+    return cancelled;
+  }
+
+  /** Execute exactly the approved artifact. A workspace change in a planned file blocks execution
+   * and creates an explicit drift event instead of silently asking the model for a new plan. */
+  async executePlanArtifact(id: string, revision?: number, parentRunId?: string, signal?: AbortSignal): Promise<TaskNodeRow[]> {
+    const plan = this.getPlanArtifact(id, revision);
+    if (!plan) throw new Error(`unknown plan: ${id}`);
+    if (!isApprovedExact(plan)) throw new Error(`plan ${id} revision ${plan.revision} is not approved exactly`);
+    const files = [...new Set(plan.steps.flatMap((step) => step.allowedFiles))];
+    const currentFingerprint = workspaceFingerprint(plan.projectRoot, files);
+    if (currentFingerprint !== plan.workspaceFingerprint) {
+      const drifted = { ...plan, status: "needs_review" as const, updatedAt: this.now() };
+      this.store.savePlan(drifted);
+      this.emit(plan.conversationId, { type: "plan.drifted", runId: plan.id, planId: plan.id, revision: plan.revision, hash: plan.hash, status: drifted.status, detail: "planned files changed since approval" });
+      throw new Error("planned files changed since approval; review the plan before implementing");
+    }
+    const runId = parentRunId ?? this.newId("plan-run");
+    this.store.updatePlanStatus(plan.id, plan.revision, "running", this.now());
+    this.emit(plan.conversationId, { type: "plan.started", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: "running" });
+    const nodes = plan.steps.map((step) => ({
+      id: `${plan.id}-r${plan.revision}-${step.id}`,
+      agent: step.agent,
+      objective: step.objective,
+      dependencies: step.dependsOn.map((dep) => `${plan.id}-r${plan.revision}-${dep}`),
+      allowedFiles: step.allowedFiles,
+      forbiddenFiles: step.forbiddenFiles,
+      acceptanceCriteria: step.acceptanceCriteria,
+      modelTier: step.modelTier,
+      workspaceMode: step.workspaceMode,
+      budget: { maxTurns: 20, maxTokens: 24_000, maxWallMs: 0, maxToolCalls: 60 },
+    }));
+    try {
+      this.createTaskPlan({ conversationId: plan.conversationId, nodes, ts: this.now() }, runId);
+      const settled = await this.runTaskPlan(plan.conversationId, runId, signal);
+      const ok = settled.every((node) => node.status === "completed" || node.status === "waiting");
+      this.store.updatePlanStatus(plan.id, plan.revision, ok ? "completed" : "needs_review", this.now());
+      this.emit(plan.conversationId, { type: "plan.completed", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: ok ? "completed" : "needs_review", detail: ok ? "all approved steps settled" : "one or more approved steps did not complete" });
+      return settled;
+    } catch (error) {
+      const cancelled = signal?.aborted || /cancel/i.test(String((error as Error).message ?? error));
+      this.store.updatePlanStatus(plan.id, plan.revision, cancelled ? "cancelled" : "needs_review", this.now());
+      this.emit(plan.conversationId, { type: "plan.cancelled", runId, planId: plan.id, revision: plan.revision, hash: plan.hash, status: cancelled ? "cancelled" : "needs_review", detail: String((error as Error).message ?? error).slice(0, 300) });
+      throw error;
+    }
   }
 
   /** Change the approval policy (e.g. a TUI sets "ask", a --dangerous headless run sets "auto-allow"). */
@@ -253,8 +369,15 @@ export class KittenApp {
     // "ask": register the resolver BEFORE emitting, so a synchronous client answer during the broadcast
     // isn't lost (the same ordering guarantee cancel() relies on).
     const p = new Promise<boolean>((resolve) => { this.pendingApprovals.set(`${runId}:${callId}`, resolve); });
+    this.emit(conversationId, { type: "run.status", runId, status: "waiting_approval", detail: reason.slice(0, 200) });
     this.emit(conversationId, { type: "tool.approval_required", runId, callId, name, reason, risk });
-    return p;
+    return p.then((allowed) => {
+      // The run resumes either way (a denial feeds back to the model as guidance, not a terminal stop).
+      if (this.inflight.has(runId) && !this.inflight.get(runId)!.signal.aborted) {
+        this.emit(conversationId, { type: "run.status", runId, status: "running" });
+      }
+      return allowed;
+    });
   }
 
   /** Release the underlying store (the app owns its lifecycle). */
@@ -272,6 +395,15 @@ export class KittenApp {
   /** Persist an event, then broadcast it. Persistence-before-broadcast guarantees a late subscriber
    *  can replay from the store and see exactly what earlier subscribers saw. */
   private emit(conversationId: string, payload: EventPayload): KittenEvent {
+    // Reasoning is streamed live and deliberately never replayed (see the renderer contract), so
+    // writing it to the durable log only costs disk. That cost is what forced the stream to be
+    // coarse — one event per 300 characters, which reads as the model thinking in slow lurches.
+    // Broadcasting it without persisting is what lets it stream at a readable rate.
+    if (TRANSIENT_EVENTS.has(payload.type)) {
+      const live = { id: `${conversationId}:live`, conversationId, seq: 0, ts: this.now(), schemaVersion: EVENT_SCHEMA_VERSION, ...payload } as KittenEvent;
+      for (const fn of this.listeners) { try { fn(live); } catch { /* a bad listener never breaks a run */ } }
+      return live;
+    }
     const event = this.store.appendEvent(conversationId, payload, this.now());
     for (const fn of this.listeners) { try { fn(event); } catch { /* a bad listener never breaks a run */ } }
     return event;
@@ -297,6 +429,7 @@ export class KittenApp {
       model: input.model ?? this.model,
       mode: input.mode ?? "auto",
       agent: input.agent ?? "general",
+      effort: input.effort !== undefined ? resolveEffort(input.effort) : undefined,
       ts: this.now(),
     });
     // Broadcast the creation event the store already appended (seq 1).
@@ -369,9 +502,39 @@ export class KittenApp {
     });
   }
 
+  /** Map a TaskGraphEvent onto the canonical step.* events, persisted on the node's conversation. */
+  private bridgeTaskGraphEvent(e: TaskGraphEvent): void {
+    const runId = e.runId ?? "task-plan";
+    try {
+      if (e.type === "task.started") {
+        // resume() re-queues nodes with status "queued" — that is a plan snapshot change, not a step start.
+        if (e.status === "running") this.emit(e.conversationId, { type: "step.started", runId, stepId: e.taskNodeId, label: e.label, agent: e.agent });
+        return;
+      }
+      const status = (["completed", "waiting", "failed", "blocked", "cancelled"] as const).find((s) => s === e.status) ?? "failed";
+      this.emit(e.conversationId, {
+        type: "step.completed", runId, stepId: e.taskNodeId, status,
+        ...(e.report ? { report: e.report.slice(0, 2000) } : {}),
+        ...(e.evidence?.length ? { evidence: e.evidence.slice(0, 16) } : {}),
+      });
+    } catch { /* bridging must never break the graph run */ }
+  }
+
+  /** Emit the current DAG as a plan.updated snapshot (renderers replace, never append). */
+  private emitPlanSnapshot(conversationId: string, runId: string, reason?: string): void {
+    const nodes = this.tasks.list(conversationId);
+    if (!nodes.length) return;
+    this.emit(conversationId, {
+      type: "plan.updated", runId, source: "task-graph", ...(reason ? { reason } : {}),
+      steps: nodes.slice(0, 24).map((n) => ({ id: n.id, label: n.objective.slice(0, 120), status: n.status, dependsOn: n.dependencies, agent: n.agent })),
+    });
+  }
+
   /** Persist a dependency-aware subagent plan. Execution remains owned by the orchestration layer. */
-  createTaskPlan(plan: TaskGraphPlan): TaskNodeRow[] {
-    return this.tasks.createPlan(plan);
+  createTaskPlan(plan: TaskGraphPlan, runId = "task-plan"): TaskNodeRow[] {
+    const rows = this.tasks.createPlan(plan);
+    this.emitPlanSnapshot(plan.conversationId, runId, "plan created");
+    return rows;
   }
 
   /** Resume the incomplete portion of a durable plan; completed nodes remain untouched. */
@@ -388,7 +551,8 @@ export class KittenApp {
   async runTaskPlan(conversationId: string, parentRunId = "task-plan", signal?: AbortSignal): Promise<TaskNodeRow[]> {
     const parent = this.store.getConversation(conversationId);
     if (!parent) throw new Error(`runTaskPlan: unknown conversation ${conversationId}`);
-    return this.tasks.runUntilSettled(conversationId, async (node, capsule, childSignal) => {
+    this.emitPlanSnapshot(conversationId, parentRunId, "plan execution started");
+    const settled = await this.tasks.runUntilSettled(conversationId, async (node, capsule, childSignal) => {
       if (childSignal.aborted) throw new Error("task plan cancelled");
       const prompt = [
         `Work only on this self-contained subtask: ${capsule.objective}`,
@@ -423,13 +587,16 @@ export class KittenApp {
       return { report: child.run.summary, evidence: child.run.filesChanged, verified: child.run.status === "completed" && child.run.verified };
     }, {
       signal,
+      runId: parentRunId,
       repoBrief: parent.projectRoot,
-      // Independent clerical scouts can fan out, while any ready main-model worker
-      // keeps the local GPU/context budget serialized. This makes subagent plans
-      // faster without sending two heavyweight coding turns into one runtime.
-      maxConcurrent: 2,
-      maxConcurrentFor: (ready) => ready.some((node) => node.modelTier === "main") ? 1 : 2,
+      // Independent clerical scouts fan out per the conversation's effort level, while any ready
+      // main-model worker keeps the local GPU/context budget serialized (one heavyweight coding
+      // turn per runtime, whatever the dial says).
+      maxConcurrent: effortProfile(parent.effort).subagentMaxConcurrent,
+      maxConcurrentFor: (ready) => ready.some((node) => node.modelTier === "main") ? 1 : effortProfile(parent.effort).subagentMaxConcurrent,
     });
+    this.emitPlanSnapshot(conversationId, parentRunId, "plan settled");
+    return settled;
   }
 
   /** Spawn a durable child conversation and return only after its first run has a terminal receipt. */
@@ -471,6 +638,11 @@ export class KittenApp {
     this.store.renameConversation(id, title.trim() || "Untitled", this.now());
     const ev = lastEventOfType(this.store, id, "conversation.renamed");
     if (ev) for (const fn of this.listeners) { try { fn(ev); } catch { /* ignore */ } }
+  }
+
+  /** Persist the conversation's effort level (the per-run choice lands on route.selected anyway). */
+  setEffort(id: string, effort: string): boolean {
+    return this.store.setEffort(id, resolveEffort(effort), this.now());
   }
 
   archive(id: string, archived = true): void {
@@ -553,6 +725,20 @@ export class KittenApp {
         promptEpoch: epoch.id,
         warnings: result.validation.warnings.map((w) => `${w.code}: ${w.message}`).slice(0, 8),
       });
+      // A lightweight plan outline derived from the contract (deliverables + executable checks), so a
+      // client can show "what Kitten intends to produce" even when no subagent DAG exists. Advisory:
+      // statuses stay "planned"; a task-graph plan later replaces it.
+      const deliverables = result.task.deliverables.slice(0, 6);
+      if (deliverables.length) {
+        const checks = result.task.verification.requiredChecks.filter((c) => c.command).slice(0, 2);
+        this.emit(conversationId, {
+          type: "plan.updated", runId, source: "compiled-contract", reason: "outline from the compiled contract",
+          steps: [
+            ...deliverables.map((d) => ({ id: d.id, label: `${d.kind}: ${d.target}`.slice(0, 120), status: "planned", dependsOn: [] as string[] })),
+            ...checks.map((c) => ({ id: c.id, label: `verify: ${c.command ?? c.claim}`.slice(0, 120), status: "planned", dependsOn: [] as string[] })),
+          ],
+        });
+      }
       // An explicit lane override means the user chose the execution shape themselves; the contract
       // still grounds the prompt, but it must not redirect a lane the user asked for.
       if (explicitLane) result.task.executionPolicy.laneHint = null;
@@ -563,12 +749,74 @@ export class KittenApp {
   }
 
   /** Route, letting a compiled contract supply a lane hint the deterministic router does not have. */
-  private route(text: string, conv: ConversationRow, opts: SubmitOptions, compiled: CompileResult | null): RouteDecision {
+  private route(text: string, conv: ConversationRow, opts: SubmitOptions, compiled: CompileResult | null, effort?: EffortLevel): RouteDecision {
     const explicit = opts.lane ?? (conv.mode === "auto" ? undefined : conv.mode);
-    const decision = routeMessage(text, { lane: explicit, k: opts.k, cwd: conv.projectRoot });
+    const decision = routeMessage(text, { lane: explicit, k: opts.k, cwd: conv.projectRoot, effort });
     const hint = compiled?.task.executionPolicy.laneHint;
     if (explicit || !hint || hint === decision.lane) return decision;
     return { ...decision, lane: hint, reasons: [...decision.reasons, compiled!.task.executionPolicy.laneReason] };
+  }
+
+  // ── Think-hard decomposition ─────────────────────────────────────────────────────────────────
+  /** Derive + persist a bounded DAG from the compiled contract, or null when it declines/fails. */
+  private planDecomposition(conversationId: string, runId: string, compiled: CompileResult): { reason: string; nodeIds: string[] } | null {
+    try {
+      const d = decomposeCompiledTask(compiled.task);
+      if (!d.nodes.length) return null;
+      // Node ids are store-global; prefix with the run so two think-hard runs never collide.
+      const prefixed = d.nodes.map((n) => ({
+        ...n,
+        id: `${runId}-${n.id}`,
+        dependencies: n.dependencies.map((dep) => `${runId}-${dep}`),
+      }));
+      validateTaskPlan({ conversationId, nodes: prefixed });
+      this.createTaskPlan({ conversationId, nodes: prefixed, ts: this.now() }, runId);
+      return { reason: d.reason, nodeIds: prefixed.map((n) => n.id) };
+    } catch {
+      return null; // any planning defect → the ordinary lane run handles the turn
+    }
+  }
+
+  /** Execute a decomposed plan as THE run: step events flow via the task-graph bridge, and the run's
+   *  outcome is synthesized from the settled node rows (integrate node = the verification word). */
+  private async runDecomposedPlan(conversationId: string, runId: string, text: string, conv: ConversationRow, planned: { reason: string; nodeIds: string[] }, controller: AbortController, effort: EffortLevel, hardness: number): Promise<RunRow> {
+    const started = this.now();
+    this.emit(conversationId, { type: "route.selected", runId, lane: "direct", reasons: [`think-hard decomposition: ${planned.reason}`], k: 1, hardness, effort });
+    this.emit(conversationId, { type: "run.started", runId, request: text, lane: "direct", model: conv.model, agent: "task-compiler" });
+    let snapshotRef: string | null = null;
+    try { const snap = captureSnapshot(conv.projectRoot); snapshotRef = snap.ref; this.store.setRunSnapshot(runId, JSON.stringify(snap)); } catch { /* best-effort */ }
+    void snapshotRef;
+    try {
+      const settled = await this.runTaskPlan(conversationId, runId, controller.signal);
+      if (controller.signal.aborted) {
+        this.emit(conversationId, { type: "run.cancelled", runId });
+        return this.store.getRun(runId)!;
+      }
+      const mine = settled.filter((n) => planned.nodeIds.includes(n.id));
+      const integrate = mine.find((n) => n.id.endsWith("-tc-integrate"));
+      const finished = mine.length > 0 && mine.every((n) => n.status === "completed" || n.status === "waiting");
+      const verified = integrate?.status === "completed";
+      const filesChanged = [...new Set(mine.flatMap((n) => n.evidence))].filter((e) => /[\\/.]/.test(e)).slice(0, 64);
+      try { const snap = captureSnapshotAfter(conv.projectRoot); this.store.setRunSnapshotAfter(runId, JSON.stringify(snap)); } catch { /* best-effort */ }
+      const summary = (integrate?.report || mine.map((n) => n.report).find(Boolean) || planned.reason).slice(0, 300);
+      this.emit(conversationId, {
+        type: "run.completed", runId, finished, verified, lane: "direct", model: conv.model,
+        summary, wallMs: this.now() - started, usage: { prompt: 0, completion: 0, reasoning: 0 },
+      });
+      this.emit(conversationId, {
+        type: "receipt.finalized", runId,
+        lines: [
+          `think-hard decomposition: ${planned.reason}`,
+          ...mine.map((n) => `  ${n.id.slice(runId.length + 1)}: ${n.status}${n.report ? ` — ${n.report.slice(0, 140)}` : ""}`),
+        ],
+        filesChanged, verified,
+      });
+      return this.store.getRun(runId)!;
+    } catch (e) {
+      if (controller.signal.aborted) this.emit(conversationId, { type: "run.cancelled", runId });
+      else this.emit(conversationId, { type: "run.failed", runId, error: (e as Error).message.slice(0, 500) });
+      return this.store.getRun(runId)!;
+    }
   }
 
   /** Ask the one blocking question and terminate the turn honestly: an answer, not a change. */
@@ -606,9 +854,16 @@ export class KittenApp {
     const conv = this.store.getConversation(conversationId);
     if (!conv) throw new Error(`submitMessage: unknown conversation ${conversationId}`);
 
+    // The effort dial: a per-message override wins, else the conversation's stored level. The profile
+    // sets the BOUNDS every lever below reads; hardness still makes the per-task decisions.
+    const effort: EffortLevel = resolveEffort(opts.effort ?? conv.effort);
+    const profile = effortProfile(effort);
+
     // Assemble the model-facing conversation context from PRIOR turns BEFORE persisting the new message
     // (so the current request isn't duplicated into its own context). This is what makes resume real.
-    const built = this.context.build(conversationId, conv.projectRoot);
+    // "fast" trims the history budget (a lean turn should not pay a full-window prefill).
+    const built = this.context.build(conversationId, conv.projectRoot,
+      profile.contextWindowFraction < 1 ? { windowTokens: Math.floor(this.context.windowTokens() * profile.contextWindowFraction) } : undefined);
     const sidecarContext = typeof opts.contextPreamble === "string" ? opts.contextPreamble.trim().slice(0, 12_000) : "";
 
     this.emit(conversationId, { type: "user.message", text });
@@ -632,7 +887,7 @@ export class KittenApp {
       return this.requestClarification(conversationId, runId, text, compiled);
     }
 
-    const decision: RouteDecision = this.route(text, conv, opts, compiled);
+    const decision: RouteDecision = this.route(text, conv, opts, compiled, effort);
     // Register the abort controller BEFORE emitting run events, so a synchronous subscriber can cancel
     // the instant the run appears (the run row already exists by the time run.started broadcasts).
     const controller = new AbortController();
@@ -641,7 +896,23 @@ export class KittenApp {
     const externalAbort = externalSignal ? () => controller.abort(externalSignal.reason) : undefined;
     if (externalSignal?.aborted) controller.abort(externalSignal.reason);
     else if (externalAbort && externalSignal) externalSignal.addEventListener("abort", externalAbort, { once: true });
-    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k });
+
+    // Think-hard auto-decomposition: a decomposable contract becomes a bounded, per-piece-verified
+    // subagent DAG instead of one long trajectory. Any decline or failure falls through to the
+    // ordinary lane run — plan machinery must never fail the user's turn.
+    if (profile.autoDecompose && !opts.lane && compiled?.validation.ok && decision.lane !== "answer") {
+      const planned = this.planDecomposition(conversationId, runId, compiled);
+      if (planned) {
+        try {
+          return await this.runDecomposedPlan(conversationId, runId, text, conv, planned, controller, effort, decision.hardness);
+        } finally {
+          if (externalSignal && externalAbort) externalSignal.removeEventListener("abort", externalAbort);
+          this.inflight.delete(runId);
+        }
+      }
+    }
+
+    this.emit(conversationId, { type: "route.selected", runId, lane: decision.lane, reasons: decision.reasons, k: decision.k, hardness: decision.hardness, effort });
     this.emit(conversationId, { type: "run.started", runId, request: text, lane: decision.lane, model: conv.model, agent: conv.agent ?? "general" });
 
     // Capture a pre-run snapshot for /undo BEFORE the runner mutates anything (cheap; never touches the
@@ -655,7 +926,12 @@ export class KittenApp {
         runId, conversationId, task: text, cwd: conv.projectRoot,
         lane: decision.lane, k: decision.k, model: conv.model, agent: conv.agent ?? "general", signal: controller.signal, allowedFiles: opts.allowedFiles, forbiddenFiles: opts.forbiddenFiles,
         conversationContext,
+        hardness: decision.signal,
+        profile,
         snapshotRef,
+        // The same window the history preamble was budgeted against, so the in-run masking and the
+        // cross-turn digest are working from one number rather than two guesses.
+        contextWindowTokens: this.context.windowTokens(),
         emit: (payload) => { this.emit(conversationId, payload); },
         requestApproval: (callId, name, reason, risk) => this.requestApproval(conversationId, runId, callId, name, reason, risk),
         spawnTask: (input) => this.spawnChild({ parentConversationId: conversationId, parentRunId: runId, agent: input.agent, prompt: input.prompt, model: input.model }).then((child) => ({ conversationId: child.conversation.id, runId: child.run.id, status: child.run.status, summary: child.run.summary })),
@@ -671,6 +947,9 @@ export class KittenApp {
         this.emit(conversationId, {
           type: "run.completed", runId, finished: outcome.finished, verified: outcome.verified, lane: decision.lane,
           model: outcome.model ?? conv.model, summary: outcome.summary, wallMs: outcome.wallMs, usage: outcome.usage,
+          ...(outcome.stoppedByCeiling ? { stoppedByCeiling: true } : {}),
+          ...(outcome.executionStrategy ? { executionStrategy: outcome.executionStrategy } : {}),
+          ...(outcome.performance ? { performance: outcome.performance } : {}),
         });
         this.emit(conversationId, {
           type: "receipt.finalized", runId, lines: outcome.receiptLines,

@@ -52,6 +52,36 @@ export const EDIT_SCRIPT_GRAMMAR = [
   `line ::= [^\\n]* "\\n"`,
 ].join("\n");
 
+/**
+ * A tool call in the tag format, for the ONE case where constraining decode is clearly right: the
+ * retry after the model's own arguments failed to parse.
+ *
+ * Two findings drive this. NVIDIA measured grammar-constrained RETRY (not always-on constraint)
+ * lifting mean bash-task pass rate across thirteen models from 62.5% to 75.2%, with the largest gains
+ * on the smallest models, almost entirely by eliminating malformed calls. Kitten's own A/B pushed the
+ * other way: an always-on schema constraint COST content on the 2B, and a prompt hint was the better
+ * fix. Retry-only is where both results agree.
+ *
+ * The format matters as much as the constraint. Argument parse failures here are overwhelmingly a
+ * large payload — a whole source file inlined into a JSON arguments string, its quotes and newlines
+ * escaped — breaking the parser mid-string. The tag format does not escape anything, so the same
+ * payload passes through literally and there is nothing left to break. `parseTextToolCalls` already
+ * reads it, which is why the retry asks for text rather than a native tool call.
+ */
+export function toolCallGrammar(toolNames: readonly string[]): string {
+  const unique = [...new Set(toolNames.map((n) => n.trim()).filter(Boolean))];
+  if (!unique.length) throw new Error("toolCallGrammar requires at least one tool name");
+  return [
+    `root ::= "<tool_call>\\n<function=" name ">\\n" param+ "</function>\\n</tool_call>"`,
+    `name ::= ${unique.map(literal).join(" | ")}`,
+    `param ::= "<parameter=" key ">\\n" value "\\n</parameter>\\n"`,
+    // A parameter key is a bare identifier; the VALUE is deliberately unconstrained apart from its
+    // closing tag, because it may legitimately be an entire file.
+    `key ::= [a-z_]+`,
+    `value ::= ( [^<] | "<" [^/] )*`,
+  ].join("\n");
+}
+
 /** A hunk parsed back out of an edit script. */
 export interface EditHunk {
   path: string;

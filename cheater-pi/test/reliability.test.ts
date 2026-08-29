@@ -1,6 +1,15 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { postEditSyntaxGate, pythonImportBaseline, pythonImportRegression, receiptTouchesTheWork } from "../src/core/reliable.js";
+import type { ToolContext } from "../src/core/tools.js";
 import { DEFAULT_BLUEPRINT_CONFIG } from "../src/blueprint/config.js";
+
+function ctxAt(): ToolContext {
+  return { cwd: mkdtempSync(join(tmpdir(), "kt-gate-")), filesRead: new Set(), filesWritten: new Set() };
+}
 import { LoopGovernor } from "../src/reliability/loopGovernor.js";
 import { modelProfile, inferModelClass, inferParamBillions } from "../src/reliability/modelProfile.js";
 import { operatingRulesFor } from "../src/reliability/packetPrompt.js";
@@ -224,4 +233,153 @@ test("reliability benchmark variant E records retrieval gate metrics", () => {
   const results = runReliabilityBenchmark({ cwd: process.cwd(), variant: "E", limit: 2, config: DEFAULT_BLUEPRINT_CONFIG });
   assert.equal(results.length, 2);
   assert.ok(results.every((result) => result.retrievalGateTrusted === true));
+});
+
+test("the self-call arity gate catches a wrong-arity method call a smoke test would miss", async () => {
+  // Live bakeoff finding: a produced expression parser had exactly one bad call site,
+  // `self._consume(")")`, on the parenthesis path. Its own verification ran "2 + 3", never took that
+  // branch, and the finish gate accepted the green receipt. `(1+2)*3` then raised TypeError.
+  const ctx = ctxAt();
+  const bad = [
+    "class P:",
+    "    def _consume(self):",
+    "        return 1",
+    "    def parse(self):",
+    "        return self._consume(')')",
+    "",
+  ].join("\n");
+  writeFileSync(join(ctx.cwd, "calc.py"), bad);
+  const hit = postEditSyntaxGate({ name: "write", args: { path: "calc.py" } }, { output: "", isError: false }, ctx);
+  assert.ok(hit, "a provably-wrong self call must be reported");
+  assert.match(hit!, /METHOD CALL CHECK FAILED/);
+  assert.match(hit!, /_consume/);
+
+  // Everything it cannot PROVE wrong must pass untouched: correct arity, defaults, *args, decorators,
+  // inherited methods, and keyword calls.
+  const good = [
+    "import functools",
+    "class Base:",
+    "    def inherited(self, a, b):",
+    "        return a + b",
+    "class P(Base):",
+    "    def one(self, a):",
+    "        return a",
+    "    def defaulted(self, a, b=2):",
+    "        return a + b",
+    "    def varargs(self, *args):",
+    "        return args",
+    "    @property",
+    "    def prop(self):",
+    "        return 1",
+    "    def go(self):",
+    "        self.one(1)",
+    "        self.defaulted(1)",
+    "        self.defaulted(1, 2)",
+    "        self.varargs(1, 2, 3)",
+    "        self.inherited(1, 2)",
+    "        self.one(a=1)",
+    "        return self.prop",
+    "",
+  ].join("\n");
+  writeFileSync(join(ctx.cwd, "ok.py"), good);
+  const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
+  assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
+});
+
+
+test("the import invariant catches a rename that broke an existing importer", () => {
+  // The multi-file failure a model cannot see from the file it edited: rename a function, forget the
+  // module that imports it. Neither a syntax check nor a smoke test on the edited file notices.
+  const cwd = mkdtempSync(join(tmpdir(), "kt-import-"));
+  writeFileSync(join(cwd, "core.py"), "def compute_total(items):\n    return sum(items)\n");
+  writeFileSync(join(cwd, "invoice.py"), "from core import compute_total\n\n\ndef build(i):\n    return compute_total(i)\n");
+  const baseline = pythonImportBaseline(cwd);
+  assert.ok(baseline.includes("core") && baseline.includes("invoice"), `baseline should hold both: ${JSON.stringify(baseline)}`);
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "an untouched repo has no regression");
+
+  // Rename in core.py only — invoice.py's import now dangles.
+  writeFileSync(join(cwd, "core.py"), "def compute_subtotal(items):\n    return sum(items)\n");
+  const broken = pythonImportRegression(cwd, baseline);
+  assert.ok(broken, "a broken importer must be reported");
+  assert.match(broken!, /BROKEN modules/);
+  assert.match(broken!, /invoice/);
+
+  // Fixing the caller clears it.
+  writeFileSync(join(cwd, "invoice.py"), "from core import compute_subtotal\n\n\ndef build(i):\n    return compute_subtotal(i)\n");
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "a consistent repo must pass");
+});
+
+test("the import invariant never blames the agent for a repo that was already broken", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "kt-import2-"));
+  writeFileSync(join(cwd, "fine.py"), "VALUE = 1\n");
+  writeFileSync(join(cwd, "needs_missing_dep.py"), "import definitely_not_installed_xyz\n");
+  writeFileSync(join(cwd, "already_broken.py"), "from nowhere import thing\n");
+  const baseline = pythonImportBaseline(cwd);
+  assert.ok(baseline.includes("fine"), "a healthy module is recorded");
+  assert.ok(!baseline.includes("needs_missing_dep"), "a module needing an absent package is NOT baselined");
+  assert.ok(!baseline.includes("already_broken"), "a pre-broken module is NOT baselined");
+  assert.equal(pythonImportRegression(cwd, baseline), undefined, "pre-existing breakage must never block");
+});
+test("the arity gate also covers module-level functions, and stays quiet when a name could be shadowed", () => {
+  const ctx = ctxAt();
+  // The free-function twin of the method bug: def summary(rows, column) called with one argument.
+  writeFileSync(join(ctx.cwd, "stats.py"), [
+    "def summary(rows, column):",
+    "    return (rows, column)",
+    "",
+    "def report(rows):",
+    "    return summary(rows)",
+    "",
+  ].join("\n"));
+  const hit = postEditSyntaxGate({ name: "write", args: { path: "stats.py" } }, { output: "", isError: false }, ctx);
+  assert.ok(hit, "a provably-wrong module-level call must be reported");
+  assert.match(hit!, /summary\(\.\.\.\) passes 1 argument/);
+
+  // Must stay silent wherever the name might not resolve to that definition, or the call is fine.
+  writeFileSync(join(ctx.cwd, "ok.py"), [
+    "from os.path import join",              // imported name of its own
+    "",
+    "def helper(a, b=2):",
+    "    return a + b",
+    "",
+    "def shadowed(a):",
+    "    return a",
+    "",
+    "def use():",
+    "    shadowed = lambda *a: a",           // locally rebound -> never flagged
+    "    shadowed(1, 2, 3)",
+    "    helper(1)",
+    "    helper(1, 2)",
+    "    return join('a', 'b')",
+    "",
+  ].join("\n"));
+  const clean = postEditSyntaxGate({ name: "write", args: { path: "ok.py" } }, { output: "", isError: false }, ctx);
+  assert.equal(clean, undefined, `no false positive expected, got: ${clean}`);
+});
+test("a finish receipt must be about the work, not just any command that exited 0", () => {
+  // `python -c "print(1)"` matches the execution pattern and proves nothing about the change.
+  const written = ["calc.py"];
+  const targets = ["calc.py", "evaluate"];
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', written, targets), false, "an unrelated probe is not a receipt");
+  assert.equal(receiptTouchesTheWork('python -c "import os; os.getcwd()"', written, targets), false);
+  // Anything that names the produced file, its module, or a contract symbol counts.
+  assert.equal(receiptTouchesTheWork('python -c "from calc import evaluate; print(evaluate(\'1+1\'))"', written, targets), true);
+  assert.equal(receiptTouchesTheWork("python calc.py", written, targets), true);
+  assert.equal(receiptTouchesTheWork("python check_calc.py", ["check_calc.py"], []), true);
+  // A whole-project runner exercises the project by definition.
+  assert.equal(receiptTouchesTheWork("pytest -q", [], []), true);
+  assert.equal(receiptTouchesTheWork("npm test", [], []), true);
+  // A stem too short to judge ("a" from a.py) makes the question unanswerable, and the gate abstains
+  // rather than blocking a legitimate finish — see the dedicated abstain test below.
+  assert.equal(receiptTouchesTheWork("python -c \"print(2)\"", ["a.py"], []), true, "unjudgeable -> abstain");
+});
+
+
+test("receipt relevance is not enforced when nothing is judgeable", () => {
+  // A 1-char module stem would match almost any command, so it cannot be judged. Refusing on an
+  // unanswerable question would block a legitimate finish; the gate must abstain instead.
+  assert.equal(receiptTouchesTheWork('python -c "import a; print(a.x)"', [], ["a.py"]), true);
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', [], []), true, "no names at all -> abstain");
+  // But it still bites the moment there IS something judgeable.
+  assert.equal(receiptTouchesTheWork('python -c "print(1)"', [], ["calc.py"]), false);
 });

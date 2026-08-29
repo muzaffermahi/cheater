@@ -9,8 +9,21 @@
     <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
+    <ApplicationIcon>..\assets\icon\kitten.ico</ApplicationIcon>
+    <!-- Keep the engine beside the desktop executable in lockstep with the TypeScript source.
+         A native shell built against an older engine is a deceptively successful stale release. -->
+    <KittenPiRoot>$(MSBuildProjectDirectory)\..\cheater-pi</KittenPiRoot>
+    <KittenEngineDist>$(KittenPiRoot)\dist</KittenEngineDist>
+    <KittenEngineOutput>$(MSBuildProjectDirectory)\bin\$(Configuration)\net8.0-windows\win-x64\engine\dist</KittenEngineOutput>
   </PropertyGroup>
+  <Target Name="BuildKittenEngine" BeforeTargets="Build">
+    <Exec WorkingDirectory="$(KittenPiRoot)" Command="npm run build" />
+    <Exec WorkingDirectory="$(KittenPiRoot)" Command="node scripts/sync-desktop-engine.mjs --source &quot;$(KittenEngineDist)&quot; --destination &quot;$(KittenEngineOutput)&quot;" />
+  </Target>
   <ItemGroup>
+    <AvaloniaResource Include="..\assets\icon\kitten.ico" Link="Assets/kitten.ico" />
+    <!-- The mascot the work indicator animates. A PNG rather than the .ico so it scales cleanly. -->
+    <AvaloniaResource Include="..\assets\icon\kitten-256.png" Link="Assets/kitten-256.png" />
     <Compile Remove="Installer\**" />
     <EmbeddedResource Remove="Installer\**" />
     <None Remove="Installer\**" />

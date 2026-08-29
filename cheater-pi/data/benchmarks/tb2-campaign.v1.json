@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "campaignId": "tb2-cached-slice-v1",
+  "frozenAt": "2026-08-04T13:16:41.519Z",
+  "dataset": {
+    "name": "terminal-bench-2",
+    "revision": "terminal-bench@2.0",
+    "sha256": "61c5f87d45e479ac30ca0272532f436bfcc068e7842564d746b49f7a08ca25d5"
+  },
+  "model": {
+    "name": "qwen3.6-35b-a3b",
+    "endpointId": "credential-proxy"
+  },
+  "budgets": {
+    "ceilingSeconds": 900,
+    "maxModalUsd": 20,
+    "maxTransferBytes": 262144000
+  },
+  "executionOrder": {
+    "kitten": [
+      "cancel-async-tasks",
+      "configure-git-webserver",
+      "db-wal-recovery",
+      "fix-code-vulnerability",
+      "fix-git",
+      "fix-ocaml-gc",
+      "git-leak-recovery",
+      "git-multibranch",
+      "headless-terminal",
+      "kv-store-grpc",
+      "large-scale-text-editing",
+      "sanitize-git-repo"
+    ],
+    "opencode": [
+      "fix-git",
+      "fix-ocaml-gc",
+      "git-leak-recovery",
+      "git-multibranch",
+      "headless-terminal",
+      "kv-store-grpc",
+      "large-scale-text-editing",
+      "sanitize-git-repo",
+      "cancel-async-tasks",
+      "configure-git-webserver",
+      "db-wal-recovery",
+      "fix-code-vulnerability"
+    ],
+    "omp": [
+      "headless-terminal",
+      "kv-store-grpc",
+      "large-scale-text-editing",
+      "sanitize-git-repo",
+      "cancel-async-tasks",
+      "configure-git-webserver",
+      "db-wal-recovery",
+      "fix-code-vulnerability",
+      "fix-git",
+      "fix-ocaml-gc",
+      "git-leak-recovery",
+      "git-multibranch"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "cancel-async-tasks",
+      "image": "alexgshaw/cancel-async-tasks:20251031",
+      "imageDigest": "sha256:84c7fae6b256dcc56a350790e2a9715eefc7dad662a9d8e8a472363aa71ef18d",
+      "taskTomlSha256": "2cff2357b5fca9dda4e84d36579dc4f420b1c1326490cd7534bf2b0bd0f6078d"
+    },
+    {
+      "id": "configure-git-webserver",
+      "image": "alexgshaw/configure-git-webserver:20251031",
+      "imageDigest": "sha256:9e48389b917fd4650dda1f64406bd7198bbf20dc1c6b0e5c4d81a3c16369f88c",
+      "taskTomlSha256": "0761df033f7364160b0a844b22a43c4712677cec281bc4f617da03ede3c10a7c"
+    },
+    {
+      "id": "db-wal-recovery",
+      "image": "alexgshaw/db-wal-recovery:20251031",
+      "imageDigest": "sha256:0e33ea5ec823975d1bd6c3778395c9f94251dd88f571146057bff6adb7e4594e",
+      "taskTomlSha256": "39bc5d4fa5d7b0f996bc495819180523078855f4ca553b267031f182343d6f96"
+    },
+    {
+      "id": "fix-code-vulnerability",
+      "image": "alexgshaw/fix-code-vulnerability:20251031",
+      "imageDigest": "sha256:cac325252991f823713b2d0441502972901dd782bd67f66c03d9b1e410dac5c0",
+      "taskTomlSha256": "6d17c0d8e21616bf516285248940c22dacd12e100ae81efb45827f33dbe794ab"
+    },
+    {
+      "id": "fix-git",
+      "image": "alexgshaw/fix-git:20251031",
+      "imageDigest": "sha256:61e431c00c58df652287aadce5457634d9f9330cfdd153ebdf2802df0d540119",
+      "taskTomlSha256": "f080901bfefd3105b4dcf8ca1f61e3144c1f6db6777edbeeb8ac3ab83711d228"
+    },
+    {
+      "id": "fix-ocaml-gc",
+      "image": "alexgshaw/fix-ocaml-gc:20251031",
+      "imageDigest": "sha256:66a1e2293076c9ef27a118611b3089a6284fdf467fd4675592d0cce7d11e5b0b",
+      "taskTomlSha256": "0ab2659074c23f9ea9f9f0cc7e19df832ef1743be69407f57b39d2c6c9f763b3"
+    },
+    {
+      "id": "git-leak-recovery",
+      "image": "alexgshaw/git-leak-recovery:20251031",
+      "imageDigest": "sha256:62160e522a4238b8bcd522411ea97b5b200f811e5899d34947e66809bef7e586",
+      "taskTomlSha256": "7dc6e0f37cdea55f44957d6679e0a160d3f2ea8bbbe393e62a053d949c85cfb8"
+    },
+    {
+      "id": "git-multibranch",
+      "image": "alexgshaw/git-multibranch:20251031",
+      "imageDigest": "sha256:5bc449921c138295f6ddd8dca2977319fee2ce523811dbe56cec4ca663385fb5",
+      "taskTomlSha256": "a3b1ec9794e98ffed8cbbb43f7aaedeaf4e5d7bb6319f3c8931078b3adf45ffb"
+    },
+    {
+      "id": "headless-terminal",
+      "image": "alexgshaw/headless-terminal:20251031",
+      "imageDigest": "sha256:eb7e209672bf6cef2785fafd9e13509b10626c327bcc2b37f5bf40ca83eaf3aa",
+      "taskTomlSha256": "fce1ae7c7724173137fd321e285953268c35f4305203cba7df47a8c503f3a7da"
+    },
+    {
+      "id": "kv-store-grpc",
+      "image": "alexgshaw/kv-store-grpc:20251031",
+      "imageDigest": "sha256:3399400800dcb207634daa42bc1b052e831e285cc9d221eea66c47bc0fc79791",
+      "taskTomlSha256": "4b0070562b12fbfc00585098f5b833d144eb87dcf05a593da3bf9ca2046483e5"
+    },
+    {
+      "id": "large-scale-text-editing",
+      "image": "alexgshaw/large-scale-text-editing:20251031",
+      "imageDigest": "sha256:719adca3f1388220546ce6a155eee56eff3c4fe318183100320606a210f6b59c",
+      "taskTomlSha256": "fa2203b052ed8e6eb9859d25a09809b78af7527821da5452dcd96e44132bfb2f"
+    },
+    {
+      "id": "sanitize-git-repo",
+      "image": "alexgshaw/sanitize-git-repo:20251031",
+      "imageDigest": "sha256:4b5234da5bb0d67f3b0bf8db40a2883c07a5219f62b64c2bf9ff1ac84cd0f672",
+      "taskTomlSha256": "583f3790c50589942636bda5582db700caf91a88822110e4c71fcee1b9d33092"
+    }
+  ],
+  "agents": {
+    "kitten": {
+      "version": "0.7.3-dirty-worktree",
+      "bundleSha256": "91f0c30ef774b17dd8df9ddd2686cde1e3b1539dc898ca5c4354a43906825e1d",
+      "adapter": "kitten",
+      "configurationSha256": "1410b3ed48aa775ee60e0b45d33265fe680ad3a6d1737a537c84c13c6697def6"
+    },
+    "opencode": {
+      "version": "1.15.13",
+      "bundleSha256": "eca8bf2823f27022ad1d035e3b6101ba33c32f10901d3427153e797f16cccb64",
+      "adapter": "opencode",
+      "configurationSha256": "8edbd93927378d26025c718b44c8157fed7afd588ac134101503e04015c60c5a"
+    },
+    "omp": {
+      "version": "17.2.7",
+      "bundleSha256": "7c3bd1ad0e291e171f4ebb16279e64a1fbd5d38816fafbf7b07b06451998f64f",
+      "adapter": "omp:https://github.com/can1357/oh-my-pi/releases/download/v17.2.7/omp-linux-x64",
+      "configurationSha256": "58eb97f462146f655e2be383ef5d69af69ce6788e911d0760ad64b159d4ff165"
+    }
+  },
+  "resultSchema": "trial-record-v1"
+}

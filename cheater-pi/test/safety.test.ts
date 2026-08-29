@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runAgent } from "../src/core/agent.js";
@@ -8,6 +8,7 @@ import type { KittenLLM, ChatParams, ChatResult } from "../src/core/llm.js";
 import { KittenApp, type Runner } from "../src/core/app.js";
 import { defaultRunner } from "../src/core/runner.js";
 import { ConversationStore } from "../src/core/store/conversationStore.js";
+import { EFFORT_PROFILES } from "../src/core/effort.js";
 import { openSqlite } from "../src/core/store/db.js";
 
 // A scripted LLM that emits a fixed sequence of tool calls (then finish). No network.
@@ -172,4 +173,47 @@ test("logprobs are requested only when a run has candidates to be compared again
   seen.length = 0;
   await runAgent({ ...base, captureConfidence: false, candidateCount: 3 });
   assert.equal(seen[0].logprobs, false, "the lever still turns it off entirely");
+});
+
+// ── The degraded ascent run is still the user's run ──────────────────────────────────────────────
+// Regression: when defaultAscentConfig refused (a poisoned experience store), runAscentLane rebuilt a
+// THINNER parameter set for its reliable fallback — dropping commandGate, the file scope, and the
+// inference phase. A run that degraded therefore executed destructive shell commands with no approval
+// prompt at all, silently, on a lane the user had asked to be careful.
+test("an ascent run that degrades to reliable keeps its destructive-command approval gate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "kitten-degrade-"));
+  // Poison the experience store so defaultAscentConfig() hard-fails at assembly, exactly as it would
+  // if a benchmark solve had been dropped into it.
+  const expDir = mkdtempSync(join(tmpdir(), "kitten-degrade-exp-"));
+  writeFileSync(join(expDir, "store.jsonl"), JSON.stringify({
+    id: "crack-7z-hash", family: "parser", approachShape: "s", filesTouched: [], verified: true, at: 1,
+  }) + "\n");
+  const prevExp = process.env.KITTEN_EXPERIENCE_DIR;
+  process.env.KITTEN_EXPERIENCE_DIR = expDir;
+
+  const llm = scriptedLlm([
+    { tool: "bash", args: { command: "git push --force origin main" } },
+    { finish: "done" },
+  ]) as never;
+
+  const asked: Array<{ tool: string; risk: string }> = [];
+  const events: Array<{ type: string }> = [];
+  try {
+    await defaultRunner(llm, { fastPath: "off" })({
+      runId: "r1", conversationId: "c1", task: "force push the branch", lane: "ascent", k: 3, model: "fake",
+      cwd: dir, signal: new AbortController().signal, conversationContext: "", hardness: {},
+      profile: EFFORT_PROFILES.balanced, snapshotRef: null,
+      emit: (p: { type: string }) => events.push(p),
+      requestApproval: async (_id: string, tool: string, _detail: string, risk: string) => {
+        asked.push({ tool, risk });
+        return false; // deny, like an auto-deny policy would
+      },
+    } as never);
+  } finally {
+    if (prevExp === undefined) delete process.env.KITTEN_EXPERIENCE_DIR;
+    else process.env.KITTEN_EXPERIENCE_DIR = prevExp;
+  }
+
+  assert.ok(events.some((e) => e.type === "verification.failed"), "the degradation is reported, not hidden");
+  assert.deepEqual(asked, [{ tool: "bash", risk: "medium" }], "the fallback consulted the approval policy");
 });

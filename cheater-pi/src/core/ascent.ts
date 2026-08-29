@@ -29,10 +29,12 @@ import { loadOrm } from "./orm.js";
 import { runCascade, cascadeReceiptLines, type CascadeCandidate } from "./cascade.js";
 import { Verifier, verifierReceiptLines, type Candidate } from "./verifier.js";
 import { generateFnProbes } from "./synthtest.js";
+import { generateReproScript, isRepoShaped } from "./reproTest.js";
+import { generatePlans, selectPlan, planDirective, type CandidatePlan } from "./planFirst.js";
 import { extractWorkedExamples, extractSetupVars, runExampleTest, renderExampleFailures } from "./workedExamples.js";
 import { buildBanDecode } from "./constraints.js";
 import type { OrmScorer } from "./orm.js";
-import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
+import { cloudBurstGenerate, cloudLlm, adoptWorkspace, cleanupBurst, checkpointCandidates, clearCheckpoints, CHECKPOINT_DIR, cloudBurstConfigFromEnv, type BurstAttempt, type CloudBurstConfig, type RunOne } from "./cloudBurst.js";
 import { EvalRegistry, defaultRegistry } from "./disjointness.js";
 
 /** Which levers are ON. Part D3 flips these one at a time to measure each lever's marginal Best@1. */
@@ -57,6 +59,14 @@ export interface AscentLevers {
 export const ALL_LEVERS: AscentLevers = { diversity: true, web: true, experience: true, skills: true, cascade: true, cloudBurst: false, orm: true, confidence: true, banForbidden: true, samplerDiversity: true, leanReasoning: false };
 export const NO_LEVERS: AscentLevers = { diversity: false, web: false, experience: false, skills: false, cascade: false, cloudBurst: false, orm: false, confidence: false, banForbidden: false, samplerDiversity: false, leanReasoning: false };
 
+/** Live progress from the ascent machine, for the app event stream (repair rounds + verification). */
+export type AscentProgress =
+  | { kind: "repair.started"; round: number; reason: string }
+  | { kind: "verification.started"; what: string }
+  | { kind: "verification.evidence"; index: number; check: string; passed: boolean; durationMs: number }
+  | { kind: "verification.passed"; detail: string }
+  | { kind: "verification.failed"; detail: string };
+
 export interface AscentConfig {
   llm: KittenLLM;
   registry?: EvalRegistry;
@@ -66,6 +76,10 @@ export interface AscentConfig {
   cloudBurst?: CloudBurstConfig | null;
   ceiling?: ComputeCeiling;
   levers?: Partial<AscentLevers>;
+  /** Effort dial: repair-round bound (replaces the hardcoded samples<=1?1:2 when set). */
+  maxRepairRounds?: number;
+  /** Live progress sink (repair rounds, verification phases). Advisory; never changes the grade. */
+  onProgress?: (e: AscentProgress) => void;
   /** Injectable generator (default: cloudBurstGenerate). Tests supply a deterministic one. */
   runOne?: RunOne;
   /** Rough per-sample token estimate for the budget governor. */
@@ -73,8 +87,15 @@ export interface AscentConfig {
   /** Measurement hook (D1): awaited with all candidate workspaces + the verdict BEFORE cleanup, so a
    *  rig can oracle-score every candidate (pass@k) not just the winner. */
   onVerified?: (ctx: { attempts: BurstAttempt[]; verdict: { winner: number | null; slate: Array<{ index: number }> } }) => void | Promise<void>;
-  /** Durable candidate cards for the desktop/app event stream. */
-  onCandidate?: (event: { phase: "started" | "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
+  /** Durable candidate cards for the desktop/app event stream. Only ever fired with a REAL resolved
+   *  attempt, which is why "started" is a separate hook — at start there is no attempt yet. */
+  onCandidate?: (event: { phase: "completed" | "rejected"; attempt: BurstAttempt; reason?: string }) => void | Promise<void>;
+  /** The competing plans and the one chosen to implement (plan-diversity mode). */
+  onPlanSelected?: (event: { considered: CandidatePlan[]; chosen: CandidatePlan; reason: string }) => void;
+  /** A candidate has begun generating. Fires immediately, not once the burst resolves. */
+  onCandidateStart?: (event: { index: number; lead: boolean }) => void;
+  /** Live agent events from the lead candidate, so the generation phase is not a black box. */
+  onLeadEvent?: (e: AgentEvent) => void;
 }
 
 export interface AscentParams {
@@ -84,6 +105,10 @@ export interface AscentParams {
   hardness?: HardnessSignal;
   /** Measurement-only (D1): force the sample count to a fixed N, overriding the hardness budget. */
   forceSamples?: number;
+  /** Effort dial: clamp the hardness-budgeted sample count into [kFloor, kCap] (the governor still
+   *  caps downward — ceilings are hard). forceSamples bypasses the clamp (measurement stays exact). */
+  kFloor?: number;
+  kCap?: number;
   maxTurns?: number;
   reasoningEffort?: "low" | "medium" | "high";
   /** Model-facing conversation context (prior turns + repo truth); every candidate gets the same one. */
@@ -177,10 +202,16 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   const testCommand = project.focusedTestCommand ?? project.testCommand ?? null;
 
   // C3 — budget: hardness → sample count, capped by the governor's ceiling.
-  const budget = computeBudget(params.hardness ?? {}, { adaptiveComputeEnabled: true } as any);
+  const budget = computeBudget(params.hardness ?? {}, { adaptiveComputeEnabled: true });
   const governor = new BudgetGovernor(config.ceiling ?? {});
   const estTokens = config.estTokensPerSample ?? DEFAULT_EST_TOKENS;
   let samples = params.forceSamples ?? (lever(config, "diversity") ? Math.max(1, budget.samples) : 1);
+  // Effort clamp (forceSamples = measurement, stays exact): floor then cap, then the governor's hard
+  // downward cap — ceilings always win over floors.
+  if (params.forceSamples === undefined) {
+    if (params.kFloor && params.kFloor > samples) samples = params.kFloor;
+    if (params.kCap && params.kCap < samples) samples = params.kCap;
+  }
   samples = governor.capSamples(samples, estTokens);
   receipts.push(`budget: hardness ${budget.hardness} → k=${samples} (${budget.reason})`);
 
@@ -213,13 +244,27 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // B2 target (single-fn consensus), computed once.
   const probe = await generateFnProbes(config.llm, params.task, contract).catch(() => null);
 
+  // B1 red-then-green for a REPO-shaped task. The probes above cover the single-function case; a task
+  // that is "here is a codebase and an issue" has no worked examples and its existing suite usually
+  // passes on the unfixed code, so `reproduction` was permanently n/a and eligibility collapsed to
+  // "did not break anything" — satisfied by a candidate that changed nothing of consequence. One
+  // model call buys the missing signal, and the verifier screens it on the base before believing it.
+  // Only asked when there is a base to screen against; an unscreened script is worse than none.
+  // The base IS `params.cwd`: candidates run in isolated copies and the winner is applied only after
+  // verification, so until then the project directory still holds the unchanged code. Nothing is ever
+  // written into it — the script runs from a temp directory with the workspace on the import path.
+  const reproScript = !probe && isRepoShaped(contract, params.task)
+    ? await generateReproScript(config.llm, params.task, contract).catch(() => null)
+    : null;
+  if (reproScript) receipts.push("generated a reproduction script (screened against the base before it counts)");
+
   // Consensus floor: a statically-"easy" task (hardness 0 → k=1) can still hide edge-case difficulty —
   // json_query reads easy yet a lone k=1 candidate shipped 2/56 wrong. When a self-probe exists and the
   // caller didn't pin k, floor easy tasks to k=2 so there are ≥2 candidates to select between. Originally
   // k=3 (for a majority vote), but the ground-truth eligibility gate + mid-loop repair now filter wrong
   // candidates directly — so k=2 recovers json_query (measured 0/56) at ⅓ less latency than k=3, and a
   // task that stays wrong earns more depth from the repair round anyway. Hard tasks keep their budgeted k.
-  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 2) {
+  if (probe && lever(config, "diversity") && params.forceSamples === undefined && budget.hardness < 2 && samples < 2 && (params.kCap ?? 2) >= 2) {
     const floored = governor.capSamples(2, estTokens);
     if (floored > samples) { samples = floored; receipts.push(`consensus floor: k→${samples} (self-probe present → select between candidates)`); }
   }
@@ -254,7 +299,23 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   let allAttempts: BurstAttempt[] = [];
   let repairSeed: string | undefined;
   let round = 0;
-  const maxRounds = lever(config, "diversity") ? (samples <= 1 ? 1 : 2) : 1;
+  const maxRounds = lever(config, "diversity") ? (config.maxRepairRounds ?? (samples <= 1 ? 1 : 2)) : 1;
+
+  // Plan-diversity: spend k on PLANS, then implement once. Only when the candidates would serialize
+  // (concurrency 1 — a local single-slot runtime); a cloud burst runs them concurrently and keeps the
+  // stronger implementation-diversity. See planFirst.ts for the measurement behind this.
+  let planDirectiveText: string | undefined;
+  if (samples > 1 && concurrency === 1 && lever(config, "diversity")) {
+    const generated = await generatePlans(genLlm, params.task, samples, params.signal);
+    const selection = await selectPlan(genLlm, params.task, generated, params.signal);
+    if (selection.chosen) {
+      planDirectiveText = planDirective(selection.chosen);
+      receipts.push(`plan-first: ${generated.length} plan(s) generated, ${selection.reason} → 1 implementation (candidates would have run serially)`);
+      try { config.onPlanSelected?.({ considered: selection.considered, chosen: selection.chosen, reason: selection.reason }); } catch { /* UI hook */ }
+      // The diversity budget was spent on plans. Implementing k times as well would be paying twice.
+      samples = 1;
+    }
+  }
 
   for (round = 1; round <= maxRounds; round++) {
     if (governor.exhausted()) { receipts.push("budget exhausted → stop generating"); break; }
@@ -269,29 +330,43 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
     // and any candidate that hits the finish gate gets its reasoning back for the repair turns.
     const leanReasoning = lever(config, "leanReasoning") && budget.hardness < 2;
     if (round === 1 && leanReasoning) receipts.push("lean-reasoning: no-think forward pass (easy task)");
-    const attempts = await cloudBurstGenerate(
-      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: basePrime, contextPreamble: params.contextPreamble,
-        decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
-      plans,
-      { concurrency, runOne: config.runOne }
-    );
-    for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
     // cloudBurst assigns round-local indices 1..k, but cascade/verifier/measure use `index` as a stable
     // GLOBAL identity. Without reindexing, a repair round's indices collide with round 1 — collapsing the
     // survivorsByIndex map (round 2 shadows round 1), adopting the wrong round's workspace, and
-    // misattributing Best@1. Give each attempt a unique index across rounds.
+    // misattributing Best@1. Give each attempt a unique index across rounds. Computed BEFORE the burst
+    // so a candidate announced at start carries the same identity it will report at completion.
     const indexBase = allAttempts.length;
+    const attempts = await cloudBurstGenerate(
+      { task: params.task, cwd: params.cwd, llm: genLlm, model: params.model, maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, experiencePrime: [basePrime, planDirectiveText].filter(Boolean).join("\n\n"), contextPreamble: params.contextPreamble,
+        decode: banDecode, banForbidden: lever(config, "banForbidden"), disableThinking: leanReasoning, signal: params.signal },
+      plans,
+      {
+        concurrency, runOne: config.runOne,
+        // Announce each candidate as it STARTS. This used to run after the burst resolved, which meant
+        // the whole generation phase — the longest part of the run — reported nothing at all.
+        onStart: (plan) => {
+          // Global index, matching the reindexing applied to the resolved attempts below, so a
+          // "started" and its later "completed" name the same candidate.
+          const slot = plans.findIndex((p) => p === plan);
+          try { config.onCandidateStart?.({ index: indexBase + (slot < 0 ? 0 : slot) + 1, lead: slot === 0 }); } catch { /* UI hook */ }
+        },
+        onLeadEvent: config.onLeadEvent,
+      }
+    );
+    for (const a of attempts) governor.record(a.result.usage.prompt + a.result.usage.completion + a.result.usage.reasoning, a.result.wallMs);
     attempts.forEach((a, j) => { a.index = indexBase + j + 1; });
     allAttempts = allAttempts.concat(attempts);
-    for (const attempt of attempts) {
-      try { await config.onCandidate?.({ phase: "started", attempt }); } catch { /* telemetry-free UI hook */ }
-    }
 
     // Did anything finish AND actually satisfy the prompt's ground-truth examples? "Finished" alone is
     // not enough — a candidate can pass its own finish gate yet be wrong on the worked examples, and
     // stopping here would just hand the verifier a slate of wrong answers to pick the least-bad from.
     // Keep a repair round in reserve for exactly this: finished-but-wrong seeds a grounded resample.
     const finished = attempts.filter((a) => a.result.finished);
+    // Survive an interrupt with something to show for the time. Until the winner is adopted (far
+    // below), every candidate lives in an isolated workspace and `cwd` is untouched — so a kill here
+    // leaves the user with nothing, which is exactly what json_patch did after fifteen minutes.
+    const checkpointed = checkpointCandidates(params.cwd, finished, round);
+    if (checkpointed.length) receipts.push(`round ${round}: ${checkpointed.length} candidate(s) checkpointed to ${CHECKPOINT_DIR}/`);
     if (finished.some((a) => passesGroundTruth(a.workspace))) break;
     if (finished.length && workedExamples.length) receipts.push(`round ${round}: ${finished.length} finished but none pass the worked examples → repair`);
     if (round < maxRounds) {
@@ -330,6 +405,7 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
       if (priorEvidence) receipts.push(digestReceiptLine(digests));
 
       repairSeed = [repairDirective(failReason, worst?.plan.stance), priorEvidence, webBrief].filter(Boolean).join("\n\n");
+      try { config.onProgress?.({ kind: "repair.started", round: round + 1, reason: failReason.slice(0, 300) }); } catch { /* advisory */ }
     }
   }
 
@@ -350,13 +426,26 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   // candidate that fails them is ineligible regardless of consensus (real I/O beats model-generated votes).
   const verifier = new Verifier({
     llm: config.llm, task: params.task, contract, testCommand,
+    // The unchanged project directory is the base every red-then-green screen is measured against.
+    baseWorkspace: params.cwd,
+    reproScript,
     behavioralChecks: contract.commands, probe, orm: lever(config, "orm") ? config.orm ?? null : null,
     confidence: lever(config, "confidence"), module: pyModule,
-    workedExamples, workedModule: pyModule, setupVars
+    workedExamples, workedModule: pyModule, setupVars,
+    onCheck: (e) => { try { config.onProgress?.({ kind: "verification.evidence", ...e }); } catch { /* advisory */ } }
   });
   const candidates: Candidate[] = survivors.map((a) => ({ index: a.index, workspace: a.workspace, finished: a.result.finished, summary: a.result.summary, trajectory: buildTrajectory(a), selfCertainty: a.result.confidence?.selfCertainty }));
+  try { config.onProgress?.({ kind: "verification.started", what: `verifying ${candidates.length} candidate(s) by execution` }); } catch { /* advisory */ }
   const verdict = await verifier.verify(candidates);
   receipts.push(...verifierReceiptLines(verdict));
+  try {
+    if (verdict.winner != null && verdict.winnerHasExecutionReceipt) {
+      config.onProgress?.({ kind: "verification.passed", detail: `winner: attempt ${verdict.winner} via ${verdict.selector} (green execution receipt)` });
+    } else if (verdict.winner == null) {
+      config.onProgress?.({ kind: "verification.failed", detail: "no candidate was eligible (no execution evidence passed)" });
+    }
+    // winner-without-receipt = "checked, not verified" — neither a pass nor a failure; run.completed says it.
+  } catch { /* advisory */ }
 
   for (const attempt of allAttempts) {
     const signal = verdict.slate.find((entry) => entry.index === attempt.index);
@@ -374,6 +463,11 @@ export async function runAscent(params: AscentParams, config: AscentConfig): Pro
   }
 
   const winnerAttempt = verdict.winner ? survivorsByIndex.get(verdict.winner) ?? null : null;
+  // Clear the interrupt checkpoints BEFORE adopting: adoptWorkspace clears cwd and copies the
+  // winner in, and a stale `.kitten-candidates/` left behind would be both litter and a liability
+  // (the next run's checkpoint would be indistinguishable from this run's). A run that reaches this
+  // line no longer needs them — the winner is about to land in cwd for real.
+  if (winnerAttempt) clearCheckpoints(params.cwd);
   const adoptedFiles = winnerAttempt ? adoptWorkspace(params.cwd, winnerAttempt.workspace) : [];
 
   // A3 — remember a verifier-confirmed solve (disjoint by construction; admit() hard-fails on an eval id).

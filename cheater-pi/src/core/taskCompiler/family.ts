@@ -106,6 +106,22 @@ const PERF_RE = /\b(?:performance|slow|speed ?up|faster|latency|throughput|optim
 const INVESTIGATION_RE = /^\s*(?:where|which|how does|why does|what does|find|locate|trace|investigate|audit|review|list)\b/i;
 
 /**
+ * Imperative verbs that mean "change something", used only in the last-resort fallback below.
+ *
+ * Deliberately narrow and imperative: this decides between "do the work" and "explain the work" for
+ * requests nothing else classified, so a false positive costs an unwanted edit while a false
+ * negative costs the entire task. `find`/`review`/`audit` are absent on purpose — they are the
+ * investigation verbs, and INVESTIGATION_RE has already had its say by the time this is consulted.
+ */
+const MUTATION_REQUEST_RE = new RegExp(
+  "\\b(?:sanitiz(?:e|ing)|scrub|redact|remove|delete|strip|replace|rename|move|clean\\s*up|"
+  + "fix|repair|resolve|patch|update|upgrade|downgrade|install|uninstall|configure|set\\s*up|"
+  + "enable|disable|restore|revert|convert|extract|split|merge|deduplicate|"
+  + "make\\s+(?:it|them|the\\s+\\S+)\\s+(?:work|pass|build|run|compile))\\b",
+  "i",
+);
+
+/**
  * The shared autopilot classifier calls anything matching "replace X with Y" / "move X to Y" a
  * migration, which is far too loose for a template decision: "replace spaces with hyphens" is a
  * one-line string change, not a schema migration, and routing it to the migration template attaches
@@ -157,9 +173,18 @@ export function classifyFamily(request: string, literals: LiteralExtraction, cwd
   // `unknown`/`benchmark` fall here. A request that names an artifact is a change; otherwise treat it
   // as an investigation rather than guessing at a mutation the user never asked for.
   const namesArtifact = Boolean(literals.contract.files.length || literals.contract.symbols.length || literals.contract.endpoints.length);
-  return namesArtifact
-    ? decide("feature_implementation", "unclassified but names a concrete artifact")
-    : decide("repository_investigation", "unclassified and names no artifact — treated as read-only");
+  if (namesArtifact) return decide("feature_implementation", "unclassified but names a concrete artifact");
+  // ...but "names no file" is NOT the same as "asks for no change". Plenty of real requests demand
+  // work without naming a single path: "sanitize this repo of API keys", "clean up the build",
+  // "make the tests pass". Falling through to read-only there produces the worst possible outcome —
+  // the agent explains what it *would* do, edits nothing, and reports success. Observed live on
+  // Terminal-Bench: a "find and remove all API keys, ensure they are not present afterwards"
+  // task compiled to an investigation, took the answer lane (which has no tools at all), and the
+  // model resorted to typing <tool_call> blocks into prose. Zero files changed, zero score.
+  if (MUTATION_REQUEST_RE.test(text)) {
+    return decide("feature_implementation", "no artifact named, but the request explicitly asks for a change");
+  }
+  return decide("repository_investigation", "unclassified, names no artifact and asks for no change — treated as read-only");
 }
 
 export function familyTemplate(family: TaskFamily): FamilyTemplate {

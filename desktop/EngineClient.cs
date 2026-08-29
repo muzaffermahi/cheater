@@ -39,6 +39,16 @@ public sealed class EngineClient : IAsyncDisposable
         return Path.Combine(home, "engine.json");
     }
 
+    /// <summary>
+    /// The engine's published connection details, or null if there is no LIVE engine to connect to.
+    ///
+    /// The liveness check is the point. An engine that dies without running its cleanup leaves this
+    /// file behind, and a stale file is worse than a missing one: the shell reads the dead engine's
+    /// token immediately, skips waiting for the new engine to publish its own, and then presents the
+    /// wrong secret the moment the new pipe appears. The user sees
+    /// "engine handshake token is invalid" — a security-shaped message for what is really a leftover
+    /// file. Treating a dead engine's file as absent makes the connect loop wait for the real one.
+    /// </summary>
     private static EngineInfo? ReadInfo()
     {
         try
@@ -50,9 +60,33 @@ public sealed class EngineClient : IAsyncDisposable
             var socketPath = root.TryGetProperty("socketPath", out var s) ? s.GetString() : null;
             var token = root.TryGetProperty("token", out var t) ? t.GetString() : null;
             if (string.IsNullOrWhiteSpace(socketPath) || string.IsNullOrWhiteSpace(token)) return null;
+            var pid = root.TryGetProperty("pid", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
+            if (pid > 0 && !IsProcessAlive(pid)) return null;
             return new EngineInfo(socketPath!, token!);
         }
         catch { return null; }
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Remove a token file whose engine is gone, so nothing can read it during the next start.</summary>
+    public static void ClearStaleInfo()
+    {
+        try
+        {
+            var path = InfoPath();
+            if (!File.Exists(path)) return;
+            if (ReadInfo() is null) File.Delete(path);
+        }
+        catch { /* a live engine overwrites it anyway */ }
     }
 
     private static string PipeName(string socketPath)
@@ -66,12 +100,31 @@ public sealed class EngineClient : IAsyncDisposable
         // The engine writes its info file only once it owns the socket, so waiting for the file is
         // also how the shell waits for a ready engine.
         var deadline = DateTime.UtcNow.AddSeconds(15);
-        EngineInfo? info;
-        while ((info = ReadInfo()) is null)
+        Exception? last = null;
+        while (DateTime.UtcNow < deadline)
         {
-            if (DateTime.UtcNow >= deadline) throw new TimeoutException("The Kitten engine did not publish its local connection details.");
-            await Task.Delay(150, cancellationToken);
+            var info = ReadInfo();
+            if (info is null)
+            {
+                await Task.Delay(150, cancellationToken);
+                continue;
+            }
+            try { return await HandshakeAsync(info, cancellationToken); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception error)
+            {
+                // A rejected token is a RACE, not a verdict: the engine restarts and publishes a new
+                // secret, and a connection begun a moment earlier is holding the old one. Re-read and
+                // try again until the deadline instead of ending the session on it.
+                last = error;
+                await Task.Delay(200, cancellationToken);
+            }
         }
+        throw last ?? new TimeoutException("The Kitten engine did not publish its local connection details.");
+    }
+
+    private static async Task<EngineClient> HandshakeAsync(EngineInfo info, CancellationToken cancellationToken)
+    {
         var pipe = new NamedPipeClientStream(".", PipeName(info.SocketPath), PipeDirection.InOut, PipeOptions.Asynchronous);
         await pipe.ConnectAsync(5000, cancellationToken);
         var client = new EngineClient(pipe);

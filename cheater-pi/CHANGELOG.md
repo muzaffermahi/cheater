@@ -3,6 +3,37 @@
 All notable changes to Kitten are recorded here. Dates are ISO (UTC). This is an **alpha / technical
 preview** — expect rough edges and breaking changes between preview releases.
 
+## [0.7.3] — 2026-08-01
+
+Fixes earned by a 30-task bakeoff against opencode (both agents on the same local ornith-1.0-35B,
+hidden behaviour oracles). Kitten 24/30, opencode 0/30 — and Kitten's six failures paid for the list
+below.
+
+### Fixed
+- **`bash` runs a real POSIX shell on Windows.** `spawn(..., {shell: true})` resolved to `cmd.exe`,
+  so every `ls`, `pwd`, `cat` and `grep` a POSIX-trained model reaches for failed on the product's
+  primary platform. Git for Windows' bash is used instead, resolved from `git --exec-path` with
+  `KITTEN_SHELL` as an override. WSL launchers (`System32ash.exe`, the WindowsApps stub) are
+  refused even when named explicitly — they run in a filesystem namespace where the workspace path
+  does not exist.
+- **An interrupted ascent run keeps its work.** Candidates live in isolated workspaces and the winner
+  was adopted only at the very end, so a kill discarded everything — one bakeoff task ran fifteen
+  minutes and left an empty folder. Finished candidates are now checkpointed to
+  `.kitten-candidates/`, and cleared once the winner is adopted. Deliberately a copy *beside* the
+  work, never a provisional adoption: adoption clears `cwd`, so adopting early would replace the
+  user's own files with a candidate that never won.
+- **The effort ceiling is a real deadline, on every lane.** It was set only on the ascent branch, and
+  even there the budget governor checked the clock only *between* rounds — nothing bounded a
+  candidate in flight, and a Balanced run (10 min) went 900 s. A timer-backed abort signal now binds
+  every lane, and a ceilinged run says so instead of looking like the model gave up.
+- **A transient runtime 500 is retried** (failed slot, GC pause) instead of ending the run, while a
+  500 reporting that the server could not parse the model's *own* tool call fails fast — an
+  identical resend reproduces it, and the guided "write it in smaller pieces" retry one level up is
+  what actually fixes it.
+- **A rejected tool call says which argument and why.** The transcript showed only
+  `bad args for write`; it now carries the parse error and payload size, and an oversized payload
+  gets advice the model can act on.
+
 ## [0.7.0] — Unreleased Kitten product (technical preview)
 
 The unification of the split Cheater / Kitten / Ascent code into one local-first product, `kitten`,

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Plain dockerd in WSL does not synthesize host.docker.internal. The gateway is stamped by the
+# cached rig setup and is the Windows host where the payload/model proxies listen.
+grep -q "host.docker.internal" /etc/hosts || echo "172.19.240.1 host.docker.internal" >> /etc/hosts
+# Harbor renders this template inside a task container. It is intentionally offline: the payload
+# host must already have the pinned 17.2.7 Linux bundle, otherwise setup fails instead of downloading.
+mkdir -p /tmp/omp-bundle
+PAYLOAD_URL="${TB2_PAYLOAD_URL:-http://host.docker.internal:8899/omp-linux-x64.gz}"
+if command -v curl >/dev/null 2>&1; then curl --fail --silent --show-error --max-time 30 "$PAYLOAD_URL" -o /tmp/omp-payload
+elif command -v wget >/dev/null 2>&1; then wget -q -O /tmp/omp-payload "$PAYLOAD_URL"
+else python3 -c 'import urllib.request; urllib.request.urlretrieve("'"$PAYLOAD_URL"'", "/tmp/omp-payload")'
+fi
+TB2_OMP_SHA256="${TB2_OMP_SHA256:-6e382c80b0af58016b0f537b604a3a29f1e9104abb498705295341e38fbdc774}"
+if gzip -t /tmp/omp-payload >/dev/null 2>&1; then gzip -dc /tmp/omp-payload > /tmp/omp-raw; else cp /tmp/omp-payload /tmp/omp-raw; fi
+test "$(sha256sum /tmp/omp-raw | awk '{print $1}')" = "$TB2_OMP_SHA256" || { echo 'OMP bundle digest mismatch' >&2; exit 42; }
+if tar -tzf /tmp/omp-raw >/dev/null 2>&1; then tar -xzf /tmp/omp-raw -C /tmp/omp-bundle; install -m 0755 /tmp/omp-bundle/omp /usr/local/bin/omp; else install -m 0755 /tmp/omp-raw /usr/local/bin/omp; fi
+rm -rf /tmp/omp-bundle /tmp/omp-payload /tmp/omp-raw

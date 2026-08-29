@@ -15,6 +15,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { basename, dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { ToolSchema } from "./llm.js";
+import { shellFailureHint, interactiveStallHint } from "./shellGuard.js";
 
 export interface ToolContext {
   cwd: string;
@@ -29,6 +30,9 @@ export interface ToolContext {
   /** Optional task scope. An empty allow-list means "workspace", otherwise paths must match it. */
   allowedFiles?: readonly string[];
   forbiddenFiles?: readonly string[];
+  /** Live progress sink: a long-running tool (bash) streams bounded output chunks here so a UI can
+   *  show "what is it doing right now". Purely progressive — the final ToolResult stays authoritative. */
+  onOutput?: (chunk: string) => void;
 }
 
 export interface ToolResult {
@@ -57,6 +61,54 @@ function rel(ctx: ToolContext, p: string): string {
 
 /** Windows and macOS compare paths case-insensitively; a scope check that does not would be bypassable. */
 const CASE_INSENSITIVE_PATHS = process.platform === "win32" || process.platform === "darwin";
+
+/**
+ * A POSIX shell for the `bash` tool on Windows, or null to fall back to cmd.exe.
+ *
+ * `spawn(cmd, { shell: true })` resolves to %COMSPEC% on Windows, so every `ls`, `pwd`, `cat` and
+ * `grep` the model types comes back "is not recognized as an internal or external command". Models
+ * are trained overwhelmingly on POSIX; on the bakeoff's mini_sql task two consecutive orientation
+ * commands failed that way and the run never recovered its footing. Windows is this product's
+ * primary platform, so that is a self-inflicted tax on every run.
+ *
+ * Git for Windows ships a real bash and is already a dependency of anyone using a coding agent.
+ *
+ * `C:\Windows\System32\bash.exe` and the WindowsApps stub are DELIBERATELY excluded: those launch
+ * WSL, a different filesystem namespace where the workspace path (`C:\Users\...`) does not exist and
+ * `cwd` would be meaningless. Silently running the model's commands in the wrong filesystem is far
+ * worse than cmd.exe.
+ */
+export function resolvePosixShell(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (process.platform !== "win32") return null;      // spawn's own shell is already POSIX
+  const usable = (p: string | undefined): p is string => {
+    if (!p) return false;
+    const norm = p.replace(/\\/g, "/").toLowerCase();
+    if (norm.includes("/system32/") || norm.includes("/windowsapps/")) return false;  // WSL, not bash
+    return existsSync(p);
+  };
+  const override = env.KITTEN_SHELL?.trim();
+  if (override) return usable(override) ? override : null;   // explicit and wrong: don't guess past it
+  // Derive from the git on PATH, so a non-default install location still works.
+  const candidates: string[] = [];
+  try {
+    const execPath = spawnSync("git", ["--exec-path"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+    const root = execPath.stdout?.trim().replace(/\\/g, "/").replace(/\/mingw\d+\/libexec\/git-core\/?$/i, "");
+    if (root) candidates.push(`${root}/bin/bash.exe`, `${root}/usr/bin/bash.exe`);
+  } catch { /* git absent — fall through to the well-known locations */ }
+  candidates.push(
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+    "C:/Program Files (x86)/Git/bin/bash.exe",
+  );
+  return candidates.find(usable) ?? null;
+}
+
+/** Resolved once per process — the git probe spawns, and `bash` is called constantly. */
+let posixShellCache: string | null | undefined;
+function bashShellOption(): string | true {
+  if (posixShellCache === undefined) posixShellCache = resolvePosixShell();
+  return posixShellCache ?? true;
+}
 function fold(value: string): string {
   return CASE_INSENSITIVE_PATHS ? value.toLowerCase() : value;
 }
@@ -283,6 +335,43 @@ function nearestLines(text: string, search: string): string {
 
 // --- bash -----------------------------------------------------------------------------------
 
+/**
+ * Commands that, invoked bare, drop into an interactive REPL and read from a terminal forever.
+ *
+ * A model reaches for these more often than you would expect — `python` to "just check something",
+ * `node` to poke at a value. With no terminal on the other end they block until the timeout, and on
+ * this machine Python 3.14's REPL hangs even with stdin redirected from NUL. Measured live: three
+ * bare `python` calls burned six minutes inside a single task and taught the model nothing.
+ *
+ * So refuse instantly with the fix. A one-line correction the model can act on beats a two-minute
+ * silence every time. Only the BARE form is refused: `python -c "..."`, `python script.py`, and
+ * anything piped or redirected are all real commands and run untouched.
+ */
+const INTERACTIVE_BARE = new Set([
+  "python", "python3", "py", "node", "irb", "ghci", "julia", "scala", "R",
+  "sqlite3", "mysql", "psql", "mongo", "redis-cli", "ftp", "telnet",
+  "vi", "vim", "nano", "emacs", "less", "more", "top", "htop", "cat", "head", "sort",
+]);
+
+/** The guidance for a bare interactive command, or null when the command is fine to run. */
+export function interactiveCommandRefusal(command: string): string | null {
+  const trimmed = (command ?? "").trim();
+  // Anything with a pipe, redirect, or chain has a real stdin/purpose — leave it alone.
+  if (/[|<>&;]/.test(trimmed)) return null;
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length !== 1) return null;
+  const base = parts[0].replace(/^.*[\\/]/, "").replace(/\.exe$/i, "").toLowerCase();
+  if (!INTERACTIVE_BARE.has(base) && !INTERACTIVE_BARE.has(parts[0])) return null;
+  const hint = base === "python" || base === "python3" || base === "py"
+    ? 'run the code non-interactively instead, e.g. python -c "import mod; print(mod.f(1))" or python script.py'
+    : base === "node"
+      ? 'run the code non-interactively instead, e.g. node -e "console.log(require(\'./mod\').f(1))" or node script.js'
+      : base === "cat" || base === "head" || base === "sort"
+        ? "give it a file argument (it is waiting on standard input)"
+        : "pass the command/query as an argument instead of opening the interactive session";
+  return `blocked: \`${trimmed}\` opens an interactive session with no terminal attached, so it would hang until the timeout — ${hint}.`;
+}
+
 export const bashTool: Tool = {
   schema: {
     name: "bash",
@@ -296,6 +385,9 @@ export const bashTool: Tool = {
   execute(args, ctx): Promise<ToolResult> {
     const command = String(args.command ?? "");
     if (!command.trim()) return Promise.resolve({ output: "bash: empty command", isError: true });
+    // Refuse a hang before paying for it, with the correction inline.
+    const refusal = interactiveCommandRefusal(command);
+    if (refusal) return Promise.resolve({ output: refusal, isError: true, meta: { interactive: true } });
     // A non-numeric timeout_seconds (the model can emit "5 minutes"; args aren't schema-coerced) would
     // make Number(...) NaN → setTimeout(NaN) ≈ 0ms → the command is killed instantly and falsely reported
     // as timed out. Fall back to the 120s default for anything that doesn't parse to a finite number.
@@ -305,14 +397,36 @@ export const bashTool: Tool = {
       // Already-cancelled: don't even start.
       if (ctx.signal?.aborted) { resolve({ output: `$ ${command}\n[cancelled before start]`, isError: true, meta: { cancelled: true } }); return; }
       // detached on POSIX so we can signal the whole process GROUP; on Windows we taskkill the tree.
-      const child = spawn(command, { cwd: ctx.cwd, shell: true, windowsHide: true, detached: process.platform !== "win32" });
+      // stdin is CLOSED, not an open pipe. A model reaches for an interactive tool more often than
+      // you would think (`python` with no script, `node`, `cat`, a pager, `ssh`), and with an open
+      // stdin every one of those blocks until the timeout expires — measured live: three bare
+      // `python` REPLs burned six minutes of a single task. With stdin at EOF they exit at once,
+      // and the model gets an immediate, honest result it can act on.
+      const child = spawn(command, { cwd: ctx.cwd, shell: bashShellOption(), windowsHide: true, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
       let out = "", err = "", killedBy: "timeout" | "cancelled" | null = null;
       const CAP = 12 * 1024 * 1024;
+      // Live progress: coalesce output into at most 8 bounded chunks per call (flush at ≥1KB or 500ms)
+      // so a chatty build log becomes a handful of progress events, never a firehose. The completion
+      // output below stays authoritative — dropping every streamed chunk loses nothing.
+      const MAX_STREAM_CHUNKS = 8, STREAM_FLUSH_CHARS = 1024, STREAM_FLUSH_MS = 500;
+      let streamed = 0, pending = "";
+      let streamTimer: NodeJS.Timeout | null = null;
+      const flushStream = (): void => {
+        if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; }
+        if (pending && streamed < MAX_STREAM_CHUNKS) { streamed++; ctx.onOutput?.(pending.slice(0, 2048)); }
+        pending = "";
+      };
+      const pushStream = (text: string): void => {
+        if (!ctx.onOutput || streamed >= MAX_STREAM_CHUNKS || !text) return;
+        pending += text;
+        if (pending.length >= STREAM_FLUSH_CHARS) flushStream();
+        else if (!streamTimer) streamTimer = setTimeout(flushStream, STREAM_FLUSH_MS);
+      };
       // Decode via StringDecoder so a multibyte UTF-8 char split across two chunks isn't corrupted into
       // U+FFFD (a plain per-chunk d.toString("utf8") mangles boundary-straddling sequences).
       const decOut = new StringDecoder("utf8"), decErr = new StringDecoder("utf8");
-      const onOut = (d: Buffer): void => { if (out.length < CAP) out += decOut.write(d); };
-      const onErr = (d: Buffer): void => { if (err.length < CAP) err += decErr.write(d); };
+      const onOut = (d: Buffer): void => { if (out.length < CAP) { const s = decOut.write(d); out += s; pushStream(s); } };
+      const onErr = (d: Buffer): void => { if (err.length < CAP) { const s = decErr.write(d); err += s; pushStream(s); } };
       child.stdout?.on("data", onOut);
       child.stderr?.on("data", onErr);
       const timer = setTimeout(() => { killedBy = "timeout"; killTree(child); }, timeoutMs);
@@ -320,20 +434,45 @@ export const bashTool: Tool = {
       ctx.signal?.addEventListener("abort", onAbort, { once: true });
       const done = (code: number | null, signalName: NodeJS.Signals | null): void => {
         clearTimeout(timer);
+        if (streamTimer) { clearTimeout(streamTimer); streamTimer = null; } // completion output is authoritative; no final flush
         ctx.signal?.removeEventListener("abort", onAbort);
         out += decOut.end(); err += decErr.end(); // flush any trailing partial multibyte sequence
         const combined = truncate([out, err].filter(Boolean).join("\n"));
         const status = killedBy === "timeout" ? `(timed out after ${timeoutMs / 1000}s — process tree killed)`
           : killedBy === "cancelled" ? "(cancelled — process tree killed)"
           : signalName ? `killed by ${signalName}` : `exit ${code ?? 1}`;
+        // A shell failure that names something — a binary, a path — is worth one more sentence:
+        // what DOES exist nearby. "command not found" is the largest single failure bucket in the
+        // TB2 taxonomy, and on its own it tells the model nothing it can act on. See shellGuard.ts.
+        const hint = killedBy === "timeout"
+          ? interactiveStallHint(combined)
+          : killedBy === null ? shellFailureHint(combined, ctx.cwd) : null;
         resolve({
-          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]`,
+          output: `$ ${command}\n${combined || "(no output)"}\n[${status}]${hint ? `\n${hint}` : ""}`,
           isError: killedBy !== null || (code ?? 1) !== 0 || !!signalName,
-          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName },
+          meta: { exitCode: code, timedOut: killedBy === "timeout", cancelled: killedBy === "cancelled", signal: signalName, ...(hint ? { hint: true } : {}) },
         });
       };
-      child.on("close", done);
-      child.on("error", (e) => { clearTimeout(timer); ctx.signal?.removeEventListener("abort", onAbort); resolve({ output: `bash: ${e.message}`, isError: true }); });
+      // "close" waits for every stdio pipe to drain, which is right for a normal finish: it
+      // guarantees the full output. But once we have DELIBERATELY killed the tree it becomes a trap.
+      // Under the POSIX shell, `bash -c "node -e ..."` runs the real work in a GRANDCHILD; killing
+      // bash leaves that grandchild holding the stdout pipe open, so "close" does not fire until it
+      // exits on its own — a cancel that should take milliseconds took the command's full 10s.
+      // After a kill, the child we spawned is gone and its own exit is the honest signal to report.
+      let settled = false;
+      const settle = (code: number | null, signalName: NodeJS.Signals | null): void => {
+        if (settled) return;
+        settled = true;
+        done(code, signalName);
+      };
+      child.on("close", settle);
+      child.on("exit", (code, signalName) => {
+        if (killedBy === null) return;        // normal finish: let "close" deliver the complete output
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        settle(code, signalName);
+      });
+      child.on("error", (e) => { clearTimeout(timer); if (streamTimer) clearTimeout(streamTimer); ctx.signal?.removeEventListener("abort", onAbort); if (!settled) { settled = true; resolve({ output: `bash: ${e.message}`, isError: true }); } });
     });
   }
 };

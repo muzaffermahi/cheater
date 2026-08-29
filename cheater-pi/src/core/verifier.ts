@@ -14,11 +14,16 @@
 //         stdout format (the 29th-pass lesson: format-brittle oracles manufacture fake fails).
 //   B2 consensus (generalise synthtest): execution vote across eligible candidates — the plurality
 //       output with fewest crashes wins ties; catches the subtly-wrong-but-self-verified attempt.
+//   B2b dual agreement (CodeT): the same executions read JOINTLY — cluster candidates by whole
+//       behaviour and score √(agreeing candidates × probes they agree on), so a coherent minority
+//       beats an incoherent plurality. Free: it re-reads outcomes B2 already paid for. On a genuine
+//       tie between two behaviours, S*-style adjudication puts the one concrete disagreement to the
+//       model ("same input, two answers, which does the spec say?"). See dualAgreement.ts.
 //   B3 ORM (optional, top-end): a trained 2B outcome reward model scores P(solved); off unless a
 //       checkpoint exists — B1+B2 already beat naive selection.
 //
-// Fusion (B4): eligible = passed B1; order by (consensus, ORM); winner = top; the finish gate refuses
-// "done" unless the winner has a green execution receipt. The full slate is recorded for audit.
+// Fusion (B4): eligible = passed B1; order by (consensus, agreement, ORM); winner = top; the finish
+// gate refuses "done" unless the winner has a green execution receipt. The slate is recorded for audit.
 //
 // Everything is spawnSync-guarded with timeouts and never throws into a run; an absent signal is "n/a",
 // not a failure.
@@ -29,6 +34,8 @@ import type { AcceptanceContract } from "../runstate/contract.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runFnProbes, selectByConsensus, type FnProbe, type ProbeOutcome } from "./synthtest.js";
+import { dualAgreement, firstDisagreement, renderDisagreement, readVerdict, type Disagreement } from "./dualAgreement.js";
+import { screenReproScript, runReproScript, type ReproScript } from "./reproTest.js";
 import { reviewerConfidence } from "./selfCertainty.js";
 import { runExampleTest, type WorkedExample } from "./workedExamples.js";
 import type { OrmScorer } from "./orm.js";
@@ -63,6 +70,10 @@ export interface CandidateSignals {
   weaklyEligible: boolean;
   consensusRank?: number;      // 0 = best consensus agreement
   consensusCrashes?: number;
+  /** B2b CodeT dual agreement: √(agreeing candidates × probes they agree on). Higher is better. */
+  agreementScore?: number;
+  /** How many candidates share this one's exact behaviour. */
+  agreementCluster?: number;
   ormScore?: number;           // B3 P(solved) in [0,1]
   selfCertainty?: number;      // P1 tiebreaker: how decisive the generation was
   receipt: string[];
@@ -88,6 +99,10 @@ export interface VerifierOpts {
   behavioralChecks?: string[];
   /** B2 consensus target for single-function tasks. */
   probe?: FnProbe | null;
+  /** A generated reproduction script for a repo-shaped task: the only red-then-green source when the
+   *  repo's own suite already passes on the unfixed code. SCREENED against the base before it counts —
+   *  a script that passes there reproduces nothing and is discarded. See reproTest.ts. */
+  reproScript?: ReproScript | null;
   /** B3 outcome reward model. Off (null) unless a trained checkpoint is loaded. */
   orm?: OrmScorer | null;
   /** P1: run a bounded reviewer self-certainty pass per candidate (owned-engine tiebreaker). */
@@ -101,6 +116,9 @@ export interface VerifierOpts {
   setupVars?: string[];
   /** Per-command timeout for execution signals. */
   timeoutMs?: number;
+  /** Live check reporting: each executed signal (repo tests / smoke / ground truth) per candidate, as
+   *  it runs, so a UI can show verification progress instead of a silent multi-minute pause. */
+  onCheck?: (e: { index: number; check: string; passed: boolean; durationMs: number }) => void;
 }
 
 function runCmd(cmd: string, cwd: string, timeoutMs: number): { ok: boolean; out: string } {
@@ -127,19 +145,56 @@ export class Verifier {
       ? !runCmd(this.opts.testCommand, this.opts.baseWorkspace, this.timeoutMs).ok
       : false;
 
+    // A generated reproduction script is believed ONLY if it is red on the unchanged base. A model
+    // asked for a failing test will happily write one that passes everywhere (vacuous) or fails
+    // everywhere (broken); the first would credit every candidate, the second none. Screening once
+    // against the base is what separates evidence from noise. No base to screen against ⇒ no signal.
+    let repro: ReproScript | null = null;
+    let reproNote = "";
+    if (this.opts.reproScript && this.opts.baseWorkspace) {
+      const screen = screenReproScript(this.opts.baseWorkspace, this.opts.reproScript, this.timeoutMs);
+      reproNote = screen.reason;
+      if (screen.usable) repro = this.opts.reproScript;
+    } else if (this.opts.reproScript) {
+      reproNote = "reproduction script discarded: no base snapshot to screen it against";
+    }
+
     for (const c of candidates) {
       const receipt: string[] = [];
       let reproduction: Signal = "n/a", regression: Signal = "n/a", smoke: Signal = "n/a";
 
       if (this.opts.testCommand) {
+        const t0 = Date.now();
         const r = runCmd(this.opts.testCommand, c.workspace, this.timeoutMs);
         regression = r.ok ? "pass" : "fail";
         receipt.push(`repo tests: ${regression}`);
+        this.opts.onCheck?.({ index: c.index, check: `repo tests (${this.opts.testCommand})`, passed: r.ok, durationMs: Date.now() - t0 });
         if (baseRedFailed) { reproduction = r.ok ? "pass" : "fail"; receipt.push(`red-then-green: ${reproduction} (base was red)`); }
+      }
+
+      // The generated reproduction, when it survived the base screen. This is the ONLY red-then-green
+      // available on a repo-shaped task whose existing suite already passes on the unfixed code — the
+      // case where eligibility otherwise collapses to "did not break anything", which every candidate
+      // satisfies including one that changed nothing of consequence.
+      if (repro) {
+        const t0 = Date.now();
+        const r = runReproScript(c.workspace, repro, this.timeoutMs);
+        if (r.ran) {
+          // It is red on the base by construction, so passing here IS the red-then-green screen. A
+          // candidate that leaves it red has not fixed the reported behaviour.
+          reproduction = r.passed ? "pass" : "fail";
+          receipt.push(`reproduction script: ${reproduction} (red on base)`);
+          this.opts.onCheck?.({ index: c.index, check: "reproduction script", passed: r.passed, durationMs: Date.now() - t0 });
+        } else {
+          receipt.push("reproduction script: n/a (did not run in this candidate's workspace)");
+        }
+      } else if (reproNote) {
+        receipt.push(reproNote);
       }
 
       if (this.opts.behavioralChecks?.length) {
         let allOk = true;
+        const t0 = Date.now();
         for (const cmd of this.opts.behavioralChecks) {
           if (!/[a-z]/i.test(cmd)) continue;
           const r = runCmd(cmd, c.workspace, this.timeoutMs);
@@ -147,14 +202,20 @@ export class Verifier {
         }
         smoke = allOk ? "pass" : "fail";
         receipt.push(`behavioral smoke: ${smoke}`);
+        this.opts.onCheck?.({ index: c.index, check: "behavioral smoke", passed: allOk, durationMs: Date.now() - t0 });
       }
 
       // GROUND TRUTH — the prompt's own worked examples (real I/O, not model-generated). The strongest
       // execution signal: fail here ⇒ definitely wrong, whatever consensus votes.
       let groundTruth: Signal = "n/a";
       if (this.opts.workedExamples?.length && this.opts.workedModule) {
+        const t0 = Date.now();
         const r = runExampleTest(c.workspace, this.opts.workedModule, this.opts.workedExamples, this.opts.setupVars ?? []);
-        if (r.ran) { groundTruth = r.failures.length ? "fail" : "pass"; receipt.push(`worked examples: ${groundTruth}${r.failures.length ? ` (${r.failures.length} fail)` : ""}`); }
+        if (r.ran) {
+          groundTruth = r.failures.length ? "fail" : "pass";
+          receipt.push(`worked examples: ${groundTruth}${r.failures.length ? ` (${r.failures.length} fail)` : ""}`);
+          this.opts.onCheck?.({ index: c.index, check: "worked examples (ground truth)", passed: !r.failures.length, durationMs: Date.now() - t0 });
+        }
       }
 
       // Eligibility (B1): pass every APPLICABLE signal. If none applied, fall back to the finish gate
@@ -172,6 +233,42 @@ export class Verifier {
     // that fails a thin repo test but agrees with the plurality is still visible for tie-breaking).
     if (this.opts.probe) {
       const outcomes: (ProbeOutcome | null)[] = candidates.map((c) => runFnProbes(c.workspace, this.opts.probe!));
+
+      // B2b — CodeT dual agreement over the same outcomes, at no extra execution cost. Per-probe
+      // plurality asks each probe independently and can crown an incoherent candidate: one that
+      // matched the majority on probe 1 under one theory of the problem and on probe 3 under a
+      // contradictory one. Clustering by whole-behaviour and scoring √(candidates × probes) rewards
+      // agreement that holds together. See dualAgreement.ts.
+      const dual = dualAgreement(outcomes);
+      for (const cluster of dual.clusters) {
+        for (const m of cluster.members) {
+          if (!slate[m]) continue;
+          slate[m].agreementScore = cluster.score;
+          slate[m].agreementCluster = cluster.members.length;
+          slate[m].receipt.push(`dual agreement ${cluster.score.toFixed(2)} (${cluster.members.length} candidate${cluster.members.length === 1 ? "" : "s"} × ${cluster.cleanProbes} clean probe${cluster.cleanProbes === 1 ? "" : "s"})`);
+        }
+      }
+
+      // S* disambiguation — only on a GENUINE tie between the two leading behaviours, and only when
+      // they actually differ on some probe. One short model call, adjudicating one concrete input:
+      // "same input, two answers, which does the spec say?". A tie that cannot be phrased as a
+      // question is left to the deterministic ordering rather than paid for.
+      if (dual.tied && this.opts.confidence) {
+        const d = firstDisagreement(dual);
+        const input = d ? this.opts.probe.inputs[d.probeIndex] : undefined;
+        if (d && input !== undefined) {
+          const verdict = await this.adjudicate(this.opts.task, input, d);
+          if (verdict !== "undecided") {
+            const winner = verdict === "a" ? d.a.candidate : d.b.candidate;
+            const loser = verdict === "a" ? d.b.candidate : d.a.candidate;
+            // A nudge, not an override: it breaks the tie the execution signals could not, and it
+            // can never promote a candidate that failed a real check.
+            if (slate[winner]) { slate[winner].agreementScore = (slate[winner].agreementScore ?? 0) + 1e-3; slate[winner].receipt.push("distinguishing input: judged correct"); }
+            if (slate[loser]) slate[loser].receipt.push("distinguishing input: judged incorrect");
+          }
+        }
+      }
+
       const pick = selectByConsensus(outcomes);
       if (pick) {
         for (let i = 0; i < slate.length; i++) {
@@ -225,6 +322,24 @@ export class Verifier {
     return this.fuse(slate);
   }
 
+  /**
+   * S* adjudication: put ONE concrete disagreement to the model and read a single-character verdict.
+   * Bounded (one short call, small token cap) and failure-tolerant — anything that is not a clean
+   * A/B answer is "undecided", which leaves the deterministic ordering in charge. A judge that is
+   * allowed to be vague is a judge that decides by coin flip.
+   */
+  private async adjudicate(spec: string, input: unknown[], d: Disagreement): Promise<"a" | "b" | "undecided"> {
+    try {
+      const r = await this.opts.llm.chat({
+        messages: [{ role: "user", content: renderDisagreement(spec, input, d) }],
+        maxTokens: 8, temperature: 0, timeoutMs: 45000,
+      });
+      return r.ok ? readVerdict(r.content) : "undecided";
+    } catch {
+      return "undecided";
+    }
+  }
+
   /** Do the top execution-eligible candidates tie on (consensus rank, ORM)? Only then does the P1
    *  self-certainty tiebreaker change anything — otherwise it's pure latency. */
   private tieAmongEligible(slate: CandidateSignals[]): boolean {
@@ -251,6 +366,10 @@ export class Verifier {
       if (we !== 0) return we;
       const cr = (a.consensusRank ?? 99) - (b.consensusRank ?? 99);
       if (cr !== 0) return cr;
+      // B2b dual agreement sits directly under per-probe consensus: it reads the SAME executions, so
+      // it costs nothing, and it is the signal that separates candidates whose per-probe scores tied.
+      const agree = (b.agreementScore ?? -1) - (a.agreementScore ?? -1);
+      if (Math.abs(agree) > 1e-9) return agree;
       const orm = (b.ormScore ?? -1) - (a.ormScore ?? -1);
       if (orm !== 0) return orm;
       const sc = (b.selfCertainty ?? -1) - (a.selfCertainty ?? -1);

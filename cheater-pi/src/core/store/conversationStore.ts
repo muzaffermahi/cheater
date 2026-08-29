@@ -17,6 +17,7 @@ import {
   type Lane,
 } from "../events.js";
 import { openSqlite, transact, userVersion, setUserVersion, type SqlDatabase, type SqlValue } from "./db.js";
+import type { PlanArtifact, PlanStatus } from "../planArtifact.js";
 
 export interface ConversationRow {
   id: string;
@@ -33,6 +34,8 @@ export interface ConversationRow {
   agent?: string | null;
   parentConversationId?: string | null;
   parentRunId?: string | null;
+  /** The conversation's effort level (fast|balanced|careful|think-hard). Default "balanced". */
+  effort: string;
 }
 
 export interface RunRow {
@@ -73,6 +76,7 @@ export interface CreateConversationInput {
   agent?: string | null;
   parentConversationId?: string | null;
   parentRunId?: string | null;
+  effort?: string;
 }
 
 export interface ListConversationsOptions {
@@ -117,6 +121,18 @@ export interface TaskCompilationRow {
   rendered: string;
   promptEpoch: string;
   createdAt: number;
+}
+
+export interface PlanRow {
+  id: string;
+  conversationId: string;
+  revision: number;
+  status: PlanStatus;
+  hash: string;
+  approvedHash: string | null;
+  artifact: PlanArtifact;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface CreateTaskNodeInput {
@@ -262,6 +278,28 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
   `,
+  // v6 — the per-conversation effort level (fast|balanced|careful|think-hard).
+  `
+  ALTER TABLE conversations ADD COLUMN effort TEXT NOT NULL DEFAULT 'balanced';
+  `,
+  // v7 — immutable, approval-bound plan revisions. The artifact is canonical JSON; the row is a
+  // query projection so clients can find the latest plan without replaying the entire event log.
+  `
+  CREATE TABLE plans (
+    id              TEXT NOT NULL,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    revision        INTEGER NOT NULL,
+    status          TEXT NOT NULL,
+    hash            TEXT NOT NULL,
+    approved_hash   TEXT,
+    artifact        TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (id, revision)
+  );
+  CREATE INDEX idx_plans_conversation ON plans(conversation_id, updated_at DESC);
+  CREATE INDEX idx_plans_status ON plans(status);
+  `,
 ];
 
 /**
@@ -336,6 +374,25 @@ const REPAIR_TABLES: ReadonlyArray<{ table: string; ddl: string }> = [
     CREATE INDEX IF NOT EXISTS idx_task_compilations_conversation ON task_compilations(conversation_id, created_at);
     `,
   },
+  {
+    table: "plans",
+    ddl: `
+    CREATE TABLE IF NOT EXISTS plans (
+      id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      approved_hash TEXT,
+      artifact TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (id, revision)
+    );
+    CREATE INDEX IF NOT EXISTS idx_plans_conversation ON plans(conversation_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_plans_status ON plans(status);
+    `,
+  },
 ];
 
 /** Every column this code line reads or writes beyond the v1 tables. */
@@ -350,6 +407,7 @@ const REPAIR_COLUMNS: ReadonlyArray<{ table: string; column: string; type: strin
   { table: "conversations", column: "agent", type: "TEXT" },
   { table: "conversations", column: "parent_conversation_id", type: "TEXT" },
   { table: "conversations", column: "parent_run_id", type: "TEXT" },
+  { table: "conversations", column: "effort", type: "TEXT NOT NULL DEFAULT 'balanced'" },
 ];
 
 function tableNames(db: SqlDatabase): Set<string> {
@@ -436,11 +494,11 @@ export class ConversationStore {
   createConversation(input: CreateConversationInput): { conversation: ConversationRow; event: KittenEvent } {
     return transact(this.db, () => {
       this.db.prepare(
-        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO conversations (id, title, project_root, project_id, model, mode, created_at, updated_at, archived, last_seq, search_text, schema_version, provider, agent, parent_conversation_id, parent_run_id, effort)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         input.id, input.title, input.projectRoot, input.projectId, input.model, input.mode,
-        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null
+        input.ts, input.ts, input.title.toLowerCase(), EVENT_SCHEMA_VERSION, input.provider ?? null, input.agent ?? null, input.parentConversationId ?? null, input.parentRunId ?? null, input.effort ?? "balanced"
       );
       const event = this._append(input.id, {
         type: "conversation.created", title: input.title, projectRoot: input.projectRoot,
@@ -479,6 +537,14 @@ export class ConversationStore {
       this.db.prepare("UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?").run(title, ts, id);
       return this._append(id, { type: "conversation.renamed", title }, ts);
     });
+  }
+
+  /** Persist the conversation's effort level. A plain column update — no event (the per-run choice
+   *  is already durably recorded on route.selected). */
+  setEffort(id: string, effort: string, ts: number): boolean {
+    if (!this.getConversation(id)) return false;
+    this.db.prepare("UPDATE conversations SET effort = ?, updated_at = ? WHERE id = ?").run(effort, ts, id);
+    return true;
   }
 
   setArchived(id: string, archived: boolean, ts: number): KittenEvent | null {
@@ -623,8 +689,37 @@ export class ConversationStore {
       .map(mapRun);
   }
 
+  /** Persist one immutable plan revision. A later revision supersedes the previous projection only
+   * through the artifact's own status; historical rows remain available for audit and replay. */
+  savePlan(plan: PlanArtifact): PlanRow {
+    this.db.prepare(
+      `INSERT INTO plans (id, conversation_id, revision, status, hash, approved_hash, artifact, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id, revision) DO UPDATE SET status = excluded.status, hash = excluded.hash,
+       approved_hash = excluded.approved_hash, artifact = excluded.artifact, updated_at = excluded.updated_at`
+    ).run(plan.id, plan.conversationId, plan.revision, plan.status, plan.hash, plan.approvedHash ?? null,
+      JSON.stringify(plan), plan.createdAt, plan.updatedAt);
+    return this.getPlan(plan.id, plan.revision)!;
+  }
+
+  getPlan(id: string, revision?: number): PlanRow | null {
+    const row = revision === undefined
+      ? this.db.prepare("SELECT * FROM plans WHERE id = ? ORDER BY revision DESC LIMIT 1").get(id)
+      : this.db.prepare("SELECT * FROM plans WHERE id = ? AND revision = ?").get(id, revision);
+    return row ? mapPlan(row) : null;
+  }
+
+  listPlans(conversationId: string): PlanRow[] {
+    return this.db.prepare("SELECT * FROM plans WHERE conversation_id = ? ORDER BY updated_at DESC, revision DESC").all(conversationId).map(mapPlan);
+  }
+
+  updatePlanStatus(id: string, revision: number, status: PlanStatus, updatedAt: number): PlanRow | null {
+    this.db.prepare("UPDATE plans SET status = ?, updated_at = ? WHERE id = ? AND revision = ?").run(status, updatedAt, id, revision);
+    return this.getPlan(id, revision);
+  }
+
   createTaskNode(input: CreateTaskNodeInput): TaskNodeRow {
-    const budget = { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40, ...(input.budget ?? {}) };
+    const budget = { maxTurns: 12, maxTokens: 12000, maxWallMs: 0, maxToolCalls: 40, ...(input.budget ?? {}) };
     this.db.prepare(
       `INSERT INTO task_nodes (id, conversation_id, run_id, parent_id, agent, objective, acceptance_criteria,
        dependencies, allowed_files, forbidden_files, model_tier, workspace_mode, status, budget, report, evidence, created_at, updated_at)
@@ -730,6 +825,7 @@ function mapConversation(r: Record<string, SqlValue>): ConversationRow {
     agent: r.agent != null ? String(r.agent) : null,
     parentConversationId: r.parent_conversation_id != null ? String(r.parent_conversation_id) : null,
     parentRunId: r.parent_run_id != null ? String(r.parent_run_id) : null,
+    effort: r.effort != null ? String(r.effort) : "balanced",
   };
 }
 
@@ -780,6 +876,15 @@ function mapTaskCompilation(r: Record<string, SqlValue>): TaskCompilationRow {
   };
 }
 
+function mapPlan(r: Record<string, SqlValue>): PlanRow {
+  const raw = JSON.parse(String(r.artifact)) as PlanArtifact;
+  return {
+    id: String(r.id), conversationId: String(r.conversation_id), revision: Number(r.revision),
+    status: String(r.status) as PlanStatus, hash: String(r.hash), approvedHash: r.approved_hash == null ? null : String(r.approved_hash),
+    artifact: raw, createdAt: Number(r.created_at), updatedAt: Number(r.updated_at),
+  };
+}
+
 function mapEvent(r: Record<string, SqlValue>): KittenEvent {
   const payload = JSON.parse(String(r.payload)) as EventPayload;
   const conversationId = String(r.conversation_id);
@@ -799,6 +904,6 @@ function safeUsage(v: SqlValue): { prompt: number; completion: number; reasoning
 function safeBudget(v: SqlValue): TaskNodeRow["budget"] {
   try {
     const b = JSON.parse(String(v ?? "{}"));
-    return { maxTurns: Number(b.maxTurns ?? 12), maxTokens: Number(b.maxTokens ?? 12000), maxWallMs: Number(b.maxWallMs ?? 900_000), maxToolCalls: Number(b.maxToolCalls ?? 40) };
-  } catch { return { maxTurns: 12, maxTokens: 12000, maxWallMs: 900_000, maxToolCalls: 40 }; }
+    return { maxTurns: Number(b.maxTurns ?? 12), maxTokens: Number(b.maxTokens ?? 12000), maxWallMs: Number(b.maxWallMs ?? 0), maxToolCalls: Number(b.maxToolCalls ?? 40) };
+  } catch { return { maxTurns: 12, maxTokens: 12000, maxWallMs: 0, maxToolCalls: 40 }; }
 }

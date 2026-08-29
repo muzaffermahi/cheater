@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KittenLLM, cloudModels } from "./llm.js";
 import { runReliableAgent, type ReliableParams } from "./reliable.js";
-import type { AgentRunResult } from "./agent.js";
+import type { AgentRunResult, AgentEvent } from "./agent.js";
 import { rotateLocalization, type AttemptPlan } from "./diversity.js";
 import { extractAcceptanceContract } from "../runstate/contract.js";
 
@@ -81,6 +81,22 @@ export interface CloudBurstParams {
 export interface CloudBurstOpts {
   concurrency?: number;
   runOne?: RunOne;             // injectable (default runReliableAgent)
+  /**
+   * Fired the moment a candidate's agent is about to start — NOT after the burst resolves.
+   *
+   * Ascent used to announce every candidate only once `cloudBurstGenerate` had already returned, i.e.
+   * after all of them had finished. On a local 35B that is the entire multi-minute run, so the UI sat
+   * on "starting" for eight minutes and then learned everything at once. A start hook has to be a
+   * start hook.
+   */
+  onStart?: (plan: AttemptPlan) => void;
+  /**
+   * Live agent events from ONE designated candidate (the lead). k candidates interleaving their token
+   * streams is unreadable noise, which is why this lane streamed nothing at all — but "nothing at all"
+   * left the hardest tasks as the most opaque ones. Following a single candidate is readable and
+   * honest, and the others stay silent.
+   */
+  onLeadEvent?: (e: AgentEvent) => void;
 }
 
 /**
@@ -92,12 +108,20 @@ export async function cloudBurstGenerate(params: CloudBurstParams, plans: Attemp
   const runOne = opts.runOne ?? runReliableAgent;
   const contract = extractAcceptanceContract(params.task);
   const concurrency = Math.max(1, opts.concurrency ?? 6);
+  // One candidate carries the live view. The first plan is the natural choice: it is the unperturbed
+  // one (no directive rotation, base temperature), so what the user watches is the straight attempt.
+  const leadIndex = plans.length ? plans[0].index : -1;
   return mapLimit(plans, concurrency, async (plan) => {
     const workspace = isolate(params.cwd);
     const localizationFiles = plan.localizationRotation > 0 ? rotateLocalization(contract.files, plan.localizationRotation) : undefined;
+    const isLead = plan.index === leadIndex && typeof opts.onLeadEvent === "function";
+    try { opts.onStart?.(plan); } catch { /* a UI hook must never fail a candidate */ }
     let result: AgentRunResult & { contractTargets: string[] };
     try {
       result = await runOne({
+        // Only the lead reports. `streamDeltas` without an `onEvent` sink is pointless work, so the
+        // two travel together.
+        ...(isLead ? { onEvent: opts.onLeadEvent, streamDeltas: true } : {}),
         task: params.task, cwd: workspace, llm: params.llm, model: params.model,
         maxTurns: params.maxTurns, reasoningEffort: params.reasoningEffort, temperature: plan.temperature,
         extraDirective: plan.directive, localizationFiles, experiencePrime: params.experiencePrime,
@@ -160,6 +184,46 @@ function listAdoptedFiles(root: string, prefix = "", depth = 0): string[] {
 
 export function cleanupBurst(attempts: BurstAttempt[]): void {
   for (const a of attempts) { try { rmSync(a.workspace, { recursive: true, force: true }); } catch { /* ignore */ } }
+}
+
+/** Where an interrupted run leaves its candidates for the user to find. */
+export const CHECKPOINT_DIR = ".kitten-candidates";
+
+/**
+ * Copy finished candidates into `<cwd>/.kitten-candidates/` so an interrupted run keeps its work.
+ *
+ * Ascent builds each candidate in an isolated workspace and adopts the winner into `cwd` only at
+ * the very end. In the bakeoff, `json_patch` ran two candidates for fifteen minutes, was killed
+ * before adoption, and left a workspace containing nothing at all — the oracle then reported
+ * `ModuleNotFoundError`, indistinguishable from an agent that never tried.
+ *
+ * This is deliberately NON-DESTRUCTIVE. Adopting provisionally into `cwd` would be more convenient,
+ * but `adoptWorkspace` clears `cwd` first — so an interrupt landing after a provisional adoption
+ * would leave the user holding an unverified loser's edits *instead of their own files*. Losing
+ * fifteen minutes of the agent's work is bad; quietly replacing someone's repository with a
+ * candidate that never won is worse. The checkpoint sits beside the work, and the winner still
+ * adopts normally.
+ */
+export function checkpointCandidates(cwd: string, attempts: BurstAttempt[], round: number): string[] {
+  const saved: string[] = [];
+  for (const a of attempts) {
+    if (!a.result.finished) continue;                 // unfinished candidates aren't worth the copy
+    const dest = join(cwd, CHECKPOINT_DIR, `round${round}-candidate${a.index}`);
+    try {
+      rmSync(dest, { recursive: true, force: true });
+      cpSync(a.workspace, dest, {
+        recursive: true,
+        filter: (src) => !/[\\/](node_modules|\.git|__pycache__|\.venv|dist|build|\.kitten-candidates)$/i.test(src),
+      });
+      saved.push(dest);
+    } catch { /* best effort: a failed checkpoint must never fail the run */ }
+  }
+  return saved;
+}
+
+/** Remove the checkpoints once the winner is safely adopted — a clean run leaves no litter. */
+export function clearCheckpoints(cwd: string): void {
+  try { rmSync(join(cwd, CHECKPOINT_DIR), { recursive: true, force: true }); } catch { /* ignore */ }
 }
 
 /** Resolve cloud-burst config from env (KITTEN_CLOUD_BASE_URL + KITTEN_CLOUD_API_KEY), or null. */

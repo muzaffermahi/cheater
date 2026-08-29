@@ -50,9 +50,9 @@ test("receiptLines render spend vs ceiling and flag exhaustion", () => {
   assert.match(lines[0], /EXHAUSTED/);
 });
 
-test("defaultCeiling is bounded and sane", () => {
+test("defaultCeiling has a token bound and no wall-clock stop", () => {
   const c = defaultCeiling(60);
   assert.ok(c.maxTokens && c.maxTokens > 0);
-  assert.ok(c.maxWallMs && c.maxWallMs <= 20 * 60000);
+  assert.equal(c.maxWallMs, undefined);
   assert.equal(c.usdPerMTokens, 60);
 });

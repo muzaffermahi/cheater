@@ -1,9 +1,10 @@
-import test from "node:test";
+﻿import test from "node:test";
+// (bakeoff regression) An interactive command must hit EOF instead of hanging on an open stdin.
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
+import { bashTool, interactiveCommandRefusal, resolvePosixShell, editTool, readTool, writeTool, globTool, grepTool, globToRegExp, type ToolContext } from "../src/core/tools.js";
 
 function ctxAt(): ToolContext {
   return { cwd: mkdtempSync(join(tmpdir(), "kt-tools-")), filesRead: new Set(), filesWritten: new Set() };
@@ -30,7 +31,7 @@ test("edit matches leniently when whitespace differs", async () => {
 
 test("edit matches leniently on a CRLF file (Windows line endings)", async () => {
   // Regression: findLenient rejoined lines with "\n" and indexOf'd that against the raw text, so on a
-  // \r\n file it never matched — the lenient rescue was dead on the primary platform.
+  // \r\n file it never matched â€” the lenient rescue was dead on the primary platform.
   const ctx = ctxAt();
   writeFileSync(join(ctx.cwd, "m.py"), "def f():\r\n        return 1\r\n"); // CRLF, 8-space indent
   const r = await editTool.execute({ path: "m.py", search: "    return 1", replace: "    return 2" }, ctx); // 4-space
@@ -40,7 +41,7 @@ test("edit matches leniently on a CRLF file (Windows line endings)", async () =>
 
 test("edit refuses an ambiguous lenient match (2+ normalized regions) instead of guessing", async () => {
   // Regression: findLenient applied the FIRST normalized match, unlike the exact path which errors on
-  // multiple matches — so it could silently edit the wrong one of two similar blocks.
+  // multiple matches â€” so it could silently edit the wrong one of two similar blocks.
   const ctx = ctxAt();
   writeFileSync(join(ctx.cwd, "m.py"), "if a:\n    x = 1\n    return x\nif b:\n        x = 1\n        return x\n");
   const before = readFileSync(join(ctx.cwd, "m.py"), "utf8");
@@ -177,3 +178,74 @@ test("globToRegExp keeps * inside one segment", () => {
   assert.equal(globToRegExp("a?.ts").test("ab.ts"), true);
   assert.equal(globToRegExp("a?.ts").test("abc.ts"), false);
 });
+
+
+test("a bare interactive command is refused instantly with the fix, not left to hang", async () => {
+  // Live bakeoff finding: the model ran bare `python`. With no terminal attached it blocks until the
+  // timeout — and on Python 3.14 it hangs even with stdin redirected from NUL — so three of them ate
+  // six minutes of one task. Refusing costs milliseconds and tells the model exactly what to do.
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-stdin-"));
+  const c: ToolContext = { cwd, filesRead: new Set(), filesWritten: new Set() };
+  const started = Date.now();
+  const res = await bashTool.execute({ command: "python", timeout_seconds: 30 }, c);
+  assert.ok(Date.now() - started < 3000, "must refuse immediately, not wait for the timeout");
+  assert.equal(res.isError, true);
+  assert.match(res.output, /interactive session/);
+  assert.match(res.output, /python -c/, "the refusal must carry the correction");
+  for (const bare of ["node", "  vim  ", "sqlite3", "cat", "C:\\Python314\\python.exe"]) {
+    assert.ok(interactiveCommandRefusal(bare), `${bare} should be refused`);
+  }
+  // Real commands must be untouched — including the piped/redirected/argument forms.
+  for (const real of ['python -c "print(1)"', "python script.py", "echo hi | python", "cat file.txt",
+                      "node -e \"console.log(1)\"", "npm test", "python < input.txt", "pytest -q"]) {
+    assert.equal(interactiveCommandRefusal(real), null, `${real} must NOT be refused`);
+  }
+  const good = await bashTool.execute({ command: 'python -c "print(6*7)"', timeout_seconds: 60 }, c);
+  assert.equal(good.isError, false, `a normal python -c must still run: ${good.output.slice(0, 200)}`);
+  assert.match(good.output, /42/);
+});
+
+test("the bash tool never resolves its shell to WSL", () => {
+  // The dangerous near-miss. C:\Windows\System32\bash.exe and the WindowsApps stub are WSL
+  // launchers: they run in a different filesystem namespace where the workspace path does not
+  // exist, so `cwd` is meaningless and the model's edits would land somewhere nobody is looking.
+  // Silently running in the wrong filesystem is strictly worse than the cmd.exe problem this
+  // resolver exists to fix, so those paths must never be chosen — even when named explicitly.
+  for (const wsl of ["C:\\Windows\\System32\\bash.exe",
+                     "C:/Windows/System32/bash.exe",
+                     "C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe"]) {
+    assert.equal(resolvePosixShell({ KITTEN_SHELL: wsl } as NodeJS.ProcessEnv), null,
+      `${wsl} is WSL and must be refused`);
+  }
+  // A KITTEN_SHELL that simply does not exist falls back to cmd.exe rather than guessing past it.
+  assert.equal(resolvePosixShell({ KITTEN_SHELL: "C:/nope/bash.exe" } as NodeJS.ProcessEnv), null);
+});
+
+test("on Windows the bash tool runs POSIX commands the model actually types", async (t) => {
+  // The regression this exists to prevent: `spawn(cmd, {shell:true})` uses %COMSPEC%, so `ls` and
+  // `pwd` come back "is not recognized as an internal or external command". Measured live on the
+  // bakeoff's mini_sql task, which burned two turns on exactly this before giving up on orienting
+  // itself. Skipped where no POSIX shell is installed — the fallback to cmd.exe is intentional.
+  if (process.platform === "win32" && !resolvePosixShell()) {
+    t.skip("no Git bash on this machine; cmd.exe fallback is the documented behaviour");
+    return;
+  }
+  const cwd = mkdtempSync(join(tmpdir(), "kitten-posix-"));
+  writeFileSync(join(cwd, "marker.txt"), "hello\n");
+  const c: ToolContext = { cwd, filesRead: new Set(), filesWritten: new Set() };
+
+  const ls = await bashTool.execute({ command: "ls", timeout_seconds: 30 }, c);
+  assert.equal(ls.isError, false, `ls must work: ${ls.output.slice(0, 200)}`);
+  assert.match(ls.output, /marker\.txt/);
+  assert.doesNotMatch(ls.output, /not recognized as an internal or external command/);
+
+  const pwd = await bashTool.execute({ command: "pwd && cat marker.txt", timeout_seconds: 30 }, c);
+  assert.equal(pwd.isError, false, `pwd && cat must work: ${pwd.output.slice(0, 200)}`);
+  assert.match(pwd.output, /hello/);
+
+  // Windows toolchain commands must keep working — this must not trade one broken shell for another.
+  const py = await bashTool.execute({ command: 'python -c "print(6*7)"', timeout_seconds: 60 }, c);
+  assert.equal(py.isError, false, `python must still run under the POSIX shell: ${py.output.slice(0, 200)}`);
+  assert.match(py.output, /42/);
+});
+

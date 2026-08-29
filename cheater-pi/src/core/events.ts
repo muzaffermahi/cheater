@@ -10,7 +10,15 @@
 // store (the ordering source of truth), and `id` is derived as `${conversationId}:${seq}` so it is
 // stable and reproducible — no randomness, which keeps replay and tests deterministic.
 
-/** Bump when a payload shape changes incompatibly; the store records this per row for migration. */
+/**
+ * Bump ONLY for an incompatible change: renaming/removing/retyping an existing field, or changing a
+ * field's semantics. Adding a new event type or a new OPTIONAL field does NOT bump — renderers are
+ * required to ignore unknown `type`s and tolerate absent optional fields (the desktop shell replays
+ * stored history through the same dispatch as live events, so this is what keeps old sessions
+ * rendering). See docs/engine-events.md for the renderer-facing contract.
+ *
+ * Reserved (declared, no emitter yet — do not build UI against them): `tool.proposed`, `diff.updated`.
+ */
 export const EVENT_SCHEMA_VERSION = 1;
 
 /** A run's lifecycle status (Goal §6 state machine). Transient states become `interrupted` on
@@ -73,6 +81,10 @@ export interface RouteSelected {
   reasons: string[];
   /** Planned sample count for bon/ascent (1 otherwise). */
   k: number;
+  /** The deterministic hardness score behind the choice. Optional: stored events predate it. */
+  hardness?: number;
+  /** The user's effort level for this run (fast|balanced|careful|think-hard), when one was set. */
+  effort?: string;
 }
 
 export interface RunStarted {
@@ -130,6 +142,8 @@ export interface ToolStarted {
   runId: string;
   callId: string;
   name: string;
+  /** What the call is acting on — a path, a command, a pattern. Optional: stored events predate it. */
+  target?: string;
 }
 export interface ToolOutput {
   type: "tool.output";
@@ -154,10 +168,36 @@ export interface ToolCompleted {
   output: string;
 }
 
+/** One bounded model-call timing record; optional for older providers without llama.cpp timings. */
+export interface InferenceCompleted {
+  type: "inference.completed";
+  runId: string;
+  role: string;
+  cacheTokens: number;
+  promptTokens: number;
+  promptMs: number;
+  predictedTokens: number;
+  predictedMs: number;
+  decodeTokensPerSecond: number;
+  /** Truthful Runtime Director acknowledgement; optional for pre-director persisted events. */
+  runtimeReceipt?: {
+    phase: string;
+    role: string;
+    ownership: "managed-native" | "external-compatible";
+    evidence: "verified" | "sent-only";
+    requested: Record<string, unknown>;
+    applied: Record<string, unknown>;
+    dropped: string[];
+    unverifiable: string[];
+  };
+}
+
 export interface CandidateStarted {
   type: "candidate.started";
   runId: string;
   index: number;
+  /** The candidate whose reasoning and tool calls are being streamed live. */
+  lead?: boolean;
 }
 export interface CandidateCompleted {
   type: "candidate.completed";
@@ -251,6 +291,19 @@ export interface RunCompleted {
   summary: string;
   wallMs: number;
   usage: { prompt: number; completion: number; reasoning: number };
+  /** The engine's effort timer ended the run; the user did not press Stop. */
+  stoppedByCeiling?: boolean;
+  executionStrategy?: "compiled-fast" | "compiled-fast-to-reliable" | "agent";
+  performance?: {
+    modelCalls: number;
+    cacheTokens: number;
+    promptTokens: number;
+    promptMs: number;
+    predictedTokens: number;
+    predictedMs: number;
+    decodeTokensPerSecond: number;
+    effectiveOutputRate: number;
+  };
 }
 
 /** A run's file changes were rolled back by `/undo` (Goal §8). Records what was reverted/deleted. */
@@ -383,6 +436,50 @@ export interface RunStepCritique {
   productiveRatio: number;
 }
 
+/**
+ * The current plan for a run, as a bounded step list. Two sources: the durable task DAG
+ * ("task-graph": real subagent nodes with dependencies + live statuses) and the compiled contract
+ * ("compiled-contract": an advisory outline derived from deliverables + checks, statuses stay
+ * "planned"). Re-emitted on material change; renderers replace, never append.
+ */
+export interface PlanUpdated {
+  type: "plan.updated";
+  runId: string;
+  source: "task-graph" | "compiled-contract";
+  reason?: string;
+  steps: Array<{ id: string; label: string; status: string; dependsOn: string[]; agent?: string }>;
+}
+
+/** Immutable user-facing plan lifecycle. The revision/hash pair is the approval boundary. */
+export interface PlanLifecycle {
+  type: "plan.created" | "plan.revised" | "plan.approved" | "plan.started" | "plan.drifted" | "plan.completed" | "plan.cancelled";
+  runId: string;
+  planId: string;
+  revision: number;
+  hash: string;
+  status: string;
+  detail?: string;
+}
+/** A plan step began executing (task-graph source only). */
+export interface StepStarted {
+  type: "step.started";
+  runId: string;
+  stepId: string;
+  label: string;
+  agent?: string;
+}
+/** A plan step reached a resting state. Failure/blockage folds in via `status`. */
+export interface StepCompleted {
+  type: "step.completed";
+  runId: string;
+  stepId: string;
+  status: "completed" | "waiting" | "failed" | "blocked" | "cancelled";
+  /** Bounded worker report (≤2000 chars). */
+  report?: string;
+  /** Bounded evidence list (≤16 items). */
+  evidence?: string[];
+}
+
 /** A user-approved native verification run, persisted as bounded execution evidence. */
 export interface WorkspaceVerification {
   type: "workspace.verification";
@@ -409,6 +506,7 @@ export type EventPayload =
   | ToolStarted
   | ToolOutput
   | ToolCompleted
+  | InferenceCompleted
   | CandidateStarted
   | CandidateCompleted
   | CandidateRejected
@@ -434,6 +532,10 @@ export type EventPayload =
   | TaskCompiled
   | TaskClarificationRequested
   | RunStepCritique
+  | PlanUpdated
+  | PlanLifecycle
+  | StepStarted
+  | StepCompleted
   | WorkspaceVerification;
 
 export type EventType = EventPayload["type"];
@@ -451,6 +553,16 @@ export interface EventEnvelope {
 }
 
 export type KittenEvent = EventEnvelope & EventPayload;
+
+/**
+ * Events that are broadcast to live listeners but never written to the durable log.
+ *
+ * Reasoning is the only member today, and it qualifies on its own terms: the renderer contract says
+ * it is "streamed live, not replayed", so every row written for it is disk spent on something no
+ * reader will ever ask for. Keeping it out of the log is also what makes a fine-grained stream
+ * affordable — the coarse 300-character flush existed to protect the store, not the reader.
+ */
+export const TRANSIENT_EVENTS: ReadonlySet<string> = new Set(["reasoning.delta"]);
 
 /** Derive the canonical event id from its coordinates. */
 export function eventId(conversationId: string, seq: number): string {

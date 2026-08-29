@@ -75,3 +75,62 @@ test("cloudBurstConfigFromEnv returns null without env creds", () => {
   if (saved.u) process.env.KITTEN_CLOUD_BASE_URL = saved.u; else delete process.env.KITTEN_CLOUD_BASE_URL;
   if (saved.k) process.env.KITTEN_CLOUD_API_KEY = saved.k; else delete process.env.KITTEN_CLOUD_API_KEY;
 });
+
+// ── Live progress on the ascent lane ─────────────────────────────────────────────────────────────
+//
+// Observed live: an 8-minute Pac-Man run on the ascent lane showed "starting" for its whole duration
+// and streamed not one token. Three causes, two of them here.
+
+test("onStart fires while a candidate is still running, not after the burst resolves", async () => {
+  const base = mkdtempSync(join(tmpdir(), "burst-start-"));
+  const plans = planAttempts(3);
+  const started: number[] = [];
+  let running = 0, sawStartDuringRun = false;
+  const runOne: RunOne = async () => {
+    running++;
+    // If onStart were called after the burst resolved, `started` would still be empty here.
+    if (started.length > 0) sawStartDuringRun = true;
+    await new Promise((r) => setTimeout(r, 5));
+    running--;
+    return { finished: true, summary: "ok", turns: 1, toolCalls: 0, filesWritten: [], events: [], usage: { prompt: 0, completion: 0, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
+  };
+  await cloudBurstGenerate(
+    { task: "t", cwd: base, llm: cloudLlm({ baseUrl: "x", apiKey: "y" }) },
+    plans,
+    { concurrency: 3, runOne, onStart: (p) => started.push(p.index) }
+  );
+  assert.equal(started.length, 3, "every candidate announced its start");
+  assert.ok(sawStartDuringRun, "a start was announced while candidates were still in flight");
+  assert.equal(running, 0);
+});
+
+test("exactly one candidate streams — the lead — so k token streams never interleave", async () => {
+  const base = mkdtempSync(join(tmpdir(), "burst-lead-"));
+  const plans = planAttempts(3);
+  const streaming: Array<number | undefined> = [];
+  const runOne: RunOne = async (p) => {
+    streaming.push(p.streamDeltas ? p.temperature : undefined);
+    p.onEvent?.({ turn: 1, kind: "reasoning_delta", detail: "thinking out loud" });
+    return { finished: true, summary: "ok", turns: 1, toolCalls: 0, filesWritten: [], events: [], usage: { prompt: 0, completion: 0, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
+  };
+  const seen: string[] = [];
+  await cloudBurstGenerate(
+    { task: "t", cwd: base, llm: cloudLlm({ baseUrl: "x", apiKey: "y" }) },
+    plans,
+    { concurrency: 3, runOne, onLeadEvent: (e) => seen.push(e.kind) }
+  );
+  assert.equal(streaming.filter((s) => s !== undefined).length, 1, "only one candidate had streamDeltas set");
+  assert.equal(seen.length, 1, "only the lead's events reached the sink");
+  assert.equal(seen[0], "reasoning_delta");
+});
+
+test("without an onLeadEvent sink no candidate pays for streaming", async () => {
+  const base = mkdtempSync(join(tmpdir(), "burst-nolead-"));
+  let streamed = 0;
+  const runOne: RunOne = async (p) => {
+    if (p.streamDeltas) streamed++;
+    return { finished: true, summary: "ok", turns: 1, toolCalls: 0, filesWritten: [], events: [], usage: { prompt: 0, completion: 0, reasoning: 0 }, wallMs: 1, stopReason: "finish", contractTargets: [] };
+  };
+  await cloudBurstGenerate({ task: "t", cwd: base, llm: cloudLlm({ baseUrl: "x", apiKey: "y" }) }, planAttempts(2), { runOne });
+  assert.equal(streamed, 0, "streaming without a sink is pointless work");
+});

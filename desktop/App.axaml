@@ -115,6 +115,34 @@
       <Setter Property="FontSize" Value="11.5" />
     </Style>
 
+    <!-- The effort dial: a joined segmented control. Quiet until checked; the checked segment carries
+         the accent so the current level reads at a glance. -->
+    <Style Selector="ToggleButton.segment">
+      <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush2}" />
+      <Setter Property="BorderThickness" Value="1,1,0,1" />
+      <Setter Property="CornerRadius" Value="0" />
+      <Setter Property="Padding" Value="10,4" />
+      <Setter Property="FontSize" Value="11.5" />
+      <Setter Property="Cursor" Value="Hand" />
+    </Style>
+    <Style Selector="ToggleButton.segment.first">
+      <Setter Property="CornerRadius" Value="6,0,0,6" />
+    </Style>
+    <Style Selector="ToggleButton.segment.last">
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="0,6,6,0" />
+    </Style>
+    <Style Selector="ToggleButton.segment:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource Surface3Brush}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource TextBrush}" />
+    </Style>
+    <Style Selector="ToggleButton.segment:checked /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource AccentSoftBrush}" />
+      <Setter Property="TextBlock.Foreground" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
     <Style Selector="TextBox">
       <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />

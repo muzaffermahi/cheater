@@ -9,7 +9,6 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { SidecarAssist } from "./sidecarAssist.js";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
@@ -51,7 +50,7 @@ export async function runWeb(argv: string[] = process.argv.slice(2)): Promise<vo
   const settings = loadKittenSettings(cwd);
   const resolvedModel = modelFlagProvided ? model : settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: settings.approvalPolicy, taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: settings.approvalPolicy, taskCompiler: settings.taskCompiler });
   app.recover();
 
   const server = await startWebServer({ app, store, cwd, port, model: resolvedModel });
@@ -102,7 +101,7 @@ export async function runServe(argv: string[] = process.argv.slice(2)): Promise<
   const settings = loadKittenSettings(cwd);
   const resolvedModel = modelFlagProvided ? model : settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: settings.approvalPolicy, taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
+  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: settings.approvalPolicy, taskCompiler: settings.taskCompiler });
   app.recover();
 
   const MASCOT_STATES: MascotState[] = ["ready", "thinking", "working", "sampling", "verifying", "success", "blocked", "sleeping"];

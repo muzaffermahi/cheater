@@ -30,6 +30,13 @@ export interface TaskGraphEvent {
   status: TaskNodeStatus;
   report?: string;
   evidence?: string[];
+  /** The conversation the node belongs to — lets a subscriber bridge into the durable event stream. */
+  conversationId: string;
+  /** The parent run driving this settle (from runUntilSettled opts); absent for resume/plan edits. */
+  runId?: string;
+  /** Bounded objective + agent, so a bridge can label the step without a store round-trip. */
+  label: string;
+  agent: string;
 }
 
 export interface TaskGraphPlan {
@@ -106,7 +113,7 @@ export class TaskGraphController {
     for (const node of this.list(conversationId)) {
       if (!recoverable.includes(node.status) || node.status === "queued") continue;
       this.store.updateTaskNode(node.id, { status: "queued", report: "", evidence: [], ts: this.now() });
-      this.emit({ type: "task.started", taskNodeId: node.id, status: "queued" });
+      this.emit({ type: "task.started", taskNodeId: node.id, status: "queued", ...identity(node) });
     }
     return this.list(conversationId);
   }
@@ -118,7 +125,7 @@ export class TaskGraphController {
   }
 
   /** Run all currently runnable nodes until the graph reaches a terminal state. */
-  async runUntilSettled(conversationId: string, executor: (node: TaskNodeRow, capsule: TaskCapsule, signal: AbortSignal) => Promise<TaskExecutionResult>, opts: { maxConcurrent?: number; /** Adapt concurrency to the currently-ready work (for example, serialize main-model nodes but fan out sidecar scouts). */ maxConcurrentFor?: (ready: TaskNodeRow[]) => number; repoBrief?: string; knownFacts?: string[]; signal?: AbortSignal } = {}): Promise<TaskNodeRow[]> {
+  async runUntilSettled(conversationId: string, executor: (node: TaskNodeRow, capsule: TaskCapsule, signal: AbortSignal) => Promise<TaskExecutionResult>, opts: { maxConcurrent?: number; /** Adapt concurrency to the currently-ready work (for example, serialize main-model nodes but fan out sidecar scouts). */ maxConcurrentFor?: (ready: TaskNodeRow[]) => number; repoBrief?: string; knownFacts?: string[]; signal?: AbortSignal; /** The parent run driving this settle; stamped on every emitted TaskGraphEvent. */ runId?: string } = {}): Promise<TaskNodeRow[]> {
     const maxConcurrent = Math.max(1, Math.floor(opts.maxConcurrent ?? 1));
     const active = new Map<string, Promise<void>>();
     const runOne = async (node: TaskNodeRow): Promise<void> => {
@@ -126,16 +133,16 @@ export class TaskGraphController {
       const cancel = (): void => controller.abort(opts.signal?.reason ?? "cancelled");
       if (opts.signal?.aborted) cancel(); else opts.signal?.addEventListener("abort", cancel, { once: true });
       this.update(node.id, "running");
-      this.emit({ type: "task.started", taskNodeId: node.id, status: "running" });
+      this.emit({ type: "task.started", taskNodeId: node.id, status: "running", ...identity(node, opts.runId) });
       try {
         const result = await executor(node, buildTaskCapsule(node, opts.repoBrief ?? "", opts.knownFacts), controller.signal);
         this.store.updateTaskNode(node.id, { status: result.verified === false ? "waiting" : "completed", report: result.report, evidence: result.evidence, ts: this.now() });
         const status = result.verified === false ? "waiting" : "completed";
-        this.emit({ type: "task.completed", taskNodeId: node.id, status, report: result.report, evidence: result.evidence });
+        this.emit({ type: "task.completed", taskNodeId: node.id, status, report: result.report, evidence: result.evidence, ...identity(node, opts.runId) });
       } catch (error) {
         const report = error instanceof Error ? error.message : String(error);
         this.store.updateTaskNode(node.id, { status: controller.signal.aborted ? "cancelled" : "failed", report, evidence: [], ts: this.now() });
-        this.emit({ type: "task.failed", taskNodeId: node.id, status: controller.signal.aborted ? "cancelled" : "failed", report });
+        this.emit({ type: "task.failed", taskNodeId: node.id, status: controller.signal.aborted ? "cancelled" : "failed", report, ...identity(node, opts.runId) });
       } finally {
         if (opts.signal?.aborted) controller.abort(opts.signal.reason);
         active.delete(node.id);
@@ -150,7 +157,7 @@ export class TaskGraphController {
       for (const node of nodes) {
         if (node.status === "queued" && node.dependencies.some((id) => ["failed", "cancelled", "blocked", "interrupted"].includes(byId.get(id)?.status ?? ""))) {
           this.update(node.id, "blocked");
-          this.emit({ type: "task.blocked", taskNodeId: node.id, status: "blocked", report: "dependency did not complete" });
+          this.emit({ type: "task.blocked", taskNodeId: node.id, status: "blocked", report: "dependency did not complete", ...identity(node, opts.runId) });
         }
       }
       const ready = this.ready(conversationId);
@@ -163,7 +170,7 @@ export class TaskGraphController {
         // Remaining queued nodes are necessarily cyclic or depend on a non-terminal waiting node.
         for (const node of this.list(conversationId).filter((n) => n.status === "queued")) {
           this.update(node.id, "blocked");
-          this.emit({ type: "task.blocked", taskNodeId: node.id, status: "blocked", report: "no runnable dependency path" });
+          this.emit({ type: "task.blocked", taskNodeId: node.id, status: "blocked", report: "no runnable dependency path", ...identity(node, opts.runId) });
         }
         break;
       }
@@ -174,4 +181,9 @@ export class TaskGraphController {
 
   private update(id: string, status: TaskNodeStatus): void { this.store.updateTaskNode(id, { status, ts: this.now() }); }
   private emit(event: TaskGraphEvent): void { for (const listener of this.listeners) { try { listener(event); } catch {} } }
+}
+
+/** The identity fields every TaskGraphEvent carries, derived from the node row itself. */
+function identity(node: TaskNodeRow, runId?: string): { conversationId: string; runId?: string; label: string; agent: string } {
+  return { conversationId: node.conversationId, ...(runId ? { runId } : {}), label: node.objective.slice(0, 120), agent: node.agent };
 }

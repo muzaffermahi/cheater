@@ -6,7 +6,7 @@ name: Desktop
 
 on:
   push:
-    branches: [main, kitten-product, kitten-hardening]
+    branches: [main, kitten-product, kitten-hardening, kitten-desktop-king]
     paths:
       - 'desktop/**'
       - 'cheater-pi/src/core/desktopEngine.ts'
@@ -39,6 +39,13 @@ jobs:
         with:
           node-version: '22'
 
+      # The shell build embeds the TypeScript engine, so its toolchain must exist before MSBuild.
+      - name: Install and build engine
+        working-directory: cheater-pi
+        run: |
+          npm install
+          npm run build
+
       # Warnings are errors here: an unused-variable warning in the shell is how a half-finished
       # handler ships.
       - name: Build native shell
@@ -51,13 +58,11 @@ jobs:
 
       - name: Publish self-contained shell
         working-directory: desktop
-        run: dotnet publish Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -o ${{ github.workspace }}/artifacts/kitten-desktop
+        run: dotnet publish Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.3 -o ${{ github.workspace }}/artifacts/kitten-desktop
 
-      - name: Build engine
-        working-directory: cheater-pi
-        run: |
-          npm install
-          npm run build
+      - name: Publish self-contained installer
+        working-directory: desktop/Installer
+        run: dotnet publish Kitten.Setup.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.3 -o ${{ github.workspace }}/artifacts/kitten-setup
 
       # The bundled engine needs its own Node runtime; the packager refuses to assemble without one.
       - name: Stage Node runtime for the bundle
@@ -65,22 +70,26 @@ jobs:
         run: |
           $node = (Get-Command node).Source
           Copy-Item $node "${{ github.workspace }}/artifacts/node.exe"
-          "KITTEN_NODE_EXE=${{ github.workspace }}/artifacts/node.exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Assemble native bundle
+      # The FULL release packager, not the raw bundler: it forbids a payload without the installer,
+      # runs the IPC smoke (incl. the unauthenticated-client refusal), writes release.json, and zips.
+      # Skipping it in CI is exactly how the runtime114 release shipped with no Kitten.Setup.exe.
+      - name: Package release bundle (installer + smoke + zip)
+        shell: pwsh
         working-directory: cheater-pi
-        run: node scripts/package-desktop.mjs --publish ${{ github.workspace }}/artifacts/kitten-desktop --out ${{ github.workspace }}/artifacts/kitten-desktop-bundle
-
-      # Launches the bundled hidden engine for real and proves the IPC contract, including that an
-      # unauthenticated local client is refused. A shipped engine open to any local process fails here.
-      - name: Native engine IPC smoke
-        working-directory: cheater-pi
-        run: node scripts/native-engine-smoke.mjs --bundle ${{ github.workspace }}/artifacts/kitten-desktop-bundle --project-root ${{ github.workspace }}
+        run: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-desktop-release.ps1
+          -Publish "${{ github.workspace }}/artifacts/kitten-desktop"
+          -Out "${{ github.workspace }}/artifacts/kitten-desktop-bundle"
+          -NodeExe "${{ github.workspace }}/artifacts/node.exe"
+          -SetupExe "${{ github.workspace }}/artifacts/kitten-setup/Kitten.Setup.exe"
 
       - name: Upload bundle
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kitten-desktop-bundle
-          path: ${{ github.workspace }}/artifacts/kitten-desktop-bundle
+          path: |
+            ${{ github.workspace }}/artifacts/kitten-desktop-bundle.zip
+            ${{ github.workspace }}/artifacts/kitten-desktop-bundle.zip.sha256
           if-no-files-found: warn

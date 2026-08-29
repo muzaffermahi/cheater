@@ -1,6 +1,9 @@
+using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
 using System.IO;
@@ -11,13 +14,24 @@ namespace Kitten.Desktop;
 
 public partial class MainWindow : Window
 {
-    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId, long UpdatedAt)
+    private sealed record ConversationItem(string Id, string Title, string ProjectRoot, string Agent, string? ParentConversationId, long UpdatedAt, string Effort = "balanced")
     {
-        public override string ToString()
+        public override string ToString() => Display;
+
+        /// <summary>Rows bind to these rather than to ToString(), so a project and a session can look
+        /// like the different things they are instead of sharing one indistinguishable template.</summary>
+        public bool IsProject => false;
+        public bool IsSession => true;
+        public string Detail => "";
+
+        public string Display
         {
-            var branch = string.IsNullOrWhiteSpace(ParentConversationId) ? "" : "↳ ";
-            var role = string.IsNullOrWhiteSpace(Agent) || string.Equals(Agent, "general", StringComparison.OrdinalIgnoreCase) ? "" : $"[{Agent}] ";
-            return $"{branch}{role}{Title}";
+            get
+            {
+                var branch = string.IsNullOrWhiteSpace(ParentConversationId) ? "" : "↳ ";
+                var role = string.IsNullOrWhiteSpace(Agent) || string.Equals(Agent, "general", StringComparison.OrdinalIgnoreCase) ? "" : $"[{Agent}] ";
+                return $"{branch}{role}{Title}";
+            }
         }
 
         /// <summary>Recency, because several sessions in one project often share the same opening line.</summary>
@@ -36,9 +50,49 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>The workspace a launcher/shortcut asked for (`--project-root`), consumed on connect.</summary>
+    public static string? InitialProjectRoot;
+
+    /// <summary>A project header row in the sessions list. Not selectable; purely structure.</summary>
+    private sealed record ProjectGroupHeader(string Root)
+    {
+        public override string ToString() => Display;
+        public bool IsProject => true;
+        public bool IsSession => false;
+        public string Age => "";
+
+        /// <summary>The folder's own name — what a person calls the project.</summary>
+        public string Display => string.IsNullOrWhiteSpace(Root) ? "No project" : Path.GetFileName(Path.TrimEndingDirectorySeparator(Root));
+
+        /// <summary>Where it actually is. Two checkouts can share a name, and "which one is this?"
+        /// was unanswerable from the rail — the parent folder is what tells them apart.</summary>
+        public string Detail
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(Root)) return "not attached to a folder";
+                var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(Root));
+                if (string.IsNullOrWhiteSpace(parent)) return Root;
+                var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                return !string.IsNullOrWhiteSpace(home) && parent.StartsWith(home, StringComparison.OrdinalIgnoreCase)
+                    ? "~" + parent[home.Length..]
+                    : parent;
+            }
+        }
+    }
+
     private EngineClient? _engine;
     private readonly TranscriptView _transcript;
+    private readonly ActivityPanel _activity;
+    private readonly WorkPanel _work = new();
     private readonly EngineProcess _engineProcess = new();
+    private string _effort = "balanced";
+    private string? _lastSubmittedText;
+    private DateTimeOffset _lastRunEventAt = DateTimeOffset.UtcNow;
+    private bool _stallWarned;
+    private readonly DispatcherTimer _stallTimer = new() { Interval = TimeSpan.FromSeconds(15) };
+    /// <summary>Once a runtime.state push arrives, the poll's own offline verdict stops competing with it.</summary>
+    private bool _runtimeStatePushed;
     private readonly List<ConversationItem> _conversationItems = new();
     private string? _conversationId;
     private string _conversationSearch = "";
@@ -46,6 +100,8 @@ public partial class MainWindow : Window
     private string? _lastCompletedRunId;
     private string? _activeTaskId;
     private string? _lastPlanRequest;
+    private string? _activePlanId;
+    private int? _activePlanRevision;
     private string? _approvalRunId;
     private string? _approvalCallId;
     private string[] _suggestedCommands = Array.Empty<string>();
@@ -60,11 +116,34 @@ public partial class MainWindow : Window
     private readonly HashSet<string> _activeRunFiles = new(StringComparer.OrdinalIgnoreCase);
     private int _activeRunAdded;
     private int _activeRunRemoved;
+    /// <summary>Built on first use; it lives in the window rather than in a dialog stack.</summary>
+    private SettingsView? _settings;
+    /// <summary>The reconnect in flight, so concurrent callers join it instead of racing it.</summary>
+    private Task? _connecting;
+    /// <summary>Whether the last drop already spent its one free automatic reconnect.</summary>
+    private bool _autoReconnected;
 
     public MainWindow()
     {
         InitializeComponent();
         _transcript = new TranscriptView(TranscriptHost, TranscriptScroll);
+        _activity = new ActivityPanel(RunMeta, RouteLine, PlanCard, PlanGoal, PlanContract, PlanSteps, PlanDetailButton, CurrentToolLine, VerificationLine);
+        WorkHost.Content = _work.Root;
+        MascotHost.Content = _work.Mascot;
+        WireAutoVisibility();
+        // The stall watchdog: a run with NO events for 90s is the "is it dead?" moment — say something
+        // instead of letting the user stare at a silent window.
+        _stallTimer.Tick += (_, _) =>
+        {
+            if (_activeRunId is null) { _stallWarned = false; return; }
+            var silentFor = DateTimeOffset.UtcNow - _lastRunEventAt;
+            if (silentFor > TimeSpan.FromSeconds(90) && !_stallWarned)
+            {
+                _stallWarned = true;
+                Activity.Text = $"Quiet for {(int)silentFor.TotalSeconds}s — normal for a long generation, but Stop and Retry if it persists.";
+            }
+        };
+        _stallTimer.Start();
     }
 
     private async void OnOpened(object? sender, EventArgs e)
@@ -79,17 +158,34 @@ public partial class MainWindow : Window
         finally { RetryEngineButton.IsEnabled = _engine is null; }
     }
 
-    private async Task ConnectEngineAsync()
+    /// <summary>
+    /// Connect, or join the connection already in progress. Two callers racing here — the window
+    /// opening while a panel asks for a handle — each spawned an engine and each registered the event
+    /// handlers, so every run event afterwards arrived twice.
+    /// </summary>
+    private Task ConnectEngineAsync()
+    {
+        if (_engine is not null) return Task.CompletedTask;
+        if (_connecting is { IsCompleted: false } inFlight) return inFlight;
+        var attempt = ConnectEngineCoreAsync();
+        _connecting = attempt;
+        return attempt;
+    }
+
+    private async Task ConnectEngineCoreAsync()
     {
         if (_engine is not null) return;
         try
         {
             Exception? last = null;
+            // A restart must reconnect against the workspace the user is actually in, not the install
+            // directory the shell happens to run from.
+            var engineRoot = InitialProjectRoot ?? _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             for (var attempt = 0; attempt < 3 && _engine is null; attempt++)
             {
                 try
                 {
-                    _engineProcess.Start();
+                    _engineProcess.Start(engineRoot);
                     _engine = await EngineClient.ConnectAsync();
                 }
                 catch (Exception ex)
@@ -104,13 +200,23 @@ public partial class MainWindow : Window
             _engine.Disconnected += OnEngineDisconnected;
             SetEngineState(EngineState.Connected, "Engine connected");
             RetryEngineButton.IsEnabled = false;
+            _autoReconnected = false;
             await RefreshModelStatusAsync();
             await RefreshConversationsAsync();
+            // A launch that named a workspace lands in it — most recent matching session, or a new one.
+            if (InitialProjectRoot is { } initialRoot)
+            {
+                InitialProjectRoot = null;
+                await OpenOrCreateForProjectAsync(initialRoot);
+            }
         }
         catch (Exception ex)
         {
-            SetEngineState(EngineState.Failed, $"Engine unavailable: {ex.Message}");
-            Activity.Text = "Install a complete Kitten package or repair the local engine.";
+            // Never the raw envelope. "engine handshake token is invalid" is a security-shaped
+            // string for what is almost always a leftover file from a crashed engine, and it told the
+            // user nothing they could act on.
+            SetEngineState(EngineState.Failed, "Engine unavailable");
+            Activity.Text = $"Kitten's background engine did not start. Press Retry — if it keeps failing, the installation may be incomplete.\n{SummariseEngineError(ex.Message)}";
             RetryEngineButton.IsEnabled = true;
         }
     }
@@ -120,6 +226,34 @@ public partial class MainWindow : Window
         if (_engine is not null) await _engine.DisposeAsync();
         _engineProcess.Dispose();
         base.OnClosed(e);
+    }
+
+    /// <summary>A second launch knocked on the activation pipe: come forward, switch project if asked.</summary>
+    public async void ActivateFromSecondInstance(string? projectRoot)
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Show();
+        Activate();
+        if (!string.IsNullOrWhiteSpace(projectRoot)) await OpenOrCreateForProjectAsync(projectRoot!);
+    }
+
+    /// <summary>Land in the named workspace: most recent matching session, or a fresh task in it.</summary>
+    private async Task OpenOrCreateForProjectAsync(string projectRoot)
+    {
+        if (_engine is null) return;
+        try
+        {
+            var existing = _conversationItems.FirstOrDefault(item => string.Equals(Path.TrimEndingDirectorySeparator(item.ProjectRoot), Path.TrimEndingDirectorySeparator(projectRoot), StringComparison.OrdinalIgnoreCase));
+            if (existing is not null)
+            {
+                ConversationList.SelectedItem = existing;
+                return;
+            }
+            var result = await _engine.CallAsync("conversation.create", new { title = "New task", projectRoot, agent = "general" });
+            var id = result?.ValueKind == JsonValueKind.Object && result.Value.TryGetProperty("id", out var idValue) ? idValue.GetString() : null;
+            await RefreshConversationsAsync(id);
+        }
+        catch (Exception ex) { Activity.Text = $"Could not open {projectRoot}: {ex.Message}"; }
     }
 
     private async Task RefreshConversationsAsync(string? selectId = null)
@@ -138,10 +272,22 @@ public partial class MainWindow : Window
                 item.TryGetProperty("projectRoot", out var root) ? root.GetString() ?? "" : "",
                 item.TryGetProperty("agent", out var agent) ? agent.GetString() ?? "general" : "general",
                 item.TryGetProperty("parentConversationId", out var parent) && parent.ValueKind == JsonValueKind.String ? parent.GetString() : null,
-                item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0));
+                item.TryGetProperty("updatedAt", out var updated) && updated.ValueKind == JsonValueKind.Number ? updated.GetInt64() : 0,
+                item.TryGetProperty("effort", out var effort) && effort.ValueKind == JsonValueKind.String ? effort.GetString() ?? "balanced" : "balanced"));
+        }
+        // Sessions live UNDER their project: a header per project root (most recently active project
+        // first), its sessions newest-first beneath it. One project, many sessions — the mental model
+        // the user actually has.
+        var grouped = new List<object>();
+        foreach (var projectGroup in _conversationItems
+            .GroupBy(item => item.ProjectRoot, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Max(item => item.UpdatedAt)))
+        {
+            grouped.Add(new ProjectGroupHeader(projectGroup.Key));
+            grouped.AddRange(projectGroup.OrderByDescending(item => item.UpdatedAt));
         }
         ConversationList.ItemsSource = null;
-        ConversationList.ItemsSource = _conversationItems;
+        ConversationList.ItemsSource = grouped;
         var wanted = selectId is null ? _conversationItems.FirstOrDefault() : _conversationItems.FirstOrDefault(x => x.Id == selectId);
         if (wanted is not null) ConversationList.SelectedItem = wanted;
         else
@@ -149,8 +295,8 @@ public partial class MainWindow : Window
             _conversationId = null;
             SetProject(null);
             _transcript.ShowSystem("Welcome to Kitten.\n\nOpen a project to start a durable coding task. Kitten will inspect the workspace, use the sidecar for bounded planning, and keep the main model focused on implementation.\n\nYou can configure a local endpoint or managed llama.cpp runtime from Configure in the Model controls.");
-            Evidence.Text = "Open a project to begin.";
-            Activity.Text = "Ready — open a project to start.";
+            Evidence.Text = "";
+            Activity.Text = "Open a project to start.";
             SetRunControls(false);
         }
     }
@@ -170,7 +316,12 @@ public partial class MainWindow : Window
             // The status line is one line. Everything else that used to be crammed into it — history
             // budget, hardware guidance, bakeoff winners, runtime state — is detail on hover, because a
             // five-line block wedged into a 24px strip is unreadable and pushed the layout around.
-            var line = new List<string> { main ?? "unknown", $"sidecar {(string.IsNullOrWhiteSpace(sidecar) ? "none" : sidecar)}" };
+            // The live panel names the model actually doing the work, not a generic "main model".
+            _work.SetModels(main ?? "", sidecar ?? "");
+            // The runtime line already names the main model; repeating it here was half the clutter
+            // in a 24px strip. This line carries only what the runtime line does not.
+            var line = new List<string>();
+            if (!string.IsNullOrWhiteSpace(sidecar) && sidecar != "none") line.Add($"sidecar {sidecar}");
             var detail = new List<string> { $"Main model: {main}", $"Sidecar model: {(string.IsNullOrWhiteSpace(sidecar) ? "none" : sidecar)}" };
             if (!string.IsNullOrWhiteSpace(sidecarEndpoint)) detail.Add($"Sidecar endpoint: {sidecarEndpoint}");
             if (value.TryGetProperty("contextWindowTokens", out var contextValue) && contextValue.ValueKind == JsonValueKind.Number)
@@ -180,7 +331,12 @@ public partial class MainWindow : Window
                 line.Add($"{contextTokens / 1000}k ctx");
                 detail.Add($"History budget: ~{historyBudget:n0} of {contextTokens:n0} context tokens");
             }
-            var recommendation = await _engine.CallAsync("model.recommend");
+            // The three independent IPC calls run concurrently — serially they added ~3 probe timeouts
+            // to every conversation activation.
+            var recommendationTask = _engine.CallAsync("model.recommend");
+            var runtimeTask = _engine.CallAsync("runtime.status");
+            var probeTask = _engine.CallAsync("model.probe", new { projectRoot });
+            var recommendation = await recommendationTask;
             if (recommendation is { } guidance && guidance.ValueKind == JsonValueKind.Object && guidance.TryGetProperty("summary", out var summary))
                 detail.Add(summary.GetString() ?? "");
             if (recommendation is { } bakeoffGuidance && bakeoffGuidance.ValueKind == JsonValueKind.Object && bakeoffGuidance.TryGetProperty("latestBakeoff", out var latestBakeoff) && latestBakeoff.ValueKind == JsonValueKind.Object && latestBakeoff.TryGetProperty("recommendations", out var latestRecommendations) && latestRecommendations.ValueKind == JsonValueKind.Array && latestRecommendations.GetArrayLength() > 0)
@@ -194,17 +350,31 @@ public partial class MainWindow : Window
                 });
                 detail.Add($"Last bakeoff: {string.Join(", ", winners)}");
             }
-            var runtime = await _engine.CallAsync("runtime.status");
-            if (runtime is { } runtimeValue && runtimeValue.ValueKind == JsonValueKind.Object && runtimeValue.TryGetProperty("running", out var running))
-                detail.Add($"Managed runtime: {(running.GetBoolean() ? "running" : "stopped")}");
-            var probe = await _engine.CallAsync("model.probe", new { projectRoot });
+            var runtime = await runtimeTask;
+            if (runtime is { } runtimeValue && runtimeValue.ValueKind == JsonValueKind.Object)
+            {
+                if (runtimeValue.TryGetProperty("running", out var running))
+                    detail.Add($"Managed runtime: {(running.GetBoolean() ? "running" : "stopped")}");
+                // Late-joiner seed for the pushed runtime.state stream: a fresh shell learns the current
+                // llama.cpp phase from the status response instead of waiting for the next transition.
+                if (runtimeValue.TryGetProperty("state", out var seededState) && seededState.ValueKind == JsonValueKind.Object)
+                    ApplyRuntimeState(seededState);
+            }
+            var probe = await probeTask;
             var offline = probe is { } probeValue && probeValue.ValueKind == JsonValueKind.Object && probeValue.TryGetProperty("reachable", out var reachable) && !reachable.GetBoolean();
-            // An unreachable endpoint is the one model fact that has to be visible without hovering.
-            if (offline) line.Add("endpoint offline — open Model settings");
+            // An unreachable endpoint is the one model fact that has to be visible without hovering —
+            // unless the pushed runtime.state already owns that story (push and poll must not fight).
+            if (offline && !_runtimeStatePushed) line.Add("endpoint offline — open Settings");
+            if (!_runtimeStatePushed)
+            {
+                RuntimeDot.Fill = (IBrush?)Application.Current?.FindResource(offline ? "ErrBrush" : "OkBrush") ?? RuntimeDot.Fill;
+                RuntimeText.Text = offline ? "model offline" : $"ready · {main}";
+                RuntimeActionButton.IsVisible = offline;
+            }
             ModelText.Text = string.Join("  ·  ", line);
             ToolTip.SetTip(ModelText, string.Join("\n", detail.Where(entry => !string.IsNullOrWhiteSpace(entry))));
         }
-        catch (Exception ex) { ModelText.Text = $"Models unavailable: {ex.Message}"; }
+        catch (Exception ex) { ModelText.Text = $"Models unavailable — {SummariseEngineError(ex.Message)}"; }
     }
 
     private async Task RefreshBakeoffHistoryAsync(string? projectRoot)
@@ -255,7 +425,7 @@ public partial class MainWindow : Window
         if (_engine is null) return;
         try
         {
-            Activity.Text = "Running a bounded model responsiveness probe...";
+            Activity.Text = "Probing responsiveness…";
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             var result = await _engine.CallAsync("model.benchmark-battery", new { projectRoot, samples = 2 });
             if (result is not { } value || value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("rows", out var rows) || rows.ValueKind != JsonValueKind.Array) { Activity.Text = "Benchmark returned no result"; return; }
@@ -268,7 +438,7 @@ public partial class MainWindow : Window
                 var tps = row.TryGetProperty("medianTokensPerSecond", out var tpsValue) && tpsValue.ValueKind == JsonValueKind.Number ? $"{tpsValue.GetDouble():0.0} tok/s" : "n/a";
                 return $"{role} {model}: {ok} successful; median {latency}; {tps}";
             });
-            Activity.Text = string.Join("\n", lines) + "\nSynthetic responsiveness check only; coding quality is not measured here.";
+            Activity.Text = string.Join("\n", lines) + "\nResponsiveness only — this says nothing about coding quality.";
         }
         catch (Exception ex) { Activity.Text = $"Benchmark failed: {ex.Message}"; }
     }
@@ -278,7 +448,7 @@ public partial class MainWindow : Window
         if (_engine is null) return;
         try
         {
-            Activity.Text = "Running isolated coding-quality probe (up to 3 tasks per model)...";
+            Activity.Text = "Running the coding probe…";
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             var result = await _engine.CallAsync("model.coding-benchmark", new { projectRoot, timeoutMs = 30_000 });
             if (result is not { } value || value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("rows", out var rows) || rows.ValueKind != JsonValueKind.Array)
@@ -295,7 +465,7 @@ public partial class MainWindow : Window
                 var score = row.TryGetProperty("score", out var scoreValue) && scoreValue.ValueKind == JsonValueKind.Number ? $" ({scoreValue.GetDouble():P0})" : "";
                 return $"{role} {model}: {passed}/{total} cases{score}";
             });
-            Activity.Text = string.Join("\n", lines) + "\nSandboxed smoke signal only; validate against your own held-out codebase.";
+            Activity.Text = string.Join("\n", lines) + "\nA sandboxed smoke signal, not a verdict.";
         }
         catch (Exception ex) { Activity.Text = $"Coding probe failed: {ex.Message}"; }
     }
@@ -305,7 +475,7 @@ public partial class MainWindow : Window
         if (_engine is null) return;
         try
         {
-            Activity.Text = "Running held-out multi-file project probe (VM-isolated, no workspace writes)...";
+            Activity.Text = "Running the held-out project probe…";
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             var result = await _engine.CallAsync("model.project-benchmark", new { projectRoot, timeoutMs = 90_000 });
             if (result is not { } value || value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("rows", out var rows) || rows.ValueKind != JsonValueKind.Array)
@@ -322,7 +492,7 @@ public partial class MainWindow : Window
                 var score = row.TryGetProperty("score", out var scoreValue) && scoreValue.ValueKind == JsonValueKind.Number ? $" ({scoreValue.GetDouble():P0})" : "";
                 return $"{role} {model}: {passed}/{total} hidden project cases{score}";
             });
-            Activity.Text = string.Join("\n", lines) + "\nHeld-out signal only; generated files never touched the project or ran shell/network code.";
+            Activity.Text = string.Join("\n", lines) + "\nHeld-out signal only — nothing ran against your project.";
         }
         catch (Exception ex) { Activity.Text = $"Project probe failed: {ex.Message}"; }
     }
@@ -336,7 +506,7 @@ public partial class MainWindow : Window
         ShowBakeoffSection(true);
         try
         {
-            Activity.Text = "Running full local-model bakeoff (coding + held-out project tasks; up to 90 seconds per request)...";
+            Activity.Text = "Running the full bakeoff — up to 90s per request.";
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
             var candidates = new List<object>();
             try
@@ -384,7 +554,7 @@ public partial class MainWindow : Window
             ApplyBakeoffButton.IsEnabled = _bakeoffRecommendations.Count > 0;
             _lastBakeoffReportPath = value.TryGetProperty("reportPath", out var reportPathValue) && reportPathValue.ValueKind == JsonValueKind.String ? reportPathValue.GetString() : null;
             ViewBakeoffReportButton.IsEnabled = !string.IsNullOrWhiteSpace(_lastBakeoffReportPath);
-            Activity.Text = string.Join("\n", lines) + "\nRecommendation is based only on isolated local signals; review the saved report before changing models." + (string.IsNullOrWhiteSpace(_lastBakeoffReportPath) ? "" : $"\nSaved report: {_lastBakeoffReportPath}");
+            Activity.Text = string.Join("\n", lines) + "\nIsolated local signals only — read the report before switching." + (string.IsNullOrWhiteSpace(_lastBakeoffReportPath) ? "" : $"\nSaved report: {_lastBakeoffReportPath}");
         }
         catch (Exception ex) { Activity.Text = $"Bakeoff failed: {ex.Message}"; }
         finally { _activeBakeoffId = null; CancelBakeoffButton.IsEnabled = false; }
@@ -406,7 +576,7 @@ public partial class MainWindow : Window
                 Title = "Kitten bakeoff report",
                 Width = 900,
                 Height = 680,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new DockPanel
                 {
                     Margin = new Avalonia.Thickness(18),
@@ -433,7 +603,7 @@ public partial class MainWindow : Window
             Title = "Apply bakeoff winners",
             Width = 620,
             Height = 360,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -476,7 +646,7 @@ public partial class MainWindow : Window
         try
         {
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-            Activity.Text = "Validating configured models against the local endpoint...";
+            Activity.Text = "Validating the configured models…";
             var main = await _engine.CallAsync("model.validate", new { role = "main", projectRoot, probe = true, timeoutMs = 10_000 });
             var sidecar = await _engine.CallAsync("model.validate", new { role = "sidecar", projectRoot, probe = true, timeoutMs = 10_000 });
             static string Format(JsonElement? value, string role)
@@ -498,7 +668,7 @@ public partial class MainWindow : Window
         try
         {
             var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-            Activity.Text = "Checking configured models and a bounded set of local candidates...";
+            Activity.Text = "Checking models and local candidates…";
             var checks = new[]
             {
                 (Role: "main", Result: await _engine.CallAsync("model.health", new { role = "main", projectRoot, timeoutMs = 2500, maxCandidates = 8 })),
@@ -538,7 +708,7 @@ public partial class MainWindow : Window
                 Title = "Kitten model recovery",
                 Width = 640,
                 Height = Math.Min(520, 180 + candidates.Count * 64),
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             };
             var content = new StackPanel { Margin = new Avalonia.Thickness(24), Spacing = 10 };
             content.Children.Add(new TextBlock { Text = "Nothing changes automatically. Select a responding candidate only when you want to use it.", TextWrapping = Avalonia.Media.TextWrapping.Wrap });
@@ -613,7 +783,7 @@ public partial class MainWindow : Window
             Title = "Kitten workspace explorer",
             Width = 900,
             Height = 760,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -691,7 +861,7 @@ public partial class MainWindow : Window
             Title = "Kitten agent library",
             Width = 900,
             Height = 680,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             // The definition list is long, so the actions dock instead of scrolling out of reach.
             Content = new DockPanel
             {
@@ -752,7 +922,7 @@ public partial class MainWindow : Window
             var createDialog = new Window
             {
                 Title = "Create project agent", Width = 560, Height = 520,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new StackPanel
                 {
                     Margin = new Avalonia.Thickness(24), Spacing = 12,
@@ -811,7 +981,7 @@ public partial class MainWindow : Window
                 Title = "Run Kitten subagent",
                 Width = 640,
                 Height = 420,
-                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
                 Content = new StackPanel
                 {
                     Margin = new Avalonia.Thickness(24), Spacing = 12,
@@ -984,7 +1154,7 @@ public partial class MainWindow : Window
             Title = "Kitten task board",
             Width = 860,
             Height = 640,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1065,7 +1235,7 @@ public partial class MainWindow : Window
             Title = "Kitten changes",
             Width = 980,
             Height = 760,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1182,7 +1352,7 @@ public partial class MainWindow : Window
             Title = "Kitten sidecar toolbox",
             Width = 780,
             Height = 680,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -1295,356 +1465,63 @@ public partial class MainWindow : Window
         await dialog.ShowDialog(this);
     }
 
-    private async void ConfigureModels(object? sender, RoutedEventArgs e)
+    /// <summary>
+    /// Open the settings panel. It replaces the old "Model settings" dialog outright: the same values,
+    /// but as a surface inside the window with the groups on the left, plus the runtime's live log and
+    /// launch command that used to be a second dialog nobody could find.
+    /// </summary>
+    private void ConfigureModels(object? sender, RoutedEventArgs e) => ShowSettings();
+
+    private void ToggleSettings(object? sender, RoutedEventArgs e)
     {
-        if (_engine is null) return;
-        var endpoint = new TextBox { Watermark = "OpenAI-compatible endpoint", MinWidth = 420 };
-        var sidecarEndpoint = new TextBox { Watermark = "Sidecar endpoint (optional; defaults to the main endpoint)", MinWidth = 420 };
-        var main = new TextBox { Watermark = "Main model (35B-200B)", MinWidth = 420 };
-        var sidecar = new TextBox { Watermark = "Sidecar model (2B-9B)", MinWidth = 420 };
-        var runtimeExecutable = new TextBox { Watermark = "Local runtime executable (for example llama-server.exe)", MinWidth = 420 };
-        var mainModelPath = new TextBox { Watermark = "Main model file (.gguf)", MinWidth = 420 };
-        var sidecarModelPath = new TextBox { Watermark = "Sidecar model file (.gguf, optional)", MinWidth = 420 };
-        var discoverStatus = new TextBlock { Text = "", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 };
-        var findLocal = new Button { Content = "Find local endpoint" };
-        var discover = new Button { Content = "Discover models at endpoint" };
-        var importCatalog = new Button { Content = "Import verified catalog JSON" };
-        var downloadCatalog = new Button { Content = "Download catalog entries", IsEnabled = false };
-        var cancelDownload = new Button { Content = "Cancel download", IsEnabled = false };
-        var startRuntime = new Button { Content = "Start local runtime" };
-        var stopRuntime = new Button { Content = "Stop local runtime" };
-        var runtimeStatus = new TextBlock { Text = "", TextWrapping = Avalonia.Media.TextWrapping.Wrap, Opacity = 0.75 };
-        var browseRuntime = new Button { Content = "Browse runtime" };
-        var findRuntime = new Button { Content = "Find installed runtime" };
-        var browseMainModel = new Button { Content = "Browse main model" };
-        var browseSidecarModel = new Button { Content = "Browse sidecar model" };
-        JsonElement[] catalogEntries = Array.Empty<JsonElement>();
-        string? activeDownloadId = null;
-        try
+        if (SettingsHost.IsVisible) HideSettings();
+        else ShowSettings();
+    }
+
+    private void ToggleContextDrawer(object? sender, RoutedEventArgs e)
+    {
+        ContextDrawer.IsVisible = !ContextDrawer.IsVisible;
+        ContextButton.Content = ContextDrawer.IsVisible ? "Hide activity" : "Activity";
+    }
+
+    private void ShowSettings(string? section = null)
+    {
+        // Settings opens whether or not the engine is up. It is the screen you go to WHEN something is
+        // wrong, so refusing to open it until everything is right was exactly backwards; each field
+        // asks for a live engine itself, and reconnects if it has to.
+        if (_settings is null)
         {
-            var selectedProjectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-            var current = await _engine.CallAsync("settings.inspect", new { projectRoot = selectedProjectRoot });
-            if (current is { } value && value.ValueKind == JsonValueKind.Object)
-            {
-                var models = value.GetProperty("models");
-                endpoint.Text = models.GetProperty("baseUrl").GetString();
-                if (models.TryGetProperty("sidecarBaseUrl", out var sidecarEndpointValue) && sidecarEndpointValue.ValueKind == JsonValueKind.String) sidecarEndpoint.Text = sidecarEndpointValue.GetString();
-                main.Text = models.GetProperty("main").GetString();
-                sidecar.Text = models.GetProperty("sidecar").GetString();
-                if (value.TryGetProperty("managedRuntime", out var managedRuntime) && managedRuntime.ValueKind == JsonValueKind.Object)
-                {
-                    if (managedRuntime.TryGetProperty("executable", out var executable) && executable.ValueKind == JsonValueKind.String) runtimeExecutable.Text = executable.GetString();
-                    if (managedRuntime.TryGetProperty("mainModelPath", out var mainPath) && mainPath.ValueKind == JsonValueKind.String) mainModelPath.Text = mainPath.GetString();
-                    if (managedRuntime.TryGetProperty("sidecarModelPath", out var sidecarPath) && sidecarPath.ValueKind == JsonValueKind.String) sidecarModelPath.Text = sidecarPath.GetString();
-                }
-            }
+            _settings = new SettingsView(
+                EnsureEngineAsync,
+                this,
+                () => _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot,
+                message => Activity.Text = message,
+                HideSettings,
+                RefreshModelStatusAsync);
+            SettingsHost.Child = _settings.Root;
         }
-        catch { }
-        var save = new Button { Content = "Save for this project" };
-        var cancel = new Button { Content = "Cancel" };
-        // Every field is labelled and every button row wraps. Fixed-width inputs beside non-wrapping
-        // button rows overflowed the window: the description, the last button in each row and the Save
-        // row were all clipped off the edge, and the two model fields showed bare values with no idea
-        // which was which once a watermark had been replaced.
-        save.Classes.Add("primary");
-        foreach (var input in new[] { endpoint, sidecarEndpoint, main, sidecar, runtimeExecutable, mainModelPath, sidecarModelPath }) input.MinWidth = 260;
-        // Each field now carries a label, so a watermark that repeats it is just noise. Keep watermarks
-        // only where they add an example.
-        endpoint.Watermark = "http://localhost:1234/v1";
-        sidecarEndpoint.Watermark = "";
-        main.Watermark = "";
-        sidecar.Watermark = "";
-        runtimeExecutable.Watermark = "";
-        mainModelPath.Watermark = "";
-        sidecarModelPath.Watermark = "";
-        var dialog = new Window
-        {
-            Title = "Kitten model setup",
-            Width = 780,
-            Height = 720,
-            MinWidth = 560,
-            MinHeight = 420,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            // Save and Cancel are docked, not scrolled: the primary action must never be below the fold.
-            Content = new DockPanel
-            {
-                LastChildFill = true,
-                Children =
-                {
-                    new Border
-                    {
-                        [DockPanel.DockProperty] = Dock.Bottom,
-                        Padding = new Avalonia.Thickness(24, 12),
-                        BorderThickness = new Avalonia.Thickness(0, 1, 0, 0),
-                        BorderBrush = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#26262e")),
-                        Child = ButtonRow(save, cancel),
-                    },
-                    new ScrollViewer
-                    {
-                        VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
-                        Content = new StackPanel
-                        {
-                            Margin = new Avalonia.Thickness(24),
-                            Spacing = 14,
-                            Children =
-                            {
-                        Section("Endpoint"),
-                        Hint("Kitten talks to an OpenAI-compatible local server. The sidecar handles clerical work so the main model stays on the code."),
-                        Field("Main endpoint", endpoint),
-                        Field("Sidecar endpoint (optional — defaults to the main endpoint)", sidecarEndpoint),
-                        ButtonRow(findLocal, discover, importCatalog, downloadCatalog, cancelDownload),
-                        discoverStatus,
-                        Section("Models"),
-                        Field("Main model (35B–200B)", main),
-                        Field("Sidecar model (2B–9B)", sidecar),
-                        Section("Managed local runtime"),
-                        Hint("Optional. Point Kitten at a llama.cpp server and it starts and stops it for you — no terminal."),
-                        Field("Runtime executable (for example llama-server.exe)", PathRow(runtimeExecutable, browseRuntime, findRuntime)),
-                        Field("Main model file (.gguf)", PathRow(mainModelPath, browseMainModel)),
-                        Field("Sidecar model file (.gguf, optional)", PathRow(sidecarModelPath, browseSidecarModel)),
-                                ButtonRow(startRuntime, stopRuntime),
-                                runtimeStatus,
-                            },
-                        },
-                    },
-                },
-            },
-        };
-        cancel.Click += async (_, _) =>
-        {
-            if (activeDownloadId is not null)
-            {
-                try { await _engine.CallAsync("model.download.cancel", new { id = activeDownloadId }); } catch { }
-                activeDownloadId = null;
-            }
-            dialog.Close();
-        };
-        cancelDownload.Click += async (_, _) =>
-        {
-            if (activeDownloadId is null) return;
-            cancelDownload.IsEnabled = false;
-            discoverStatus.Text = "Cancelling model download...";
-            try { await _engine.CallAsync("model.download.cancel", new { id = activeDownloadId }); }
-            catch (Exception ex) { discoverStatus.Text = $"Download cancellation failed: {ex.Message}"; }
-        };
-        async Task PickModelFileAsync(TextBox target)
-        {
-            var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-            {
-                AllowMultiple = false,
-                Title = "Choose a local model file",
-                FileTypeFilter = new[] { new FilePickerFileType("Model files") { Patterns = new[] { "*.gguf", "*.safetensors", "*.bin" } } },
-            });
-            if (files.Count > 0) target.Text = files[0].Path.LocalPath;
-        }
-        browseRuntime.Click += async (_, _) =>
-        {
-            var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-            {
-                AllowMultiple = false,
-                Title = "Choose the local runtime executable",
-                FileTypeFilter = new[] { new FilePickerFileType("Executable") { Patterns = new[] { "*.exe", "*" } } },
-            });
-            if (files.Count > 0) runtimeExecutable.Text = files[0].Path.LocalPath;
-        };
-        findRuntime.Click += async (_, _) =>
-        {
-            try
-            {
-                var found = await _engine.CallAsync("runtime.discover");
-                if (found is { } value && value.ValueKind == JsonValueKind.Object && value.TryGetProperty("executables", out var executables) && executables.ValueKind == JsonValueKind.Array)
-                {
-                    var first = executables.EnumerateArray().Select(item => item.GetString()).FirstOrDefault(path => !string.IsNullOrWhiteSpace(path));
-                    runtimeExecutable.Text = first ?? runtimeExecutable.Text;
-                    runtimeStatus.Text = first is null ? "No installed llama-server was found on PATH. Browse for one or use an OpenAI-compatible endpoint." : $"Found runtime: {first}";
-                }
-            }
-            catch (Exception ex) { runtimeStatus.Text = $"Runtime discovery failed: {ex.Message}"; }
-        };
-        findLocal.Click += async (_, _) =>
-        {
-            findLocal.IsEnabled = false;
-            discoverStatus.Text = "Checking common local model endpoints...";
-            try
-            {
-                var found = await _engine.CallAsync("model.local-discover", new { timeoutMs = 900 });
-                if (found is { } value && value.ValueKind == JsonValueKind.Array && value.GetArrayLength() > 0)
-                {
-                    var first = value.EnumerateArray().FirstOrDefault(item => item.ValueKind == JsonValueKind.Object && item.TryGetProperty("baseUrl", out var url) && url.ValueKind == JsonValueKind.String);
-                    if (first.ValueKind == JsonValueKind.Object)
-                    {
-                        endpoint.Text = first.GetProperty("baseUrl").GetString();
-                        var models = first.TryGetProperty("models", out var advertised) && advertised.ValueKind == JsonValueKind.Array
-                            ? advertised.EnumerateArray().Select(item => item.GetString()).Where(item => !string.IsNullOrWhiteSpace(item)).Cast<string>().ToArray()
-                            : Array.Empty<string>();
-                        discoverStatus.Text = $"Found local endpoint {endpoint.Text} ({models.Length} advertised model(s)). Click Discover models to populate the tier fields.";
-                    }
-                }
-                else discoverStatus.Text = "No common local endpoint responded. Start LM Studio/llama.cpp or enter an endpoint manually.";
-            }
-            catch (Exception ex) { discoverStatus.Text = $"Local endpoint scan failed: {ex.Message}"; }
-            finally { findLocal.IsEnabled = true; }
-        };
-        browseMainModel.Click += async (_, _) => await PickModelFileAsync(mainModelPath);
-        browseSidecarModel.Click += async (_, _) => await PickModelFileAsync(sidecarModelPath);
-        startRuntime.Click += async (_, _) =>
-        {
-            if (string.IsNullOrWhiteSpace(runtimeExecutable.Text) || string.IsNullOrWhiteSpace(mainModelPath.Text))
-            {
-                runtimeStatus.Text = "Choose the runtime executable and main model file first.";
-                return;
-            }
-            startRuntime.IsEnabled = false;
-            runtimeStatus.Text = "Starting the managed local runtime and checking its endpoint...";
-            try
-            {
-                var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-                var result = await _engine.CallAsync("runtime.start", new
-                {
-                    executable = runtimeExecutable.Text,
-                    mainModelPath = mainModelPath.Text,
-                    sidecarModelPath = string.IsNullOrWhiteSpace(sidecarModelPath.Text) ? null : sidecarModelPath.Text,
-                    baseUrl = endpoint.Text,
-                    sidecarBaseUrl = string.IsNullOrWhiteSpace(sidecarEndpoint.Text) ? null : sidecarEndpoint.Text,
-                    projectRoot,
-                });
-                var reachable = result is { } value && value.ValueKind == JsonValueKind.Object && value.TryGetProperty("probe", out var probe) && probe.TryGetProperty("reachable", out var isReachable) && isReachable.GetBoolean();
-                runtimeStatus.Text = reachable ? "Managed runtime is running and responding." : "Runtime started, but its endpoint did not respond.";
-                await RefreshModelStatusAsync();
-            }
-            catch (Exception ex) { runtimeStatus.Text = $"Runtime start failed: {ex.Message}"; }
-            finally { startRuntime.IsEnabled = true; }
-        };
-        stopRuntime.Click += async (_, _) =>
-        {
-            stopRuntime.IsEnabled = false;
-            try
-            {
-                await _engine.CallAsync("runtime.stop");
-                runtimeStatus.Text = "Managed runtime stopped.";
-                await RefreshModelStatusAsync();
-            }
-            catch (Exception ex) { runtimeStatus.Text = $"Runtime stop failed: {ex.Message}"; }
-            finally { stopRuntime.IsEnabled = true; }
-        };
-        discover.Click += async (_, _) =>
-        {
-            discover.IsEnabled = false;
-            discoverStatus.Text = "Contacting the local model endpoint...";
-            try
-            {
-                var found = await _engine.CallAsync("model.discover", new { baseUrl = endpoint.Text });
-                if (found is { } value && value.ValueKind == JsonValueKind.Object && value.TryGetProperty("models", out var models) && models.ValueKind == JsonValueKind.Array)
-                {
-                    var ids = models.EnumerateArray().Select(item => item.TryGetProperty("id", out var id) ? id.GetString() : null).Where(id => !string.IsNullOrWhiteSpace(id)).Cast<string>().ToArray();
-                    if (ids.Length > 0)
-                    {
-                        // Never trust provider ordering: a local endpoint often advertises the
-                        // lightweight model first. Prefer known-size candidates that fit Kitten's
-                        // lanes, while retaining unknown-size IDs for providers that omit parameter
-                        // counts. The server applies the same contract when settings are saved.
-                        var discoveredMain = ids.FirstOrDefault(id => BakeoffRoleForModel(id) == "main") ?? ids.FirstOrDefault(id => BakeoffRoleForModel(id) is null) ?? ids[0];
-                        var discoveredSidecar = ids.FirstOrDefault(id => BakeoffRoleForModel(id) == "sidecar" && !string.Equals(id, discoveredMain, StringComparison.OrdinalIgnoreCase));
-                        main.Text = discoveredMain;
-                        if (string.IsNullOrWhiteSpace(sidecar.Text) || sidecar.Text == "none") sidecar.Text = discoveredSidecar ?? sidecar.Text;
-                        var mainLabel = discoveredMain;
-                        var sidecarLabel = discoveredSidecar is null ? "no known sidecar candidate" : discoveredSidecar;
-                        discoverStatus.Text = $"Found {ids.Length} model(s). Suggested main: {mainLabel}; sidecar: {sidecarLabel}. Review before saving.";
-                    }
-                    else discoverStatus.Text = "The endpoint responded, but did not advertise any models.";
-                }
-                else discoverStatus.Text = "The endpoint could not be queried. Check that the local runtime is running.";
-            }
-            catch (Exception ex) { discoverStatus.Text = $"Discovery failed: {ex.Message}"; }
-            finally { discover.IsEnabled = true; }
-        };
-        importCatalog.Click += async (_, _) =>
-        {
-            var files = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
-            {
-                AllowMultiple = false,
-                Title = "Import Kitten model catalog",
-                FileTypeFilter = new[] { new FilePickerFileType("JSON catalog") { Patterns = new[] { "*.json" } } },
-            });
-            if (files.Count == 0) return;
-            try
-            {
-                await using var stream = await files[0].OpenReadAsync();
-                using var reader = new StreamReader(stream);
-                var raw = await reader.ReadToEndAsync();
-                var catalog = await _engine.CallAsync("model.catalog", new { raw });
-                if (catalog is not { } value || value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("entries", out var entries) || entries.ValueKind != JsonValueKind.Array) throw new InvalidOperationException("catalog contains no entries");
-                var parsed = entries.EnumerateArray().ToArray();
-                catalogEntries = parsed;
-                downloadCatalog.IsEnabled = parsed.Length > 0;
-                var mainEntry = parsed.FirstOrDefault(entry => entry.TryGetProperty("role", out var role) && role.GetString() == "main");
-                var sidecarEntry = parsed.FirstOrDefault(entry => entry.TryGetProperty("role", out var role) && role.GetString() == "sidecar");
-                if (mainEntry.ValueKind == JsonValueKind.Object && mainEntry.TryGetProperty("id", out var mainId)) main.Text = mainId.GetString();
-                if (sidecarEntry.ValueKind == JsonValueKind.Object && sidecarEntry.TryGetProperty("id", out var sidecarId)) sidecar.Text = sidecarId.GetString();
-                discoverStatus.Text = $"Imported {parsed.Length} verified catalog entr{(parsed.Length == 1 ? "y" : "ies")}. Review the selected tiers, then save.";
-            }
-            catch (Exception ex) { discoverStatus.Text = $"Catalog import failed: {ex.Message}"; }
-        };
-        downloadCatalog.Click += async (_, _) =>
-        {
-            if (catalogEntries.Length == 0) return;
-            var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions { AllowMultiple = false, Title = "Choose where to store downloaded models" });
-            if (folders.Count == 0) return;
-            downloadCatalog.IsEnabled = false;
-            cancelDownload.IsEnabled = true;
-            try
-            {
-                var folder = folders[0].Path.LocalPath;
-                for (var index = 0; index < catalogEntries.Length; index++)
-                {
-                    var entry = catalogEntries[index];
-                    var id = entry.TryGetProperty("id", out var idValue) ? idValue.GetString() ?? $"model-{index + 1}" : $"model-{index + 1}";
-                    var format = entry.TryGetProperty("format", out var formatValue) ? formatValue.GetString() : "gguf";
-                    var safeName = string.Concat(id.Select(character => Path.GetInvalidFileNameChars().Contains(character) || character is '/' or '\\' ? '_' : character));
-                    var destination = Path.Combine(folder, $"{safeName}.{(format == "safetensors" ? "safetensors" : "gguf")}");
-                    activeDownloadId = $"catalog-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}-{index}";
-                    Activity.Text = $"Downloading catalog model {index + 1}/{catalogEntries.Length}: {id}";
-                    await _engine.CallAsync("model.download", new { id = activeDownloadId, entry, destination });
-                    var role = entry.TryGetProperty("role", out var roleValue) ? roleValue.GetString() : null;
-                    if (string.Equals(role, "main", StringComparison.OrdinalIgnoreCase)) mainModelPath.Text = destination;
-                    else if (string.Equals(role, "sidecar", StringComparison.OrdinalIgnoreCase)) sidecarModelPath.Text = destination;
-                }
-                discoverStatus.Text = $"Downloaded {catalogEntries.Length} catalog model(s) with checksum verification.";
-            }
-            catch (Exception ex) { discoverStatus.Text = ex.Message.Contains("cancel", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("abort", StringComparison.OrdinalIgnoreCase) ? "Model download cancelled." : $"Model download failed: {ex.Message}"; }
-            finally { activeDownloadId = null; downloadCatalog.IsEnabled = true; cancelDownload.IsEnabled = false; }
-        };
-        save.Click += async (_, _) =>
-        {
-            try
-            {
-                var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
-                await _engine.CallAsync("settings.update", new
-                {
-                    scope = "project",
-                    projectRoot,
-                    update = new
-                    {
-                        baseUrl = endpoint.Text,
-                        sidecarBaseUrl = string.IsNullOrWhiteSpace(sidecarEndpoint.Text) ? null : sidecarEndpoint.Text,
-                        mainModel = main.Text,
-                        sidecarModel = sidecar.Text,
-                        runtimeExecutable = string.IsNullOrWhiteSpace(runtimeExecutable.Text) ? null : runtimeExecutable.Text,
-                        mainModelPath = string.IsNullOrWhiteSpace(mainModelPath.Text) ? null : mainModelPath.Text,
-                        sidecarModelPath = string.IsNullOrWhiteSpace(sidecarModelPath.Text) ? null : sidecarModelPath.Text,
-                    },
-                });
-                await RefreshModelStatusAsync();
-                Activity.Text = "Model settings saved";
-                dialog.Close();
-            }
-            catch (Exception ex) { Activity.Text = $"Could not save model settings: {ex.Message}"; }
-        };
-        await dialog.ShowDialog(this);
+        var settings = _settings;
+        if (section is not null) settings.Select(section);
+        SettingsHost.IsVisible = true;
+        SettingsButton.Content = "Close settings";
+        _ = settings.LoadAsync();
+    }
+
+    private void HideSettings()
+    {
+        SettingsHost.IsVisible = false;
+        SettingsButton.Content = "Settings";
+        _settings?.OnHidden();
     }
 
     private async void SelectConversation(object? sender, SelectionChangedEventArgs e)
     {
+        // Project headers are structure, not sessions: clicking one bounces back to the active session.
+        if (ConversationList.SelectedItem is ProjectGroupHeader)
+        {
+            ConversationList.SelectedItem = _conversationItems.FirstOrDefault(x => x.Id == _conversationId);
+            return;
+        }
         if (ConversationList.SelectedItem is ConversationItem item) await ActivateConversationAsync(item);
     }
 
@@ -1656,6 +1533,8 @@ public partial class MainWindow : Window
         {
             _conversationId = item.Id;
             _lastPlanRequest = null;
+            _activePlanId = null;
+            _activePlanRevision = null;
             _suggestedCommands = Array.Empty<string>();
             _activeVerificationId = null;
             RunChecksButton.IsEnabled = false;
@@ -1666,12 +1545,16 @@ public partial class MainWindow : Window
             UndoButton.IsEnabled = false;
             RedoButton.IsEnabled = false;
             ResetApproval();
+            _activity.Reset();
+            _work.Reset();
+            SetEffortControl(item.Effort);
             var events = await _engine.CallAsync("conversation.events", new { id = item.Id });
-            Evidence.Text = "Verified receipts will appear here.";
+            // Empty, not a promise. The section hides itself until a run actually produces evidence.
+            Evidence.Text = "";
             RenderHistory(events);
             if (!string.IsNullOrWhiteSpace(item.ProjectRoot))
             {
-                try { await _engine.CallAsync("runtime.ensure", new { projectRoot = item.ProjectRoot }); } catch { /* runtime setup remains available from Model settings */ }
+                try { await _engine.CallAsync("runtime.ensure", new { projectRoot = item.ProjectRoot }); } catch { /* runtime setup remains available from Settings */ }
             }
             await RefreshModelStatusAsync();
             await RefreshBakeoffHistoryAsync(item.ProjectRoot);
@@ -1706,12 +1589,34 @@ public partial class MainWindow : Window
         string? historicReceipt = null;
         string? historicPostflight = null;
         string? historicVerificationOutputText = null;
+        // An approval that was still pending when the window (or conversation) was switched must come
+        // back as a LIVE decision, not vanish: track the last unresolved request per run and whether
+        // that run ever reached a terminal state.
+        (string RunId, string CallId, string Prompt)? pendingApproval = null;
+        var terminalRuns = new HashSet<string>(StringComparer.Ordinal);
         foreach (var frame in events.Value.EnumerateArray())
         {
             var type = frame.TryGetProperty("type", out var typeValue) ? typeValue.GetString() ?? "" : "";
             var runId = frame.TryGetProperty("runId", out var runValue) ? runValue.GetString() ?? "" : "";
+            if (type is "run.completed" or "run.failed" or "run.cancelled" or "run.interrupted") terminalRuns.Add(runId);
             switch (type)
             {
+                case "tool.approval_required":
+                    {
+                        var approvalCall = frame.TryGetProperty("callId", out var approvalCallValue) ? approvalCallValue.GetString() ?? "" : "";
+                        var approvalName = frame.TryGetProperty("name", out var approvalNameValue) ? approvalNameValue.GetString() ?? "action" : "action";
+                        var approvalReason = frame.TryGetProperty("reason", out var approvalReasonValue) ? approvalReasonValue.GetString() ?? "" : "";
+                        pendingApproval = (runId, approvalCall, $"Approval needed: {approvalName}\n{approvalReason}");
+                        break;
+                    }
+                case "tool.approval_resolved":
+                    {
+                        // A decided approval replays as a note (it used to vanish from history entirely).
+                        if (pendingApproval is { } pending && pending.RunId == runId) pendingApproval = null;
+                        var allowed = frame.TryGetProperty("allowed", out var allowedValue) && allowedValue.ValueKind == JsonValueKind.True;
+                        text.Append($"Approval {(allowed ? "granted" : "denied")}\n\n");
+                        break;
+                    }
                 case "user.message":
                     if (frame.TryGetProperty("text", out var user)) text.Append($"You: {user.GetString()}\n\n");
                     break;
@@ -1726,6 +1631,16 @@ public partial class MainWindow : Window
                     if (!streamedRuns.Contains(runId)) { text.Append("Kitten: "); streamedRuns.Add(runId); }
                     if (frame.TryGetProperty("text", out var delta)) text.Append(delta.GetString() ?? "");
                     break;
+                case "task.compiled":
+                    {
+                        // The contract that shaped the run is part of the story a replayed session tells.
+                        var compiledGoal = frame.TryGetProperty("goal", out var compiledGoalValue) ? compiledGoalValue.GetString() ?? "" : "";
+                        var compiledMode = frame.TryGetProperty("mode", out var compiledModeValue) ? compiledModeValue.GetString() ?? "" : "";
+                        var compiledRequirements = frame.TryGetProperty("requirementCount", out var compiledReqValue) && compiledReqValue.ValueKind == JsonValueKind.Number ? compiledReqValue.GetInt32() : 0;
+                        if (!string.IsNullOrWhiteSpace(compiledGoal) && compiledMode is not ("passthrough" or ""))
+                            text.Append($"Task contract ({compiledMode}, {compiledRequirements} requirement{(compiledRequirements == 1 ? "" : "s")}): {compiledGoal}\n\n");
+                        break;
+                    }
                 case "tool.completed":
                     // Replayed history has to show the work, not just the conclusion.
                     text.Append(TranscriptView.ToolLine(
@@ -1815,6 +1730,16 @@ public partial class MainWindow : Window
             }
         }
         _transcript.Replay(text.ToString());
+        // Restore a still-live approval: the run never reached a terminal state, so the engine is
+        // still blocked waiting for this answer.
+        if (pendingApproval is { } stillPending && !terminalRuns.Contains(stillPending.RunId))
+        {
+            _approvalRunId = stillPending.RunId;
+            _approvalCallId = stillPending.CallId;
+            ShowApproval(stillPending.Prompt);
+            ApproveButton.IsEnabled = true;
+            DenyButton.IsEnabled = true;
+        }
         // A replayed session reports the files that session touched, instead of claiming "no changes".
         SetChangesSummary(replayedFiles.Count, 0, 0);
         if (historicPostflight is not null && !string.IsNullOrWhiteSpace(historicVerificationOutputText)) historicPostflight += $"\n\n{historicVerificationOutputText}";
@@ -1858,6 +1783,18 @@ public partial class MainWindow : Window
             // wrapper too, otherwise RetryEngine could see a still-live stale child and never spawn
             // a fresh engine for the new pipe connection.
             _engineProcess.Dispose();
+            // One automatic reconnect. An engine that restarted should not cost the user a button
+            // press — but if it drops again immediately, stop and let them decide, because a
+            // reconnect loop against a crashing engine helps nobody and hides the reason.
+            if (!_autoReconnected)
+            {
+                _autoReconnected = true;
+                _ = Dispatcher.UIThread.InvokeAsync(async () =>
+                {
+                    await Task.Delay(600);
+                    await ConnectEngineAsync();
+                });
+            }
         });
     }
 
@@ -1894,8 +1831,17 @@ public partial class MainWindow : Window
                 else Activity.Text = $"Bakeoff {phase}: {role} {model} — {taskId} {taskIndex}/{taskTotal} running...";
                 return;
             }
+            // runtime.state is app-global (no conversationId): the pushed llama.cpp lifecycle.
+            if (type == "runtime.state" && progressPayload.ValueKind == JsonValueKind.Object)
+            {
+                ApplyRuntimeState(progressPayload);
+                return;
+            }
             var eventConversation = frame.TryGetProperty("conversationId", out var conversation) ? conversation.GetString() : null;
             if (eventConversation is not null && eventConversation != _conversationId) return;
+            // Any event for the active conversation is proof of life for the stall watchdog.
+            _lastRunEventAt = DateTimeOffset.UtcNow;
+            if (_stallWarned && _activeRunId is not null) { _stallWarned = false; }
             var payload = frame.TryGetProperty("payload", out var payloadValue) ? payloadValue : default;
             var runId = payload.ValueKind == JsonValueKind.Object && payload.TryGetProperty("runId", out var rid) ? rid.GetString() : null;
             switch (type)
@@ -1906,7 +1852,10 @@ public partial class MainWindow : Window
                     break;
                 case "sidecar.preflight":
                     var phase = payload.TryGetProperty("phase", out var preflightPhase) ? preflightPhase.GetString() : "started";
-                    Activity.Text = phase switch { "ready" => "Sidecar orientation ready; starting main model", "fallback" => "Sidecar unavailable; using deterministic orientation", _ => "Sidecar is orienting the task..." };
+                    // The sidecar runs on the CPU in parallel with the main model. Showing it as its
+                    // own worker is the difference between "one black box" and "two models, both busy".
+                    if (phase == "ready" || phase == "fallback") _work.SidecarDone(phase == "fallback" ? "unavailable — used the deterministic path" : null);
+                    else _work.SidecarWorking("orienting the task");
                     break;
                 case "sidecar.postflight":
                     var secrets = payload.TryGetProperty("secrets", out var secretValue) && secretValue.ValueKind == JsonValueKind.Array ? secretValue.EnumerateArray().Select(value => value.GetString()).Where(value => !string.IsNullOrWhiteSpace(value)).ToArray() : Array.Empty<string>();
@@ -1919,10 +1868,10 @@ public partial class MainWindow : Window
                     var postflightTestCases = ReadStringArray(payload, "generatedTestCases");
                     var postflightSource = payload.TryGetProperty("source", out var sourceValue) ? sourceValue.GetString() : "deterministic";
                     Activity.Text = secrets.Length > 0 ? "Postflight warning: possible secret material" : warnings.Length > 0 ? "Postflight review found a warning" : "Postflight review complete";
-                    Evidence.Text += $"\nSidecar postflight ({postflightSource}):\n" + (secrets.Length > 0 ? $"Possible secrets: {string.Join(", ", secrets)}\n" : "No credential patterns detected.\n") + (warnings.Length > 0 ? $"Review warnings: {string.Join("; ", warnings)}\n" : "No diff warnings.\n") + (evidenceWarnings.Length > 0 ? $"Evidence notes: {string.Join("; ", evidenceWarnings)}\n" : "Evidence packet present.\n") + $"Risk: {postflightRisk}{(postflightRiskReasons.Length > 0 ? $" ({string.Join(", ", postflightRiskReasons)})" : "")}";
-                    if (recommendedTests.Length > 0) Evidence.Text += $"\nRecommended tests: {string.Join(", ", recommendedTests)}";
-                    if (postflightTestCases.Length > 0) Evidence.Text += $"\nGenerated edge cases: {string.Join("; ", postflightTestCases)}";
-                    if (suggestedCommands.Length > 0) Evidence.Text += $"\nSuggested commands: {string.Join(" · ", suggestedCommands)}";
+                    AppendEvidence($"\nSidecar postflight ({postflightSource}):\n" + (secrets.Length > 0 ? $"Possible secrets: {string.Join(", ", secrets)}\n" : "No credential patterns detected.\n") + (warnings.Length > 0 ? $"Review warnings: {string.Join("; ", warnings)}\n" : "No diff warnings.\n") + (evidenceWarnings.Length > 0 ? $"Evidence notes: {string.Join("; ", evidenceWarnings)}\n" : "Evidence packet present.\n") + $"Risk: {postflightRisk}{(postflightRiskReasons.Length > 0 ? $" ({string.Join(", ", postflightRiskReasons)})" : "")}");
+                    if (recommendedTests.Length > 0) AppendEvidence($"\nRecommended tests: {string.Join(", ", recommendedTests)}");
+                    if (postflightTestCases.Length > 0) AppendEvidence($"\nGenerated edge cases: {string.Join("; ", postflightTestCases)}");
+                    if (suggestedCommands.Length > 0) AppendEvidence($"\nSuggested commands: {string.Join(" · ", suggestedCommands)}");
                     _suggestedCommands = suggestedCommands;
                     RunChecksButton.IsEnabled = suggestedCommands.Length > 0;
                     break;
@@ -1933,25 +1882,111 @@ public partial class MainWindow : Window
                     var failureCause = payload.TryGetProperty("likelyCause", out var failureCauseValue) ? failureCauseValue.GetString() : "inspect the failure";
                     var failureLines = ReadStringArray(payload, "salientLines");
                     Activity.Text = "Sidecar failure card ready";
-                    Evidence.Text += $"\nFailure card ({failureSource}, {failureSeverity})\nSignature: {failureSignature}\nLikely cause: {failureCause}" + (failureLines.Length > 0 ? $"\nSalient lines: {string.Join(" | ", failureLines)}" : "");
+                    AppendEvidence($"\nFailure card ({failureSource}, {failureSeverity})\nSignature: {failureSignature}\nLikely cause: {failureCause}" + (failureLines.Length > 0 ? $"\nSalient lines: {string.Join(" | ", failureLines)}" : ""));
                     break;
                 case "workspace.verification":
                     var verificationPassed = payload.TryGetProperty("passed", out var verificationPassedValue) && verificationPassedValue.ValueKind == JsonValueKind.True;
                     var verificationCancelled = payload.TryGetProperty("cancelled", out var verificationCancelledValue) && verificationCancelledValue.ValueKind == JsonValueKind.True;
                     var verificationCommands = ReadStringArray(payload, "commands");
                     Activity.Text = verificationCancelled ? "Verification cancelled" : verificationPassed ? "Suggested verification passed" : "Suggested verification failed";
-                    Evidence.Text += $"\nNative verification {(verificationCancelled ? "cancelled" : verificationPassed ? "passed" : "failed")}: {string.Join(" · ", verificationCommands)}";
+                    AppendEvidence($"\nNative verification {(verificationCancelled ? "cancelled" : verificationPassed ? "passed" : "failed")}: {string.Join(" · ", verificationCommands)}");
                     _activeVerificationId = null;
                     CancelChecksButton.IsEnabled = false;
                     RunChecksButton.IsEnabled = _suggestedCommands.Length > 0;
                     break;
+                case "route.selected":
+                    _activity.SetRoute(
+                        payload.TryGetProperty("lane", out var routeLane) ? routeLane.GetString() ?? "?" : "?",
+                        payload.TryGetProperty("k", out var routeK) && routeK.ValueKind == JsonValueKind.Number ? routeK.GetInt32() : 1,
+                        payload.TryGetProperty("hardness", out var routeHardness) && routeHardness.ValueKind == JsonValueKind.Number ? routeHardness.GetDouble() : null,
+                        payload.TryGetProperty("effort", out var routeEffort) ? routeEffort.GetString() : null);
+                    break;
+                case "task.compiled":
+                    {
+                        var goal = payload.TryGetProperty("goal", out var goalValue) ? goalValue.GetString() ?? "" : "";
+                        var requirements = payload.TryGetProperty("requirementCount", out var reqValue) && reqValue.ValueKind == JsonValueKind.Number ? reqValue.GetInt32() : 0;
+                        var assumptions = payload.TryGetProperty("assumptionCount", out var assumeValue) && assumeValue.ValueKind == JsonValueKind.Number ? assumeValue.GetInt32() : 0;
+                        var mode = payload.TryGetProperty("mode", out var modeValue) ? modeValue.GetString() ?? "" : "";
+                        var compiledWarnings = ReadStringArray(payload, "warnings");
+                        var contractLine = $"{mode} · {requirements} requirement{(requirements == 1 ? "" : "s")} · {assumptions} assumption{(assumptions == 1 ? "" : "s")}{(compiledWarnings.Length > 0 ? $" · {compiledWarnings.Length} warning(s)" : "")}";
+                        if (runId is not null && !string.IsNullOrWhiteSpace(goal)) _activity.SetCompiled(runId, goal, contractLine);
+                        break;
+                    }
+                case "plan.updated":
+                    if (payload.TryGetProperty("steps", out var planSteps) && planSteps.ValueKind == JsonValueKind.Array)
+                    {
+                        var rows = planSteps.EnumerateArray().Select(step => (
+                            step.TryGetProperty("id", out var stepId) ? stepId.GetString() ?? "" : "",
+                            step.TryGetProperty("label", out var stepLabel) ? stepLabel.GetString() ?? "" : "",
+                            step.TryGetProperty("status", out var stepStatus) ? stepStatus.GetString() ?? "planned" : "planned"
+                        )).Where(row => row.Item1.Length > 0).ToList();
+                        _activity.SetPlanSteps(rows);
+                    }
+                    break;
+                case "step.started":
+                    if (payload.TryGetProperty("stepId", out var startedStep)) _activity.StepChanged(startedStep.GetString() ?? "", "running");
+                    if (payload.TryGetProperty("label", out var startedLabel)) Activity.Text = $"Step: {startedLabel.GetString()}";
+                    break;
+                case "step.completed":
+                    if (payload.TryGetProperty("stepId", out var doneStep)) _activity.StepChanged(doneStep.GetString() ?? "", payload.TryGetProperty("status", out var doneStatus) ? doneStatus.GetString() ?? "completed" : "completed");
+                    break;
+                case "run.status":
+                    {
+                        var runStatus = payload.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : null;
+                        var statusDetail = payload.TryGetProperty("detail", out var detailValue) ? detailValue.GetString() : null;
+                        if (runStatus == "waiting_approval") Activity.Text = "Waiting for your approval";
+                        else if (runStatus == "cancelling") Activity.Text = "Stopping…";
+                        // A detail on a running status is the engine narrating recovery ("model error —
+                        // retrying (1/3)") — the exact moment the user must NOT be left guessing.
+                        else if (runStatus == "running" && !string.IsNullOrWhiteSpace(statusDetail)) Activity.Text = statusDetail!;
+                        else if (runStatus == "running" && _activeRunId is not null) Activity.Text = "Running…";
+                        break;
+                    }
+                // The ascent lane runs k candidates in parallel isolated workspaces, and that IS the run —
+                // yet the shell had no case for any of these, so the whole generation phase (the longest
+                // part of the longest runs) reported nothing and the panel sat on "starting".
+                case "candidate.started":
+                    _work.CandidateStarted(
+                        payload.TryGetProperty("index", out var candIndex) && candIndex.ValueKind == JsonValueKind.Number ? candIndex.GetInt32() : 0,
+                        payload.TryGetProperty("lead", out var candLead) && candLead.ValueKind == JsonValueKind.True);
+                    break;
+                case "candidate.completed":
+                    _work.CandidateFinished(
+                        payload.TryGetProperty("index", out var doneIndex) && doneIndex.ValueKind == JsonValueKind.Number ? doneIndex.GetInt32() : 0,
+                        payload.TryGetProperty("finished", out var candFinished) && candFinished.ValueKind == JsonValueKind.True,
+                        payload.TryGetProperty("summary", out var candSummary) ? candSummary.GetString() ?? "" : "");
+                    break;
+                case "candidate.rejected":
+                    _work.CandidateRejected(
+                        payload.TryGetProperty("index", out var rejIndex) && rejIndex.ValueKind == JsonValueKind.Number ? rejIndex.GetInt32() : 0,
+                        payload.TryGetProperty("reason", out var rejReason) ? rejReason.GetString() ?? "" : "");
+                    break;
+                case "repair.started":
+                    {
+                        var repairRound = payload.TryGetProperty("round", out var roundValue) && roundValue.ValueKind == JsonValueKind.Number ? roundValue.GetInt32() : 0;
+                        var repairSeed = payload.TryGetProperty("seed", out var seedValue) ? seedValue.GetString() ?? "" : "";
+                        _activity.RepairStarted(repairRound, repairSeed);
+                        Activity.Text = $"Repairing (round {repairRound}) — verification found a gap";
+                        break;
+                    }
+                case "verification.evidence":
+                    _activity.VerificationEvidence(
+                        payload.TryGetProperty("check", out var checkValue) ? checkValue.GetString() ?? "check" : "check",
+                        payload.TryGetProperty("passed", out var passedEvidence) && passedEvidence.ValueKind == JsonValueKind.True,
+                        payload.TryGetProperty("durationMs", out var evidenceMs) && evidenceMs.ValueKind == JsonValueKind.Number ? evidenceMs.GetInt64() : 0);
+                    break;
                 case "run.started":
                     _activeRunId = runId;
                     ResumeButton.IsEnabled = false;
+                    RetryRunButton.IsEnabled = false;
+                    _stallWarned = false;
+                    _lastRunEventAt = DateTimeOffset.UtcNow;
                     _assistantStreamed = false;
                     _activeRunFiles.Clear();
                     _activeRunAdded = 0;
                     _activeRunRemoved = 0;
+                    _activity.RunStarted();
+                    _work.RunStarted();
                     Activity.Text = runId is null ? "Run started" : $"Run {ShortId(runId)} started";
                     // The panels describe THIS run. Leaving the previous run's receipt and file count on
                     // screen while a new one is in flight reads as if they belong to it.
@@ -1960,10 +1995,15 @@ public partial class MainWindow : Window
                     SetComposerHint("");
                     SetRunControls(true);
                     break;
+                case "runtime.calibration":
+                    _settings?.OnCalibrationProgress(payload);
+                    break;
                 case "reasoning.delta":
-                    // The card already reads "thinking…" from the moment it opens; this only confirms
-                    // in the run panel that the model is reasoning. The reasoning itself is never shown.
-                    Activity.Text = "Thinking…";
+                    // Show it. This used to be dropped on the floor — the model spent the first minute
+                    // of every turn behind the word "thinking…" while the one thing that would tell you
+                    // whether it had understood the task was discarded.
+                    if (payload.TryGetProperty("text", out var reasoning)) _transcript.AppendReasoning(reasoning.GetString() ?? "");
+                    _work.Working("thinking");
                     break;
                 case "assistant.delta":
                     if (payload.TryGetProperty("text", out var delta))
@@ -1987,19 +2027,53 @@ public partial class MainWindow : Window
                     if (payload.TryGetProperty("filesChanged", out var receiptFiles) && receiptFiles.ValueKind == JsonValueKind.Array)
                         foreach (var file in receiptFiles.EnumerateArray()) if (file.ValueKind == JsonValueKind.String) _activeRunFiles.Add(file.GetString() ?? "");
                     break;
-                case "tool.started": Activity.Text = payload.TryGetProperty("name", out var tool) ? $"Using {tool.GetString()}" : "Running tool"; break;
-                case "tool.completed":
-                    // The step lands in the transcript the moment it finishes, so the conversation shows
-                    // the actual work — which files were read, what was edited, which command ran.
-                    _transcript.AddTool(
-                        payload.TryGetProperty("name", out var doneName) ? doneName.GetString() ?? "tool" : "tool",
-                        payload.TryGetProperty("target", out var doneTarget) ? doneTarget.GetString() ?? "" : "",
-                        !payload.TryGetProperty("ok", out var doneOk) || doneOk.ValueKind != JsonValueKind.False,
-                        payload.TryGetProperty("durationMs", out var doneMs) && doneMs.ValueKind == JsonValueKind.Number ? doneMs.GetInt64() : 0,
-                        payload.TryGetProperty("output", out var doneOutput) ? doneOutput.GetString() ?? "" : "");
+                case "tool.started":
+                    {
+                        var toolName = payload.TryGetProperty("name", out var tool) ? tool.GetString() ?? "tool" : "tool";
+                        var toolTarget = payload.TryGetProperty("target", out var targetValue) ? targetValue.GetString() ?? "" : "";
+                        var callId = payload.TryGetProperty("callId", out var callIdValue) ? callIdValue.GetString() : null;
+                        if (callId is not null) _transcript.BeginTool(callId, toolName, toolTarget);
+                        _activity.ToolStarted(toolName, toolTarget);
+                        _work.ToolStarted(toolName, toolTarget);
+                        Activity.Text = string.IsNullOrWhiteSpace(toolTarget) ? $"Using {toolName}" : $"Using {toolName}: {toolTarget}";
+                        break;
+                    }
+                case "tool.output":
+                    if (payload.TryGetProperty("callId", out var chunkCall) && payload.TryGetProperty("chunk", out var chunkValue))
+                        _transcript.AppendToolOutput(chunkCall.GetString() ?? "", chunkValue.GetString() ?? "");
                     break;
-                case "task.started": Activity.Text = payload.TryGetProperty("agent", out var taskAgent) ? $"Sidecar subagent started: {taskAgent.GetString()}" : "Subagent started"; break;
-                case "task.completed": Activity.Text = payload.TryGetProperty("status", out var taskStatus) ? $"Subagent completed: {taskStatus.GetString()}" : "Subagent completed"; break;
+                case "tool.completed":
+                    {
+                        // A live card resolves in place; anything else (replay, legacy engines, parallel
+                        // candidates) lands as the classic after-the-fact step.
+                        var doneName = payload.TryGetProperty("name", out var doneNameValue) ? doneNameValue.GetString() ?? "tool" : "tool";
+                        var doneTarget = payload.TryGetProperty("target", out var doneTargetValue) ? doneTargetValue.GetString() ?? "" : "";
+                        var doneOkFlag = !payload.TryGetProperty("ok", out var doneOk) || doneOk.ValueKind != JsonValueKind.False;
+                        var doneDuration = payload.TryGetProperty("durationMs", out var doneMs) && doneMs.ValueKind == JsonValueKind.Number ? doneMs.GetInt64() : 0;
+                        var doneOutput = payload.TryGetProperty("output", out var doneOutputValue) ? doneOutputValue.GetString() ?? "" : "";
+                        var doneCallId = payload.TryGetProperty("callId", out var doneCallValue) ? doneCallValue.GetString() : null;
+                        if (doneCallId is null || !_transcript.CompleteTool(doneCallId, doneOkFlag, doneDuration, doneOutput))
+                            _transcript.AddTool(doneName, doneTarget, doneOkFlag, doneDuration, doneOutput);
+                        _activity.ToolFinished();
+                        break;
+                    }
+                case "task.started":
+                    // A subagent is a whole conversation of its own. It used to appear as one status
+                    // line that the next event immediately overwrote, so parallel work was invisible.
+                    _work.SubagentStarted(
+                        payload.TryGetProperty("childConversationId", out var childId) ? childId.GetString() ?? "" : "",
+                        payload.TryGetProperty("agent", out var taskAgent) ? taskAgent.GetString() ?? "subagent" : "subagent",
+                        payload.TryGetProperty("prompt", out var taskPrompt) ? taskPrompt.GetString() ?? "" : "");
+                    break;
+                case "task.completed":
+                    var taskUsage = payload.TryGetProperty("usage", out var taskUsageValue) && taskUsageValue.ValueKind == JsonValueKind.Object ? taskUsageValue : default;
+                    _work.SubagentFinished(
+                        payload.TryGetProperty("childConversationId", out var doneChild) ? doneChild.GetString() ?? "" : "",
+                        payload.TryGetProperty("status", out var taskStatus) ? taskStatus.GetString() ?? "completed" : "completed",
+                        payload.TryGetProperty("summary", out var taskSummary) ? taskSummary.GetString() ?? "" : "",
+                        taskUsage.ValueKind == JsonValueKind.Object && taskUsage.TryGetProperty("prompt", out var pT) && pT.ValueKind == JsonValueKind.Number ? pT.GetInt32() : 0,
+                        taskUsage.ValueKind == JsonValueKind.Object && taskUsage.TryGetProperty("completion", out var cT) && cT.ValueKind == JsonValueKind.Number ? cT.GetInt32() : 0);
+                    break;
                 case "task.blocked": Activity.Text = payload.TryGetProperty("report", out var taskReport) ? $"Subagent blocked: {taskReport.GetString()}" : "Subagent blocked"; break;
                 case "tool.approval_required":
                     _approvalRunId = runId;
@@ -2010,9 +2084,18 @@ public partial class MainWindow : Window
                     Activity.Text = "Waiting for your approval";
                     break;
                 case "tool.approval_resolved": ResetApproval(); break;
-                case "verification.started": Activity.Text = "Verifying the result"; break;
-                case "verification.passed": Evidence.Text = "Verification passed; evidence recorded."; break;
-                case "verification.failed": Evidence.Text = "Verification failed; Kitten will keep the run honest."; break;
+                case "verification.started":
+                    Activity.Text = "Verifying the result";
+                    _activity.VerificationStarted(payload.TryGetProperty("what", out var verifyWhat) ? verifyWhat.GetString() ?? "verification" : "verification");
+                    break;
+                case "verification.passed":
+                    _activity.VerificationPassed(payload.TryGetProperty("detail", out var passedDetail) ? passedDetail.GetString() ?? "verified" : "verified");
+                    Evidence.Text = "Verification passed; evidence recorded.";
+                    break;
+                case "verification.failed":
+                    _activity.VerificationFailed(payload.TryGetProperty("detail", out var failedDetail) ? failedDetail.GetString() ?? "verification failed" : "verification failed");
+                    Evidence.Text = "Verification failed; Kitten will keep the run honest.";
+                    break;
                 case "run.completed":
                     var finished = payload.TryGetProperty("finished", out var finishedValue) && finishedValue.ValueKind == JsonValueKind.True;
                     var verified = payload.TryGetProperty("verified", out var verifiedValue) && verifiedValue.ValueKind == JsonValueKind.True;
@@ -2024,13 +2107,20 @@ public partial class MainWindow : Window
                         ? "Usage: " + ReadLong(usageValue, "prompt") + " prompt + " + ReadLong(usageValue, "completion") + " completion tokens"
                         : "Usage: unavailable";
                     var completionTokens = payload.TryGetProperty("usage", out var speedUsage) && speedUsage.ValueKind == JsonValueKind.Object ? ReadLong(speedUsage, "completion") : 0;
+                    var performance = payload.TryGetProperty("performance", out var performanceValue) && performanceValue.ValueKind == JsonValueKind.Object ? performanceValue : default;
+                    var telemetry = performance.ValueKind == JsonValueKind.Object
+                        ? $"\nModel calls: {ReadLong(performance, "modelCalls")} · evaluated prompt: {ReadLong(performance, "promptTokens")} · cache: {ReadLong(performance, "cacheTokens")} · decode: {ReadDouble(performance, "decodeTokensPerSecond"):0.0} tok/s"
+                        : "";
                     var speed = wallMs > 0 && completionTokens > 0 ? $" · {completionTokens / (wallMs / 1000.0):0.0} tok/s" : "";
-                    Evidence.Text = $"{grade}\n{summary}\nFiles: {_activeRunFiles.Count} ( +{_activeRunAdded} / -{_activeRunRemoved} lines )\n{usage}{speed}";
+                    Evidence.Text = $"{grade}\n{summary}\nFiles: {_activeRunFiles.Count} ( +{_activeRunAdded} / -{_activeRunRemoved} lines )\n{usage}{speed.Replace("tok/s", "effective output/s", StringComparison.Ordinal)}{telemetry}";
                     SetChangesSummary(_activeRunFiles.Count, _activeRunAdded, _activeRunRemoved);
                     SetComposerHint($"{grade} · {Duration(wallMs)}{speed}");
                     _lastCompletedRunId = runId;
                     _activeRunId = null;
                     _canResumeInterrupted = false;
+                    _activity.RunEnded();
+                    _work.RunEnded(RunOutcomeWord(type));
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
                     SetRunControls(false);
                     UndoButton.IsEnabled = _lastCompletedRunId is not null;
@@ -2038,29 +2128,325 @@ public partial class MainWindow : Window
                     break;
                 case "run.failed":
                     var failureMessage = payload.TryGetProperty("error", out var failure) ? failure.GetString() ?? "Run failed" : "Run failed";
-                    Activity.Text = System.Text.RegularExpressions.Regex.IsMatch(failureMessage, "timeout|timed out|unloaded|model.*respond", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
-                        ? $"Main model is unavailable or still loading: {failureMessage}\nUse Model health to find a responding local tier."
-                        : $"Run failed: {failureMessage}";
-                    Evidence.Text = Activity.Text;
+                    var friendly = FriendlyModelFailure(failureMessage);
+                    Activity.Text = friendly.Headline;
+                    Evidence.Text = $"{friendly.Headline}\n{failureMessage}";
+                    // The failure lands in the CONVERSATION, in red, with the plain-language cause and
+                    // what to do next — never only in a side panel.
+                    _transcript.AddFailure($"Run failed — {friendly.Headline}", $"{friendly.Advice}\n\nDetail: {failureMessage}");
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _work.RunEnded(RunOutcomeWord(type));
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
+                    RetryRunButton.IsEnabled = _lastSubmittedText is not null;
                     SetRunControls(false);
                     break;
                 case "run.cancelled":
                     Activity.Text = "Run cancelled";
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _work.RunEnded(RunOutcomeWord(type));
+                    _transcript.AbandonOpenTools();
                     ResumeButton.IsEnabled = false;
                     SetRunControls(false);
                     break;
                 case "run.interrupted":
                     Activity.Text = "Run interrupted; it can be resumed safely";
                     _activeRunId = null;
+                    _activity.RunEnded();
+                    _work.RunEnded(RunOutcomeWord(type));
+                    _transcript.AbandonOpenTools();
                     _canResumeInterrupted = true;
                     ResumeButton.IsEnabled = true;
                     SetRunControls(false);
                     break;
             }
         });
+    }
+
+    /// <summary>Render a pushed runtime.state: the llama.cpp lifecycle, no polling required.</summary>
+    private void ApplyRuntimeState(JsonElement payload)
+    {
+        _runtimeStatePushed = true;
+        var phase = payload.TryGetProperty("phase", out var phaseValue) ? phaseValue.GetString() ?? "stopped" : "stopped";
+        var model = payload.TryGetProperty("model", out var modelValue) ? modelValue.GetString() ?? "model" : "model";
+        var ctx = payload.TryGetProperty("ctxTokens", out var ctxValue) && ctxValue.ValueKind == JsonValueKind.Number ? ctxValue.GetInt32() : 0;
+        var stderrTail = payload.TryGetProperty("stderrTail", out var stderrValue) ? stderrValue.GetString() ?? "" : "";
+        var sidecar = payload.TryGetProperty("sidecarModel", out var sidecarValue) && sidecarValue.ValueKind == JsonValueKind.String ? sidecarValue.GetString() : null;
+        var warnings = ReadStringArray(payload, "warnings");
+        var ok = (IBrush?)Application.Current?.FindResource("OkBrush") ?? Brushes.Green;
+        var warn = (IBrush?)Application.Current?.FindResource("WarnBrush") ?? Brushes.Orange;
+        var err = (IBrush?)Application.Current?.FindResource("ErrBrush") ?? Brushes.Red;
+        var faint = (IBrush?)Application.Current?.FindResource("FaintBrush") ?? Brushes.Gray;
+        var elapsedMs = payload.TryGetProperty("elapsedMs", out var elapsedValue) && elapsedValue.ValueKind == JsonValueKind.Number ? elapsedValue.GetInt64() : 0;
+        var liveLog = payload.TryGetProperty("log", out var logValue) ? logValue.GetString() ?? "" : "";
+        switch (phase)
+        {
+            case "starting":
+            case "probing":
+                RuntimeDot.Fill = warn;
+                RuntimeText.Text = $"starting {model}{(elapsedMs > 0 ? $" ({elapsedMs / 1000}s)" : "")}";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "loading":
+                // Loading is PROGRESS, and it is slow for a big model — say so with a timer instead of
+                // leaving the user to guess whether it hung.
+                RuntimeDot.Fill = warn;
+                RuntimeText.Text = $"loading {model} into memory — {elapsedMs / 1000}s (large models take minutes)";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "ready":
+            case "external":
+                RuntimeDot.Fill = ok;
+                RuntimeText.Text = $"ready · {model}{(ctx > 0 ? $" · {ctx / 1024}k ctx" : "")}{(string.IsNullOrWhiteSpace(sidecar) ? "" : " · sidecar")}{(phase == "external" ? " (external)" : "")}";
+                RuntimeActionButton.IsVisible = false;
+                break;
+            case "stopped":
+                RuntimeDot.Fill = faint;
+                RuntimeText.Text = "model offline";
+                RuntimeActionButton.Content = "Start runtime";
+                RuntimeActionButton.IsVisible = true;
+                break;
+            default: // failed
+                RuntimeDot.Fill = err;
+                var reason = CleanRuntimeText(stderrTail);
+                var firstLine = reason.Split('\n').FirstOrDefault(line => line.Trim().Length > 0)?.Trim() ?? "no reason reported";
+                RuntimeText.Text = $"runtime failed — {(firstLine.Length > 80 ? firstLine[..80] + "…" : firstLine)}";
+                RuntimeActionButton.Content = "Retry runtime";
+                RuntimeActionButton.IsVisible = true;
+                // The panel gets a READABLE summary and a pointer to the full log — never a raw dump.
+                Activity.Text = $"The local model runtime failed to start.\n{firstLine}\n\nSettings, under Runtime & logs, has the server's full output and the launch command.";
+                break;
+        }
+        var tip = new List<string> { $"Phase: {phase}", $"Model: {model}" };
+        if (ctx > 0) tip.Add($"Server context: {ctx:n0} tokens");
+        if (!string.IsNullOrWhiteSpace(sidecar)) tip.Add($"Sidecar: {sidecar}");
+        tip.AddRange(warnings);
+        var cleanedTail = CleanRuntimeText(string.IsNullOrWhiteSpace(stderrTail) ? liveLog : stderrTail);
+        if (!string.IsNullOrWhiteSpace(cleanedTail)) tip.Add($"Runtime said:\n{cleanedTail}");
+        ToolTip.SetTip(RuntimeText, string.Join("\n", tip));
+    }
+
+    /// <summary>
+    /// Make runtime output human-readable: unescape the JSON-transported newlines and strip ANSI
+    /// colour. Without this the failure panel showed literal `[34m0.00.080` garbage.
+    /// </summary>
+    private static string CleanRuntimeText(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var text = raw
+            .Replace("\\u001b", "").Replace("\\x1b", "")
+            .Replace("\\r\\n", "\n").Replace("\\n", "\n").Replace("\\t", " ").Replace("\\\"", "\"");
+        text = System.Text.RegularExpressions.Regex.Replace(text, "\\[[0-9;]*[A-Za-z]", "");
+        var lines = text.Replace("\r\n", "\n").Split('\n')
+            .Select(line => System.Text.RegularExpressions.Regex.Replace(line, @"^\s*\d+\.\d{2}\.\d{3}\s*", "").TrimEnd())
+            .Where(line => line.Trim().Length > 0)
+            .ToList();
+        // Lead with the line that explains the failure, not the banner noise before it.
+        var salient = lines.LastOrDefault(line => System.Text.RegularExpressions.Regex.IsMatch(line, "error|failed|cannot|unable|unknown argument|invalid|out of memory|not found", System.Text.RegularExpressions.RegexOptions.IgnoreCase)
+            && !System.Text.RegularExpressions.Regex.IsMatch(line, "^\\s*(?:W|warn|DEPRECATED)", System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+        if (salient is not null) { lines.Remove(salient); lines.Insert(0, salient); }
+        return string.Join("\n", lines.Take(12));
+    }
+
+    /// <summary>The runtime control room — a section of settings now, not a second window.</summary>
+    private void ShowRuntimePanel(object? sender, RoutedEventArgs e) => ShowSettings("Runtime & logs");
+
+    /// <summary>One-click runtime start from the status bar; an unconfigured setup lands in settings.</summary>
+    private async void StartRuntime(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null) return;
+        RuntimeActionButton.IsEnabled = false;
+        try
+        {
+            var projectRoot = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
+            var result = await _engine.CallAsync("runtime.ensure", new { projectRoot });
+            if (result is { } value && value.ValueKind == JsonValueKind.Object && value.TryGetProperty("configured", out var configured) && configured.ValueKind == JsonValueKind.False)
+            {
+                // Kitten finds the server binary itself, so the only thing that can still be missing is
+                // which weights to load. Say that, and open the page that asks for exactly that.
+                Activity.Text = "Kitten needs model weights before it can start a runtime — choose a .gguf in Settings, under Local runtime.";
+                ShowSettings("Local runtime");
+            }
+        }
+        // The engine error arrives as a JSON envelope wrapping the server's escaped stderr. Showing
+        // that verbatim is what filled the panel with ANSI garbage — summarise instead, and point at
+        // the settings page where the full, cleaned log lives.
+        catch (Exception ex) { Activity.Text = $"The runtime did not start.\n{SummariseEngineError(ex.Message)}\n\nSettings, under Runtime & logs, has the server's own output."; }
+        finally { RuntimeActionButton.IsEnabled = true; }
+    }
+
+    /// <summary>
+    /// Blocks appear when they have something true to say and vanish when they do not.
+    ///
+    /// The right pane used to be a column of permanent placeholders — "Verified receipts appear here
+    /// after a run", "No changes in this run", "No active run" — three lines of furniture that were
+    /// wrong or vacuous most of the time. Rather than auditing fifty assignment sites, visibility
+    /// simply follows content: whatever writes text decides what is on screen.
+    /// </summary>
+    private void WireAutoVisibility()
+    {
+        static void FollowText(TextBlock source, Control shown)
+        {
+            void Sync() => shown.IsVisible = !string.IsNullOrWhiteSpace(source.Text);
+            source.PropertyChanged += (_, e) => { if (e.Property == TextBlock.TextProperty) Sync(); };
+            Sync();
+        }
+        FollowText(Activity, Activity);
+        FollowText(RunMeta, RunMeta);
+        FollowText(Evidence, EvidenceSection);
+        FollowText(ChangesSummary, ChangesSection);
+
+        // The action row earns its place only when one of its buttons can actually do something.
+        var actions = new[] { UndoButton, RedoButton, ResumeButton, RetryRunButton };
+        void SyncActions() => RunActions.IsVisible = actions.Any(button => button.IsEnabled);
+        foreach (var button in actions)
+        {
+            button.PropertyChanged += (_, e) => { if (e.Property == IsEnabledProperty) SyncActions(); };
+        }
+        SyncActions();
+    }
+
+    /// <summary>The word the live panel settles on when a run ends — its own outcome, not a guess.</summary>
+    private static string RunOutcomeWord(string eventType) => eventType switch
+    {
+        "run.completed" => "Done",
+        "run.failed" => "Failed",
+        "run.cancelled" => "Stopped",
+        "run.interrupted" => "Interrupted",
+        _ => "Idle",
+    };
+
+    /// <summary>
+    /// The engine handle, reconnecting first if it has gone away. Every surface that acts on the
+    /// engine goes through this: `_engine` is set to null the moment the pipe drops, so a panel that
+    /// captured the field and dereferenced it later greeted the user with a raw
+    /// "Object reference not set to an instance of an object" instead of "the engine restarted".
+    /// </summary>
+    internal async Task<EngineClient?> EnsureEngineAsync()
+    {
+        if (_engine is not null) return _engine;
+        try { await ConnectEngineAsync(); }
+        catch { /* ConnectEngineAsync reports its own failure in the status line */ }
+        return _engine;
+    }
+
+    /// <summary>Pull the human sentence out of an engine error envelope (JSON + escaped stderr).</summary>
+    internal static string SummariseEngineError(string raw)
+    {
+        var message = raw;
+        try
+        {
+            // Engine failures arrive as {"code":"…","message":"…"}; the message is the part worth showing.
+            var braceIndex = raw.IndexOf('{');
+            if (braceIndex >= 0)
+            {
+                using var doc = JsonDocument.Parse(raw[braceIndex..]);
+                if (doc.RootElement.TryGetProperty("message", out var inner) && inner.ValueKind == JsonValueKind.String) message = inner.GetString() ?? raw;
+                else if (doc.RootElement.TryGetProperty("error", out var errorValue) && errorValue.ValueKind == JsonValueKind.Object
+                    && errorValue.TryGetProperty("message", out var errorMessage) && errorMessage.ValueKind == JsonValueKind.String) message = errorMessage.GetString() ?? raw;
+            }
+        }
+        catch { /* not JSON — use it as-is */ }
+        var cleaned = CleanRuntimeText(message);
+        return string.IsNullOrWhiteSpace(cleaned) ? message : string.Join("\n", cleaned.Split('\n').Take(4));
+    }
+
+    /// <summary>The effort dial. Mutual exclusion by hand — four ToggleButtons, one checked.</summary>
+    private async void EffortClicked(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton clicked || clicked.Tag is not string level) return;
+        SetEffortControl(level);
+        SetComposerHint(level switch
+        {
+            "fast" => "one pass, light checks",
+            "careful" => "more candidates, deeper checks",
+            "think-hard" => "candidates + subagents + web · slow",
+            _ => "standard routing and checks",
+        });
+        if (_engine is not null && _conversationId is not null)
+        {
+            try { await _engine.CallAsync("conversation.set-effort", new { conversationId = _conversationId, effort = level }); }
+            catch { /* the level still applies to the next submit */ }
+        }
+    }
+
+    private void SetEffortControl(string level)
+    {
+        _effort = level is "fast" or "balanced" or "careful" or "think-hard" ? level : "balanced";
+        EffortFast.IsChecked = _effort == "fast";
+        EffortBalanced.IsChecked = _effort == "balanced";
+        EffortCareful.IsChecked = _effort == "careful";
+        EffortHard.IsChecked = _effort == "think-hard";
+    }
+
+    /// <summary>Fetch and show the full compiled contract for the plan card's run.</summary>
+    private async void ShowCompiledContract(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null || _activity.CompiledRunId is null) return;
+        try
+        {
+            var record = await _engine.CallAsync("task.compiled-get", new { runId = _activity.CompiledRunId });
+            if (record is not { } value || value.ValueKind != JsonValueKind.Object) { Activity.Text = "No compiled contract is stored for this run."; return; }
+            var rendered = value.TryGetProperty("rendered", out var renderedValue) ? renderedValue.GetString() ?? "" : "";
+            var ir = value.TryGetProperty("ir", out var irValue) ? irValue.GetString() ?? "" : "";
+            var body = string.IsNullOrWhiteSpace(rendered) ? ir : rendered;
+            var close = new Button { Content = "Close" };
+            var text = new TextBox { Text = body, IsReadOnly = true, AcceptsReturn = true, TextWrapping = Avalonia.Media.TextWrapping.NoWrap, FontFamily = "Consolas", MinHeight = 420 };
+            var scroll = new ScrollViewer { Content = text, HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto, VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto };
+            var dialog = new Window
+            {
+                Title = "Task contract",
+                Width = 860,
+                Height = 640,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
+                Content = new DockPanel { Margin = new Avalonia.Thickness(18), Children = { close, scroll } },
+            };
+            DockPanel.SetDock(close, Dock.Bottom);
+            close.Margin = new Avalonia.Thickness(0, 12, 0, 0);
+            close.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right;
+            close.Click += (_, _) => dialog.Close();
+            await dialog.ShowDialog(this);
+        }
+        catch (Exception ex) { Activity.Text = $"Could not load the contract: {ex.Message}"; }
+    }
+
+    /// <summary>Translate a raw model-failure string into a headline + what-to-do, in user language.</summary>
+    private static (string Headline, string Advice) FriendlyModelFailure(string error)
+    {
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "parse|json|unterminated|missing closing", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model's reply was cut off mid-tool-call",
+                "Kitten already retried this in-run; the model kept producing oversized tool calls. A larger context window usually fixes it (Settings → Performance → Context tokens), or press Retry to run the request again.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "context size|context.*exceed", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the context window overflowed",
+                "The conversation plus the work no longer fit the model's context. Raise Context tokens in Settings → Performance (auto sizes it from your GPU), or start a fresh task for this request.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "timeout|timed out|unloaded|model.*respond|ECONNREFUSED|fetch failed", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model endpoint stopped responding",
+                "Check the runtime segment in the status bar — if it shows offline or failed, start/retry the runtime there, then press Retry.");
+        if (System.Text.RegularExpressions.Regex.IsMatch(error, "HTTP 5\\d\\d", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+            return ("the model server returned an internal error",
+                "Kitten retried in-run without success. The runtime tooltip in the status bar carries the server's own last words; a runtime restart usually clears it. Then press Retry.");
+        return ("the run hit an unrecoverable error", "Press Retry to run the request again, or check the runtime status below.");
+    }
+
+    /// <summary>Re-run the last failed request with one click — a dead run must never be a dead end.</summary>
+    private async void RetryFailedRun(object? sender, RoutedEventArgs e)
+    {
+        if (_engine is null || _conversationId is null || _lastSubmittedText is null || _activeRunId is not null || _submissionActive) return;
+        RetryRunButton.IsEnabled = false;
+        var text = _lastSubmittedText;
+        _submissionActive = true;
+        Activity.Text = "Retrying the failed request…";
+        _transcript.AddUser(text);
+        _transcript.BeginAssistant("Kitten");
+        SetRunControls(true);
+        try
+        {
+            await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text, effort = _effort });
+        }
+        catch (Exception ex) { Activity.Text = $"Retry failed: {ex.Message}"; RetryRunButton.IsEnabled = true; }
+        finally { _submissionActive = false; SetRunControls(false); }
     }
 
     private static string ShortId(string id) => id[..Math.Min(8, id.Length)];
@@ -2074,6 +2460,16 @@ public partial class MainWindow : Window
 
     private static long ReadLong(JsonElement value, string property)
         => value.TryGetProperty(property, out var number) && number.ValueKind == JsonValueKind.Number ? number.GetInt64() : 0;
+
+    private static double ReadDouble(JsonElement value, string property)
+        => value.TryGetProperty(property, out var number) && number.ValueKind == JsonValueKind.Number ? number.GetDouble() : 0;
+
+    /// <summary>Append to the Evidence panel with a hard cap — unbounded += grew without limit on long sessions.</summary>
+    private void AppendEvidence(string chunk)
+    {
+        var combined = Evidence.Text + chunk;
+        Evidence.Text = combined.Length > 12_000 ? combined[^12_000..] : combined;
+    }
 
     private async void OpenProject(object? sender, RoutedEventArgs e)
     {
@@ -2093,7 +2489,8 @@ public partial class MainWindow : Window
         var project = _conversationItems.FirstOrDefault(item => item.Id == _conversationId)?.ProjectRoot;
         if (string.IsNullOrWhiteSpace(project))
         {
-            Activity.Text = "Open a project before starting a new task.";
+            // No project yet → this IS the choose-a-project moment; open the picker instead of nagging.
+            OpenProject(sender, e);
             return;
         }
         try
@@ -2142,6 +2539,7 @@ public partial class MainWindow : Window
             await SubmitMentionAsync(mention.Groups["agent"].Value, mention.Groups["prompt"].Value.Trim());
             return;
         }
+        _lastSubmittedText = text;
         _submissionActive = true;
         Activity.Text = "Running...";
         _transcript.AddUser(text);
@@ -2149,7 +2547,7 @@ public partial class MainWindow : Window
         SetRunControls(true);
         try
         {
-            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text });
+            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text, effort = _effort });
             if (result is { } completed && completed.ValueKind == JsonValueKind.Object)
             {
                 if (completed.TryGetProperty("cancelled", out var cancelled) && cancelled.ValueKind == JsonValueKind.True) Activity.Text = "Run cancelled before the model started.";
@@ -2211,7 +2609,7 @@ public partial class MainWindow : Window
         SetRunControls(true);
         try
         {
-            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text = "Continue the interrupted task from the last durable state. Re-check the workspace and report what remains before making changes." });
+            var result = await _engine.CallAsync("conversation.submit", new { conversationId = _conversationId, text = "Continue the interrupted task from the last durable state. Re-check the workspace and report what remains before making changes.", effort = _effort });
             if (result is { } completed && completed.ValueKind == JsonValueKind.Object)
             {
                 if (completed.TryGetProperty("cancelled", out var cancelled) && cancelled.ValueKind == JsonValueKind.True) Activity.Text = "Resume cancelled before the model started.";
@@ -2227,66 +2625,55 @@ public partial class MainWindow : Window
         if (_engine is null || string.IsNullOrWhiteSpace(_conversationId) || string.IsNullOrWhiteSpace(Prompt.Text) || _activeRunId is not null || _activeTaskId is not null) return;
         var text = Prompt.Text.Trim();
         Prompt.Text = "";
-        _activeTaskId = $"task-plan-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
-        Activity.Text = "Sidecar is mapping the repository, reviewing risks, and defining verification...";
+        _activeTaskId = $"plan-create-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
+        Activity.Text = "Kitten is creating an editable plan...";
         SetRunControls(true);
         try
         {
-            var suggestion = await _engine.CallAsync("task.plan-suggest", new { conversationId = _conversationId, text, parentRunId = _activeTaskId });
-            if (suggestion is not { } suggested || suggested.ValueKind != JsonValueKind.Object || !suggested.TryGetProperty("nodes", out var nodes) || nodes.ValueKind != JsonValueKind.Array) throw new InvalidOperationException("sidecar did not return a task plan");
-            await _engine.CallAsync("task.plan", new { conversationId = _conversationId, nodes });
-            var result = await _engine.CallAsync("task.run", new { conversationId = _conversationId, parentRunId = _activeTaskId });
-            if (result is { } rows && rows.ValueKind == JsonValueKind.Array)
+            var created = await _engine.CallAsync("plan.create", new { conversationId = _conversationId, text, planId = $"plan-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}" });
+            if (created is not { } plan || plan.ValueKind != JsonValueKind.Object || !plan.TryGetProperty("id", out var idValue)) throw new InvalidOperationException("Kitten did not return a plan artifact");
+            _activePlanId = idValue.GetString();
+            _activePlanRevision = plan.TryGetProperty("revision", out var revValue) && revValue.ValueKind == JsonValueKind.Number ? revValue.GetInt32() : 1;
+            if (plan.TryGetProperty("steps", out var steps) && steps.ValueKind == JsonValueKind.Array)
             {
-                var summaries = rows.EnumerateArray().Select(row =>
+                var summaries = steps.EnumerateArray().Select(step =>
                 {
-                    var agent = row.TryGetProperty("agent", out var agentValue) ? agentValue.GetString() : "subagent";
-                    var status = row.TryGetProperty("status", out var statusValue) ? statusValue.GetString() : "unknown";
-                    var report = row.TryGetProperty("report", out var reportValue) ? reportValue.GetString() : "";
-                    return $"{agent}: {status}\n{report}";
+                    var title = step.TryGetProperty("title", out var titleValue) ? titleValue.GetString() : "step";
+                    var agent = step.TryGetProperty("agent", out var agentValue) ? agentValue.GetString() : "agent";
+                    var files = step.TryGetProperty("allowedFiles", out var filesValue) && filesValue.ValueKind == JsonValueKind.Array ? string.Join(", ", filesValue.EnumerateArray().Select(v => v.GetString()).Where(v => !string.IsNullOrWhiteSpace(v))) : "";
+                    return $"{title} · {agent}{(string.IsNullOrWhiteSpace(files) ? "" : $"\n  files: {files}")}";
                 });
-                _transcript.AddNote($"Sidecar plan for: {text}", string.Join("\n\n", summaries));
-                Evidence.Text = "Read-only subagent reports completed. Review them, then use Run for the implementation step.";
+                _transcript.AddNote($"Plan draft (revision {_activePlanRevision}) for: {text}", string.Join("\n\n", summaries));
+                Evidence.Text = "Plan saved. Review it, then choose Implement plan to approve and execute this exact revision.";
             }
             _lastPlanRequest = text;
             await RefreshConversationsAsync(_conversationId);
             ImplementButton.IsEnabled = true;
-            Activity.Text = "Sidecar plan complete";
+            Activity.Text = "Plan draft ready for approval";
         }
-        catch (Exception ex) { Activity.Text = $"Sidecar plan failed: {ex.Message}"; }
+        catch (Exception ex) { Activity.Text = $"Plan creation failed: {ex.Message}"; }
         finally { _activeTaskId = null; SetRunControls(false); }
     }
 
     private async void ImplementPlan(object? sender, RoutedEventArgs e)
     {
-        if (_engine is null || string.IsNullOrWhiteSpace(_conversationId) || string.IsNullOrWhiteSpace(_lastPlanRequest) || _activeRunId is not null || _activeTaskId is not null) return;
+        if (_engine is null || string.IsNullOrWhiteSpace(_conversationId) || string.IsNullOrWhiteSpace(_activePlanId) || _activeRunId is not null || _activeTaskId is not null) return;
         try
         {
-            var planId = $"task-implementation-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
-            _activeTaskId = planId;
-            SetRunControls(true);
-            Activity.Text = "Sidecar is orienting the bounded implementation scope...";
-            var suggestion = await _engine.CallAsync("task.plan-edit-suggest", new { conversationId = _conversationId, text = _lastPlanRequest, parentRunId = planId });
-            if (suggestion is not { } suggested)
-            {
-                Activity.Text = "No bounded implementation scope was found";
-                return;
-            }
-            if (suggested.ValueKind != JsonValueKind.Object || !suggested.TryGetProperty("nodes", out var nodes) || nodes.ValueKind != JsonValueKind.Array)
-            {
-                Activity.Text = suggested.TryGetProperty("note", out var note) ? note.GetString() : "No bounded implementation scope was found";
-                return;
-            }
-            var allowed = suggested.TryGetProperty("allowedFiles", out var allowedValue) && allowedValue.ValueKind == JsonValueKind.Array
-                ? allowedValue.EnumerateArray().Select(value => value.GetString()).Where(value => !string.IsNullOrWhiteSpace(value)).Cast<string>().ToArray()
+            var planValue = await _engine.CallAsync("plan.get", new { planId = _activePlanId, revision = _activePlanRevision });
+            if (planValue is not { } plan || plan.ValueKind != JsonValueKind.Object) throw new InvalidOperationException("saved plan is no longer available");
+            var allowed = plan.TryGetProperty("steps", out var planSteps) && planSteps.ValueKind == JsonValueKind.Array
+                ? planSteps.EnumerateArray().SelectMany(step => step.TryGetProperty("allowedFiles", out var files) && files.ValueKind == JsonValueKind.Array ? files.EnumerateArray().Select(v => v.GetString()) : Enumerable.Empty<string>()).Where(v => !string.IsNullOrWhiteSpace(v)).Distinct().Cast<string>().ToArray()
                 : Array.Empty<string>();
-            if (allowed.Length == 0) { Activity.Text = "No bounded implementation scope was found"; return; }
+            if (allowed.Length == 0) { Activity.Text = "The plan has no bounded file scope; revise it before implementing."; return; }
             if (!await ConfirmImplementationAsync(allowed)) { Activity.Text = "Implementation cancelled; no files were changed."; return; }
-            _activeTaskId = planId;
-            Activity.Text = "Main model is implementing the approved file scope...";
+            _activeTaskId = $"plan-run-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds():x}";
             SetRunControls(true);
-            await _engine.CallAsync("task.plan", new { conversationId = _conversationId, nodes });
-            var result = await _engine.CallAsync("task.run", new { conversationId = _conversationId, parentRunId = _activeTaskId });
+            Activity.Text = $"Executing approved plan revision {_activePlanRevision}...";
+            SetRunControls(true);
+            var alreadyApproved = plan.TryGetProperty("status", out var statusValue) && string.Equals(statusValue.GetString(), "approved", StringComparison.OrdinalIgnoreCase);
+            if (!alreadyApproved) await _engine.CallAsync("plan.approve", new { planId = _activePlanId, revision = _activePlanRevision });
+            var result = await _engine.CallAsync("plan.execute", new { planId = _activePlanId, revision = _activePlanRevision, parentRunId = _activeTaskId });
             if (result is { } rows && rows.ValueKind == JsonValueKind.Array)
             {
                 var summaries = rows.EnumerateArray().Select(row =>
@@ -2296,13 +2683,13 @@ public partial class MainWindow : Window
                     var report = row.TryGetProperty("report", out var reportValue) ? reportValue.GetString() : "";
                     return $"{agent}: {status}\n{report}";
                 });
-                _transcript.AddNote("Bounded implementation results (approved files only)", string.Join("\n\n", summaries));
-                Evidence.Text = "Implementation and verification subagents returned durable reports. Inspect the changed files before continuing.";
+                _transcript.AddNote($"Approved plan revision {_activePlanRevision} results", string.Join("\n\n", summaries));
+                Evidence.Text = "The approved plan revision completed. Inspect the changed files and verification receipts.";
             }
             await RefreshConversationsAsync(_conversationId);
-            Activity.Text = "Bounded implementation complete";
+            Activity.Text = "Approved plan execution complete";
         }
-        catch (Exception ex) { Activity.Text = $"Bounded implementation failed: {ex.Message}"; }
+        catch (Exception ex) { Activity.Text = $"Plan execution failed: {ex.Message}"; }
         finally { _activeTaskId = null; SetRunControls(false); }
     }
 
@@ -2316,7 +2703,7 @@ public partial class MainWindow : Window
             Title = "Approve bounded implementation",
             Width = 620,
             Height = 420,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner, Icon = Icon,
             Content = new StackPanel
             {
                 Margin = new Avalonia.Thickness(24),
@@ -2410,7 +2797,7 @@ public partial class MainWindow : Window
     {
         var hasConversation = !string.IsNullOrWhiteSpace(_conversationId);
         PlanButton.IsEnabled = hasConversation && !running;
-        ImplementButton.IsEnabled = hasConversation && !running && !string.IsNullOrWhiteSpace(_lastPlanRequest);
+        ImplementButton.IsEnabled = hasConversation && !running && !string.IsNullOrWhiteSpace(_activePlanId);
         RunButton.IsEnabled = hasConversation && !running;
         CancelButton.IsEnabled = running && (_activeRunId is not null || _activeTaskId is not null || _submissionActive);
     }

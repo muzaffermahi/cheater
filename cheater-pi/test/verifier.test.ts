@@ -182,3 +182,73 @@ test("verifierReceiptLines renders the full audit slate", async () => {
   assert.match(lines[0], /verifier: winner=attempt 1/);
   assert.ok(lines.some((l) => /#1:/.test(l)));
 });
+
+// ── B2b: CodeT dual agreement inside the real verifier ──────────────────────────────────────────
+
+test("dual agreement separates candidates that per-probe consensus leaves tied", async () => {
+  // Three candidates, no repo test, no worked examples: the ONLY evidence is how they behave. Two
+  // agree exactly; the third is subtly wrong on one input. Per-probe plurality scores all three
+  // highly (they agree on two of three probes); joint clustering does not.
+  const right = "def f(xs):\n    return sorted(xs)[len(xs)//2]\n";
+  const wrong = "def f(xs):\n    return sorted(xs)[0]\n";
+  const mk = (body: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "ver-dual-"));
+    writeFileSync(join(dir, "impl.py"), body);
+    return dir;
+  };
+  const contract = extractAcceptanceContract("implement f in impl.py returning the middle element of the sorted list");
+  const v = new Verifier({
+    llm: dummyLlm, task: "middle element", contract,
+    probe: { module: "impl.py", symbol: "f", inputs: [[[5]], [[3, 1, 2]], [[9, 8, 7]]] },
+  });
+  const res = await v.verify([
+    { index: 1, workspace: mk(right), finished: true, summary: "" },
+    { index: 2, workspace: mk(right), finished: true, summary: "" },
+    { index: 3, workspace: mk(wrong), finished: true, summary: "" },
+  ]);
+
+  const s1 = res.slate.find((s) => s.index === 1)!;
+  const s3 = res.slate.find((s) => s.index === 3)!;
+  assert.equal(s1.agreementCluster, 2, "the two identical candidates cluster together");
+  assert.equal(s3.agreementCluster, 1, "the odd one out stands alone");
+  assert.ok((s1.agreementScore ?? 0) > (s3.agreementScore ?? 0), "and scores below the pair that agree");
+  assert.notEqual(res.winner, 3, "the lone dissenter does not win");
+  assert.ok(s1.receipt.some((r) => /dual agreement/.test(r)), "the slate records why");
+});
+
+test("the distinguishing-input question is only asked on a genuine tie", async () => {
+  // 2-vs-2 with no other signal is exactly the case S* exists for; anything else must not pay for it.
+  const mk = (body: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), "ver-star-"));
+    writeFileSync(join(dir, "impl.py"), body);
+    return dir;
+  };
+  const a = "def f(xs):\n    return sorted(xs)[len(xs)//2]\n";
+  const b = "def f(xs):\n    return sorted(xs)[0]\n";
+  let asked = 0;
+  const judge = {
+    chat: async () => { asked++; return { ok: true, content: "A", reasoning: "", toolCalls: [], finishReason: "stop", usage: { prompt: 1, completion: 1, reasoning: 0, total: 2 }, elapsedMs: 1 }; },
+  } as any;
+  const contract = extractAcceptanceContract("implement f in impl.py returning the middle element of the sorted list");
+  const opts = {
+    llm: judge, task: "middle element", contract, confidence: true,
+    probe: { module: "impl.py", symbol: "f", inputs: [[[3, 1, 2]], [[9, 8, 7]]] },
+  };
+
+  const tied = await new Verifier(opts).verify([
+    { index: 1, workspace: mk(a), finished: true, summary: "" },
+    { index: 2, workspace: mk(a), finished: true, summary: "" },
+    { index: 3, workspace: mk(b), finished: true, summary: "" },
+    { index: 4, workspace: mk(b), finished: true, summary: "" },
+  ]);
+  assert.equal(asked, 1, "one short call adjudicates one concrete disagreement");
+  assert.ok(tied.slate.some((s) => s.receipt.some((r) => /distinguishing input: judged correct/.test(r))));
+
+  asked = 0;
+  await new Verifier(opts).verify([
+    { index: 1, workspace: mk(a), finished: true, summary: "" },
+    { index: 2, workspace: mk(a), finished: true, summary: "" },
+    { index: 3, workspace: mk(b), finished: true, summary: "" },
+  ]);
+  assert.equal(asked, 0, "2-vs-1 is already decided; asking would be pure latency");
+});

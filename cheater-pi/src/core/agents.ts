@@ -13,6 +13,9 @@ export interface AgentDefinition {
     edit?: "allow" | "ask" | "deny";
     bash?: "allow" | "ask" | "deny";
     task?: "allow" | "ask" | "deny";
+    /** Web tool access. Unset defaults by mode: subagents deny (bounded workers stay bounded),
+     *  primary agents allow (still gated by settings.webAccess + the effort profile). */
+    web?: "allow" | "ask" | "deny";
   };
   allowSpawn?: boolean;
   hidden?: boolean;

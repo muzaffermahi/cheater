@@ -1,0 +1,30 @@
+{"id":"task-01-cli-validation","smoke":true,"prompt":"In src/index.mjs, repair parseConfig. It must accept only numeric ports 1..65535 and mode dev/prod, return a normalized object, and return null for invalid input. Run verify.mjs before finishing."}
+{"id":"task-02-http-retry","prompt":"In src/index.mjs, fix backoff so attempt 0 starts at baseMs, doubles per retry, and clamps at maxMs. Preserve the function signature and run verify.mjs."}
+{"id":"task-03-cache-invalidation","prompt":"In src/index.mjs, make updateCache replace an existing value as well as insert a new key. Preserve Map identity and verify both paths."}
+{"id":"task-04-parser-edge","prompt":"In src/index.mjs, make parseList treat empty input and a trailing comma as no empty item, while still trimming real values. Run verify.mjs."}
+{"id":"task-05-concurrency-race","prompt":"In src/index.mjs, cancellation must be checked before starting work as well as after it. An already-aborted signal must not invoke work. Run verify.mjs."}
+{"id":"task-06-schema-migration","prompt":"In src/index.mjs, migrate both legacy {baseUrl,mainModel} settings and current {version,endpoint,model} settings to the stable version-2 shape. Do not lose values."}
+{"id":"task-07-path-security","prompt":"In src/index.mjs, make inside enforce a path-segment boundary and reject traversal. /app2 and /app/../secret are outside /app; /app/file is inside."}
+{"id":"task-08-stream-decoding","prompt":"In src/index.mjs, repair frames so SSE frames split across arbitrary chunks are reassembled before parsing. Run the provided fragmented-chunk verification."}
+{"id":"task-09-timeout-cleanup","prompt":"In src/index.mjs, make withTimeout reject slow work with timeout and resolve fast work. Do not let the timeout path be bypassed."}
+{"id":"task-10-json-roundtrip","prompt":"In src/index.mjs, preserve explicit false, zero, and empty-string values through encode/decode. Undefined may be omitted, but falsy values must survive."}
+{"id":"task-11-cli-help","prompt":"In src/index.mjs, make help preserve the caller's option order while rendering each option. The output must be deterministic and match verify.mjs."}
+{"id":"task-12-error-cause","prompt":"In src/index.mjs, wrap must preserve the original Error as the public error's cause while retaining the stable message."}
+{"id":"task-13-sql-filter","prompt":"In src/index.mjs, distinguish an absent key from a present null key. An empty filter matches; filtering for null must not match a missing property."}
+{"id":"task-14-event-replay","prompt":"In src/index.mjs, make replay idempotent by applying each event id at most once while retaining event order and state mutation."}
+{"id":"task-15-config-precedence","prompt":"In src/index.mjs, resolve precedence as project over user over environment, and ignore undefined environment values rather than erasing valid settings."}
+{"id":"task-16-tool-arguments","prompt":"In src/index.mjs, parse escaped JSON tool arguments including embedded quotes and unicode. Preserve the parsed value and surface malformed JSON normally."}
+{"id":"task-17-pagination","prompt":"In src/index.mjs, fetch pages until a page is shorter than the requested size. An exactly full page may have a following page; do not stop early."}
+{"id":"task-18-log-rotation","prompt":"In src/index.mjs, rotate to the last max lines, including the exact max=0 case. Preserve line order and do not mutate the input."}
+{"id":"task-19-file-atomicity","prompt":"In src/index.mjs, generate a collision-safe temporary replacement name by appending .tmp.1 after any existing .tmp suffix."}
+{"id":"task-20-metrics","prompt":"In src/index.mjs, sum only present totalMs timing values; missing timing fields must not become NaN or add unrelated fields."}
+{"id":"task-21-auth-header","prompt":"In src/index.mjs, let an explicitly supplied authorization header override the generated default, without dropping other headers."}
+{"id":"task-22-template-controls","prompt":"In src/index.mjs, include chat_template_kwargs.enable_thinking whenever thinking is explicitly true or false, and omit it only when unspecified."}
+{"id":"task-23-batch-limits","prompt":"In src/index.mjs, validate batch <= context and ubatch <= batch, with actionable errors for either violation."}
+{"id":"task-24-model-switch","prompt":"In src/index.mjs, include the model in cacheKey so switching models cannot reuse incompatible prompt cache entries."}
+{"id":"task-25-tool-permissions","prompt":"In src/index.mjs, permission checks must be case-insensitive and deny aliases such as writeFile when write is denied."}
+{"id":"task-26-repair-loop","prompt":"In src/index.mjs, request repair only when at least one check failed. A fully passing verification must stop the repair loop."}
+{"id":"task-27-desktop-ipc","prompt":"In src/index.mjs, parseFrame must return a structured {error:'invalid frame'} for malformed JSON without throwing or killing the caller."}
+{"id":"task-28-package-paths","prompt":"In src/index.mjs, joinRoot must normalize exactly one separator between root and child and preserve absolute-drive roots."}
+{"id":"task-29-doc-contract","prompt":"In src/index.mjs, implement describe(runtime) with this exact contract: return the string \"verified\" when runtime.managed is true, and return the string \"sent-only\" when runtime.managed is false. Run npm test before finishing."}
+{"id":"task-30-cleanroom","prompt":"In src/index.mjs, cleanName must trim, lowercase, and convert runs of non-alphanumeric characters to single hyphens, trimming edge hyphens."}

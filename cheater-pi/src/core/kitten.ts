@@ -15,21 +15,24 @@
 import { resolve } from "node:path";
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { SidecarAssist } from "./sidecarAssist.js";
 import { KittenApp } from "./app.js";
 import { defaultRunner } from "./runner.js";
 import { ConversationStore } from "./store/conversationStore.js";
 import { storePath } from "./paths.js";
 import { KittenLLM, DEFAULT_MODELS, tierSidecar } from "./llm.js";
 import { loadKittenSettings } from "./settings.js";
+import { probeContextSize } from "./capabilities.js";
 import { runRepl } from "./repl.js";
 import { runTui } from "./tui.js";
 import { runWeb, runServe } from "./web.js";
 import { VERSION } from "../config.js";
 import { runAttach } from "./tui.js";
+import { SidecarAssist } from "./sidecarAssist.js";
+import { resolveBenchmarkProfile } from "./benchmark.js";
 import { gatherSupportInfo } from "./support.js";
 import { launchApp, installLauncher } from "./app-launch.js";
 import type { KittenEvent, Lane } from "./events.js";
+import { parseRunFlags } from "./runFlags.js";
 import type { ConversationRow } from "./store/conversationStore.js";
 
 const dim = (s: string): string => `\x1b[2m${s}\x1b[0m`;
@@ -59,12 +62,12 @@ Usage:
   kitten help
 
 run options:  --cwd DIR  --model M  --lane answer|direct|reliable|bon|ascent  --k N  --json  --dangerous
+              --effort fast|balanced|careful|think-hard   how much compute the run may spend
               -c, --conversation <id>   continue an existing conversation (headless multi-turn)
+              --deadline-ms N   cancel the run after N ms so the result is still written
+                                (for harnesses whose grader kills the process; there is no
+                                 automatic wall clock — see runner.startEffortDeadline)
 `;
-
-function isLane(s: string | undefined): s is Lane {
-  return s === "answer" || s === "direct" || s === "reliable" || s === "bon" || s === "ascent";
-}
 
 /** A concise human line for a streamed/replayed event. Returns null for events not worth showing. */
 function renderEvent(e: KittenEvent): string | null {
@@ -95,36 +98,41 @@ function renderEvent(e: KittenEvent): string | null {
 }
 
 async function cmdRun(rest: string[]): Promise<number> {
-  let cwd = process.cwd();
-  let model: string | undefined;
-  let lane: Lane | undefined;
-  let k: number | undefined;
-  let json = false;
-  let dangerous = false;
-  let continueId: string | undefined;
-  const words: string[] = [];
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === "--cwd") cwd = resolve(rest[++i] ?? ".");
-    else if (a === "--model") model = rest[++i];
-    else if (a === "--lane") { const l = rest[++i]; if (isLane(l)) lane = l; }
-    else if (a === "--k") k = Math.max(1, Number(rest[++i]) || 1);
-    else if (a === "--json") json = true;
-    else if (a === "--dangerous" || a === "--yes") dangerous = true;
-    else if (a === "--conversation" || a === "-c") continueId = rest[++i];
-    else words.push(a);
-  }
-  const task = words.join(" ").trim();
+  const { cwd, model, lane, k, effort, json, dangerous, continueId, deadlineMs, task } = parseRunFlags(rest);
   if (!task) { process.stderr.write('kitten run: give a task, e.g. kitten run "fix the parser"\n'); return 2; }
 
   const store = ConversationStore.open(storePath());
   // Resolve endpoint/model from config (env > project .kitten > user config > defaults); --model wins.
   const settings = loadKittenSettings(cwd);
+  const benchmarkProfile = resolveBenchmarkProfile();
+  // Benchmark switches are intentionally environment-only and never appear in supported config/UI.
+  const benchmarkCompilerOff = benchmarkProfile === "minimal" || benchmarkProfile === "no-compiler" || benchmarkProfile === "no-learned";
+  const benchmarkWebAccess = benchmarkProfile === "full" ? settings.webAccess : "off";
   const resolvedModel = model ?? settings.models.main;
   const llm = new KittenLLM(tierSidecar({ ...settings.models, main: resolvedModel }));
   // Unattended headless runs default to auto-deny for destructive commands; --dangerous opts in.
-  const app = new KittenApp({ store, runner: defaultRunner(llm), projectRoot: cwd, model: resolvedModel, approvalPolicy: dangerous ? "auto-allow" : "auto-deny", taskCompiler: settings.taskCompiler, sidecarAssist: new SidecarAssist({ llm }) });
+  // The supported CLI path uses one primary runtime; legacy sidecar assist is not scheduled.
+  const app = new KittenApp({
+    store,
+    runner: defaultRunner(llm, { webAccess: benchmarkWebAccess, fastPath: benchmarkProfile === "minimal" ? "off" : settings.fastPath }),
+    projectRoot: cwd,
+    model: resolvedModel,
+    contextWindowTokens: typeof settings.contextWindowTokens === "number" ? settings.contextWindowTokens : undefined,
+    approvalPolicy: dangerous ? "auto-allow" : "auto-deny",
+    taskCompiler: benchmarkCompilerOff ? "off" : settings.taskCompiler,
+  });
   app.recover();
+  // "auto" means ASK THE SERVER, not "fall back to the 16k default". The desktop closes this loop on
+  // every runtime state change; headless never did, so a benchmark against a 64k llama.cpp planned
+  // its whole run against 16k — a quarter of the window, on the one path every measurement uses.
+  // Best-effort and bounded: an unreachable endpoint leaves the default in place and the run proceeds.
+  if (settings.contextWindowTokens === "auto") {
+    const probed = await probeContextSize(settings.models.baseUrl, settings.models.apiKey);
+    if (probed && probed > 0) {
+      app.setContextWindowTokens(probed);
+      if (!json) process.stdout.write(dim(`context: ${probed} tokens (from the server)\n`));
+    }
+  }
   if (!json) {
     // Stream assistant deltas inline; finalize on assistant.final without re-printing (no duplicate text).
     const streamed = new Set<string>();
@@ -149,7 +157,34 @@ async function cmdRun(rest: string[]): Promise<number> {
     conv = app.createConversation({ title: task.slice(0, 72), projectRoot: cwd, model });
   }
   if (!json) process.stdout.write(bold("Kitten") + dim(` · ${conv.id}${continueId ? " (continued)" : ""} · ${cwd}`) + "\n");
-  const run = await app.submitMessage(conv.id, task, { lane, k });
+
+  // An explicit, caller-owned deadline. Kitten has no automatic wall clock — the effort levels are a
+  // cost hint, not a contract — but a harness whose grader kills the container at a fixed time needs
+  // the run to stop *itself* a little earlier so the durable result gets written. Measured on
+  // Terminal-Bench 2: the grader kills at 900s, and a run killed mid-flight loses everything it did.
+  // This cancels exactly as the user's own cancel does, at a seam where partial work survives.
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  let unsubscribeDeadline: (() => void) | undefined;
+  if (deadlineMs > 0) {
+    unsubscribeDeadline = app.subscribe((e) => {
+      if (e.type !== "run.started" || deadlineTimer) return;
+      const runId = e.runId;
+      deadlineTimer = setTimeout(() => {
+        process.stderr.write(`kitten run: deadline of ${Math.round(deadlineMs / 1000)}s reached; cancelling so the result is written\n`);
+        app.cancel(runId);
+      }, deadlineMs);
+      deadlineTimer.unref?.();
+      unsubscribeDeadline?.();
+    });
+  }
+
+  const run = await app.submitMessage(conv.id, task, {
+    lane: benchmarkProfile === "minimal" && lane && lane !== "answer" ? "reliable" : lane,
+    k: benchmarkProfile === "minimal" ? 1 : k,
+    effort,
+  });
+  if (deadlineTimer) clearTimeout(deadlineTimer);
+  unsubscribeDeadline?.();
 
   if (json) {
     process.stdout.write(JSON.stringify({ conversationId: conv.id, run }) + "\n");
