@@ -76,9 +76,10 @@ export function nearestNames(name: string, candidates: Iterable<string>): string
 /** Every executable name on PATH. Bounded and failure-tolerant: an unreadable entry is skipped. */
 export function executablesOnPath(env: NodeJS.ProcessEnv = process.env): string[] {
   const sep = process.platform === "win32" ? ";" : ":";
-  const exts = process.platform === "win32"
-    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map((e) => e.toLowerCase())
-    : [];
+  // Honour an explicitly supplied PATHEXT even when the caller is exercising a
+  // Windows environment from another host (for example, in cross-platform CI).
+  const pathExt = env.PATHEXT ?? (process.platform === "win32" ? ".COM;.EXE;.BAT;.CMD" : "");
+  const exts = pathExt ? pathExt.split(";").map((e) => e.toLowerCase()).filter(Boolean) : [];
   const names: string[] = [];
   let scanned = 0;
   for (const dir of (env.PATH ?? "").split(sep)) {
