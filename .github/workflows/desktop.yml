@@ -39,6 +39,13 @@ jobs:
         with:
           node-version: '22'
 
+      # The shell build embeds the TypeScript engine, so its toolchain must exist before MSBuild.
+      - name: Install and build engine
+        working-directory: cheater-pi
+        run: |
+          npm install
+          npm run build
+
       # Warnings are errors here: an unused-variable warning in the shell is how a half-finished
       # handler ships.
       - name: Build native shell
@@ -51,17 +58,11 @@ jobs:
 
       - name: Publish self-contained shell
         working-directory: desktop
-        run: dotnet publish Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.0 -o ${{ github.workspace }}/artifacts/kitten-desktop
+        run: dotnet publish Kitten.Desktop.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.3 -o ${{ github.workspace }}/artifacts/kitten-desktop
 
       - name: Publish self-contained installer
         working-directory: desktop/Installer
-        run: dotnet publish Kitten.Setup.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.0 -o ${{ github.workspace }}/artifacts/kitten-setup
-
-      - name: Build engine
-        working-directory: cheater-pi
-        run: |
-          npm install
-          npm run build
+        run: dotnet publish Kitten.Setup.csproj -c Release -r win-x64 --self-contained true -p:Version=0.7.3 -o ${{ github.workspace }}/artifacts/kitten-setup
 
       # The bundled engine needs its own Node runtime; the packager refuses to assemble without one.
       - name: Stage Node runtime for the bundle

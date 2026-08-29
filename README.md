@@ -19,6 +19,9 @@ WebView, terminal, or TUI surface.
 
 ## Quick start
 
+[**Download the latest Windows release**](https://github.com/muzaffermahi/cheater/releases/latest),
+extract the zip, and run `Kitten.Setup.exe`.
+
 The supported user path is the packaged native app: extract the release zip, run `Kitten.Setup.exe`,
 and Kitten appears on your **Desktop and Start Menu** with its own icon — double-click it and the app
 opens; the engine and (if configured) the local llama.cpp runtime start themselves. The installer and

@@ -85,3 +85,6 @@ cheater-pi/.cheater/
 .cheater/commitlets/
 *.egg-info/
 runtimes/
+
+# Local Terminal-Bench retry queue; canonical campaign manifests are tracked under data/benchmarks.
+cheater-pi/scripts/tb2/retry-tasks.txt
